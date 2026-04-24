@@ -59,9 +59,15 @@ public final class RpcServer {
 
     private final boolean describeEnabled;
     private farm.query.vgirpc.external.LocationResolver locationResolver;
+    private farm.query.vgirpc.external.ExternalLocationConfig externalConfig;
 
     /** Attach an external-location resolver so streaming inputs with pointer batches are fetched transparently. */
     public void setLocationResolver(farm.query.vgirpc.external.LocationResolver r) { this.locationResolver = r; }
+
+    /** Configure outgoing-batch externalisation. Uploaded via {@link farm.query.vgirpc.external.ExternalStorage}. */
+    public void setExternalConfig(farm.query.vgirpc.external.ExternalLocationConfig cfg) {
+        this.externalConfig = cfg;
+    }
 
     public String serverId() { return serverId; }
     public String protocolName() { return serviceInterface.getSimpleName(); }
@@ -200,7 +206,15 @@ public final class RpcServer {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put(resultField.getName(), convertResult(result, info.resultType(), resultField));
         try (VectorSchemaRoot root = Marshalling.encodeRow(schema, row, Allocators.root())) {
-            w.writeBatch(root, null);
+            farm.query.vgirpc.external.Externalizer.Pointer ptr =
+                    farm.query.vgirpc.external.Externalizer.maybeExternalize(root, null, externalConfig);
+            if (ptr != null) {
+                try (VectorSchemaRoot pr = ptr.root()) {
+                    w.writeBatch(pr, ptr.customMetadata());
+                }
+            } else {
+                w.writeBatch(root, null);
+            }
         }
     }
 
@@ -342,6 +356,22 @@ public final class RpcServer {
     private void flushCollector(IpcStreamWriter writer, OutputCollector out) throws IOException {
         for (OutputCollector.Entry e : out.entries()) {
             try {
+                if (e.isData && externalConfig != null && externalConfig.storage() != null) {
+                    try {
+                        farm.query.vgirpc.external.Externalizer.Pointer ptr =
+                                farm.query.vgirpc.external.Externalizer.maybeExternalize(
+                                        e.root, e.customMetadata, externalConfig);
+                        if (ptr != null) {
+                            try (VectorSchemaRoot pr = ptr.root()) {
+                                writer.writeBatch(pr, ptr.customMetadata());
+                            }
+                            continue;
+                        }
+                    } catch (Exception up) {
+                        // Upload failed — fall through and write the batch inline rather than
+                        // failing the stream. The client will still receive valid data.
+                    }
+                }
                 writer.writeBatch(e.root, e.customMetadata);
             } finally {
                 e.root.close();
