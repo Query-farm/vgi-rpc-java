@@ -1,0 +1,363 @@
+// Copyright 2025-2026 Query.Farm LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package farm.query.vgirpc.http.auth;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import farm.query.vgirpc.AuthContext;
+import farm.query.vgirpc.http.AuthException;
+import farm.query.vgirpc.http.Authenticator;
+import farm.query.vgirpc.http.HttpPreHandler;
+import jakarta.servlet.http.Cookie;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
+
+/**
+ * Self-contained OAuth 2.1 PKCE (RFC 7636 + 6749 + 8252) flow helper.
+ *
+ * <p>Callers attach two things to the {@link farm.query.vgirpc.http.HttpServer}:
+ * the {@link #preHandler()} intercepts requests to the {@code callbackPath} and
+ * redirects unauthenticated browser requests to the authorization server; the
+ * {@link #authenticator()} reads the signed auth cookie on authenticated
+ * requests and produces an {@link AuthContext}.</p>
+ *
+ * <p>Cookies are HMAC-SHA256 signed + URL-safe base64 using
+ * {@link SignedCookie}; the ID token claims live inside the auth cookie as
+ * JSON (not the raw JWT — the server-side validation has already happened).</p>
+ */
+public final class OAuthPkce {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    private static final String SESSION_COOKIE = "_vgi_oauth_session";
+    private static final String AUTH_COOKIE = "_vgi_auth";
+    private static final long SESSION_TTL_SECONDS = 600;       // 10 min — authorization round-trip
+    private static final long DEFAULT_AUTH_TTL_SECONDS = 3600; // 1 hour default if id_token has no exp
+
+    private final String clientId;
+    private final String redirectUri;
+    private final String callbackPath;
+    private final String scope;
+    private final byte[] sessionKey;
+    private final byte[] authKey;
+    private final long authTtlSeconds;
+    private final OidcMetadata oidc;
+    private final JwtAuthenticator idTokenValidator;
+    private final HttpClient http;
+    private final String domain;
+
+    public static Builder builder() { return new Builder(); }
+
+    private OAuthPkce(Builder b) {
+        this.clientId = Objects.requireNonNull(b.clientId, "clientId");
+        this.redirectUri = Objects.requireNonNull(b.redirectUri, "redirectUri");
+        this.callbackPath = Objects.requireNonNull(b.callbackPath, "callbackPath");
+        this.scope = b.scope;
+        this.sessionKey = b.sessionKey.clone();
+        this.authKey = b.authKey.clone();
+        this.authTtlSeconds = b.authTtlSeconds;
+        this.oidc = Objects.requireNonNull(b.oidc, "oidc");
+        this.idTokenValidator = Objects.requireNonNull(b.idTokenValidator, "idTokenValidator");
+        this.domain = b.domain;
+        this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+    }
+
+    /** Mount on {@code HttpServer}'s preHandler list to route {@code callbackPath} requests. */
+    public HttpPreHandler preHandler() {
+        return (req, resp) -> {
+            String path = req.getRequestURI();
+            if (path != null && path.equals(callbackPath)) {
+                handleCallback(req, resp);
+                return true;
+            }
+            return false;
+        };
+    }
+
+    /** Authenticator that reads the auth cookie set by the callback handler. */
+    public Authenticator authenticator() {
+        return request -> {
+            String token = cookie(request, AUTH_COOKIE);
+            if (token == null) throw new AuthException("Missing auth cookie");
+            try {
+                byte[] payload = SignedCookie.verify(token, authKey);
+                SignedCookie.TimestampedPayload tp =
+                        SignedCookie.TimestampedPayload.unpack(payload, authTtlSeconds);
+                Map<String, Object> claims = JSON.readValue(tp.payload(), Map.class);
+                String principal = String.valueOf(claims.getOrDefault("sub", ""));
+                return new AuthContext(domain, true, principal, claims);
+            } catch (Exception e) {
+                throw new AuthException("Invalid auth cookie: " + e.getMessage());
+            }
+        };
+    }
+
+    /**
+     * Build a URL to start the PKCE flow: generates verifier + challenge, stores
+     * them in a signed session cookie, and returns the authorize URL to redirect
+     * the browser to. Callers typically invoke this in a 401 handler.
+     */
+    public String beginAuthorization(HttpServletResponse resp, String returnTo) {
+        String verifier = Pkce.generateCodeVerifier();
+        String challenge = Pkce.codeChallengeS256(verifier);
+        String state = Pkce.generateStateNonce();
+
+        Map<String, String> session = new LinkedHashMap<>();
+        session.put("verifier", verifier);
+        session.put("state", state);
+        if (returnTo != null) session.put("return_to", returnTo);
+        try {
+            byte[] payload = SignedCookie.TimestampedPayload.pack(JSON.writeValueAsBytes(session));
+            String signed = SignedCookie.sign(payload, sessionKey);
+            Cookie c = new Cookie(SESSION_COOKIE, signed);
+            c.setHttpOnly(true);
+            c.setPath("/");
+            c.setMaxAge((int) SESSION_TTL_SECONDS);
+            resp.addCookie(c);
+        } catch (Exception e) {
+            throw new RuntimeException("failed to build session cookie", e);
+        }
+
+        StringBuilder url = new StringBuilder(oidc.authorizationEndpoint().toString());
+        url.append('?');
+        url.append("response_type=code");
+        url.append("&client_id=").append(enc(clientId));
+        url.append("&redirect_uri=").append(enc(redirectUri));
+        url.append("&code_challenge=").append(enc(challenge));
+        url.append("&code_challenge_method=S256");
+        url.append("&state=").append(enc(state));
+        if (scope != null) url.append("&scope=").append(enc(scope));
+        return url.toString();
+    }
+
+    private void handleCallback(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        String code = req.getParameter("code");
+        String state = req.getParameter("state");
+        if (code == null || state == null) {
+            badRequest(resp, "missing code or state");
+            return;
+        }
+        String sessionCookie = cookie(req, SESSION_COOKIE);
+        if (sessionCookie == null) {
+            badRequest(resp, "missing session cookie");
+            return;
+        }
+        Map<String, String> session;
+        try {
+            byte[] raw = SignedCookie.verify(sessionCookie, sessionKey);
+            SignedCookie.TimestampedPayload tp = SignedCookie.TimestampedPayload.unpack(raw, SESSION_TTL_SECONDS);
+            session = JSON.readValue(tp.payload(), Map.class);
+        } catch (Exception e) {
+            badRequest(resp, "invalid session cookie: " + e.getMessage());
+            return;
+        }
+        if (!state.equals(session.get("state"))) {
+            badRequest(resp, "state mismatch — possible CSRF");
+            return;
+        }
+        String verifier = session.get("verifier");
+        String returnTo = session.getOrDefault("return_to", "/");
+
+        // Exchange code for tokens
+        Map<String, String> form = new LinkedHashMap<>();
+        form.put("grant_type", "authorization_code");
+        form.put("code", code);
+        form.put("redirect_uri", redirectUri);
+        form.put("client_id", clientId);
+        form.put("code_verifier", verifier);
+        String body = form.entrySet().stream()
+                .map(e -> enc(e.getKey()) + "=" + enc(e.getValue()))
+                .reduce((a, b2) -> a + "&" + b2).orElse("");
+        HttpResponse<String> tokenResp;
+        try {
+            tokenResp = http.send(
+                    HttpRequest.newBuilder(oidc.tokenEndpoint())
+                            .header("Content-Type", "application/x-www-form-urlencoded")
+                            .header("Accept", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                            .build(),
+                    HttpResponse.BodyHandlers.ofString());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            badRequest(resp, "token endpoint interrupted");
+            return;
+        }
+        if (tokenResp.statusCode() / 100 != 2) {
+            badRequest(resp, "token endpoint HTTP " + tokenResp.statusCode() + ": "
+                    + tokenResp.body());
+            return;
+        }
+        JsonNode tokens = JSON.readTree(tokenResp.body());
+        JsonNode idTokenNode = tokens.get("id_token");
+        if (idTokenNode == null || !idTokenNode.isTextual()) {
+            badRequest(resp, "token response missing id_token");
+            return;
+        }
+        String idToken = idTokenNode.asText();
+
+        // Validate id_token via JwtAuthenticator (runs JWKS + signature + issuer/audience).
+        AuthContext claims;
+        try {
+            claims = idTokenValidator.authenticate(new HeaderRequest("Authorization", "Bearer " + idToken));
+        } catch (AuthException ae) {
+            badRequest(resp, "id_token validation failed: " + ae.getMessage());
+            return;
+        }
+
+        // Package claims into the auth cookie.
+        try {
+            byte[] claimsBytes = JSON.writeValueAsBytes(claims.claims());
+            byte[] wrapped = SignedCookie.TimestampedPayload.pack(claimsBytes);
+            String signed = SignedCookie.sign(wrapped, authKey);
+            Cookie c = new Cookie(AUTH_COOKIE, signed);
+            c.setHttpOnly(true);
+            c.setPath("/");
+            c.setMaxAge((int) authTtlSeconds);
+            resp.addCookie(c);
+            // Clear the session cookie.
+            Cookie sc = new Cookie(SESSION_COOKIE, "");
+            sc.setPath("/");
+            sc.setMaxAge(0);
+            resp.addCookie(sc);
+        } catch (Exception e) {
+            badRequest(resp, "failed to issue auth cookie: " + e.getMessage());
+            return;
+        }
+
+        resp.setStatus(HttpServletResponse.SC_FOUND);
+        resp.setHeader("Location", returnTo);
+    }
+
+    private static String cookie(HttpServletRequest req, String name) {
+        Cookie[] cookies = req.getCookies();
+        if (cookies == null) return null;
+        for (Cookie c : cookies) if (c.getName().equals(name)) return c.getValue();
+        return null;
+    }
+
+    private static String enc(String s) {
+        return URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+
+    private static void badRequest(HttpServletResponse resp, String msg) throws IOException {
+        resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+        resp.setContentType("text/plain; charset=utf-8");
+        resp.getOutputStream().write(("oauth callback error: " + msg).getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Minimal HttpServletRequest stub for validating an id_token via JwtAuthenticator. */
+    private static final class HeaderRequest implements HttpServletRequest {
+        private final String name, value;
+        HeaderRequest(String name, String value) { this.name = name; this.value = value; }
+        @Override public String getHeader(String n) { return n.equalsIgnoreCase(name) ? value : null; }
+        // --- unused methods (dispatch only reads headers) -----------------
+        @Override public Object getAttribute(String name) { return null; }
+        @Override public java.util.Enumeration<String> getAttributeNames() { return java.util.Collections.emptyEnumeration(); }
+        @Override public String getCharacterEncoding() { return null; }
+        @Override public void setCharacterEncoding(String env) {}
+        @Override public int getContentLength() { return 0; }
+        @Override public long getContentLengthLong() { return 0; }
+        @Override public String getContentType() { return null; }
+        @Override public jakarta.servlet.ServletInputStream getInputStream() { return null; }
+        @Override public String getParameter(String name) { return null; }
+        @Override public java.util.Enumeration<String> getParameterNames() { return java.util.Collections.emptyEnumeration(); }
+        @Override public String[] getParameterValues(String name) { return null; }
+        @Override public java.util.Map<String, String[]> getParameterMap() { return java.util.Map.of(); }
+        @Override public String getProtocol() { return null; }
+        @Override public String getScheme() { return null; }
+        @Override public String getServerName() { return null; }
+        @Override public int getServerPort() { return 0; }
+        @Override public java.io.BufferedReader getReader() { return null; }
+        @Override public String getRemoteAddr() { return null; }
+        @Override public String getRemoteHost() { return null; }
+        @Override public void setAttribute(String name, Object o) {}
+        @Override public void removeAttribute(String name) {}
+        @Override public java.util.Locale getLocale() { return java.util.Locale.ROOT; }
+        @Override public java.util.Enumeration<java.util.Locale> getLocales() { return java.util.Collections.emptyEnumeration(); }
+        @Override public boolean isSecure() { return false; }
+        @Override public jakarta.servlet.RequestDispatcher getRequestDispatcher(String path) { return null; }
+        @Override public int getRemotePort() { return 0; }
+        @Override public String getLocalName() { return null; }
+        @Override public String getLocalAddr() { return null; }
+        @Override public int getLocalPort() { return 0; }
+        @Override public jakarta.servlet.ServletContext getServletContext() { return null; }
+        @Override public jakarta.servlet.AsyncContext startAsync() { return null; }
+        @Override public jakarta.servlet.AsyncContext startAsync(jakarta.servlet.ServletRequest req, jakarta.servlet.ServletResponse res) { return null; }
+        @Override public boolean isAsyncStarted() { return false; }
+        @Override public boolean isAsyncSupported() { return false; }
+        @Override public jakarta.servlet.AsyncContext getAsyncContext() { return null; }
+        @Override public jakarta.servlet.DispatcherType getDispatcherType() { return null; }
+        @Override public String getRequestId() { return ""; }
+        @Override public String getProtocolRequestId() { return ""; }
+        @Override public jakarta.servlet.ServletConnection getServletConnection() { return null; }
+        @Override public String getAuthType() { return null; }
+        @Override public Cookie[] getCookies() { return null; }
+        @Override public long getDateHeader(String n) { return -1; }
+        @Override public java.util.Enumeration<String> getHeaders(String n) { return java.util.Collections.enumeration(java.util.List.of(getHeader(n) == null ? "" : getHeader(n))); }
+        @Override public java.util.Enumeration<String> getHeaderNames() { return java.util.Collections.enumeration(java.util.List.of(name)); }
+        @Override public int getIntHeader(String n) { return -1; }
+        @Override public String getMethod() { return "POST"; }
+        @Override public String getPathInfo() { return null; }
+        @Override public String getPathTranslated() { return null; }
+        @Override public String getContextPath() { return ""; }
+        @Override public String getQueryString() { return null; }
+        @Override public String getRemoteUser() { return null; }
+        @Override public boolean isUserInRole(String role) { return false; }
+        @Override public java.security.Principal getUserPrincipal() { return null; }
+        @Override public String getRequestedSessionId() { return null; }
+        @Override public String getRequestURI() { return "/"; }
+        @Override public StringBuffer getRequestURL() { return new StringBuffer("http://local/"); }
+        @Override public String getServletPath() { return ""; }
+        @Override public jakarta.servlet.http.HttpSession getSession(boolean create) { return null; }
+        @Override public jakarta.servlet.http.HttpSession getSession() { return null; }
+        @Override public String changeSessionId() { return null; }
+        @Override public boolean isRequestedSessionIdValid() { return false; }
+        @Override public boolean isRequestedSessionIdFromCookie() { return false; }
+        @Override public boolean isRequestedSessionIdFromURL() { return false; }
+        @Override public boolean authenticate(HttpServletResponse resp) { return false; }
+        @Override public void login(String u, String p) {}
+        @Override public void logout() {}
+        @Override public java.util.Collection<jakarta.servlet.http.Part> getParts() { return java.util.List.of(); }
+        @Override public jakarta.servlet.http.Part getPart(String name) { return null; }
+        @Override public <T extends jakarta.servlet.http.HttpUpgradeHandler> T upgrade(Class<T> cls) { return null; }
+    }
+
+    public static final class Builder {
+        private String clientId;
+        private String redirectUri;
+        private String callbackPath = "/_oauth/callback";
+        private String scope = "openid";
+        private byte[] sessionKey;
+        private byte[] authKey;
+        private long authTtlSeconds = DEFAULT_AUTH_TTL_SECONDS;
+        private OidcMetadata oidc;
+        private JwtAuthenticator idTokenValidator;
+        private String domain = "oauth-pkce";
+
+        public Builder clientId(String v) { this.clientId = v; return this; }
+        public Builder redirectUri(String v) { this.redirectUri = v; return this; }
+        public Builder callbackPath(String v) { this.callbackPath = v; return this; }
+        public Builder scope(String v) { this.scope = v; return this; }
+        public Builder sessionKey(byte[] v) { this.sessionKey = v; return this; }
+        public Builder authKey(byte[] v) { this.authKey = v; return this; }
+        public Builder authTtlSeconds(long v) { this.authTtlSeconds = v; return this; }
+        public Builder oidcMetadata(OidcMetadata v) { this.oidc = v; return this; }
+        public Builder idTokenValidator(JwtAuthenticator v) { this.idTokenValidator = v; return this; }
+        public Builder domain(String v) { this.domain = v; return this; }
+
+        public OAuthPkce build() { return new OAuthPkce(this); }
+    }
+}

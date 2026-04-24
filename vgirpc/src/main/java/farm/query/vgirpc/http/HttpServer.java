@@ -44,21 +44,28 @@ public final class HttpServer {
     private final RpcServer rpc;
     private final HttpStreamHandler streamHandler;
     private final Authenticator authenticator;
+    private final java.util.List<HttpPreHandler> preHandlers;
     private final Server jetty;
     private final String prefix;
     private int port;
 
     public HttpServer(RpcServer rpc) {
-        this(rpc, "", 0, null, 0, null);
+        this(rpc, "", 0, null, 0, null, null);
     }
 
     public HttpServer(RpcServer rpc, String prefix, int port) {
-        this(rpc, prefix, port, null, 0, null);
+        this(rpc, prefix, port, null, 0, null, null);
     }
 
     public HttpServer(RpcServer rpc, String prefix, int port,
                       byte[] signingKey, long tokenTtlSeconds) {
-        this(rpc, prefix, port, signingKey, tokenTtlSeconds, null);
+        this(rpc, prefix, port, signingKey, tokenTtlSeconds, null, null);
+    }
+
+    public HttpServer(RpcServer rpc, String prefix, int port,
+                      byte[] signingKey, long tokenTtlSeconds,
+                      Authenticator authenticator) {
+        this(rpc, prefix, port, signingKey, tokenTtlSeconds, authenticator, null);
     }
 
     /**
@@ -69,13 +76,18 @@ public final class HttpServer {
      *     {@code 0} disables TTL enforcement.
      * @param authenticator per-request authenticator; {@code null} means
      *     anonymous (default).
+     * @param preHandlers optional list of pre-route handlers, run in order
+     *     before the default /health + /{method} + /{method}/init + /{method}/exchange
+     *     dispatch. Used to mount add-on routes (e.g. OAuth PKCE callback).
      */
     public HttpServer(RpcServer rpc, String prefix, int port,
                       byte[] signingKey, long tokenTtlSeconds,
-                      Authenticator authenticator) {
+                      Authenticator authenticator,
+                      java.util.List<HttpPreHandler> preHandlers) {
         this.rpc = rpc;
         this.streamHandler = new HttpStreamHandler(rpc, signingKey, tokenTtlSeconds);
         this.authenticator = authenticator != null ? authenticator : Authenticator.ANONYMOUS;
+        this.preHandlers = preHandlers != null ? java.util.List.copyOf(preHandlers) : java.util.List.of();
         this.prefix = prefix;
         this.jetty = new Server();
         ServerConnector connector = new ServerConnector(jetty);
@@ -107,6 +119,7 @@ public final class HttpServer {
     private final class RouterServlet extends HttpServlet {
         @Override
         protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            if (runPreHandlers(req, resp)) return;
             String p = pathInfo(req);
             if ("health".equals(p) || "".equals(p) || "/".equals(p)) {
                 resp.setContentType("application/json");
@@ -120,6 +133,7 @@ public final class HttpServer {
 
         @Override
         protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            if (runPreHandlers(req, resp)) return;
             String rest = pathInfo(req);
             if (rest.isEmpty() || "health".equals(rest)) {
                 resp.sendError(HttpServletResponse.SC_NOT_FOUND);
@@ -139,6 +153,13 @@ public final class HttpServer {
                 return;
             }
             handleUnary(req, resp, rest);
+        }
+
+        private boolean runPreHandlers(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            for (HttpPreHandler h : preHandlers) {
+                if (h.handle(req, resp)) return true;
+            }
+            return false;
         }
 
         private String pathInfo(HttpServletRequest req) {

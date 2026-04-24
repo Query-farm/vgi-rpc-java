@@ -8,10 +8,13 @@ import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.conformance.ConformanceService;
 import farm.query.vgirpc.conformance.ConformanceServiceImpl;
 import farm.query.vgirpc.http.Authenticator;
+import farm.query.vgirpc.http.HttpPreHandler;
 import farm.query.vgirpc.http.HttpServer;
 import farm.query.vgirpc.http.auth.BearerAuthenticator;
 import farm.query.vgirpc.http.auth.JwtAuthenticator;
 import farm.query.vgirpc.http.auth.MTlsAuthenticator;
+import farm.query.vgirpc.http.auth.OAuthPkce;
+import farm.query.vgirpc.http.auth.OidcMetadata;
 import farm.query.vgirpc.transport.StdioTransport;
 import farm.query.vgirpc.transport.UnixSocketTransport;
 
@@ -19,6 +22,7 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 public final class Main {
 
@@ -34,6 +38,7 @@ public final class Main {
         String mode = null;
         String unixPath = null;
         Authenticator authenticator = null;
+        java.util.List<HttpPreHandler> preHandlers = new java.util.ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
             switch (a) {
@@ -68,6 +73,15 @@ public final class Main {
                     if (i + 1 >= args.length) { System.err.println("--auth-jwt requires issuer=<iss>,audience=<aud>,jwks=<url>"); System.exit(2); }
                     authenticator = buildJwt(args[++i]);
                 }
+                case "--auth-pkce" -> {
+                    // value format: comma-separated key=value pairs.  Required:
+                    //   client_id, redirect_uri, issuer, audience
+                    // Optional: session_key_hex, auth_key_hex (random if omitted)
+                    if (i + 1 >= args.length) { System.err.println("--auth-pkce requires a config string"); System.exit(2); }
+                    OAuthPkce pkce = buildPkce(args[++i]);
+                    authenticator = pkce.authenticator();
+                    preHandlers.add(pkce.preHandler());
+                }
                 default -> {
                     System.err.println("unknown arg: " + a);
                     System.exit(2);
@@ -76,10 +90,52 @@ public final class Main {
         }
         if (mode == null) { servePipe(server); return; }
         switch (mode) {
-            case "http" -> serveHttp(server, signingKey, tokenTtl, authenticator);
+            case "http" -> serveHttp(server, signingKey, tokenTtl, authenticator, preHandlers);
             case "unix" -> serveUnix(server, Path.of(unixPath));
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
         }
+    }
+
+    private static OAuthPkce buildPkce(String spec) {
+        Map<String, String> cfg = new LinkedHashMap<>();
+        for (String pair : spec.split(",")) {
+            int eq = pair.indexOf('=');
+            if (eq <= 0) { System.err.println("malformed --auth-pkce entry: " + pair); System.exit(2); }
+            cfg.put(pair.substring(0, eq).trim(), pair.substring(eq + 1).trim());
+        }
+        String clientId = Objects.requireNonNull(cfg.get("client_id"), "client_id required");
+        String redirectUri = Objects.requireNonNull(cfg.get("redirect_uri"), "redirect_uri required");
+        String issuer = Objects.requireNonNull(cfg.get("issuer"), "issuer required");
+        String audience = Objects.requireNonNull(cfg.get("audience"), "audience required");
+
+        OidcMetadata oidc;
+        try { oidc = OidcMetadata.discover(issuer); }
+        catch (Exception e) { throw new RuntimeException("OIDC discovery failed: " + e.getMessage(), e); }
+
+        JwtAuthenticator jwt = JwtAuthenticator.builder()
+                .issuer(issuer).audience(audience)
+                .jwksUri(oidc.jwksUri().toString())
+                .build();
+
+        byte[] sessionKey = cfg.containsKey("session_key_hex")
+                ? parseHex(cfg.get("session_key_hex")) : randomKey(32);
+        byte[] authKey = cfg.containsKey("auth_key_hex")
+                ? parseHex(cfg.get("auth_key_hex")) : randomKey(32);
+
+        return OAuthPkce.builder()
+                .clientId(clientId)
+                .redirectUri(redirectUri)
+                .oidcMetadata(oidc)
+                .idTokenValidator(jwt)
+                .sessionKey(sessionKey)
+                .authKey(authKey)
+                .build();
+    }
+
+    private static byte[] randomKey(int length) {
+        byte[] out = new byte[length];
+        new java.security.SecureRandom().nextBytes(out);
+        return out;
     }
 
     private static Authenticator buildJwt(String spec) {
@@ -129,8 +185,9 @@ public final class Main {
     }
 
     private static void serveHttp(RpcServer server, byte[] signingKey, long tokenTtl,
-                                   Authenticator authenticator) throws Exception {
-        HttpServer http = new HttpServer(server, "", 0, signingKey, tokenTtl, authenticator);
+                                   Authenticator authenticator,
+                                   java.util.List<HttpPreHandler> preHandlers) throws Exception {
+        HttpServer http = new HttpServer(server, "", 0, signingKey, tokenTtl, authenticator, preHandlers);
         http.start();
         System.out.println("PORT:" + http.port());
         System.out.flush();
