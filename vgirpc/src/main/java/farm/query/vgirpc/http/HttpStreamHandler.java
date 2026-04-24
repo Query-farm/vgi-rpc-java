@@ -97,7 +97,8 @@ public final class HttpStreamHandler {
         }
 
         OutputCollectorSink sink = new OutputCollectorSink();
-        CallContext ctx = new CallContext(AuthContext.ANONYMOUS, sink, Map.of(),
+        farm.query.vgirpc.AuthScope.Scope scope = farm.query.vgirpc.AuthScope.current();
+        CallContext ctx = new CallContext(scope.auth, sink, scope.transportMetadata,
                 rpc.serverId(), method, rpc.protocolName(), "");
 
         Stream<?> streamResult;
@@ -165,7 +166,8 @@ public final class HttpStreamHandler {
         StreamState state = StateSerializer.deserialize(token.state, stateCls);
 
         OutputCollectorSink sink = new OutputCollectorSink();
-        CallContext ctx = new CallContext(AuthContext.ANONYMOUS, sink, Map.of(),
+        farm.query.vgirpc.AuthScope.Scope scope = farm.query.vgirpc.AuthScope.current();
+        CallContext ctx = new CallContext(scope.auth, sink, scope.transportMetadata,
                 rpc.serverId(), method, rpc.protocolName(), "");
 
         // Handle cancel: invoke on_cancel, return empty stream (schema + EOS).

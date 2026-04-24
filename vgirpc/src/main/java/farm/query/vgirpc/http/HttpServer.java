@@ -43,16 +43,22 @@ public final class HttpServer {
 
     private final RpcServer rpc;
     private final HttpStreamHandler streamHandler;
+    private final Authenticator authenticator;
     private final Server jetty;
     private final String prefix;
     private int port;
 
     public HttpServer(RpcServer rpc) {
-        this(rpc, "", 0, null, 0);
+        this(rpc, "", 0, null, 0, null);
     }
 
     public HttpServer(RpcServer rpc, String prefix, int port) {
-        this(rpc, prefix, port, null, 0);
+        this(rpc, prefix, port, null, 0, null);
+    }
+
+    public HttpServer(RpcServer rpc, String prefix, int port,
+                      byte[] signingKey, long tokenTtlSeconds) {
+        this(rpc, prefix, port, signingKey, tokenTtlSeconds, null);
     }
 
     /**
@@ -61,11 +67,15 @@ public final class HttpServer {
      *     clients resume streams across server restarts.
      * @param tokenTtlSeconds maximum state-token age before it's rejected;
      *     {@code 0} disables TTL enforcement.
+     * @param authenticator per-request authenticator; {@code null} means
+     *     anonymous (default).
      */
     public HttpServer(RpcServer rpc, String prefix, int port,
-                      byte[] signingKey, long tokenTtlSeconds) {
+                      byte[] signingKey, long tokenTtlSeconds,
+                      Authenticator authenticator) {
         this.rpc = rpc;
         this.streamHandler = new HttpStreamHandler(rpc, signingKey, tokenTtlSeconds);
+        this.authenticator = authenticator != null ? authenticator : Authenticator.ANONYMOUS;
         this.prefix = prefix;
         this.jetty = new Server();
         ServerConnector connector = new ServerConnector(jetty);
@@ -147,18 +157,51 @@ public final class HttpServer {
         }
         body = maybeDecodeRequestBody(req, body);
 
+        farm.query.vgirpc.AuthContext auth;
+        try {
+            auth = authenticator.authenticate(req);
+        } catch (AuthException e) {
+            writeAuthFailure(resp, e);
+            return;
+        }
+
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try (InMemoryTransport t = new InMemoryTransport(body, out)) {
+        try (AutoCloseable ignored = farm.query.vgirpc.AuthScope.push(auth, buildTransportMetadata(req));
+             InMemoryTransport t = new InMemoryTransport(body, out)) {
             rpc.serveOne(t);
+        } catch (Exception e) {
+            throw new IOException(e);
         }
         resp.setContentType(ARROW_CONTENT_TYPE);
-        // Mirror the client's compression preference: if they sent zstd, return zstd.
         byte[] responseBytes = out.toByteArray();
         if (acceptsZstd(req)) {
             resp.setHeader("Content-Encoding", "zstd");
             responseBytes = com.github.luben.zstd.Zstd.compress(responseBytes, 3);
         }
         resp.getOutputStream().write(responseBytes);
+    }
+
+    private static java.util.Map<String, Object> buildTransportMetadata(HttpServletRequest req) {
+        java.util.LinkedHashMap<String, Object> md = new java.util.LinkedHashMap<>();
+        String remote = req.getRemoteAddr();
+        if (remote != null) md.put("remote_addr", remote);
+        String ua = req.getHeader("User-Agent");
+        if (ua != null) md.put("user_agent", ua);
+        return md;
+    }
+
+    private static void writeAuthFailure(HttpServletResponse resp, AuthException e) throws IOException {
+        resp.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        resp.setContentType("application/json");
+        if (e.wwwAuthenticate() != null) {
+            resp.setHeader("WWW-Authenticate", e.wwwAuthenticate());
+        }
+        String msg = e.getMessage() != null ? e.getMessage() : "Unauthorized";
+        resp.getOutputStream().write(("{\"error\":\"" + escape(msg) + "\"}").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private static String escape(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     private static byte[] maybeDecodeRequestBody(HttpServletRequest req, byte[] body) throws IOException {
@@ -185,8 +228,17 @@ public final class HttpServer {
             body = buf.toByteArray();
         }
         body = maybeDecodeRequestBody(req, body);
-        byte[] out;
+
+        farm.query.vgirpc.AuthContext auth;
         try {
+            auth = authenticator.authenticate(req);
+        } catch (AuthException e) {
+            writeAuthFailure(resp, e);
+            return;
+        }
+
+        byte[] out;
+        try (AutoCloseable ignored = farm.query.vgirpc.AuthScope.push(auth, buildTransportMetadata(req))) {
             out = init ? streamHandler.handleInit(method, body) : streamHandler.handleExchange(method, body);
         } catch (Exception e) {
             // Serialise an error stream so the client can read it uniformly.

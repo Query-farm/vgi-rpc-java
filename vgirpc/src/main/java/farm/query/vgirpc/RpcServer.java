@@ -159,9 +159,10 @@ public final class RpcServer {
     private void serveUnary(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs) throws Exception {
         Schema schema = info.resultSchema();
         ClientLogSink sink = new ClientLogSink(serverId);
+        AuthScope.Scope scope = AuthScope.current();
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer())) {
             w.writeSchema(schema);
-            CallContext ctx = new CallContext(AuthContext.ANONYMOUS, sink, Map.of(),
+            CallContext ctx = new CallContext(scope.auth, sink, scope.transportMetadata,
                     serverId, info.name(), protocolName(), "");
             sink.bind(w, schema);
             try {
@@ -213,7 +214,8 @@ public final class RpcServer {
 
     private void serveStream(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs) throws Exception {
         ClientLogSink sink = new ClientLogSink(serverId);
-        CallContext ctx = new CallContext(AuthContext.ANONYMOUS, sink, Map.of(),
+        AuthScope.Scope scope = AuthScope.current();
+        CallContext ctx = new CallContext(scope.auth, sink, scope.transportMetadata,
                 serverId, info.name(), protocolName(), "");
         Stream<?> stream;
         Throwable initException = null;
