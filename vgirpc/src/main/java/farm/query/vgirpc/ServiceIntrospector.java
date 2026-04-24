@@ -65,7 +65,7 @@ public final class ServiceIntrospector {
         Schema resultSchema;
         boolean hasReturn;
         Boolean isExchange = null;
-        Class<?> headerType = null;
+        Class<?> headerType = extractHeaderType(m);
         if (isStreamReturn(returnType)) {
             type = MethodType.STREAM;
             resultSchema = Stream.EMPTY_SCHEMA;
@@ -90,6 +90,16 @@ public final class ServiceIntrospector {
         if (t == Stream.class) return true;
         if (t instanceof ParameterizedType pt) return pt.getRawType() == Stream.class;
         return false;
+    }
+
+    /**
+     * Look for a {@code @StreamHeader(Type.class)} annotation on the method to declare
+     * the header record type (Java's wildcard Stream generic can't carry it). Returns
+     * {@code null} for streams without a header.
+     */
+    private static Class<?> extractHeaderType(java.lang.reflect.Method m) {
+        farm.query.vgirpc.schema.StreamHeader ann = m.getAnnotation(farm.query.vgirpc.schema.StreamHeader.class);
+        return ann != null ? ann.value() : null;
     }
 
     private static Boolean inferExchangeFromGeneric(Type t) {

@@ -87,7 +87,10 @@ public interface ConformanceService {
 
     // --- Producer streams with headers --------------------------------------
 
+    @farm.query.vgirpc.schema.StreamHeader(ConformanceHeader.class)
     farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_header(long count);
+
+    @farm.query.vgirpc.schema.StreamHeader(ConformanceHeader.class)
     farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_header_and_logs(long count);
 
     // --- Exchange streams ---------------------------------------------------
@@ -101,6 +104,7 @@ public interface ConformanceService {
 
     // --- Exchange with header ----------------------------------------------
 
+    @farm.query.vgirpc.schema.StreamHeader(ConformanceHeader.class)
     farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_with_header(double factor);
 
     // --- Cancellation ------------------------------------------------------

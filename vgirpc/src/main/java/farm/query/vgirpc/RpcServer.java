@@ -46,15 +46,18 @@ public final class RpcServer {
     private final Map<String, RpcMethodInfo> methods;
 
     public RpcServer(Class<?> serviceInterface, Object impl) {
-        this(serviceInterface, impl, UUID.randomUUID().toString().replace("-", "").substring(0, 12));
+        this(serviceInterface, impl, UUID.randomUUID().toString().replace("-", "").substring(0, 12), true);
     }
 
-    public RpcServer(Class<?> serviceInterface, Object impl, String serverId) {
+    public RpcServer(Class<?> serviceInterface, Object impl, String serverId, boolean enableDescribe) {
         this.serviceInterface = serviceInterface;
         this.impl = impl;
         this.serverId = serverId;
         this.methods = new LinkedHashMap<>(ServiceIntrospector.describe(serviceInterface));
+        this.describeEnabled = enableDescribe;
     }
+
+    private final boolean describeEnabled;
 
     public String serverId() { return serverId; }
     public String protocolName() { return serviceInterface.getSimpleName(); }
@@ -117,6 +120,10 @@ public final class RpcServer {
                 } catch (RuntimeException pe) {
                     Wire.writeErrorStream(transport.writer(), Stream.EMPTY_SCHEMA, pe, serverId);
                     transport.writer().flush();
+                    return;
+                }
+                if (describeEnabled && Introspect.METHOD_NAME.equals(method)) {
+                    serveDescribe(transport);
                     return;
                 }
                 RpcMethodInfo info = methods.get(method);
@@ -291,6 +298,16 @@ public final class RpcServer {
             } finally {
                 e.root.close();
             }
+        }
+    }
+
+    private void serveDescribe(RpcTransport transport) throws IOException {
+        Introspect.Built built = Introspect.build(protocolName(), methods, serverId);
+        try (IpcStreamWriter w = new IpcStreamWriter(transport.writer());
+             VectorSchemaRoot root = built.root) {
+            w.writeBatch(root, built.customMetadata);
+        } finally {
+            transport.writer().flush();
         }
     }
 
