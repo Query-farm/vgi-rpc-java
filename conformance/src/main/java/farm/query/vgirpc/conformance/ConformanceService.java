@@ -3,8 +3,13 @@
 
 package farm.query.vgirpc.conformance;
 
+import farm.query.vgirpc.CallContext;
+import farm.query.vgirpc.ExchangeState;
+import farm.query.vgirpc.ProducerState;
+import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.schema.ArrowField;
 import farm.query.vgirpc.schema.ArrowFieldType;
+import farm.query.vgirpc.schema.StreamHeader;
 
 import java.util.List;
 import java.util.Map;
@@ -15,7 +20,10 @@ import java.util.Optional;
  * more wire-protocol behaviours.
  *
  * <p>This Java surface targets the same wire shape as
- * {@code vgi_rpc.conformance._protocol.ConformanceService} in the Python reference.</p>
+ * {@code vgi_rpc.conformance._protocol.ConformanceService} in the Python reference.
+ * Method and field names intentionally use {@code snake_case} to match the Python
+ * wire (the framework binds kwargs by parameter name), so do not normalise them
+ * to Java {@code camelCase}.</p>
  */
 public interface ConformanceService {
 
@@ -76,63 +84,60 @@ public interface ConformanceService {
 
     // --- Client-directed logging -------------------------------------------
 
-    String echo_with_info_log(String value, farm.query.vgirpc.CallContext ctx);
-    String echo_with_multi_logs(String value, farm.query.vgirpc.CallContext ctx);
-    String echo_with_log_extras(String value, farm.query.vgirpc.CallContext ctx);
+    String echo_with_info_log(String value, CallContext ctx);
+    String echo_with_multi_logs(String value, CallContext ctx);
+    String echo_with_log_extras(String value, CallContext ctx);
 
     // --- Producer streams ---------------------------------------------------
 
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_n(long count);
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_empty();
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_single();
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_large_batches(
-            long rows_per_batch, long batch_count);
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_logs(long count);
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_error_mid_stream(
-            long emit_before_error);
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_error_on_init();
+    RpcStream<? extends ProducerState> produce_n(long count);
+    RpcStream<? extends ProducerState> produce_empty();
+    RpcStream<? extends ProducerState> produce_single();
+    RpcStream<? extends ProducerState> produce_large_batches(long rows_per_batch, long batch_count);
+    RpcStream<? extends ProducerState> produce_with_logs(long count);
+    RpcStream<? extends ProducerState> produce_error_mid_stream(long emit_before_error);
+    RpcStream<? extends ProducerState> produce_error_on_init();
 
     // --- Producer streams with headers --------------------------------------
 
-    @farm.query.vgirpc.schema.StreamHeader(ConformanceHeader.class)
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_header(long count);
+    @StreamHeader(ConformanceHeader.class)
+    RpcStream<? extends ProducerState> produce_with_header(long count);
 
-    @farm.query.vgirpc.schema.StreamHeader(ConformanceHeader.class)
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_header_and_logs(
-            long count, farm.query.vgirpc.CallContext ctx);
+    @StreamHeader(ConformanceHeader.class)
+    RpcStream<? extends ProducerState> produce_with_header_and_logs(long count, CallContext ctx);
 
     // --- Exchange streams ---------------------------------------------------
 
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_scale(double factor);
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_accumulate();
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_with_logs();
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_error_on_nth(long fail_on);
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_zero_columns();
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_error_on_init();
+    RpcStream<? extends ExchangeState> exchange_scale(double factor);
+    RpcStream<? extends ExchangeState> exchange_accumulate();
+    RpcStream<? extends ExchangeState> exchange_with_logs();
+    RpcStream<? extends ExchangeState> exchange_error_on_nth(long fail_on);
+    RpcStream<? extends ExchangeState> exchange_zero_columns();
+    RpcStream<? extends ExchangeState> exchange_error_on_init();
 
     // --- Exchange with header ----------------------------------------------
 
-    @farm.query.vgirpc.schema.StreamHeader(ConformanceHeader.class)
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_with_header(double factor);
+    @StreamHeader(ConformanceHeader.class)
+    RpcStream<? extends ExchangeState> exchange_with_header(double factor);
 
     // --- Cancellation ------------------------------------------------------
 
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> cancellable_producer();
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> cancellable_exchange();
-    java.util.List<Long> cancel_probe_counters();
+    RpcStream<? extends ProducerState> cancellable_producer();
+    RpcStream<? extends ExchangeState> cancellable_exchange();
+    List<Long> cancel_probe_counters();
     void reset_cancel_probe();
 
     // --- Dynamic streams with rich headers ---------------------------------
 
-    @farm.query.vgirpc.schema.StreamHeader(RichHeader.class)
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_rich_header(long seed, long count);
+    @StreamHeader(RichHeader.class)
+    RpcStream<? extends ProducerState> produce_with_rich_header(long seed, long count);
 
-    @farm.query.vgirpc.schema.StreamHeader(RichHeader.class)
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_dynamic_schema(
+    @StreamHeader(RichHeader.class)
+    RpcStream<? extends ProducerState> produce_dynamic_schema(
             long seed, long count, boolean include_strings, boolean include_floats);
 
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_cast_compatible();
+    RpcStream<? extends ExchangeState> exchange_cast_compatible();
 
-    @farm.query.vgirpc.schema.StreamHeader(RichHeader.class)
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_with_rich_header(long seed, double factor);
+    @StreamHeader(RichHeader.class)
+    RpcStream<? extends ExchangeState> exchange_with_rich_header(long seed, double factor);
 }

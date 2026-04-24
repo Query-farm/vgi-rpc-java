@@ -19,12 +19,18 @@ import farm.query.vgirpc.transport.StdioTransport;
 import farm.query.vgirpc.transport.UnixSocketTransport;
 
 import java.nio.file.Path;
+import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 public final class Main {
+
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(Main.class);
 
     private Main() {}
 
@@ -32,60 +38,33 @@ public final class Main {
         ConformanceService impl = new ConformanceServiceImpl();
         RpcServer server = new RpcServer(ConformanceService.class, impl);
 
-        // Optional flags (order independent after the mode flag)
         byte[] signingKey = null;
         long tokenTtl = 0;
         String mode = null;
         String unixPath = null;
         Authenticator authenticator = null;
-        java.util.List<HttpPreHandler> preHandlers = new java.util.ArrayList<>();
-        for (int i = 0; i < args.length; i++) {
-            String a = args[i];
+        List<HttpPreHandler> preHandlers = new ArrayList<>();
+        ArgCursor c = new ArgCursor(args);
+        while (c.hasNext()) {
+            String a = c.next();
             switch (a) {
                 case "--http" -> mode = "http";
-                case "--unix" -> {
-                    mode = "unix";
-                    if (i + 1 < args.length) { unixPath = args[++i]; }
-                    else { System.err.println("--unix requires a path"); System.exit(2); }
-                }
-                case "--signing-key" -> {
-                    if (i + 1 >= args.length) { System.err.println("--signing-key requires a hex value"); System.exit(2); }
-                    signingKey = parseHex(args[++i]);
-                }
-                case "--token-ttl" -> {
-                    if (i + 1 >= args.length) { System.err.println("--token-ttl requires a seconds value"); System.exit(2); }
-                    tokenTtl = Long.parseLong(args[++i]);
-                }
-                case "--auth-bearer" -> {
-                    // value is a comma-separated list of "token=principal" pairs
-                    if (i + 1 >= args.length) { System.err.println("--auth-bearer requires token=principal[,token=principal...]"); System.exit(2); }
-                    authenticator = buildBearer(args[++i]);
-                }
+                case "--unix" -> { mode = "unix"; unixPath = c.requireValue(a); }
+                case "--signing-key" -> signingKey = HexFormat.of().parseHex(c.requireValue(a));
+                case "--token-ttl" -> tokenTtl = Long.parseLong(c.requireValue(a));
+                case "--auth-bearer" -> authenticator = buildBearer(c.requireValue(a));
                 case "--auth-mtls" -> {
-                    // value: "xfcc"
-                    if (i + 1 >= args.length) { System.err.println("--auth-mtls requires xfcc"); System.exit(2); }
-                    String kind = args[++i];
+                    String kind = c.requireValue(a);
                     if (!"xfcc".equals(kind)) { System.err.println("unsupported --auth-mtls kind: " + kind); System.exit(2); }
                     authenticator = MTlsAuthenticator.xfcc("mtls");
                 }
-                case "--auth-jwt" -> {
-                    // value format: "issuer=<iss>,audience=<aud>,jwks=<url>"
-                    if (i + 1 >= args.length) { System.err.println("--auth-jwt requires issuer=<iss>,audience=<aud>,jwks=<url>"); System.exit(2); }
-                    authenticator = buildJwt(args[++i]);
-                }
+                case "--auth-jwt" -> authenticator = buildJwt(c.requireValue(a));
                 case "--auth-pkce" -> {
-                    // value format: comma-separated key=value pairs.  Required:
-                    //   client_id, redirect_uri, issuer, audience
-                    // Optional: session_key_hex, auth_key_hex (random if omitted)
-                    if (i + 1 >= args.length) { System.err.println("--auth-pkce requires a config string"); System.exit(2); }
-                    OAuthPkce pkce = buildPkce(args[++i]);
+                    OAuthPkce pkce = buildPkce(c.requireValue(a));
                     authenticator = pkce.authenticator();
                     preHandlers.add(pkce.preHandler());
                 }
-                default -> {
-                    System.err.println("unknown arg: " + a);
-                    System.exit(2);
-                }
+                default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
         }
         if (mode == null) { servePipe(server); return; }
@@ -96,21 +75,29 @@ public final class Main {
         }
     }
 
-    private static OAuthPkce buildPkce(String spec) {
-        Map<String, String> cfg = new LinkedHashMap<>();
-        for (String pair : spec.split(",")) {
-            int eq = pair.indexOf('=');
-            if (eq <= 0) { System.err.println("malformed --auth-pkce entry: " + pair); System.exit(2); }
-            cfg.put(pair.substring(0, eq).trim(), pair.substring(eq + 1).trim());
+    /** Mutable cursor over {@code args} that knows how to demand a value for a flag. */
+    private static final class ArgCursor {
+        private final String[] args;
+        private int i;
+        ArgCursor(String[] args) { this.args = args; }
+        boolean hasNext() { return i < args.length; }
+        String next() { return args[i++]; }
+        String requireValue(String flag) {
+            if (i >= args.length) { System.err.println(flag + " requires a value"); System.exit(2); }
+            return args[i++];
         }
-        String clientId = Objects.requireNonNull(cfg.get("client_id"), "client_id required");
+    }
+
+    private static OAuthPkce buildPkce(String spec) {
+        Map<String, String> cfg = splitKv(spec, "--auth-pkce");
+        String clientId    = Objects.requireNonNull(cfg.get("client_id"),    "client_id required");
         String redirectUri = Objects.requireNonNull(cfg.get("redirect_uri"), "redirect_uri required");
-        String issuer = Objects.requireNonNull(cfg.get("issuer"), "issuer required");
-        String audience = Objects.requireNonNull(cfg.get("audience"), "audience required");
+        String issuer      = Objects.requireNonNull(cfg.get("issuer"),      "issuer required");
+        String audience    = Objects.requireNonNull(cfg.get("audience"),    "audience required");
 
         OidcMetadata oidc;
         try { oidc = OidcMetadata.discover(issuer); }
-        catch (Exception e) { throw new RuntimeException("OIDC discovery failed: " + e.getMessage(), e); }
+        catch (Exception e) { throw new IllegalStateException("OIDC discovery failed: " + e.getMessage(), e); }
 
         JwtAuthenticator jwt = JwtAuthenticator.builder()
                 .issuer(issuer).audience(audience)
@@ -118,9 +105,9 @@ public final class Main {
                 .build();
 
         byte[] sessionKey = cfg.containsKey("session_key_hex")
-                ? parseHex(cfg.get("session_key_hex")) : randomKey(32);
+                ? HexFormat.of().parseHex(cfg.get("session_key_hex")) : randomKey(32);
         byte[] authKey = cfg.containsKey("auth_key_hex")
-                ? parseHex(cfg.get("auth_key_hex")) : randomKey(32);
+                ? HexFormat.of().parseHex(cfg.get("auth_key_hex")) : randomKey(32);
 
         return OAuthPkce.builder()
                 .clientId(clientId)
@@ -132,25 +119,15 @@ public final class Main {
                 .build();
     }
 
-    private static byte[] randomKey(int length) {
-        byte[] out = new byte[length];
-        new java.security.SecureRandom().nextBytes(out);
-        return out;
-    }
-
     private static Authenticator buildJwt(String spec) {
         JwtAuthenticator.Builder b = JwtAuthenticator.builder();
-        for (String pair : spec.split(",")) {
-            int eq = pair.indexOf('=');
-            if (eq <= 0) { System.err.println("malformed --auth-jwt entry: " + pair); System.exit(2); }
-            String key = pair.substring(0, eq).trim();
-            String value = pair.substring(eq + 1).trim();
-            switch (key) {
-                case "issuer", "iss" -> b.issuer(value);
-                case "audience", "aud" -> b.audience(value);
-                case "jwks", "jwks_uri" -> b.jwksUri(value);
-                case "principal_claim" -> b.principalClaim(value);
-                default -> { System.err.println("unknown --auth-jwt key: " + key); System.exit(2); }
+        for (Map.Entry<String, String> e : splitKv(spec, "--auth-jwt").entrySet()) {
+            switch (e.getKey()) {
+                case "issuer", "iss" -> b.issuer(e.getValue());
+                case "audience", "aud" -> b.audience(e.getValue());
+                case "jwks", "jwks_uri" -> b.jwksUri(e.getValue());
+                case "principal_claim" -> b.principalClaim(e.getValue());
+                default -> { System.err.println("unknown --auth-jwt key: " + e.getKey()); System.exit(2); }
             }
         }
         return b.build();
@@ -158,25 +135,30 @@ public final class Main {
 
     private static Authenticator buildBearer(String spec) {
         Map<String, AuthContext> tokens = new LinkedHashMap<>();
-        for (String pair : spec.split(",")) {
-            int eq = pair.indexOf('=');
-            if (eq <= 0 || eq == pair.length() - 1) {
-                System.err.println("malformed --auth-bearer entry: " + pair); System.exit(2);
+        for (Map.Entry<String, String> e : splitKv(spec, "--auth-bearer").entrySet()) {
+            if (e.getValue().isEmpty()) {
+                System.err.println("malformed --auth-bearer entry: " + e.getKey() + "=");
+                System.exit(2);
             }
-            String token = pair.substring(0, eq);
-            String principal = pair.substring(eq + 1);
-            tokens.put(token, new AuthContext("bearer", true, principal, Collections.emptyMap()));
+            tokens.put(e.getKey(), new AuthContext("bearer", true, e.getValue(), Collections.emptyMap()));
         }
         return BearerAuthenticator.fromMap(tokens);
     }
 
-    private static byte[] parseHex(String hex) {
-        int len = hex.length();
-        if ((len & 1) != 0) throw new IllegalArgumentException("hex string must have even length");
-        byte[] out = new byte[len / 2];
-        for (int i = 0; i < len; i += 2) {
-            out[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4) | Character.digit(hex.charAt(i + 1), 16));
+    /** Split a comma-separated {@code key=value} string; bail out with a usage message on malformed entries. */
+    private static Map<String, String> splitKv(String spec, String flag) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (String pair : spec.split(",")) {
+            int eq = pair.indexOf('=');
+            if (eq <= 0) { System.err.println("malformed " + flag + " entry: " + pair); System.exit(2); }
+            out.put(pair.substring(0, eq).trim(), pair.substring(eq + 1).trim());
         }
+        return out;
+    }
+
+    private static byte[] randomKey(int length) {
+        byte[] out = new byte[length];
+        new SecureRandom().nextBytes(out);
         return out;
     }
 
@@ -186,13 +168,13 @@ public final class Main {
 
     private static void serveHttp(RpcServer server, byte[] signingKey, long tokenTtl,
                                    Authenticator authenticator,
-                                   java.util.List<HttpPreHandler> preHandlers) throws Exception {
+                                   List<HttpPreHandler> preHandlers) throws Exception {
         HttpServer http = new HttpServer(server, "", 0, signingKey, tokenTtl, authenticator, preHandlers);
         http.start();
         System.out.println("PORT:" + http.port());
         System.out.flush();
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try { http.stop(); } catch (Exception ignore) {}
+            try { http.stop(); } catch (Exception e) { LOG.warn("http stop failed during shutdown", e); }
         }));
         http.join();
     }

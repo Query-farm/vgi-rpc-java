@@ -34,7 +34,9 @@ public final class CallContext {
                        String requestId) {
         this.auth = auth != null ? auth : AuthContext.ANONYMOUS;
         this.emitClientLog = emitClientLog;
-        this.transportMetadata = transportMetadata != null ? transportMetadata : Collections.emptyMap();
+        this.transportMetadata = transportMetadata != null
+                ? Collections.unmodifiableMap(transportMetadata)
+                : Collections.emptyMap();
         this.serverId = serverId;
         this.methodName = methodName;
         this.protocolName = protocolName;

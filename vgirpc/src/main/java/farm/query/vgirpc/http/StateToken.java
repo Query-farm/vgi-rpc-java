@@ -3,13 +3,12 @@
 
 package farm.query.vgirpc.http;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
+import farm.query.vgirpc.http.auth.Crypto;
+
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
-import java.util.Objects;
 
 /**
  * HTTP streaming state token: HMAC-SHA256 signed envelope holding stream state,
@@ -27,24 +26,26 @@ import java.util.Objects;
  * </pre>
  * The whole thing is base64 encoded for UTF-8-safe Arrow custom metadata.
  */
-public final class StateToken {
+public record StateToken(
+        byte[] state,
+        byte[] outputSchema,
+        byte[] inputSchema,
+        String streamId,
+        long createdAt) {
 
     private static final byte VERSION = 3;
     private static final int HMAC_LEN = 32;
 
-    public final byte[] state;
-    public final byte[] outputSchema;
-    public final byte[] inputSchema;
-    public final String streamId;
-    public final long createdAt;
-
-    public StateToken(byte[] state, byte[] outputSchema, byte[] inputSchema, String streamId, long createdAt) {
-        this.state = state;
-        this.outputSchema = outputSchema;
-        this.inputSchema = inputSchema;
-        this.streamId = streamId != null ? streamId : "";
-        this.createdAt = createdAt;
+    public StateToken {
+        state = state.clone();
+        outputSchema = outputSchema.clone();
+        inputSchema = inputSchema.clone();
+        streamId = streamId != null ? streamId : "";
     }
+
+    @Override public byte[] state()        { return state.clone(); }
+    @Override public byte[] outputSchema() { return outputSchema.clone(); }
+    @Override public byte[] inputSchema()  { return inputSchema.clone(); }
 
     /** Serialise + HMAC-sign + base64-encode the token. */
     public byte[] pack(byte[] signingKey) {
@@ -62,7 +63,7 @@ public final class StateToken {
         putSegment(payload, inputSchema);
         putSegment(payload, streamIdBytes);
         byte[] payloadBytes = payload.array();
-        byte[] mac = hmac(signingKey, payloadBytes);
+        byte[] mac = Crypto.hmacSha256(signingKey, payloadBytes);
         byte[] full = new byte[payloadBytes.length + HMAC_LEN];
         System.arraycopy(payloadBytes, 0, full, 0, payloadBytes.length);
         System.arraycopy(mac, 0, full, payloadBytes.length, HMAC_LEN);
@@ -80,8 +81,8 @@ public final class StateToken {
         System.arraycopy(raw, 0, payloadBytes, 0, payloadEnd);
         byte[] receivedMac = new byte[HMAC_LEN];
         System.arraycopy(raw, payloadEnd, receivedMac, 0, HMAC_LEN);
-        byte[] expectedMac = hmac(signingKey, payloadBytes);
-        if (!constantTimeEquals(receivedMac, expectedMac)) {
+        byte[] expectedMac = Crypto.hmacSha256(signingKey, payloadBytes);
+        if (!Crypto.constantTimeEquals(receivedMac, expectedMac)) {
             throw new IllegalArgumentException("State token signature verification failed");
         }
         ByteBuffer bb = ByteBuffer.wrap(payloadBytes).order(ByteOrder.LITTLE_ENDIAN);
@@ -121,22 +122,5 @@ public final class StateToken {
         byte[] out = new byte[len];
         b.get(out);
         return out;
-    }
-
-    private static byte[] hmac(byte[] key, byte[] data) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(Objects.requireNonNull(key), "HmacSHA256"));
-            return mac.doFinal(data);
-        } catch (Exception e) {
-            throw new RuntimeException("HMAC failed", e);
-        }
-    }
-
-    private static boolean constantTimeEquals(byte[] a, byte[] b) {
-        if (a.length != b.length) return false;
-        int r = 0;
-        for (int i = 0; i < a.length; i++) r |= a[i] ^ b[i];
-        return r == 0;
     }
 }

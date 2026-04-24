@@ -17,27 +17,28 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
 
-/** Stream-state implementations used by the conformance service. */
+/** RpcStream-state implementations used by the conformance service. */
 final class StreamStates {
 
     private StreamStates() {}
 
-    static final Schema COUNTER_SCHEMA = new Schema(List.of(
-            new Field("index", FieldType.notNullable(new ArrowType.Int(64, true)), null),
-            new Field("value", FieldType.notNullable(new ArrowType.Int(64, true)), null)));
+    /** Not-null {@code int64} field. */
+    private static Field i64(String name) {
+        return new Field(name, FieldType.notNullable(new ArrowType.Int(64, true)), null);
+    }
+    /** Not-null {@code float64} field. */
+    private static Field f64(String name) {
+        return new Field(name, FieldType.notNullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null);
+    }
 
-    static final Schema SCALE_SCHEMA = new Schema(List.of(
-            new Field("value", FieldType.notNullable(new ArrowType.FloatingPoint(
-                    org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE)), null)));
-
-    static final Schema ACCUM_SCHEMA = new Schema(List.of(
-            new Field("running_sum", FieldType.notNullable(new ArrowType.FloatingPoint(
-                    org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE)), null),
-            new Field("exchange_count", FieldType.notNullable(new ArrowType.Int(64, true)), null)));
+    static final Schema COUNTER_SCHEMA = new Schema(List.of(i64("index"), i64("value")));
+    static final Schema SCALE_SCHEMA   = new Schema(List.of(f64("value")));
+    static final Schema ACCUM_SCHEMA   = new Schema(List.of(f64("running_sum"), i64("exchange_count")));
 
     static final Schema EMPTY_SCHEMA = new Schema(List.of());
 
@@ -89,7 +90,9 @@ final class StreamStates {
     }
 
     static final class Large extends ProducerState {
-        final long rowsPerBatch; final long batchCount; long current;
+        final long rowsPerBatch;
+        final long batchCount;
+        long current;
         Large(long rowsPerBatch, long batchCount) { this.rowsPerBatch = rowsPerBatch; this.batchCount = batchCount; }
         @Override public void produce(OutputCollector out, CallContext ctx) {
             if (current >= batchCount) { out.finish(); return; }
@@ -99,7 +102,8 @@ final class StreamStates {
     }
 
     static final class LoggingProducer extends ProducerState {
-        final long count; long current;
+        final long count;
+        long current;
         LoggingProducer(long count) { this.count = count; }
         @Override public void produce(OutputCollector out, CallContext ctx) {
             if (current >= count) { out.finish(); return; }
@@ -110,7 +114,8 @@ final class StreamStates {
     }
 
     static final class ErrorAfterN extends ProducerState {
-        final long emitBeforeError; long current;
+        final long emitBeforeError;
+        long current;
         ErrorAfterN(long n) { this.emitBeforeError = n; }
         @Override public void produce(OutputCollector out, CallContext ctx) {
             if (current >= emitBeforeError) {
@@ -139,7 +144,8 @@ final class StreamStates {
     }
 
     static final class Accumulate extends ExchangeState {
-        double runningSum; long exchangeCount;
+        double runningSum;
+        long exchangeCount;
         @Override public void exchange(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
             int rows = input.root().getRowCount();
             Float8Vector inVec = (Float8Vector) input.root().getVector("value");
@@ -158,17 +164,20 @@ final class StreamStates {
         @Override public void exchange(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
             out.clientLog(Level.INFO, "exchange processing");
             out.clientLog(Level.DEBUG, "exchange debug");
-            // Echo
-            int rows = input.root().getRowCount();
-            VectorSchemaRoot root = VectorSchemaRoot.create(input.root().getSchema(), Allocators.root());
-            root.allocateNew();
-            for (int c = 0; c < root.getSchema().getFields().size(); c++) {
-                root.getVector(c).copyFromSafe(0, 0, input.root().getVector(c));
-                for (int i = 1; i < rows; i++) root.getVector(c).copyFromSafe(i, i, input.root().getVector(c));
-            }
-            root.setRowCount(rows);
-            out.emit(root);
+            out.emit(echoBatch(input.root()));
         }
+    }
+
+    /** Row-by-row, column-by-column copy of {@code in} into a freshly-allocated root of the same schema. */
+    private static VectorSchemaRoot echoBatch(VectorSchemaRoot in) {
+        int rows = in.getRowCount();
+        VectorSchemaRoot root = VectorSchemaRoot.create(in.getSchema(), Allocators.root());
+        root.allocateNew();
+        for (int c = 0; c < root.getSchema().getFields().size(); c++) {
+            for (int i = 0; i < rows; i++) root.getVector(c).copyFromSafe(i, i, in.getVector(c));
+        }
+        root.setRowCount(rows);
+        return root;
     }
 
     static final class ZeroColumns extends ExchangeState {
@@ -180,20 +189,13 @@ final class StreamStates {
     }
 
     static final class FailOnNth extends ExchangeState {
-        final long failOn; long count;
+        final long failOn;
+        long count;
         FailOnNth(long failOn) { this.failOn = failOn; }
         @Override public void exchange(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
             count++;
             if (count >= failOn) throw new RuntimeException("intentional error on exchange " + count);
-            // Echo
-            int rows = input.root().getRowCount();
-            VectorSchemaRoot root = VectorSchemaRoot.create(input.root().getSchema(), Allocators.root());
-            root.allocateNew();
-            for (int c = 0; c < root.getSchema().getFields().size(); c++) {
-                for (int i = 0; i < rows; i++) root.getVector(c).copyFromSafe(i, i, input.root().getVector(c));
-            }
-            root.setRowCount(rows);
-            out.emit(root);
+            out.emit(echoBatch(input.root()));
         }
     }
 
@@ -213,7 +215,10 @@ final class StreamStates {
     }
 
     static final class DynamicProducer extends ProducerState {
-        final long count; final boolean includeStrings; final boolean includeFloats; long current;
+        final long count;
+        final boolean includeStrings;
+        final boolean includeFloats;
+        long current;
         DynamicProducer(long count, boolean s, boolean f) {
             this.count = count; this.includeStrings = s; this.includeFloats = f;
         }
@@ -258,14 +263,7 @@ final class StreamStates {
     static final class CancellableExchange extends ExchangeState {
         @Override public void exchange(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
             CancelProbe.exchangeCalls++;
-            int rows = input.root().getRowCount();
-            VectorSchemaRoot root = VectorSchemaRoot.create(input.root().getSchema(), Allocators.root());
-            root.allocateNew();
-            for (int c = 0; c < root.getSchema().getFields().size(); c++) {
-                for (int i = 0; i < rows; i++) root.getVector(c).copyFromSafe(i, i, input.root().getVector(c));
-            }
-            root.setRowCount(rows);
-            out.emit(root);
+            out.emit(echoBatch(input.root()));
         }
         @Override public void onCancel(CallContext ctx) { CancelProbe.onCancelCalls++; }
     }

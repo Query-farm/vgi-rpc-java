@@ -5,7 +5,7 @@ package farm.query.vgirpc.benchmark;
 
 import farm.query.vgirpc.ExchangeState;
 import farm.query.vgirpc.ProducerState;
-import farm.query.vgirpc.Stream;
+import farm.query.vgirpc.RpcStream;
 
 import java.util.List;
 import java.util.Map;
@@ -30,8 +30,8 @@ public interface BenchmarkService {
     String roundtrip_types(Color color, Map<String, Long> mapping, List<Long> tags);
 
     /** Producer stream yielding {@code count} rows of {@code (i, value=i*2)}. */
-    Stream<? extends ProducerState> generate(long count);
+    RpcStream<? extends ProducerState> generate(long count);
 
     /** Exchange stream multiplying float64 values by {@code factor}. */
-    Stream<? extends ExchangeState> transform(double factor);
+    RpcStream<? extends ExchangeState> transform(double factor);
 }

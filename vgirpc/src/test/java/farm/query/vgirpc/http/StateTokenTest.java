@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class StateTokenTest {
 
@@ -26,11 +27,11 @@ final class StateTokenTest {
                 1_700_000_000L);
         byte[] packed = src.pack(KEY);
         StateToken out = StateToken.unpack(packed, KEY);
-        assertArrayEquals(src.state, out.state);
-        assertArrayEquals(src.outputSchema, out.outputSchema);
-        assertArrayEquals(src.inputSchema, out.inputSchema);
-        assertEquals(src.streamId, out.streamId);
-        assertEquals(src.createdAt, out.createdAt);
+        assertArrayEquals(src.state(), out.state());
+        assertArrayEquals(src.outputSchema(), out.outputSchema());
+        assertArrayEquals(src.inputSchema(), out.inputSchema());
+        assertEquals(src.streamId(), out.streamId());
+        assertEquals(src.createdAt(), out.createdAt());
     }
 
     @Test
@@ -39,7 +40,7 @@ final class StateTokenTest {
                 System.currentTimeMillis() / 1000 - 10_000);
         byte[] packed = src.pack(KEY);
         StateToken out = StateToken.unpack(packed, KEY, 0);
-        assertEquals(src.createdAt, out.createdAt);
+        assertEquals(src.createdAt(), out.createdAt());
     }
 
     @Test
@@ -56,7 +57,7 @@ final class StateTokenTest {
                 System.currentTimeMillis() / 1000 - 5);
         byte[] packed = src.pack(KEY);
         StateToken out = StateToken.unpack(packed, KEY, 30);
-        assertEquals(src.createdAt, out.createdAt);
+        assertEquals(src.createdAt(), out.createdAt());
     }
 
     @Test
@@ -68,7 +69,7 @@ final class StateTokenTest {
         packed[packed.length - 1] ^= 0x01;
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> StateToken.unpack(packed, KEY));
-        assert e.getMessage().contains("signature");
+        assertTrue(e.getMessage().contains("signature"));
     }
 
     @Test

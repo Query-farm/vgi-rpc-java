@@ -13,7 +13,11 @@ import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -26,6 +30,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * V4 pre-signed GET URL whose expiry defaults to one hour.</p>
  */
 public final class S3Storage implements ExternalStorage, AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(S3Storage.class);
 
     private final S3Client s3;
     private final S3Presigner presigner;
@@ -75,16 +81,17 @@ public final class S3Storage implements ExternalStorage, AutoCloseable {
                 .build();
         try {
             return presigner.presignGetObject(presign).url().toURI();
-        } catch (java.net.URISyntaxException e) {
-            throw new RuntimeException(e);
+        } catch (URISyntaxException e) {
+            // The URL came from the AWS presigner — it should not fail URI parsing.
+            throw new IllegalStateException("S3 presigner returned unparseable URL", e);
         }
     }
 
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
-            try { s3.close(); } catch (Exception ignore) {}
-            try { presigner.close(); } catch (Exception ignore) {}
+            try { s3.close(); } catch (Exception e) { LOG.warn("S3Client close failed", e); }
+            try { presigner.close(); } catch (Exception e) { LOG.warn("S3Presigner close failed", e); }
         }
     }
 
@@ -99,13 +106,13 @@ public final class S3Storage implements ExternalStorage, AutoCloseable {
 
         Builder(String bucket) { this.bucket = bucket; }
 
-        public Builder keyPrefix(String p) { this.keyPrefix = p; return this; }
-        public Builder region(Region r) { this.region = r; return this; }
-        public Builder region(String r) { return region(Region.of(r)); }
-        public Builder credentials(AwsCredentialsProvider c) { this.credentials = c; return this; }
-        public Builder endpointOverride(URI uri) { this.endpointOverride = uri; return this; }
-        public Builder forcePathStyle(boolean v) { this.forcePathStyle = v; return this; }
-        public Builder presignDuration(Duration d) { this.presignDuration = d; return this; }
+        public Builder keyPrefix(String keyPrefix) { this.keyPrefix = keyPrefix; return this; }
+        public Builder region(Region region) { this.region = region; return this; }
+        public Builder region(String region) { return region(Region.of(region)); }
+        public Builder credentials(AwsCredentialsProvider credentials) { this.credentials = credentials; return this; }
+        public Builder endpointOverride(URI endpointOverride) { this.endpointOverride = endpointOverride; return this; }
+        public Builder forcePathStyle(boolean forcePathStyle) { this.forcePathStyle = forcePathStyle; return this; }
+        public Builder presignDuration(Duration presignDuration) { this.presignDuration = presignDuration; return this; }
 
         public S3Storage build() { return new S3Storage(this); }
     }

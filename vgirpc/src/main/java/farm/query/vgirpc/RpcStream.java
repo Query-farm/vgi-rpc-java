@@ -11,20 +11,21 @@ import java.util.Iterator;
 import java.util.NoSuchElementException;
 
 /**
- * Return type for streaming RPC methods.
+ * Return type for streaming RPC methods. Named {@code RpcStream} to avoid
+ * shadowing {@link java.util.stream.Stream} in user code.
  *
- * <p>On the server side, methods construct a {@link Stream} via the static
+ * <p>On the server side, methods construct an {@link RpcStream} via the static
  * factories {@link #producer(Schema, StreamState)} /
  * {@link #exchange(Schema, Schema, StreamState)} to describe the output schema
  * (and optional header) and hand the framework a {@link StreamState} instance
  * whose {@code process()} is invoked per input batch.</p>
  *
- * <p>On the client side, the dynamic proxy returns a {@code StreamSession}
+ * <p>On the client side, the dynamic proxy returns a {@code ClientStreamSession}
  * subclass. Client callers use {@link #tick()} (producer), {@link #exchange(AnnotatedBatch)}
  * (exchange), {@link #batches()} for iteration, and {@link #close()} /
  * {@link #cancel()} to end the stream.</p>
  */
-public abstract class Stream<S extends StreamState> implements AutoCloseable {
+public abstract class RpcStream<S extends StreamState> implements AutoCloseable {
 
     public static final Schema EMPTY_SCHEMA = new Schema(Collections.emptyList());
 
@@ -73,23 +74,23 @@ public abstract class Stream<S extends StreamState> implements AutoCloseable {
 
     // --- Server factories --------------------------------------------------
 
-    public static <S extends StreamState> Stream<S> producer(Schema outputSchema, S state) {
+    public static <S extends StreamState> RpcStream<S> producer(Schema outputSchema, S state) {
         return new ServerStream<>(outputSchema, EMPTY_SCHEMA, state, null);
     }
-    public static <S extends StreamState> Stream<S> producer(Schema outputSchema, S state,
-                                                              ArrowSerializableRecord header) {
+    public static <S extends StreamState> RpcStream<S> producer(Schema outputSchema, S state,
+                                                                 ArrowSerializableRecord header) {
         return new ServerStream<>(outputSchema, EMPTY_SCHEMA, state, header);
     }
-    public static <S extends StreamState> Stream<S> exchange(Schema inputSchema, Schema outputSchema, S state) {
+    public static <S extends StreamState> RpcStream<S> exchange(Schema inputSchema, Schema outputSchema, S state) {
         return new ServerStream<>(outputSchema, inputSchema, state, null);
     }
-    public static <S extends StreamState> Stream<S> exchange(Schema inputSchema, Schema outputSchema, S state,
-                                                              ArrowSerializableRecord header) {
+    public static <S extends StreamState> RpcStream<S> exchange(Schema inputSchema, Schema outputSchema, S state,
+                                                                 ArrowSerializableRecord header) {
         return new ServerStream<>(outputSchema, inputSchema, state, header);
     }
 
     /** Concrete container used by the server. */
-    static final class ServerStream<S extends StreamState> extends Stream<S> {
+    static final class ServerStream<S extends StreamState> extends RpcStream<S> {
         private final Schema outputSchema;
         private final Schema inputSchema;
         private final S state;

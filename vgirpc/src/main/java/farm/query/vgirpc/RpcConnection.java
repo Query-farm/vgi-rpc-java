@@ -109,9 +109,9 @@ public final class RpcConnection implements AutoCloseable {
                 header = readHeaderStream(headerType);
             }
 
-            Schema inputSchema = inputSchemaForStream(info);
-            Schema outputSchema = outputSchemaForStream(info);
-            return new ClientStreamSession<>(transport, inputSchema, outputSchema, header, onLog);
+            // Client initially knows nothing about the stream's schemas; the first batch
+            // received from the server carries them, and exchange inputs carry their own schema.
+            return new ClientStreamSession<>(transport, RpcStream.EMPTY_SCHEMA, RpcStream.EMPTY_SCHEMA, header, onLog);
         }
 
         @SuppressWarnings("unchecked")
@@ -137,17 +137,6 @@ public final class RpcConnection implements AutoCloseable {
                 if (h instanceof Class<?> c && ArrowSerializableRecord.class.isAssignableFrom(c)) return c;
             }
             return null;
-        }
-
-        private Schema inputSchemaForStream(RpcMethodInfo info) {
-            // Heuristic: if the declared Stream<S> uses an ExchangeState subclass, defer to the server
-            // by returning EMPTY — the first real .exchange(batch) call will re-open with the batch's
-            // actual schema. For pure producer streams EMPTY is correct.
-            return Stream.EMPTY_SCHEMA;
-        }
-
-        private Schema outputSchemaForStream(RpcMethodInfo info) {
-            return Stream.EMPTY_SCHEMA;
         }
 
         private Object doUnary(RpcMethodInfo info, Method m, Object[] args) throws Exception {
@@ -253,10 +242,7 @@ public final class RpcConnection implements AutoCloseable {
                     && value instanceof byte[] bytes) {
                 return RecordCodec.deserializeFromBytes(bytes, (Class<? extends ArrowSerializableRecord>) returnRaw);
             }
-            if (returnRaw == int.class || returnRaw == Integer.class) return (int) ((Number) value).longValue();
-            if (returnRaw == long.class || returnRaw == Long.class) return ((Number) value).longValue();
-            if (returnRaw == float.class || returnRaw == Float.class) return ((Number) value).floatValue();
-            if (returnRaw == double.class || returnRaw == Double.class) return ((Number) value).doubleValue();
+            if (value instanceof Number) return farm.query.vgirpc.marshal.Numbers.coerce(returnRaw, value);
             return value;
         }
 

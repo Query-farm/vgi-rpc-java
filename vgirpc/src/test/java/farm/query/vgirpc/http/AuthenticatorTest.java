@@ -54,7 +54,7 @@ final class AuthenticatorTest {
 
     @Test
     void chain_propagates_last_failure_when_nobody_authenticates() {
-        Authenticator a = req -> { throw new AuthException("bad", "Bearer"); };
+        Authenticator a = req -> { throw new InvalidCredentials("bad", "Bearer"); };
         Authenticator b = Authenticator.ANONYMOUS;
         AuthException e = assertThrows(AuthException.class,
                 () -> Authenticator.chain(a, b).authenticate(stubRequest()));

@@ -4,21 +4,23 @@
 package farm.query.vgirpc.http;
 
 /**
- * Thrown by an {@link Authenticator} when credentials are missing, malformed,
- * or invalid. The framework maps this to HTTP 401 with an optional
- * {@code WWW-Authenticate} challenge header.
+ * Base for authenticator failures. Sealed so {@code HttpServer.writeAuthFailure}
+ * can dispatch on subtype if it ever needs to distinguish 401 reasons.
+ *
+ * <p>Throwers should pick a concrete subtype:
+ * {@link MissingCredentials} for absent headers / cookies,
+ * {@link InvalidCredentials} for malformed, unverifiable, or rejected values.</p>
  */
-public class AuthException extends Exception {
+public abstract sealed class AuthException extends Exception
+        permits MissingCredentials, InvalidCredentials {
 
     private final String wwwAuthenticate;
 
-    public AuthException(String message) { this(message, null); }
-
-    public AuthException(String message, String wwwAuthenticate) {
+    protected AuthException(String message, String wwwAuthenticate) {
         super(message);
         this.wwwAuthenticate = wwwAuthenticate;
     }
 
     /** The value to place on the {@code WWW-Authenticate} response header, or {@code null}. */
-    public String wwwAuthenticate() { return wwwAuthenticate; }
+    public final String wwwAuthenticate() { return wwwAuthenticate; }
 }

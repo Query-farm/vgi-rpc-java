@@ -64,17 +64,16 @@ public final class ServiceIntrospector {
         MethodType type;
         Schema resultSchema;
         boolean hasReturn;
-        Boolean isExchange = null;
+        StreamKind streamKind = StreamKind.UNKNOWN;
         Class<?> headerType = extractHeaderType(m);
         if (isStreamReturn(returnType)) {
             type = MethodType.STREAM;
-            resultSchema = Stream.EMPTY_SCHEMA;
+            resultSchema = RpcStream.EMPTY_SCHEMA;
             hasReturn = false;
-            // Inspect Stream<S> for sub-type via class hierarchy (set later from runtime instance)
-            isExchange = inferExchangeFromGeneric(returnType);
+            streamKind = inferStreamKind(returnType);
         } else if (returnType == void.class || returnType == Void.class) {
             type = MethodType.UNARY;
-            resultSchema = Stream.EMPTY_SCHEMA;
+            resultSchema = RpcStream.EMPTY_SCHEMA;
             hasReturn = false;
         } else {
             type = MethodType.UNARY;
@@ -82,19 +81,19 @@ public final class ServiceIntrospector {
             hasReturn = true;
         }
         return new RpcMethodInfo(m.getName(), m, paramsSchema, resultSchema, returnType,
-                type, hasReturn, /*doc*/ null, paramTypes, /*defaults*/ null,
-                wantsCtx, isExchange, headerType);
+                type, hasReturn, /*doc*/ null, paramTypes,
+                wantsCtx, streamKind, headerType);
     }
 
     private static boolean isStreamReturn(Type t) {
-        if (t == Stream.class) return true;
-        if (t instanceof ParameterizedType pt) return pt.getRawType() == Stream.class;
+        if (t == RpcStream.class) return true;
+        if (t instanceof ParameterizedType pt) return pt.getRawType() == RpcStream.class;
         return false;
     }
 
     /**
      * Look for a {@code @StreamHeader(Type.class)} annotation on the method to declare
-     * the header record type (Java's wildcard Stream generic can't carry it). Returns
+     * the header record type (Java's wildcard RpcStream generic can't carry it). Returns
      * {@code null} for streams without a header.
      */
     private static Class<?> extractHeaderType(java.lang.reflect.Method m) {
@@ -102,16 +101,16 @@ public final class ServiceIntrospector {
         return ann != null ? ann.value() : null;
     }
 
-    private static Boolean inferExchangeFromGeneric(Type t) {
+    private static StreamKind inferStreamKind(Type t) {
         if (t instanceof ParameterizedType pt) {
             Type stateArg = pt.getActualTypeArguments()[0];
             Class<?> stateRaw;
             if (stateArg instanceof Class<?> c) stateRaw = c;
             else if (stateArg instanceof ParameterizedType inner) stateRaw = (Class<?>) inner.getRawType();
-            else return null;
-            if (ExchangeState.class.isAssignableFrom(stateRaw)) return Boolean.TRUE;
-            if (ProducerState.class.isAssignableFrom(stateRaw)) return Boolean.FALSE;
+            else return StreamKind.UNKNOWN;
+            if (ExchangeState.class.isAssignableFrom(stateRaw)) return StreamKind.EXCHANGE;
+            if (ProducerState.class.isAssignableFrom(stateRaw)) return StreamKind.PRODUCER;
         }
-        return null;
+        return StreamKind.UNKNOWN;
     }
 }

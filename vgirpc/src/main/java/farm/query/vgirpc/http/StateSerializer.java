@@ -53,14 +53,15 @@ public final class StateSerializer {
                 JsonNode node = root.get(f.getName());
                 if (node == null || node.isNull()) continue;
                 Class<?> t = f.getType();
-                if (t == int.class || t == Integer.class) f.setInt(instance, node.asInt());
-                else if (t == long.class || t == Long.class) f.setLong(instance, node.asLong());
-                else if (t == double.class || t == Double.class) f.setDouble(instance, node.asDouble());
-                else if (t == float.class || t == Float.class) f.setFloat(instance, (float) node.asDouble());
-                else if (t == boolean.class || t == Boolean.class) f.setBoolean(instance, node.asBoolean());
-                else if (t == byte.class || t == Byte.class) f.setByte(instance, (byte) node.asInt());
-                else if (t == short.class || t == Short.class) f.setShort(instance, (short) node.asInt());
-                else if (t == String.class) f.set(instance, node.asText());
+                if      (t == int.class    || t == Integer.class) f.setInt(instance, node.asInt());
+                else if (t == long.class   || t == Long.class)    f.setLong(instance, node.asLong());
+                else if (t == double.class || t == Double.class)  f.setDouble(instance, node.asDouble());
+                else if (t == float.class  || t == Float.class)   f.setFloat(instance, (float) node.asDouble());
+                else if (t == boolean.class|| t == Boolean.class) f.setBoolean(instance, node.asBoolean());
+                else if (t == byte.class   || t == Byte.class)    f.setByte(instance, (byte) node.asInt());
+                else if (t == short.class  || t == Short.class)   f.setShort(instance, (short) node.asInt());
+                else if (t == String.class)                       f.set(instance, node.asText());
+                // Generic types (List, Map, custom records) round-trip via Jackson; they must be JSON-friendly.
                 else f.set(instance, JSON.treeToValue(node, t));
             }
             return instance;

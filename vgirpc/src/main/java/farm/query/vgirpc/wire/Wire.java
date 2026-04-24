@@ -60,11 +60,22 @@ public final class Wire {
                                          Throwable t, String serverId) throws IOException {
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(schema);
-            try (VectorSchemaRoot zero = VectorSchemaRoot.create(schema, Allocators.root())) {
-                zero.allocateNew();
-                zero.setRowCount(0);
-                w.writeBatch(zero, errorMetadata(t, serverId));
-            }
+            writeZeroBatch(w, schema, errorMetadata(t, serverId));
+        }
+    }
+
+    /**
+     * Write a single zero-row batch with the given schema and metadata.
+     *
+     * <p>Centralises the {@code VectorSchemaRoot.create + allocateNew + setRowCount(0) + writeBatch}
+     * idiom used by log, tick, and pointer batches throughout the wire path.
+     */
+    public static void writeZeroBatch(IpcStreamWriter w, Schema schema,
+                                      Map<String, String> customMetadata) throws IOException {
+        try (VectorSchemaRoot zero = VectorSchemaRoot.create(schema, Allocators.root())) {
+            zero.allocateNew();
+            zero.setRowCount(0);
+            w.writeBatch(zero, customMetadata);
         }
     }
 

@@ -4,6 +4,7 @@
 package farm.query.vgirpc.log;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import farm.query.vgirpc.wire.Metadata;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -45,13 +46,13 @@ public final class Message {
 
     public Map<String, String> addToMetadata(Map<String, String> base) {
         Map<String, String> result = base != null ? new LinkedHashMap<>(base) : new LinkedHashMap<>();
-        result.put("vgi_rpc.log_level", level.name());
-        result.put("vgi_rpc.log_message", message);
+        result.put(Metadata.LOG_LEVEL, level.name());
+        result.put(Metadata.LOG_MESSAGE, message);
         if (extra != null && !extra.isEmpty()) {
             try {
-                result.put("vgi_rpc.log_extra", JSON.writeValueAsString(extra));
+                result.put(Metadata.LOG_EXTRA, JSON.writeValueAsString(extra));
             } catch (Exception ignore) {
-                result.put("vgi_rpc.log_extra", "{}");
+                result.put(Metadata.LOG_EXTRA, "{}");
             }
         }
         return result;

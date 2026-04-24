@@ -18,6 +18,8 @@ import java.nio.file.Path;
  */
 public final class Main {
 
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(Main.class);
+
     private Main() {}
 
     public static void main(String[] args) throws Exception {
@@ -35,7 +37,7 @@ public final class Main {
                 System.out.println("PORT:" + http.port());
                 System.out.flush();
                 Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                    try { http.stop(); } catch (Exception ignore) {}
+                    try { http.stop(); } catch (Exception e) { LOG.warn("http stop failed during shutdown", e); }
                 }));
                 http.join();
             }

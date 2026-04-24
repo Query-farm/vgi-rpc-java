@@ -15,30 +15,17 @@ import java.time.Duration;
 import java.util.Objects;
 
 /**
- * Minimal OIDC discovery helper — fetches
+ * Minimal OIDC discovery result — fetches
  * {@code {issuer}/.well-known/openid-configuration} and extracts the endpoint
- * URLs the PKCE flow needs. Result is immutable; callers should cache.
+ * URLs the PKCE flow needs. Immutable; callers should cache.
  */
-public final class OidcMetadata {
+public record OidcMetadata(
+        String issuer,
+        URI authorizationEndpoint,
+        URI tokenEndpoint,
+        URI jwksUri) {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-
-    private final String issuer;
-    private final URI authorizationEndpoint;
-    private final URI tokenEndpoint;
-    private final URI jwksUri;
-
-    public OidcMetadata(String issuer, URI authorizationEndpoint, URI tokenEndpoint, URI jwksUri) {
-        this.issuer = issuer;
-        this.authorizationEndpoint = authorizationEndpoint;
-        this.tokenEndpoint = tokenEndpoint;
-        this.jwksUri = jwksUri;
-    }
-
-    public String issuer() { return issuer; }
-    public URI authorizationEndpoint() { return authorizationEndpoint; }
-    public URI tokenEndpoint() { return tokenEndpoint; }
-    public URI jwksUri() { return jwksUri; }
 
     /** Fetch and parse the OIDC discovery document. Throws on HTTP / parse errors. */
     public static OidcMetadata discover(String issuer) throws IOException, InterruptedException {

@@ -4,7 +4,6 @@
 package farm.query.vgirpc.http.auth;
 
 import com.nimbusds.jose.JWSAlgorithm;
-import com.nimbusds.jose.JWSHeader;
 import com.nimbusds.jose.jwk.source.JWKSource;
 import com.nimbusds.jose.jwk.source.JWKSourceBuilder;
 import com.nimbusds.jose.proc.JWSKeySelector;
@@ -17,14 +16,13 @@ import com.nimbusds.jwt.proc.DefaultJWTProcessor;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.http.AuthException;
 import farm.query.vgirpc.http.Authenticator;
+import farm.query.vgirpc.http.HttpHeaders;
+import farm.query.vgirpc.http.InvalidCredentials;
+import farm.query.vgirpc.http.MissingCredentials;
 import jakarta.servlet.http.HttpServletRequest;
 
 import java.net.URI;
 import java.net.URL;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -88,44 +86,36 @@ public final class JwtAuthenticator implements Authenticator {
     private URL resolveJwksUri(Builder b) {
         if (b.jwksUri != null) return b.jwksUri;
         if (issuers.isEmpty()) throw new IllegalStateException("jwksUri or at least one issuer required");
-        // OIDC discovery: fetch {issuer}/.well-known/openid-configuration and read jwks_uri.
-        String discovery = issuers.get(0).replaceAll("/+$", "") + "/.well-known/openid-configuration";
         try {
-            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
-            HttpResponse<String> resp = client.send(
-                    HttpRequest.newBuilder(URI.create(discovery)).GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() / 100 != 2) {
-                throw new IllegalStateException("OIDC discovery failed: HTTP " + resp.statusCode());
-            }
-            String body = resp.body();
-            // crude extraction of "jwks_uri": - any JSON lib works but minimising deps
-            int idx = body.indexOf("\"jwks_uri\"");
-            if (idx < 0) throw new IllegalStateException("OIDC metadata missing jwks_uri");
-            int q1 = body.indexOf('"', body.indexOf(':', idx) + 1);
-            int q2 = body.indexOf('"', q1 + 1);
-            return URI.create(body.substring(q1 + 1, q2)).toURL();
+            return OidcMetadata.discover(issuers.get(0)).jwksUri().toURL();
         } catch (Exception e) {
             throw new IllegalStateException("OIDC discovery failed: " + e.getMessage(), e);
         }
     }
 
-    @Override
-    public AuthContext authenticate(HttpServletRequest request) throws AuthException {
-        String header = request.getHeader("Authorization");
-        if (header == null || !header.regionMatches(true, 0, "Bearer ", 0, 7)) {
-            throw new AuthException("Missing or invalid Authorization header", CHALLENGE);
+    /** Validate a bare JWT string (no HTTP request wrapping). Throws on any verification failure. */
+    public AuthContext validateBearer(String token) throws AuthException {
+        if (token == null || token.isEmpty()) {
+            throw new MissingCredentials("Missing bearer token", CHALLENGE);
         }
-        String token = header.substring(7).trim();
         try {
             JWTClaimsSet claims = processor.process(token, null);
-            String principal = String.valueOf(claims.getClaim(principalClaim));
-            if (principal == null || "null".equals(principal)) principal = "";
+            Object rawPrincipal = claims.getClaim(principalClaim);
+            String principal = rawPrincipal == null ? "" : rawPrincipal.toString();
             Map<String, Object> claimsMap = new LinkedHashMap<>(claims.getClaims());
             return new AuthContext(domain, true, principal, claimsMap);
         } catch (Exception e) {
-            throw new AuthException("Invalid JWT: " + e.getMessage(), CHALLENGE);
+            throw new InvalidCredentials("Invalid JWT: " + e.getMessage(), CHALLENGE);
         }
+    }
+
+    @Override
+    public AuthContext authenticate(HttpServletRequest request) throws AuthException {
+        String header = request.getHeader(HttpHeaders.AUTHORIZATION);
+        if (header == null || !header.regionMatches(true, 0, HttpHeaders.BEARER_PREFIX, 0, HttpHeaders.BEARER_PREFIX.length())) {
+            throw new MissingCredentials("Missing or invalid Authorization header", CHALLENGE);
+        }
+        return validateBearer(header.substring(HttpHeaders.BEARER_PREFIX.length()).trim());
     }
 
     /** Issuer + audience whitelist with at-least-one-of semantics + required-claims. */
@@ -174,7 +164,7 @@ public final class JwtAuthenticator implements Authenticator {
         public Builder principalClaim(String c) { this.principalClaim = c; return this; }
         public Builder domain(String d) { this.domain = d; return this; }
         public Builder cacheTtlSeconds(long seconds) { this.cacheTtlSeconds = seconds; return this; }
-        public Builder allowedAlgorithms(Set<JWSAlgorithm> algs) { this.allowedAlgorithms = algs; return this; }
+        public Builder allowedAlgorithms(Set<JWSAlgorithm> algs) { this.allowedAlgorithms = Set.copyOf(algs); return this; }
         public Builder requireClaim(String name) {
             Set<String> n = new HashSet<>(requiredClaims); n.add(name); this.requiredClaims = n; return this;
         }
@@ -185,8 +175,4 @@ public final class JwtAuthenticator implements Authenticator {
             return new JwtAuthenticator(this);
         }
     }
-
-    // Unused, kept for future header access if needed.
-    @SuppressWarnings("unused")
-    private static JWSHeader headerFor(JWSAlgorithm a) { return new JWSHeader(a); }
 }

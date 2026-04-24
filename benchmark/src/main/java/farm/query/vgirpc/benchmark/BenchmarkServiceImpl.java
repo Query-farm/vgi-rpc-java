@@ -8,7 +8,7 @@ import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.ExchangeState;
 import farm.query.vgirpc.OutputCollector;
 import farm.query.vgirpc.ProducerState;
-import farm.query.vgirpc.Stream;
+import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.wire.Allocators;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.Float8Vector;
@@ -19,21 +19,22 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.stream.Collectors;
 
 public final class BenchmarkServiceImpl implements BenchmarkService {
 
-    static final Schema GENERATE_SCHEMA = new Schema(List.of(
-            new Field("i", FieldType.notNullable(new ArrowType.Int(64, true)), null),
-            new Field("value", FieldType.notNullable(new ArrowType.Int(64, true)), null)));
+    private static Field i64(String name) {
+        return new Field(name, FieldType.notNullable(new ArrowType.Int(64, true)), null);
+    }
+    private static Field f64(String name) {
+        return new Field(name, FieldType.notNullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null);
+    }
 
-    static final Schema TRANSFORM_SCHEMA = new Schema(List.of(
-            new Field("value", FieldType.notNullable(
-                    new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null)));
+    static final Schema GENERATE_SCHEMA  = new Schema(List.of(i64("i"), i64("value")));
+    static final Schema TRANSFORM_SCHEMA = new Schema(List.of(f64("value")));
 
     @Override public void noop() {}
 
@@ -44,38 +45,25 @@ public final class BenchmarkServiceImpl implements BenchmarkService {
     @Override
     public String roundtrip_types(Color color, Map<String, Long> mapping, List<Long> tags) {
         // Matches the Go/Python format: "{COLOR}:true:{sorted dict}:{sorted list}"
-        Map<String, Long> sortedMap = new TreeMap<>(mapping);
-        StringBuilder map = new StringBuilder("{");
-        boolean first = true;
-        for (Map.Entry<String, Long> e : sortedMap.entrySet()) {
-            if (!first) map.append(", "); first = false;
-            map.append("'").append(e.getKey()).append("': ").append(e.getValue());
-        }
-        map.append("}");
-
-        List<Long> sortedTags = new ArrayList<>(tags);
-        Collections.sort(sortedTags);
-        StringBuilder list = new StringBuilder("[");
-        for (int i = 0; i < sortedTags.size(); i++) {
-            if (i > 0) list.append(", ");
-            list.append(sortedTags.get(i));
-        }
-        list.append("]");
-
+        String map = new TreeMap<>(mapping).entrySet().stream()
+                .map(e -> "'" + e.getKey() + "': " + e.getValue())
+                .collect(Collectors.joining(", ", "{", "}"));
+        String list = tags.stream().sorted().map(String::valueOf)
+                .collect(Collectors.joining(", ", "[", "]"));
         return color.name() + ":true:" + map + ":" + list;
     }
 
     @Override
-    public Stream<? extends ProducerState> generate(long count) {
-        return Stream.producer(GENERATE_SCHEMA, new GenerateState(count));
+    public RpcStream<? extends ProducerState> generate(long count) {
+        return RpcStream.producer(GENERATE_SCHEMA, new GenerateState(count));
     }
 
     @Override
-    public Stream<? extends ExchangeState> transform(double factor) {
-        return Stream.exchange(TRANSFORM_SCHEMA, TRANSFORM_SCHEMA, new TransformState(factor));
+    public RpcStream<? extends ExchangeState> transform(double factor) {
+        return RpcStream.exchange(TRANSFORM_SCHEMA, TRANSFORM_SCHEMA, new TransformState(factor));
     }
 
-    // --- Stream states --------------------------------------------------
+    // --- RpcStream states --------------------------------------------------
 
     static final class GenerateState extends ProducerState {
         long count;

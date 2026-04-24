@@ -6,6 +6,9 @@ package farm.query.vgirpc.http.auth;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.http.AuthException;
 import farm.query.vgirpc.http.Authenticator;
+import farm.query.vgirpc.http.HttpHeaders;
+import farm.query.vgirpc.http.InvalidCredentials;
+import farm.query.vgirpc.http.MissingCredentials;
 import jakarta.servlet.http.HttpServletRequest;
 
 import java.io.ByteArrayInputStream;
@@ -49,13 +52,13 @@ public final class MTlsAuthenticator {
     public static Authenticator xfcc(String domain) {
         String dom = domain != null ? domain : "mtls";
         return request -> {
-            String header = request.getHeader("x-forwarded-client-cert");
+            String header = request.getHeader(HttpHeaders.X_FORWARDED_CLIENT_CERT);
             if (header == null || header.isEmpty()) {
-                throw new AuthException("Missing x-forwarded-client-cert header");
+                throw new MissingCredentials("Missing " + HttpHeaders.X_FORWARDED_CLIENT_CERT + " header");
             }
             List<XfccElement> elements = XfccParser.parse(header);
             if (elements.isEmpty()) {
-                throw new AuthException("Empty x-forwarded-client-cert header");
+                throw new InvalidCredentials("Empty " + HttpHeaders.X_FORWARDED_CLIENT_CERT + " header");
             }
             XfccElement element = elements.get(0);
             String principal = XfccParser.extractCn(element.subject());
@@ -74,7 +77,7 @@ public final class MTlsAuthenticator {
     public static Authenticator byFingerprint(Map<String, AuthContext> fingerprints,
                                                String header, String algorithm) {
         Objects.requireNonNull(fingerprints, "fingerprints");
-        String hdr = header != null ? header : "X-SSL-Client-Cert";
+        String hdr = header != null ? header : HttpHeaders.X_SSL_CLIENT_CERT;
         String algo = algorithm != null ? algorithm : "SHA-256";
         return request -> {
             X509Certificate cert = parseHeaderCert(request, hdr);
@@ -83,12 +86,12 @@ public final class MTlsAuthenticator {
                 MessageDigest md = MessageDigest.getInstance(algo);
                 fp = md.digest(cert.getEncoded());
             } catch (Exception e) {
-                throw new AuthException("Fingerprint computation failed: " + e.getMessage());
+                throw new InvalidCredentials("Fingerprint computation failed: " + e.getMessage());
             }
             String hex = toHex(fp);
             AuthContext ctx = fingerprints.get(hex);
             if (ctx == null) {
-                throw new AuthException("Unknown certificate fingerprint: " + hex);
+                throw new InvalidCredentials("Unknown certificate fingerprint: " + hex);
             }
             return ctx;
         };
@@ -96,14 +99,14 @@ public final class MTlsAuthenticator {
 
     /** PEM subject CN with optional allow-list. */
     public static Authenticator bySubjectCn(String header, Set<String> allowedSubjects, String domain) {
-        String hdr = header != null ? header : "X-SSL-Client-Cert";
+        String hdr = header != null ? header : HttpHeaders.X_SSL_CLIENT_CERT;
         String dom = domain != null ? domain : "mtls";
         return request -> {
             X509Certificate cert = parseHeaderCert(request, hdr);
             String dn = cert.getSubjectX500Principal().getName(); // RFC 2253 / RFC 4514
             String cn = XfccParser.extractCn(dn);
             if (allowedSubjects != null && !allowedSubjects.contains(cn)) {
-                throw new AuthException("Subject CN '" + cn + "' not in allowed subjects");
+                throw new InvalidCredentials("Subject CN '" + cn + "' not in allowed subjects");
             }
             Map<String, Object> claims = new LinkedHashMap<>();
             claims.put("subject_dn", dn);
@@ -118,18 +121,18 @@ public final class MTlsAuthenticator {
     private static X509Certificate parseHeaderCert(HttpServletRequest req, String header) throws AuthException {
         String raw = req.getHeader(header);
         if (raw == null || raw.isEmpty()) {
-            throw new AuthException("Missing " + header + " header");
+            throw new MissingCredentials("Missing " + header + " header");
         }
         String pem = URLDecoder.decode(raw, StandardCharsets.UTF_8);
         if (!pem.startsWith("-----BEGIN CERTIFICATE-----")) {
-            throw new AuthException("Header value is not a PEM certificate");
+            throw new InvalidCredentials("Header value is not a PEM certificate");
         }
         try {
             CertificateFactory cf = CertificateFactory.getInstance("X.509");
             return (X509Certificate) cf.generateCertificate(
                     new ByteArrayInputStream(pem.getBytes(StandardCharsets.UTF_8)));
         } catch (CertificateException e) {
-            throw new AuthException("Failed to parse PEM certificate: " + e.getMessage());
+            throw new InvalidCredentials("Failed to parse PEM certificate: " + e.getMessage());
         }
     }
 

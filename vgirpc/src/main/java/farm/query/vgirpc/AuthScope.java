@@ -17,13 +17,12 @@ import java.util.Map;
  */
 public final class AuthScope {
 
-    public static final class Scope {
-        public final AuthContext auth;
-        public final Map<String, Object> transportMetadata;
-
-        public Scope(AuthContext auth, Map<String, Object> transportMetadata) {
-            this.auth = auth != null ? auth : AuthContext.ANONYMOUS;
-            this.transportMetadata = transportMetadata != null ? transportMetadata : Collections.emptyMap();
+    public record Scope(AuthContext auth, Map<String, Object> transportMetadata) {
+        public Scope {
+            auth = auth != null ? auth : AuthContext.ANONYMOUS;
+            transportMetadata = transportMetadata != null
+                    ? Collections.unmodifiableMap(transportMetadata)
+                    : Collections.emptyMap();
         }
     }
 

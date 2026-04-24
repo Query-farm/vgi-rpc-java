@@ -6,6 +6,9 @@ package farm.query.vgirpc.http.auth;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.http.AuthException;
 import farm.query.vgirpc.http.Authenticator;
+import farm.query.vgirpc.http.HttpHeaders;
+import farm.query.vgirpc.http.InvalidCredentials;
+import farm.query.vgirpc.http.MissingCredentials;
 import jakarta.servlet.http.HttpServletRequest;
 
 import java.util.Map;
@@ -43,27 +46,25 @@ public final class BearerAuthenticator implements Authenticator {
 
     @Override
     public AuthContext authenticate(HttpServletRequest request) throws AuthException {
-        String header = request.getHeader("Authorization");
+        String header = request.getHeader(HttpHeaders.AUTHORIZATION);
         String token = null;
-        if (header != null && header.regionMatches(true, 0, "Bearer ", 0, 7)) {
-            token = header.substring(7).trim();
+        if (header != null && header.regionMatches(true, 0, HttpHeaders.BEARER_PREFIX, 0, HttpHeaders.BEARER_PREFIX.length())) {
+            token = header.substring(HttpHeaders.BEARER_PREFIX.length()).trim();
         } else {
-            String apiKey = request.getHeader("X-API-Key");
+            String apiKey = request.getHeader(HttpHeaders.API_KEY);
             if (apiKey != null && !apiKey.isEmpty()) token = apiKey;
         }
         if (token == null || token.isEmpty()) {
-            throw new AuthException("Missing Authorization bearer header", CHALLENGE);
+            throw new MissingCredentials("Missing Authorization bearer header", CHALLENGE);
         }
         try {
             AuthContext ctx = validator.apply(token);
             if (ctx == null || !ctx.authenticated()) {
-                throw new AuthException("Invalid bearer token", CHALLENGE);
+                throw new InvalidCredentials("Invalid bearer token", CHALLENGE);
             }
             return ctx;
-        } catch (AuthException ae) {
-            throw ae;
         } catch (IllegalArgumentException | SecurityException e) {
-            throw new AuthException(e.getMessage() != null ? e.getMessage() : "Invalid bearer token", CHALLENGE);
+            throw new InvalidCredentials(e.getMessage() != null ? e.getMessage() : "Invalid bearer token", CHALLENGE);
         }
     }
 }

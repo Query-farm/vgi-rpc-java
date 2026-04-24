@@ -132,12 +132,9 @@ public final class RecordCodec {
             return deserializeFromBytes(bytes, (Class<? extends ArrowSerializableRecord>) ptype);
         }
         if (ptype == byte[].class) return raw;
-        if (ptype == int.class || ptype == Integer.class) return (int) ((Number) raw).longValue();
-        if (ptype == long.class || ptype == Long.class) return ((Number) raw).longValue();
-        if (ptype == double.class || ptype == Double.class) return ((Number) raw).doubleValue();
-        if (ptype == float.class || ptype == Float.class) return ((Number) raw).floatValue();
         if (ptype == boolean.class || ptype == Boolean.class) return raw;
         if (ptype == String.class) return raw;
+        if (raw instanceof Number) return Numbers.coerce(ptype, raw);
         if (List.class.isAssignableFrom(ptype) && raw instanceof List<?> list) {
             // Convert nested elements based on generic component type
             java.lang.reflect.ParameterizedType pt = (java.lang.reflect.ParameterizedType) rc.getGenericType();
@@ -168,10 +165,7 @@ public final class RecordCodec {
         if (ArrowSerializableRecord.class.isAssignableFrom(ptype) && raw instanceof Map<?, ?> m) {
             return fromRowMap((Class<? extends ArrowSerializableRecord>) ptype, (Map<String, Object>) m);
         }
-        if (ptype == int.class || ptype == Integer.class) return (int) ((Number) raw).longValue();
-        if (ptype == long.class || ptype == Long.class) return ((Number) raw).longValue();
-        if (ptype == double.class || ptype == Double.class) return ((Number) raw).doubleValue();
-        if (ptype == float.class || ptype == Float.class) return ((Number) raw).floatValue();
+        if (raw instanceof Number) return Numbers.coerce(ptype, raw);
         if (List.class.isAssignableFrom(ptype) && raw instanceof List<?> list && genericType instanceof java.lang.reflect.ParameterizedType pt) {
             java.lang.reflect.Type elemType = pt.getActualTypeArguments()[0];
             List<Object> out = new ArrayList<>(list.size());

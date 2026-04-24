@@ -97,8 +97,11 @@ public final class Introspect {
                 setBinary(root, 9, i, serializeSchema(SchemaDerivation.schemaForRecord(
                         info.headerType().asSubclass(ArrowSerializableRecord.class))));
             } else ((VarBinaryVector) root.getVector(9)).setNull(i);
-            if (info.isExchange() != null) ((BitVector) root.getVector(10)).setSafe(i, info.isExchange() ? 1 : 0);
-            else ((BitVector) root.getVector(10)).setNull(i);
+            switch (info.streamKind()) {
+                case EXCHANGE -> ((BitVector) root.getVector(10)).setSafe(i, 1);
+                case PRODUCER -> ((BitVector) root.getVector(10)).setSafe(i, 0);
+                case UNKNOWN  -> ((BitVector) root.getVector(10)).setNull(i);
+            }
             ((VarCharVector) root.getVector(11)).setNull(i);
             i++;
         }
@@ -112,12 +115,8 @@ public final class Introspect {
         return new Built(root, md);
     }
 
-    /** Result of {@link #build}. Caller owns {@link #root} and must close it. */
-    public static final class Built {
-        public final VectorSchemaRoot root;
-        public final Map<String, String> customMetadata;
-        Built(VectorSchemaRoot root, Map<String, String> md) { this.root = root; this.customMetadata = md; }
-    }
+    /** Result of {@link #build}. Caller owns {@link #root()} and must close it. */
+    public record Built(VectorSchemaRoot root, Map<String, String> customMetadata) {}
 
     private static void setUtf8(VectorSchemaRoot root, int col, int row, String v) {
         ((VarCharVector) root.getVector(col)).setSafe(row, v.getBytes(StandardCharsets.UTF_8));
@@ -171,8 +170,8 @@ public final class Introspect {
     public static ServiceDescription introspect(RpcTransport transport) {
         // Send request
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer())) {
-            w.writeSchema(Stream.EMPTY_SCHEMA);
-            try (VectorSchemaRoot zero = VectorSchemaRoot.create(Stream.EMPTY_SCHEMA, Allocators.root())) {
+            w.writeSchema(RpcStream.EMPTY_SCHEMA);
+            try (VectorSchemaRoot zero = VectorSchemaRoot.create(RpcStream.EMPTY_SCHEMA, Allocators.root())) {
                 zero.allocateNew();
                 zero.setRowCount(1);
                 Map<String, String> md = new LinkedHashMap<>();

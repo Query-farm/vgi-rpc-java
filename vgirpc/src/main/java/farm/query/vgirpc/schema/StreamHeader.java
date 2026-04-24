@@ -10,8 +10,8 @@ import java.lang.annotation.Target;
 
 /**
  * Declares the header record type for a streaming RPC method. Java's wildcard
- * {@code Stream<? extends StreamState>} return type can't encode the header
- * (unlike Python's {@code Stream[S, H]}), so the method is annotated instead.
+ * {@code RpcStream<? extends StreamState>} return type can't encode the header
+ * (unlike Python's {@code RpcStream[S, H]}), so the method is annotated instead.
  *
  * <p>The value must be a record implementing {@link ArrowSerializableRecord}.</p>
  */

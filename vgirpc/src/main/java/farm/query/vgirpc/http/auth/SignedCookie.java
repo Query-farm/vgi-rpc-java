@@ -3,8 +3,6 @@
 
 package farm.query.vgirpc.http.auth;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Objects;
@@ -32,7 +30,7 @@ public final class SignedCookie {
         Objects.requireNonNull(payload, "payload");
         Objects.requireNonNull(key, "key");
         byte[] payloadB64 = ENC.encode(payload);
-        byte[] mac = hmac(key, payloadB64);
+        byte[] mac = Crypto.hmacSha256(key, payloadB64);
         return new String(payloadB64, StandardCharsets.US_ASCII) + '.' + ENC.encodeToString(mac);
     }
 
@@ -45,14 +43,14 @@ public final class SignedCookie {
         int dot = cookieValue.lastIndexOf('.');
         if (dot < 0) throw new IllegalArgumentException("malformed signed cookie: missing '.'");
         byte[] payloadB64 = cookieValue.substring(0, dot).getBytes(StandardCharsets.US_ASCII);
-        byte[] expected = hmac(key, payloadB64);
+        byte[] expected = Crypto.hmacSha256(key, payloadB64);
         byte[] actual;
         try {
             actual = DEC.decode(cookieValue.substring(dot + 1));
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("malformed signed cookie: bad base64 mac");
         }
-        if (!constantTimeEquals(expected, actual)) {
+        if (!Crypto.constantTimeEquals(expected, actual)) {
             throw new IllegalArgumentException("signed cookie signature verification failed");
         }
         try {
@@ -104,20 +102,4 @@ public final class SignedCookie {
         }
     }
 
-    private static byte[] hmac(byte[] key, byte[] data) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(key, "HmacSHA256"));
-            return mac.doFinal(data);
-        } catch (Exception e) {
-            throw new RuntimeException("HMAC-SHA256 unavailable — JVM broken", e);
-        }
-    }
-
-    private static boolean constantTimeEquals(byte[] a, byte[] b) {
-        if (a.length != b.length) return false;
-        int r = 0;
-        for (int i = 0; i < a.length; i++) r |= a[i] ^ b[i];
-        return r == 0;
-    }
 }
