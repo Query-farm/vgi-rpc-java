@@ -15,6 +15,9 @@ dependencies {
     implementation("com.fasterxml.jackson.core:jackson-databind:$jacksonVersion")
     implementation("com.github.luben:zstd-jni:1.5.6-8")
 
+    // OAuth JWT / JWKS (Phase 12)
+    implementation("com.nimbusds:nimbus-jose-jwt:10.0.1")
+
     // HTTP transport (server + client)
     implementation("org.eclipse.jetty:jetty-server:$jettyVersion")
     implementation("org.eclipse.jetty:jetty-util:$jettyVersion")

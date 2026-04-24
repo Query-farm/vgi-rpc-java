@@ -10,6 +10,7 @@ import farm.query.vgirpc.conformance.ConformanceServiceImpl;
 import farm.query.vgirpc.http.Authenticator;
 import farm.query.vgirpc.http.HttpServer;
 import farm.query.vgirpc.http.auth.BearerAuthenticator;
+import farm.query.vgirpc.http.auth.JwtAuthenticator;
 import farm.query.vgirpc.http.auth.MTlsAuthenticator;
 import farm.query.vgirpc.transport.StdioTransport;
 import farm.query.vgirpc.transport.UnixSocketTransport;
@@ -62,6 +63,11 @@ public final class Main {
                     if (!"xfcc".equals(kind)) { System.err.println("unsupported --auth-mtls kind: " + kind); System.exit(2); }
                     authenticator = MTlsAuthenticator.xfcc("mtls");
                 }
+                case "--auth-jwt" -> {
+                    // value format: "issuer=<iss>,audience=<aud>,jwks=<url>"
+                    if (i + 1 >= args.length) { System.err.println("--auth-jwt requires issuer=<iss>,audience=<aud>,jwks=<url>"); System.exit(2); }
+                    authenticator = buildJwt(args[++i]);
+                }
                 default -> {
                     System.err.println("unknown arg: " + a);
                     System.exit(2);
@@ -74,6 +80,24 @@ public final class Main {
             case "unix" -> serveUnix(server, Path.of(unixPath));
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
         }
+    }
+
+    private static Authenticator buildJwt(String spec) {
+        JwtAuthenticator.Builder b = JwtAuthenticator.builder();
+        for (String pair : spec.split(",")) {
+            int eq = pair.indexOf('=');
+            if (eq <= 0) { System.err.println("malformed --auth-jwt entry: " + pair); System.exit(2); }
+            String key = pair.substring(0, eq).trim();
+            String value = pair.substring(eq + 1).trim();
+            switch (key) {
+                case "issuer", "iss" -> b.issuer(value);
+                case "audience", "aud" -> b.audience(value);
+                case "jwks", "jwks_uri" -> b.jwksUri(value);
+                case "principal_claim" -> b.principalClaim(value);
+                default -> { System.err.println("unknown --auth-jwt key: " + key); System.exit(2); }
+            }
+        }
+        return b.build();
     }
 
     private static Authenticator buildBearer(String spec) {

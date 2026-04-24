@@ -51,11 +51,18 @@ public final class SchemaDerivation {
     private static final Map<Class<?>, Schema> RECORD_SCHEMA_CACHE = new ConcurrentHashMap<>();
 
     /**
-     * Derive an Arrow schema for a {@link ArrowSerializableRecord} class by walking
-     * its record components. Cached.
+     * Derive an Arrow schema for an {@link ArrowSerializableRecord} class by walking
+     * its record components. Cached. Uses {@code putIfAbsent} rather than
+     * {@code computeIfAbsent} so recursive derivations (a record with a nested
+     * record component) don't trip {@link java.util.concurrent.ConcurrentHashMap}'s
+     * recursive-update detector.
      */
     public static Schema schemaForRecord(Class<? extends ArrowSerializableRecord> cls) {
-        return RECORD_SCHEMA_CACHE.computeIfAbsent(cls, SchemaDerivation::buildRecordSchema);
+        Schema cached = RECORD_SCHEMA_CACHE.get(cls);
+        if (cached != null) return cached;
+        Schema built = buildRecordSchema(cls);
+        Schema existing = RECORD_SCHEMA_CACHE.putIfAbsent(cls, built);
+        return existing != null ? existing : built;
     }
 
     private static Schema buildRecordSchema(Class<?> cls) {
