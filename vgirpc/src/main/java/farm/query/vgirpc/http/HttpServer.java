@@ -4,7 +4,9 @@
 package farm.query.vgirpc.http;
 
 import farm.query.vgirpc.RpcServer;
+import farm.query.vgirpc.Stream;
 import farm.query.vgirpc.transport.RpcTransport;
+import farm.query.vgirpc.wire.Wire;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -40,6 +42,7 @@ public final class HttpServer {
     public static final String ARROW_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 
     private final RpcServer rpc;
+    private final HttpStreamHandler streamHandler;
     private final Server jetty;
     private final String prefix;
     private int port;
@@ -50,6 +53,7 @@ public final class HttpServer {
 
     public HttpServer(RpcServer rpc, String prefix, int port) {
         this.rpc = rpc;
+        this.streamHandler = new HttpStreamHandler(rpc);
         this.prefix = prefix;
         this.jetty = new Server();
         ServerConnector connector = new ServerConnector(jetty);
@@ -100,10 +104,16 @@ public final class HttpServer {
                 return;
             }
             if (rest.endsWith("/init") || rest.endsWith("/exchange")) {
-                resp.setStatus(HttpServletResponse.SC_NOT_IMPLEMENTED);
-                resp.setContentType("application/json");
-                resp.getOutputStream().write(
-                        "{\"error\":\"HTTP streaming not yet implemented in Java port\"}".getBytes());
+                String methodName;
+                boolean init;
+                if (rest.endsWith("/init")) {
+                    methodName = rest.substring(0, rest.length() - "/init".length());
+                    init = true;
+                } else {
+                    methodName = rest.substring(0, rest.length() - "/exchange".length());
+                    init = false;
+                }
+                handleStream(req, resp, methodName, init);
                 return;
             }
             handleUnary(req, resp, rest);
@@ -153,6 +163,32 @@ public final class HttpServer {
             return out;
         }
         throw new IOException("unsupported Content-Encoding: " + enc);
+    }
+
+    private void handleStream(HttpServletRequest req, HttpServletResponse resp,
+                               String method, boolean init) throws IOException {
+        byte[] body;
+        try (InputStream in = req.getInputStream(); ByteArrayOutputStream buf = new ByteArrayOutputStream()) {
+            in.transferTo(buf);
+            body = buf.toByteArray();
+        }
+        body = maybeDecodeRequestBody(req, body);
+        byte[] out;
+        try {
+            out = init ? streamHandler.handleInit(method, body) : streamHandler.handleExchange(method, body);
+        } catch (Exception e) {
+            // Serialise an error stream so the client can read it uniformly.
+            ByteArrayOutputStream errOut = new ByteArrayOutputStream();
+            Wire.writeErrorStream(errOut, Stream.EMPTY_SCHEMA, e, rpc.serverId());
+            out = errOut.toByteArray();
+            resp.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+        }
+        resp.setContentType(ARROW_CONTENT_TYPE);
+        if (acceptsZstd(req)) {
+            resp.setHeader("Content-Encoding", "zstd");
+            out = com.github.luben.zstd.Zstd.compress(out, 3);
+        }
+        resp.getOutputStream().write(out);
     }
 
     private static boolean acceptsZstd(HttpServletRequest req) {

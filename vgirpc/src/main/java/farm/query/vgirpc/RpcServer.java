@@ -63,6 +63,9 @@ public final class RpcServer {
     public String protocolName() { return serviceInterface.getSimpleName(); }
     public Map<String, RpcMethodInfo> methods() { return Collections.unmodifiableMap(methods); }
 
+    /** Underlying service implementation (exposed for the HTTP streaming handler). */
+    public Object implementation() { return impl; }
+
     /** Loop serving requests until the transport closes. */
     public void serve(RpcTransport transport) {
         while (true) {
