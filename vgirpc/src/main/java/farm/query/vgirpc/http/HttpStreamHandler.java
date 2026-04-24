@@ -146,9 +146,11 @@ public final class HttpStreamHandler {
             if (tokenB64 == null) {
                 return errorStream(new RuntimeException("Missing state token in exchange request"));
             }
+            String principal = currentPrincipal();
             StateToken token;
             try {
-                token = StateToken.unpack(tokenB64.getBytes(StandardCharsets.US_ASCII), signingKey, tokenTtlSeconds);
+                token = StateToken.unpack(tokenB64.getBytes(StandardCharsets.US_ASCII),
+                        signingKey, tokenTtlSeconds, principal);
             } catch (Exception e) {
                 return errorStream(e);
             }
@@ -186,7 +188,7 @@ public final class HttpStreamHandler {
                 } catch (Throwable t) {
                     return errorStream(t);
                 }
-                return writeExchangeResponse(collector, state, token, outputSchema, isProducer);
+                return writeExchangeResponse(collector, state, token, outputSchema, isProducer, principal);
             }
         }
     }
@@ -217,9 +219,9 @@ public final class HttpStreamHandler {
     }
 
     private byte[] writeExchangeResponse(OutputCollector collector, StreamState state, StateToken priorToken,
-                                         Schema outputSchema, boolean isProducer) throws IOException {
+                                         Schema outputSchema, boolean isProducer, String principal) throws IOException {
         boolean finished = collector.finished();
-        String newTokenStr = finished ? null : serializeContinuationToken(state, priorToken);
+        String newTokenStr = finished ? null : serializeContinuationToken(state, priorToken, principal);
 
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
@@ -254,17 +256,23 @@ public final class HttpStreamHandler {
         return out.toByteArray();
     }
 
-    private String serializeContinuationToken(StreamState state, StateToken priorToken) {
+    private String serializeContinuationToken(StreamState state, StateToken priorToken, String principal) {
         byte[] newStateBytes = StateSerializer.serialize(state);
         StateToken newToken = new StateToken(newStateBytes, priorToken.outputSchema(), priorToken.inputSchema(),
                 priorToken.streamId(), System.currentTimeMillis() / 1000);
-        return new String(newToken.pack(signingKey), StandardCharsets.US_ASCII);
+        return new String(newToken.pack(signingKey, principal), StandardCharsets.US_ASCII);
     }
 
     private CallContext buildCallContext(String method, Consumer<Message> sink) {
         AuthScope.Scope scope = AuthScope.current();
         return new CallContext(scope.auth(), sink, scope.transportMetadata(),
                 rpc.serverId(), method, rpc.protocolName(), "");
+    }
+
+    /** Principal for state-token key derivation; empty string for anonymous. */
+    private static String currentPrincipal() {
+        String p = AuthScope.current().auth().principal();
+        return p != null ? p : "";
     }
 
     // --- Init helpers -----------------------------------------------------
@@ -304,7 +312,7 @@ public final class HttpStreamHandler {
                             serializeSchema(inputSchema),
                             newStreamId(), System.currentTimeMillis() / 1000);
                     Map<String, String> md = Map.of(Metadata.STREAM_STATE,
-                            new String(token.pack(signingKey), StandardCharsets.US_ASCII));
+                            new String(token.pack(signingKey, currentPrincipal()), StandardCharsets.US_ASCII));
                     Wire.writeZeroBatch(w, outputSchema, md);
                 }
             }
@@ -324,7 +332,7 @@ public final class HttpStreamHandler {
             w.writeSchema(outputSchema);
             sink.bind(w, outputSchema);
             Map<String, String> md = Map.of(Metadata.STREAM_STATE,
-                    new String(token.pack(signingKey), StandardCharsets.US_ASCII));
+                    new String(token.pack(signingKey, currentPrincipal()), StandardCharsets.US_ASCII));
             Wire.writeZeroBatch(w, outputSchema, md);
         }
     }

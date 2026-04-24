@@ -22,9 +22,16 @@ import java.util.Base64;
  *   [4 bytes: schema_len uint32 LE] [output_schema bytes]
  *   [4 bytes: input_schema_len uint32 LE] [input_schema bytes]
  *   [4 bytes: stream_id_len uint32 LE] [stream_id utf8]
- *   [32 bytes: HMAC-SHA256(key, all above)]
+ *   [32 bytes: HMAC-SHA256(perPrincipalKey, all above)]
  * </pre>
  * The whole thing is base64 encoded for UTF-8-safe Arrow custom metadata.
+ *
+ * <p>The MAC is keyed by {@link Crypto#deriveStateTokenKey}(signingKey, principal)
+ * rather than by {@code signingKey} directly. This binds the token to the
+ * authenticated principal: an attacker who sniffs or exfiltrates user A's token
+ * cannot replay it as user B — the verifier derives B's key and HMAC fails.
+ * Anonymous streams bind to the empty string; as long as {@code /init} and
+ * {@code /exchange} agree on the principal, the token round-trips.</p>
  */
 public record StateToken(
         byte[] state,
@@ -47,8 +54,12 @@ public record StateToken(
     @Override public byte[] outputSchema() { return outputSchema.clone(); }
     @Override public byte[] inputSchema()  { return inputSchema.clone(); }
 
-    /** Serialise + HMAC-sign + base64-encode the token. */
-    public byte[] pack(byte[] signingKey) {
+    /**
+     * Serialise + HMAC-sign + base64-encode the token. The signing key is
+     * derived per-{@code principal} so the token cannot be replayed by a
+     * different user; pass {@code ""} for anonymous streams.
+     */
+    public byte[] pack(byte[] signingKey, String principal) {
         byte[] streamIdBytes = streamId.getBytes(StandardCharsets.UTF_8);
         int payloadLen = 1 + 8
                 + 4 + state.length
@@ -63,15 +74,20 @@ public record StateToken(
         putSegment(payload, inputSchema);
         putSegment(payload, streamIdBytes);
         byte[] payloadBytes = payload.array();
-        byte[] mac = Crypto.hmacSha256(signingKey, payloadBytes);
+        byte[] mac = Crypto.hmacSha256(Crypto.deriveStateTokenKey(signingKey, principal), payloadBytes);
         byte[] full = new byte[payloadBytes.length + HMAC_LEN];
         System.arraycopy(payloadBytes, 0, full, 0, payloadBytes.length);
         System.arraycopy(mac, 0, full, payloadBytes.length, HMAC_LEN);
         return Base64.getEncoder().encode(full);
     }
 
-    /** Decode + verify + unpack the token. TTL disabled when {@code ttlSeconds <= 0}. */
-    public static StateToken unpack(byte[] b64, byte[] signingKey, long ttlSeconds) {
+    /**
+     * Decode + verify + unpack the token. The verifier derives the same
+     * per-{@code principal} key as {@link #pack}; a mismatched principal
+     * fails HMAC verification identically to any other tamper.
+     * TTL disabled when {@code ttlSeconds <= 0}.
+     */
+    public static StateToken unpack(byte[] b64, byte[] signingKey, long ttlSeconds, String principal) {
         byte[] raw = Base64.getDecoder().decode(b64);
         if (raw.length < 1 + 8 + 4 * 4 + HMAC_LEN) {
             throw new IllegalArgumentException("Malformed state token");
@@ -81,7 +97,7 @@ public record StateToken(
         System.arraycopy(raw, 0, payloadBytes, 0, payloadEnd);
         byte[] receivedMac = new byte[HMAC_LEN];
         System.arraycopy(raw, payloadEnd, receivedMac, 0, HMAC_LEN);
-        byte[] expectedMac = Crypto.hmacSha256(signingKey, payloadBytes);
+        byte[] expectedMac = Crypto.hmacSha256(Crypto.deriveStateTokenKey(signingKey, principal), payloadBytes);
         if (!Crypto.constantTimeEquals(receivedMac, expectedMac)) {
             throw new IllegalArgumentException("State token signature verification failed");
         }
@@ -104,11 +120,6 @@ public record StateToken(
         byte[] streamIdBytes = getSegment(bb);
         return new StateToken(state, outputSchema, inputSchema,
                 new String(streamIdBytes, StandardCharsets.UTF_8), createdAt);
-    }
-
-    /** Backwards-compat overload: no TTL enforcement. */
-    public static StateToken unpack(byte[] b64, byte[] signingKey) {
-        return unpack(b64, signingKey, 0);
     }
 
     private static void putSegment(ByteBuffer b, byte[] seg) {
