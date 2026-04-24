@@ -48,12 +48,24 @@ public final class HttpServer {
     private int port;
 
     public HttpServer(RpcServer rpc) {
-        this(rpc, "", 0);
+        this(rpc, "", 0, null, 0);
     }
 
     public HttpServer(RpcServer rpc, String prefix, int port) {
+        this(rpc, prefix, port, null, 0);
+    }
+
+    /**
+     * @param signingKey optional HMAC signing key for stream state tokens; when
+     *     {@code null} a random per-process key is generated. Stable keys let
+     *     clients resume streams across server restarts.
+     * @param tokenTtlSeconds maximum state-token age before it's rejected;
+     *     {@code 0} disables TTL enforcement.
+     */
+    public HttpServer(RpcServer rpc, String prefix, int port,
+                      byte[] signingKey, long tokenTtlSeconds) {
         this.rpc = rpc;
-        this.streamHandler = new HttpStreamHandler(rpc);
+        this.streamHandler = new HttpStreamHandler(rpc, signingKey, tokenTtlSeconds);
         this.prefix = prefix;
         this.jetty = new Server();
         ServerConnector connector = new ServerConnector(jetty);

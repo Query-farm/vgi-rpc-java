@@ -51,13 +51,27 @@ public final class HttpStreamHandler {
 
     private final RpcServer rpc;
     private final byte[] signingKey;
+    private final long tokenTtlSeconds;
     /** method name → concrete {@link StreamState} class, learned from the first init call. */
     private final Map<String, Class<? extends StreamState>> stateTypes = new ConcurrentHashMap<>();
 
-    public HttpStreamHandler(RpcServer rpc) {
+    public HttpStreamHandler(RpcServer rpc) { this(rpc, null, 0); }
+
+    /**
+     * @param signingKey HMAC-SHA256 signing key; when {@code null} a random
+     *     per-process key is generated (tokens won't survive restarts).
+     * @param tokenTtlSeconds maximum token age in seconds; {@code 0} disables
+     *     TTL enforcement.
+     */
+    public HttpStreamHandler(RpcServer rpc, byte[] signingKey, long tokenTtlSeconds) {
         this.rpc = rpc;
-        this.signingKey = new byte[32];
-        new SecureRandom().nextBytes(this.signingKey);
+        if (signingKey != null) {
+            this.signingKey = signingKey.clone();
+        } else {
+            this.signingKey = new byte[32];
+            new SecureRandom().nextBytes(this.signingKey);
+        }
+        this.tokenTtlSeconds = tokenTtlSeconds;
     }
 
     /** Handle {@code POST /{method}/init}. Returns response IPC bytes. */
@@ -134,7 +148,7 @@ public final class HttpStreamHandler {
         }
         StateToken token;
         try {
-            token = StateToken.unpack(tokenB64.getBytes(), signingKey);
+            token = StateToken.unpack(tokenB64.getBytes(), signingKey, tokenTtlSeconds);
         } catch (Exception e) {
             inputRoot.close();
             return errorStream(e);

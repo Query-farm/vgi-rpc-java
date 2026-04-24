@@ -20,23 +20,58 @@ public final class Main {
         ConformanceService impl = new ConformanceServiceImpl();
         RpcServer server = new RpcServer(ConformanceService.class, impl);
 
-        if (args.length == 0) { servePipe(server); return; }
-        switch (args[0]) {
-            case "--http" -> serveHttp(server);
-            case "--unix" -> {
-                if (args.length < 2) { System.err.println("--unix requires a path"); System.exit(2); }
-                serveUnix(server, Path.of(args[1]));
+        // Optional flags (order independent after the mode flag)
+        byte[] signingKey = null;
+        long tokenTtl = 0;
+        String mode = null;
+        String unixPath = null;
+        for (int i = 0; i < args.length; i++) {
+            String a = args[i];
+            switch (a) {
+                case "--http" -> mode = "http";
+                case "--unix" -> {
+                    mode = "unix";
+                    if (i + 1 < args.length) { unixPath = args[++i]; }
+                    else { System.err.println("--unix requires a path"); System.exit(2); }
+                }
+                case "--signing-key" -> {
+                    if (i + 1 >= args.length) { System.err.println("--signing-key requires a hex value"); System.exit(2); }
+                    signingKey = parseHex(args[++i]);
+                }
+                case "--token-ttl" -> {
+                    if (i + 1 >= args.length) { System.err.println("--token-ttl requires a seconds value"); System.exit(2); }
+                    tokenTtl = Long.parseLong(args[++i]);
+                }
+                default -> {
+                    System.err.println("unknown arg: " + a);
+                    System.exit(2);
+                }
             }
-            default -> { System.err.println("unknown args: " + String.join(" ", args)); System.exit(2); }
         }
+        if (mode == null) { servePipe(server); return; }
+        switch (mode) {
+            case "http" -> serveHttp(server, signingKey, tokenTtl);
+            case "unix" -> serveUnix(server, Path.of(unixPath));
+            default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
+        }
+    }
+
+    private static byte[] parseHex(String hex) {
+        int len = hex.length();
+        if ((len & 1) != 0) throw new IllegalArgumentException("hex string must have even length");
+        byte[] out = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            out[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4) | Character.digit(hex.charAt(i + 1), 16));
+        }
+        return out;
     }
 
     private static void servePipe(RpcServer server) {
         try (StdioTransport t = new StdioTransport()) { server.serve(t); }
     }
 
-    private static void serveHttp(RpcServer server) throws Exception {
-        HttpServer http = new HttpServer(server);
+    private static void serveHttp(RpcServer server, byte[] signingKey, long tokenTtl) throws Exception {
+        HttpServer http = new HttpServer(server, "", 0, signingKey, tokenTtl);
         http.start();
         System.out.println("PORT:" + http.port());
         System.out.flush();

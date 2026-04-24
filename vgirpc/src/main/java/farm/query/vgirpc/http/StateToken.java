@@ -69,8 +69,8 @@ public final class StateToken {
         return Base64.getEncoder().encode(full);
     }
 
-    /** Decode + verify + unpack the token. */
-    public static StateToken unpack(byte[] b64, byte[] signingKey) {
+    /** Decode + verify + unpack the token. TTL disabled when {@code ttlSeconds <= 0}. */
+    public static StateToken unpack(byte[] b64, byte[] signingKey, long ttlSeconds) {
         byte[] raw = Base64.getDecoder().decode(b64);
         if (raw.length < 1 + 8 + 4 * 4 + HMAC_LEN) {
             throw new IllegalArgumentException("Malformed state token");
@@ -90,12 +90,24 @@ public final class StateToken {
             throw new IllegalArgumentException("Unsupported state token version " + version + " (expected " + VERSION + ")");
         }
         long createdAt = bb.getLong();
+        if (ttlSeconds > 0) {
+            long now = System.currentTimeMillis() / 1000;
+            if (now - createdAt > ttlSeconds) {
+                throw new TokenExpiredException("State token expired (age=" + (now - createdAt)
+                        + "s, ttl=" + ttlSeconds + "s)");
+            }
+        }
         byte[] state = getSegment(bb);
         byte[] outputSchema = getSegment(bb);
         byte[] inputSchema = getSegment(bb);
         byte[] streamIdBytes = getSegment(bb);
         return new StateToken(state, outputSchema, inputSchema,
                 new String(streamIdBytes, StandardCharsets.UTF_8), createdAt);
+    }
+
+    /** Backwards-compat overload: no TTL enforcement. */
+    public static StateToken unpack(byte[] b64, byte[] signingKey) {
+        return unpack(b64, signingKey, 0);
     }
 
     private static void putSegment(ByteBuffer b, byte[] seg) {
