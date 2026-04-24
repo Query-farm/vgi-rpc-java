@@ -13,6 +13,7 @@ dependencies {
     api("org.slf4j:slf4j-api:$slf4jVersion")
 
     implementation("com.fasterxml.jackson.core:jackson-databind:$jacksonVersion")
+    implementation("com.github.luben:zstd-jni:1.5.6-8")
 
     // HTTP transport (server + client)
     implementation("org.eclipse.jetty:jetty-server:$jettyVersion")
