@@ -3,6 +3,10 @@
 
 package farm.query.vgirpc.conformance;
 
+import farm.query.vgirpc.ExchangeState;
+import farm.query.vgirpc.ProducerState;
+import farm.query.vgirpc.Stream;
+
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -57,4 +61,84 @@ public final class ConformanceServiceImpl implements ConformanceService {
     @Override public String raise_type_error(String message) {
         throw new ClassCastException(message);
     }
+
+    // --- Producer streams ---------------------------------------------------
+
+    @Override public Stream<? extends ProducerState> produce_n(long count) {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Counter(count));
+    }
+    @Override public Stream<? extends ProducerState> produce_empty() {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Empty());
+    }
+    @Override public Stream<? extends ProducerState> produce_single() {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Single());
+    }
+    @Override public Stream<? extends ProducerState> produce_large_batches(long rpb, long bc) {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Large(rpb, bc));
+    }
+    @Override public Stream<? extends ProducerState> produce_with_logs(long count) {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.LoggingProducer(count));
+    }
+    @Override public Stream<? extends ProducerState> produce_error_mid_stream(long n) {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.ErrorAfterN(n));
+    }
+    @Override public Stream<? extends ProducerState> produce_error_on_init() {
+        throw new RuntimeException("intentional error during stream initialization");
+    }
+
+    @Override public Stream<? extends ProducerState> produce_with_header(long count) {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Counter(count),
+                new ConformanceHeader(count, "producer with header"));
+    }
+    @Override public Stream<? extends ProducerState> produce_with_header_and_logs(long count) {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.LoggingProducer(count),
+                new ConformanceHeader(count, "producer with header and logs"));
+    }
+
+    // --- Exchange streams ---------------------------------------------------
+
+    @Override public Stream<? extends ExchangeState> exchange_scale(double factor) {
+        return Stream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
+                new StreamStates.Scale(factor));
+    }
+    @Override public Stream<? extends ExchangeState> exchange_accumulate() {
+        return Stream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.ACCUM_SCHEMA,
+                new StreamStates.Accumulate());
+    }
+    @Override public Stream<? extends ExchangeState> exchange_with_logs() {
+        return Stream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
+                new StreamStates.LoggingExchange());
+    }
+    @Override public Stream<? extends ExchangeState> exchange_error_on_nth(long failOn) {
+        return Stream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
+                new StreamStates.FailOnNth(failOn));
+    }
+    @Override public Stream<? extends ExchangeState> exchange_zero_columns() {
+        return Stream.exchange(StreamStates.EMPTY_SCHEMA, StreamStates.EMPTY_SCHEMA,
+                new StreamStates.ZeroColumns());
+    }
+    @Override public Stream<? extends ExchangeState> exchange_error_on_init() {
+        throw new RuntimeException("intentional error during exchange stream initialization");
+    }
+    @Override public Stream<? extends ExchangeState> exchange_with_header(double factor) {
+        return Stream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
+                new StreamStates.Scale(factor),
+                new ConformanceHeader(0, "exchange with header"));
+    }
+
+    // --- Cancellation -------------------------------------------------------
+
+    @Override public Stream<? extends ProducerState> cancellable_producer() {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.CancellableProducer());
+    }
+    @Override public Stream<? extends ExchangeState> cancellable_exchange() {
+        return Stream.exchange(StreamStates.COUNTER_SCHEMA, StreamStates.COUNTER_SCHEMA,
+                new StreamStates.CancellableExchange());
+    }
+    @Override public List<Long> cancel_probe_counters() {
+        return List.of(StreamStates.CancelProbe.produceCalls,
+                StreamStates.CancelProbe.exchangeCalls,
+                StreamStates.CancelProbe.onCancelCalls);
+    }
+    @Override public void reset_cancel_probe() { StreamStates.CancelProbe.reset(); }
 }

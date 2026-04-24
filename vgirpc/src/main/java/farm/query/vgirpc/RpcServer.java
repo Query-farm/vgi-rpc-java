@@ -202,10 +202,105 @@ public final class RpcServer {
     }
 
     private void serveStream(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs) throws Exception {
-        // Will be implemented in the streaming phase. Surface an error for now.
-        Wire.writeErrorStream(transport.writer(), Stream.EMPTY_SCHEMA,
-                new UnsupportedOperationException("streaming not yet implemented in this build: " + info.name()),
-                serverId);
+        ClientLogSink sink = new ClientLogSink(serverId);
+        CallContext ctx = new CallContext(AuthContext.ANONYMOUS, sink, Map.of(),
+                serverId, info.name(), protocolName(), "");
+        Stream<?> stream;
+        Throwable initException = null;
+        try {
+            Object[] args = buildCallArgs(info, kwargs, ctx);
+            stream = (Stream<?>) info.reflectMethod().invoke(impl, args);
+        } catch (Throwable t) {
+            stream = null;
+            initException = unwrap(t);
+        }
+
+        // On init error we still need to (1) send an error stream, (2) drain
+        // the client's input IPC stream so subsequent requests aren't misparsed.
+        if (initException != null) {
+            Wire.writeErrorStream(transport.writer(), Stream.EMPTY_SCHEMA, initException, serverId);
+            transport.writer().flush();
+            try (IpcStreamReader inputReader = new IpcStreamReader(transport.reader(), Allocators.root())) {
+                try { inputReader.drain(); } catch (IOException ignore) {}
+            }
+            return;
+        }
+        Schema outputSchema = stream.outputSchema();
+        Schema inputSchema = stream.inputSchema();
+        StreamState state = stream.state();
+        boolean isProducer = stream.isProducer();
+
+        if (stream.header() != null) {
+            writeHeaderStream(transport.writer(), stream.header());
+            transport.writer().flush();
+        }
+
+        try (IpcStreamReader inputReader = new IpcStreamReader(transport.reader(), Allocators.root())) {
+            IpcStreamWriter outputWriter = new IpcStreamWriter(transport.writer());
+            try {
+                outputWriter.writeSchema(outputSchema);
+                transport.writer().flush();
+                sink.bind(outputWriter, outputSchema);
+
+                while (true) {
+                    Map<String, String> meta;
+                    try {
+                        meta = inputReader.readNextBatch();
+                    } catch (IOException e) {
+                        break;
+                    }
+                    if (meta == null) break;
+                    if (meta.containsKey(Metadata.CANCEL)) {
+                        try { state.onCancel(ctx); } catch (Exception ignore) {}
+                        break;
+                    }
+                    AnnotatedBatch input = new AnnotatedBatch(inputReader.root(), meta);
+                    OutputCollector out = new OutputCollector(outputSchema, serverId, isProducer);
+                    try {
+                        state.process(input, out, ctx);
+                    } catch (Throwable t) {
+                        Throwable inner = unwrap(t);
+                        try (VectorSchemaRoot zero = VectorSchemaRoot.create(outputSchema, Allocators.root())) {
+                            zero.allocateNew();
+                            zero.setRowCount(0);
+                            outputWriter.writeBatch(zero, Wire.errorMetadata(inner, serverId));
+                        }
+                        transport.writer().flush();
+                        break;
+                    }
+                    flushCollector(outputWriter, out);
+                    transport.writer().flush();
+                    if (out.finished()) break;
+                }
+            } finally {
+                // Close the output FIRST (sends EOS to client), then drain the
+                // client's remaining input (until its EOS) so the transport is
+                // clean for the next request. Closing output first breaks the
+                // client out of its reader; otherwise draining deadlocks.
+                try { outputWriter.close(); } catch (Exception ignore) {}
+                try { transport.writer().flush(); } catch (Exception ignore) {}
+                try { inputReader.drain(); } catch (IOException ignore) {}
+            }
+        }
+    }
+
+    private void flushCollector(IpcStreamWriter writer, OutputCollector out) throws IOException {
+        for (OutputCollector.Entry e : out.entries()) {
+            try {
+                writer.writeBatch(e.root, e.customMetadata);
+            } finally {
+                e.root.close();
+            }
+        }
+    }
+
+    private void writeHeaderStream(java.io.OutputStream os, ArrowSerializableRecord header) throws IOException {
+        Schema schema = farm.query.vgirpc.schema.SchemaDerivation.schemaForRecord(header.getClass());
+        Map<String, Object> row = RecordCodec.toRowMap(header);
+        try (IpcStreamWriter w = new IpcStreamWriter(os);
+             VectorSchemaRoot root = Marshalling.encodeRow(schema, row, Allocators.root())) {
+            w.writeBatch(root, null);
+        }
     }
 
     /** Build positional args for the impl method, injecting CallContext if requested. */

@@ -68,9 +68,77 @@ public final class RpcConnection implements AutoCloseable {
             RpcMethodInfo info = methods.get(method.getName());
             if (info == null) throw new RpcError("AttributeError", "Unknown method: " + method.getName(), "");
             if (info.methodType() == MethodType.STREAM) {
-                throw new UnsupportedOperationException("client-side streaming not yet implemented");
+                return doStream(info, method, args);
             }
             return doUnary(info, method, args);
+        }
+
+        private Object doStream(RpcMethodInfo info, Method m, Object[] args) throws Exception {
+            Map<String, Object> kwargs = bindArgs(m, args);
+            // Send request
+            try (IpcStreamWriter w = new IpcStreamWriter(transport.writer())) {
+                w.writeSchema(info.paramsSchema());
+                Map<String, Object> wireKwargs = convertForWire(kwargs, info);
+                if (info.paramsSchema().getFields().isEmpty()) {
+                    try (VectorSchemaRoot zero = VectorSchemaRoot.create(info.paramsSchema(), Allocators.root())) {
+                        zero.allocateNew();
+                        zero.setRowCount(1);
+                        w.writeBatch(zero, Wire.requestMetadata(info.name()));
+                    }
+                } else {
+                    try (VectorSchemaRoot root = Marshalling.encodeRow(info.paramsSchema(), wireKwargs, Allocators.root())) {
+                        w.writeBatch(root, Wire.requestMetadata(info.name()));
+                    }
+                }
+            }
+            transport.writer().flush();
+
+            // Read header IPC stream if declared
+            ArrowSerializableRecord header = null;
+            Class<?> headerType = resolveHeaderType(info);
+            if (headerType != null) {
+                header = readHeaderStream(headerType);
+            }
+
+            Schema inputSchema = inputSchemaForStream(info);
+            Schema outputSchema = outputSchemaForStream(info);
+            return new ClientStreamSession<>(transport, inputSchema, outputSchema, header, onLog);
+        }
+
+        @SuppressWarnings("unchecked")
+        private ArrowSerializableRecord readHeaderStream(Class<?> headerType) throws Exception {
+            try (IpcStreamReader r = new IpcStreamReader(transport.reader(), Allocators.root())) {
+                while (true) {
+                    Map<String, String> md = r.readNextBatch();
+                    if (md == null) throw new RpcError("ProtocolError", "header stream empty", "");
+                    Wire.BatchKind kind = Wire.classify(r.root().getRowCount(), md);
+                    if (kind == Wire.BatchKind.LOG) { onLog.accept(Wire.messageFromMetadata(md)); continue; }
+                    if (kind == Wire.BatchKind.ERROR) throw Wire.errorFromMetadata(md);
+                    Map<String, Object> row = Marshalling.decodeRow(r.root(), r.dictionaryProvider(), r.wireSchema());
+                    return RecordCodec.fromRowMap(
+                            (Class<? extends ArrowSerializableRecord>) headerType, row);
+                }
+            }
+        }
+
+        private Class<?> resolveHeaderType(RpcMethodInfo info) {
+            if (info.resultType() instanceof java.lang.reflect.ParameterizedType pt
+                    && pt.getActualTypeArguments().length >= 2) {
+                java.lang.reflect.Type h = pt.getActualTypeArguments()[1];
+                if (h instanceof Class<?> c && ArrowSerializableRecord.class.isAssignableFrom(c)) return c;
+            }
+            return null;
+        }
+
+        private Schema inputSchemaForStream(RpcMethodInfo info) {
+            // Heuristic: if the declared Stream<S> uses an ExchangeState subclass, defer to the server
+            // by returning EMPTY — the first real .exchange(batch) call will re-open with the batch's
+            // actual schema. For pure producer streams EMPTY is correct.
+            return Stream.EMPTY_SCHEMA;
+        }
+
+        private Schema outputSchemaForStream(RpcMethodInfo info) {
+            return Stream.EMPTY_SCHEMA;
         }
 
         private Object doUnary(RpcMethodInfo info, Method m, Object[] args) throws Exception {

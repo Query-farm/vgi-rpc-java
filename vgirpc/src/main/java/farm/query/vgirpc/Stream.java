@@ -7,53 +7,102 @@ import farm.query.vgirpc.schema.ArrowSerializableRecord;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.Collections;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
 
 /**
- * Return type for streaming RPC methods. Bundles the output schema, the state
- * object whose {@code process()} is called per input batch, the input schema,
- * and an optional one-time header record sent before the data stream begins.
+ * Return type for streaming RPC methods.
  *
- * <p>For producer streams, leave {@code inputSchema} as {@link #EMPTY_SCHEMA}.
- * For exchange streams, set {@code inputSchema} to the real input schema.</p>
+ * <p>On the server side, methods construct a {@link Stream} via the static
+ * factories {@link #producer(Schema, StreamState)} /
+ * {@link #exchange(Schema, Schema, StreamState)} to describe the output schema
+ * (and optional header) and hand the framework a {@link StreamState} instance
+ * whose {@code process()} is invoked per input batch.</p>
+ *
+ * <p>On the client side, the dynamic proxy returns a {@code StreamSession}
+ * subclass. Client callers use {@link #tick()} (producer), {@link #exchange(AnnotatedBatch)}
+ * (exchange), {@link #batches()} for iteration, and {@link #close()} /
+ * {@link #cancel()} to end the stream.</p>
  */
-public final class Stream<S extends StreamState> {
+public abstract class Stream<S extends StreamState> implements AutoCloseable {
 
     public static final Schema EMPTY_SCHEMA = new Schema(Collections.emptyList());
 
-    private final Schema outputSchema;
-    private final S state;
-    private final Schema inputSchema;
-    private final ArrowSerializableRecord header;
+    public abstract Schema outputSchema();
+    public abstract Schema inputSchema();
+    public abstract S state();
+    public abstract ArrowSerializableRecord header();
 
-    private Stream(Schema outputSchema, S state, Schema inputSchema, ArrowSerializableRecord header) {
-        this.outputSchema = outputSchema;
-        this.state = state;
-        this.inputSchema = inputSchema != null ? inputSchema : EMPTY_SCHEMA;
-        this.header = header;
+    public boolean isProducer() { return inputSchema().getFields().isEmpty(); }
+
+    // --- Client-only operations (server-built streams throw) ---------------
+
+    public AnnotatedBatch tick() {
+        throw new UnsupportedOperationException("tick() only valid on client-side stream sessions");
     }
+    public AnnotatedBatch exchange(AnnotatedBatch input) {
+        throw new UnsupportedOperationException("exchange() only valid on client-side stream sessions");
+    }
+    public void cancel() {}
+    @Override public void close() {}
+
+    /** Iterate over data batches (client-side producer streams). */
+    public Iterable<AnnotatedBatch> batches() {
+        return () -> new Iterator<AnnotatedBatch>() {
+            AnnotatedBatch pending;
+            boolean done;
+            @Override public boolean hasNext() {
+                if (done) return false;
+                if (pending != null) return true;
+                try {
+                    pending = tick();
+                    return true;
+                } catch (NoSuchElementException e) {
+                    done = true;
+                    return false;
+                }
+            }
+            @Override public AnnotatedBatch next() {
+                if (!hasNext()) throw new NoSuchElementException();
+                AnnotatedBatch ab = pending;
+                pending = null;
+                return ab;
+            }
+        };
+    }
+
+    // --- Server factories --------------------------------------------------
 
     public static <S extends StreamState> Stream<S> producer(Schema outputSchema, S state) {
-        return new Stream<>(outputSchema, state, EMPTY_SCHEMA, null);
+        return new ServerStream<>(outputSchema, EMPTY_SCHEMA, state, null);
     }
-
     public static <S extends StreamState> Stream<S> producer(Schema outputSchema, S state,
                                                               ArrowSerializableRecord header) {
-        return new Stream<>(outputSchema, state, EMPTY_SCHEMA, header);
+        return new ServerStream<>(outputSchema, EMPTY_SCHEMA, state, header);
     }
-
     public static <S extends StreamState> Stream<S> exchange(Schema inputSchema, Schema outputSchema, S state) {
-        return new Stream<>(outputSchema, state, inputSchema, null);
+        return new ServerStream<>(outputSchema, inputSchema, state, null);
     }
-
     public static <S extends StreamState> Stream<S> exchange(Schema inputSchema, Schema outputSchema, S state,
                                                               ArrowSerializableRecord header) {
-        return new Stream<>(outputSchema, state, inputSchema, header);
+        return new ServerStream<>(outputSchema, inputSchema, state, header);
     }
 
-    public Schema outputSchema() { return outputSchema; }
-    public S state() { return state; }
-    public Schema inputSchema() { return inputSchema; }
-    public ArrowSerializableRecord header() { return header; }
-
-    public boolean isProducer() { return inputSchema.getFields().isEmpty(); }
+    /** Concrete container used by the server. */
+    static final class ServerStream<S extends StreamState> extends Stream<S> {
+        private final Schema outputSchema;
+        private final Schema inputSchema;
+        private final S state;
+        private final ArrowSerializableRecord header;
+        ServerStream(Schema outputSchema, Schema inputSchema, S state, ArrowSerializableRecord header) {
+            this.outputSchema = outputSchema;
+            this.inputSchema = inputSchema;
+            this.state = state;
+            this.header = header;
+        }
+        @Override public Schema outputSchema() { return outputSchema; }
+        @Override public Schema inputSchema() { return inputSchema; }
+        @Override public S state() { return state; }
+        @Override public ArrowSerializableRecord header() { return header; }
+    }
 }

@@ -72,4 +72,41 @@ public interface ConformanceService {
     String raise_value_error(String message);
     String raise_runtime_error(String message);
     String raise_type_error(String message);
+
+    // --- Producer streams ---------------------------------------------------
+
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_n(long count);
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_empty();
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_single();
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_large_batches(
+            long rows_per_batch, long batch_count);
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_logs(long count);
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_error_mid_stream(
+            long emit_before_error);
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_error_on_init();
+
+    // --- Producer streams with headers --------------------------------------
+
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_header(long count);
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_header_and_logs(long count);
+
+    // --- Exchange streams ---------------------------------------------------
+
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_scale(double factor);
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_accumulate();
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_with_logs();
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_error_on_nth(long fail_on);
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_zero_columns();
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_error_on_init();
+
+    // --- Exchange with header ----------------------------------------------
+
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_with_header(double factor);
+
+    // --- Cancellation ------------------------------------------------------
+
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> cancellable_producer();
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> cancellable_exchange();
+    java.util.List<Long> cancel_probe_counters();
+    void reset_cancel_probe();
 }
