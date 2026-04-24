@@ -5,6 +5,8 @@ plugins {
 dependencies {
     implementation(project(":vgirpc"))
     implementation(project(":conformance"))
+    // Optional — only needed by --auth-jwt / --auth-pkce modes
+    implementation(project(":vgirpc-oauth"))
 }
 
 application {
