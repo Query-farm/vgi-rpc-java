@@ -33,5 +33,7 @@ subprojects {
 
     tasks.withType<Test>().configureEach {
         useJUnitPlatform()
+        // Arrow's memory module needs access to java.nio internals.
+        jvmArgs("--add-opens=java.base/java.nio=ALL-UNNAMED")
     }
 }

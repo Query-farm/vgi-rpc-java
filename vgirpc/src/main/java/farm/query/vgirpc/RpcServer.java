@@ -58,6 +58,10 @@ public final class RpcServer {
     }
 
     private final boolean describeEnabled;
+    private farm.query.vgirpc.external.LocationResolver locationResolver;
+
+    /** Attach an external-location resolver so streaming inputs with pointer batches are fetched transparently. */
+    public void setLocationResolver(farm.query.vgirpc.external.LocationResolver r) { this.locationResolver = r; }
 
     public String serverId() { return serverId; }
     public String protocolName() { return serviceInterface.getSimpleName(); }
@@ -266,9 +270,28 @@ public final class RpcServer {
                         try { state.onCancel(ctx); } catch (Exception ignore) {}
                         break;
                     }
+                    // Resolve external-location pointer inputs before any cast.
+                    VectorSchemaRoot inputRoot = inputReader.root();
+                    VectorSchemaRoot resolvedRoot = null;
+                    Map<String, String> effectiveMeta = meta;
+                    if (locationResolver != null
+                            && farm.query.vgirpc.external.LocationResolver.isPointer(inputRoot.getRowCount(), meta)) {
+                        try {
+                            farm.query.vgirpc.external.LocationResolver.Resolved res = locationResolver.resolve(meta);
+                            resolvedRoot = res.root();
+                            inputRoot = resolvedRoot;
+                            effectiveMeta = res.customMetadata();
+                        } catch (Exception fetchExc) {
+                            try (VectorSchemaRoot zero = VectorSchemaRoot.create(outputSchema, Allocators.root())) {
+                                zero.allocateNew(); zero.setRowCount(0);
+                                outputWriter.writeBatch(zero, Wire.errorMetadata(fetchExc, serverId));
+                            }
+                            transport.writer().flush();
+                            break;
+                        }
+                    }
                     // Cast input schema when compatible (e.g. int32 → float64) so that
                     // the state implementation always sees the declared input schema.
-                    VectorSchemaRoot inputRoot = inputReader.root();
                     VectorSchemaRoot castRoot = null;
                     if (!isProducer && !inputRoot.getSchema().equals(inputSchema)) {
                         try {
@@ -284,7 +307,7 @@ public final class RpcServer {
                             break;
                         }
                     }
-                    AnnotatedBatch input = new AnnotatedBatch(inputRoot, meta);
+                    AnnotatedBatch input = new AnnotatedBatch(inputRoot, effectiveMeta);
                     OutputCollector out = new OutputCollector(outputSchema, serverId, isProducer);
                     try {
                         state.process(input, out, ctx);
@@ -301,6 +324,7 @@ public final class RpcServer {
                     flushCollector(outputWriter, out);
                     transport.writer().flush();
                     if (castRoot != null) castRoot.close();
+                    if (resolvedRoot != null) resolvedRoot.close();
                     if (out.finished()) break;
                 }
             } finally {

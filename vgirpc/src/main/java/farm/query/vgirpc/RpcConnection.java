@@ -34,12 +34,21 @@ public final class RpcConnection implements AutoCloseable {
 
     private final RpcTransport transport;
     private final Consumer<Message> onLog;
+    private final farm.query.vgirpc.external.LocationResolver locationResolver;
 
     public RpcConnection(RpcTransport transport) { this(transport, m -> {}); }
 
     public RpcConnection(RpcTransport transport, Consumer<Message> onLog) {
+        this(transport, onLog, null);
+    }
+
+    public RpcConnection(RpcTransport transport, Consumer<Message> onLog,
+                         farm.query.vgirpc.external.ExternalLocationConfig externalConfig) {
         this.transport = transport;
         this.onLog = onLog != null ? onLog : (m -> {});
+        this.locationResolver = externalConfig != null
+                ? new farm.query.vgirpc.external.LocationResolver(externalConfig)
+                : null;
     }
 
     @SuppressWarnings("unchecked")
@@ -177,6 +186,23 @@ public final class RpcConnection implements AutoCloseable {
                     }
                     if (kind == Wire.BatchKind.ERROR) {
                         throw Wire.errorFromMetadata(md);
+                    }
+                    // Transparent resolution of external-location pointer batches.
+                    if (locationResolver != null
+                            && farm.query.vgirpc.external.LocationResolver.isPointer(root.getRowCount(), md)) {
+                        farm.query.vgirpc.external.LocationResolver.Resolved resolved;
+                        try {
+                            resolved = locationResolver.resolve(md);
+                        } catch (Exception fe) {
+                            throw new RpcError("ExternalLocationError",
+                                    "failed to resolve " + md.get(farm.query.vgirpc.wire.Metadata.LOCATION)
+                                            + ": " + fe.getMessage(), "");
+                        }
+                        try {
+                            return decodeResult(info, resolved.root());
+                        } finally {
+                            resolved.root().close();
+                        }
                     }
                     return decodeResult(info, root);
                 }
