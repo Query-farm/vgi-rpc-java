@@ -187,6 +187,8 @@ public final class RpcConnection implements AutoCloseable {
             Map<String, Object> out = new LinkedHashMap<>();
             Parameter[] params = m.getParameters();
             for (int i = 0; i < params.length; i++) {
+                // Skip framework-injected CallContext parameters — they aren't on the wire.
+                if (CallContext.class.isAssignableFrom(params[i].getType())) continue;
                 Object v = args != null && i < args.length ? args[i] : null;
                 if (v instanceof Optional<?> o) v = o.orElse(null);
                 out.put(params[i].getName(), v);

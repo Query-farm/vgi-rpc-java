@@ -3,10 +3,13 @@
 
 package farm.query.vgirpc.conformance;
 
+import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.ExchangeState;
 import farm.query.vgirpc.ProducerState;
 import farm.query.vgirpc.Stream;
+import farm.query.vgirpc.log.Level;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -32,6 +35,7 @@ public final class ConformanceServiceImpl implements ConformanceService {
 
     @Override public Point echo_point(Point point) { return point; }
     @Override public BoundingBox echo_bounding_box(BoundingBox box) { return box; }
+    @Override public AllTypes echo_all_types(AllTypes data) { return data; }
 
     @Override public String inspect_point(Point point) {
         return "Point(x=" + point.x() + ", y=" + point.y() + ")";
@@ -60,6 +64,26 @@ public final class ConformanceServiceImpl implements ConformanceService {
     }
     @Override public String raise_type_error(String message) {
         throw new ClassCastException(message);
+    }
+
+    // --- Client-directed logging -------------------------------------------
+
+    @Override public String echo_with_info_log(String value, CallContext ctx) {
+        ctx.clientLog(Level.INFO, "info log for " + value);
+        return value;
+    }
+    @Override public String echo_with_multi_logs(String value, CallContext ctx) {
+        ctx.clientLog(Level.DEBUG, "debug log");
+        ctx.clientLog(Level.INFO, "info log");
+        ctx.clientLog(Level.WARN, "warn log");
+        return value;
+    }
+    @Override public String echo_with_log_extras(String value, CallContext ctx) {
+        Map<String, Object> extra = new LinkedHashMap<>();
+        extra.put("key1", "value1");
+        extra.put("key2", 42);
+        ctx.clientLog(Level.INFO, "log with extras", extra);
+        return value;
     }
 
     // --- Producer streams ---------------------------------------------------
@@ -141,4 +165,29 @@ public final class ConformanceServiceImpl implements ConformanceService {
                 StreamStates.CancelProbe.onCancelCalls);
     }
     @Override public void reset_cancel_probe() { StreamStates.CancelProbe.reset(); }
+
+    // --- Rich-header producers / dynamic schema ----------------------------
+
+    @Override public Stream<? extends ProducerState> produce_with_rich_header(long seed, long count) {
+        return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Counter(count),
+                RichHeader.build(seed));
+    }
+    @Override public Stream<? extends ProducerState> produce_dynamic_schema(long seed, long count,
+                                                                              boolean include_strings,
+                                                                              boolean include_floats) {
+        org.apache.arrow.vector.types.pojo.Schema schema =
+                StreamStates.dynamicSchema(include_strings, include_floats);
+        return Stream.producer(schema,
+                new StreamStates.DynamicProducer(count, include_strings, include_floats),
+                RichHeader.build(seed));
+    }
+    @Override public Stream<? extends ExchangeState> exchange_cast_compatible() {
+        return Stream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
+                new StreamStates.Scale(1.0));
+    }
+    @Override public Stream<? extends ExchangeState> exchange_with_rich_header(long seed, double factor) {
+        return Stream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
+                new StreamStates.Scale(factor),
+                RichHeader.build(seed));
+    }
 }

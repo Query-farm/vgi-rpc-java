@@ -48,6 +48,7 @@ public interface ConformanceService {
 
     Point echo_point(Point point);
     BoundingBox echo_bounding_box(BoundingBox box);
+    AllTypes echo_all_types(AllTypes data);
 
     // --- Dataclass as parameter --------------------------------------------
 
@@ -72,6 +73,12 @@ public interface ConformanceService {
     String raise_value_error(String message);
     String raise_runtime_error(String message);
     String raise_type_error(String message);
+
+    // --- Client-directed logging -------------------------------------------
+
+    String echo_with_info_log(String value, farm.query.vgirpc.CallContext ctx);
+    String echo_with_multi_logs(String value, farm.query.vgirpc.CallContext ctx);
+    String echo_with_log_extras(String value, farm.query.vgirpc.CallContext ctx);
 
     // --- Producer streams ---------------------------------------------------
 
@@ -113,4 +120,18 @@ public interface ConformanceService {
     farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> cancellable_exchange();
     java.util.List<Long> cancel_probe_counters();
     void reset_cancel_probe();
+
+    // --- Dynamic streams with rich headers ---------------------------------
+
+    @farm.query.vgirpc.schema.StreamHeader(RichHeader.class)
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_rich_header(long seed, long count);
+
+    @farm.query.vgirpc.schema.StreamHeader(RichHeader.class)
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_dynamic_schema(
+            long seed, long count, boolean include_strings, boolean include_floats);
+
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_cast_compatible();
+
+    @farm.query.vgirpc.schema.StreamHeader(RichHeader.class)
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ExchangeState> exchange_with_rich_header(long seed, double factor);
 }

@@ -197,6 +197,45 @@ final class StreamStates {
         }
     }
 
+    // --- Dynamic schema producer -------------------------------------------
+
+    static Schema dynamicSchema(boolean includeStrings, boolean includeFloats) {
+        java.util.List<Field> fields = new java.util.ArrayList<>();
+        fields.add(new Field("index", FieldType.notNullable(new ArrowType.Int(64, true)), null));
+        if (includeStrings) {
+            fields.add(new Field("label", FieldType.notNullable(new ArrowType.Utf8()), null));
+        }
+        if (includeFloats) {
+            fields.add(new Field("score", FieldType.notNullable(new ArrowType.FloatingPoint(
+                    org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE)), null));
+        }
+        return new Schema(fields);
+    }
+
+    static final class DynamicProducer extends ProducerState {
+        final long count; final boolean includeStrings; final boolean includeFloats; long current;
+        DynamicProducer(long count, boolean s, boolean f) {
+            this.count = count; this.includeStrings = s; this.includeFloats = f;
+        }
+        @Override public void produce(OutputCollector out, CallContext ctx) {
+            if (current >= count) { out.finish(); return; }
+            Schema schema = dynamicSchema(includeStrings, includeFloats);
+            VectorSchemaRoot root = VectorSchemaRoot.create(schema, Allocators.root());
+            root.allocateNew();
+            ((BigIntVector) root.getVector("index")).setSafe(0, current);
+            if (includeStrings) {
+                byte[] b = ("row-" + current).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                ((org.apache.arrow.vector.VarCharVector) root.getVector("label")).setSafe(0, b);
+            }
+            if (includeFloats) {
+                ((Float8Vector) root.getVector("score")).setSafe(0, current * 1.5);
+            }
+            root.setRowCount(1);
+            out.emit(root);
+            current++;
+        }
+    }
+
     // --- Cancellation probes -----------------------------------------------
 
     static final class CancelProbe {

@@ -1,0 +1,144 @@
+"""Run the reference pytest conformance suite against the Java worker.
+
+Mirrors test_go_conformance.py from vgi-rpc-go, parametrising by transport
+(pipe / subprocess / http / unix) so the entire wire surface is exercised.
+"""
+from __future__ import annotations
+
+import contextlib
+import os
+import socket
+import subprocess
+import tempfile
+import time
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from vgi_rpc.conformance import ConformanceService
+from vgi_rpc.http import http_connect
+from vgi_rpc.log import Message
+from vgi_rpc.rpc import SubprocessTransport, _RpcProxy, unix_connect
+
+JAVA_WORKER = os.environ.get(
+    "JAVA_CONFORMANCE_WORKER",
+    str(Path(__file__).parent / "conformance-worker/build/install/conformance-worker/bin/conformance-worker"),
+)
+
+
+@pytest.fixture(scope="session")
+def java_transport() -> Iterator[SubprocessTransport]:
+    transport = SubprocessTransport([JAVA_WORKER])
+    yield transport
+    transport.close()
+
+
+def _wait_for_http(port: int, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            _ = httpx.get(f"http://127.0.0.1:{port}/health", timeout=5.0)
+            return
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            time.sleep(0.1)
+    raise TimeoutError(f"HTTP server on port {port} did not start within {timeout}s")
+
+
+@pytest.fixture(scope="session")
+def java_http_port() -> Iterator[int]:
+    proc = subprocess.Popen([JAVA_WORKER, "--http"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def _short_unix_path(name: str) -> str:
+    fd, path = tempfile.mkstemp(prefix=f"vgi-java-{name}-", suffix=".sock", dir="/tmp")
+    os.close(fd)
+    os.unlink(path)
+    return path
+
+
+def _wait_for_unix(path: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(path)
+                return
+            finally:
+                sock.close()
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
+            time.sleep(0.1)
+    raise TimeoutError(f"Unix socket at {path} did not start within {timeout}s")
+
+
+@pytest.fixture(scope="session")
+def java_unix_path() -> Iterator[str]:
+    path = _short_unix_path("conf")
+    proc = subprocess.Popen([JAVA_WORKER, "--unix", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line == f"UNIX:{path}", f"Expected UNIX:{path}, got: {line!r}"
+        _wait_for_unix(path)
+        yield path
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
+
+
+@pytest.fixture(params=["pipe", "subprocess", "http", "unix"])
+def conformance_conn(
+    request: pytest.FixtureRequest,
+    java_transport: SubprocessTransport,
+    java_http_port: int,
+    java_unix_path: str,
+) -> ConnFactory:
+    def factory(
+        on_log: Callable[[Message], None] | None = None,
+    ) -> contextlib.AbstractContextManager[Any]:
+        if request.param == "pipe":
+            @contextlib.contextmanager
+            def _pipe_conn() -> Iterator[_RpcProxy]:
+                transport = SubprocessTransport([JAVA_WORKER])
+                try:
+                    yield _RpcProxy(ConformanceService, transport, on_log)
+                finally:
+                    transport.close()
+            return _pipe_conn()
+        elif request.param == "subprocess":
+            # Share the session-scoped transport (mimics test_go_conformance's subprocess mode)
+            @contextlib.contextmanager
+            def _shared_subproc() -> Iterator[_RpcProxy]:
+                yield _RpcProxy(ConformanceService, java_transport, on_log)
+            return _shared_subproc()
+        elif request.param == "http":
+            return http_connect(
+                ConformanceService,
+                f"http://127.0.0.1:{java_http_port}",
+                on_log=on_log,
+            )
+        elif request.param == "unix":
+            return unix_connect(ConformanceService, java_unix_path, on_log=on_log)
+        raise ValueError(request.param)
+
+    return factory
+
+
+# Import the canonical pytest suite from the vgi-rpc package.
+from vgi_rpc.conformance._pytest_suite import *  # noqa: F401,F403,E402
