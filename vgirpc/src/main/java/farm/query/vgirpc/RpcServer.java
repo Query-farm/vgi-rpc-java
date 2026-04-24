@@ -217,35 +217,19 @@ public final class RpcServer {
         AuthScope.Scope scope = AuthScope.current();
         CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
                 serverId, info.name(), protocolName(), "");
-        RpcStream<?> stream;
-        Throwable initException = null;
-        try {
-            Object[] args = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
-            stream = (RpcStream<?>) info.reflectMethod().invoke(impl, args);
-        } catch (Throwable t) {
-            stream = null;
-            initException = unwrap(t);
-        }
 
-        // On init error we still need to (1) send an error stream, (2) drain
-        // the client's input IPC stream so subsequent requests aren't misparsed.
-        if (initException != null) {
-            Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, initException, serverId);
-            transport.writer().flush();
-            try (IpcStreamReader inputReader = new IpcStreamReader(transport.reader(), Allocators.root())) {
-                try { inputReader.drain(); } catch (IOException ignore) {}
-            }
-            return;
-        }
-        Schema outputSchema = stream.outputSchema();
-        Schema inputSchema = stream.inputSchema();
-        StreamState state = stream.state();
-        boolean isProducer = stream.isProducer();
+        RpcStream<?> stream = runStreamInit(info, kwargs, ctx, transport);
+        if (stream == null) return;  // init failed; error already reported + input drained
 
         if (stream.header() != null) {
             writeHeaderStream(transport.writer(), stream.header(), sink);
             transport.writer().flush();
         }
+
+        Schema outputSchema = stream.outputSchema();
+        Schema inputSchema = stream.inputSchema();
+        StreamState state = stream.state();
+        boolean isProducer = stream.isProducer();
 
         try (IpcStreamReader inputReader = new IpcStreamReader(transport.reader(), Allocators.root())) {
             IpcStreamWriter outputWriter = new IpcStreamWriter(transport.writer());
@@ -254,75 +238,122 @@ public final class RpcServer {
                 transport.writer().flush();
                 sink.bind(outputWriter, outputSchema);
 
-                while (true) {
-                    Map<String, String> meta;
-                    try {
-                        meta = inputReader.readNextBatch();
-                    } catch (IOException e) {
-                        break;
-                    }
-                    if (meta == null) break;
-                    if (meta.containsKey(Metadata.CANCEL)) {
-                        try { state.onCancel(ctx); } catch (Exception ignore) {}
-                        break;
-                    }
-                    // Resolve external-location pointer inputs before any cast.
-                    VectorSchemaRoot inputRoot = inputReader.root();
-                    VectorSchemaRoot resolvedRoot = null;
-                    Map<String, String> effectiveMeta = meta;
-                    if (locationResolver != null
-                            && LocationResolver.isPointer(inputRoot.getRowCount(), meta)) {
-                        try {
-                            LocationResolver.Resolved res = locationResolver.resolve(meta);
-                            resolvedRoot = res.root();
-                            inputRoot = resolvedRoot;
-                            effectiveMeta = res.customMetadata();
-                        } catch (Exception fetchExc) {
-                            Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(fetchExc, serverId));
-                            transport.writer().flush();
-                            break;
-                        }
-                    }
-                    // Cast input schema when compatible (e.g. int32 → float64) so that
-                    // the state implementation always sees the declared input schema.
-                    VectorSchemaRoot castRoot = null;
-                    if (!isProducer && !inputRoot.getSchema().equals(inputSchema)) {
-                        try {
-                            castRoot = Marshalling.castRoot(inputRoot, inputSchema, Allocators.root());
-                            inputRoot = castRoot;
-                        } catch (Exception castExc) {
-                            Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(
-                                    new ClassCastException(castExc.getMessage()), serverId));
-                            transport.writer().flush();
-                            break;
-                        }
-                    }
-                    AnnotatedBatch input = new AnnotatedBatch(inputRoot, effectiveMeta);
-                    OutputCollector out = new OutputCollector(outputSchema, serverId, isProducer);
-                    try {
-                        state.process(input, out, ctx);
-                    } catch (Throwable t) {
-                        Throwable inner = unwrap(t);
-                        Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(inner, serverId));
-                        transport.writer().flush();
-                        break;
-                    }
-                    flushCollector(outputWriter, out);
-                    transport.writer().flush();
-                    if (castRoot != null) castRoot.close();
-                    if (resolvedRoot != null) resolvedRoot.close();
-                    if (out.finished()) break;
-                }
+                runTickLoop(inputReader, outputWriter, transport, state, ctx,
+                        outputSchema, inputSchema, isProducer);
             } finally {
-                // Close the output FIRST (sends EOS to client), then drain the
-                // client's remaining input (until its EOS) so the transport is
-                // clean for the next request. Closing output first breaks the
-                // client out of its reader; otherwise draining deadlocks.
-                try { outputWriter.close(); } catch (Exception ignore) {}
-                try { transport.writer().flush(); } catch (Exception ignore) {}
-                try { inputReader.drain(); } catch (IOException ignore) {}
+                closeStreamCleanly(outputWriter, transport, inputReader);
             }
         }
+    }
+
+    /**
+     * Invoke the service method to obtain the {@link RpcStream}. On failure
+     * write an error stream + drain the client's input and return {@code null};
+     * callers should early-exit in that case.
+     */
+    private RpcStream<?> runStreamInit(RpcMethodInfo info, Map<String, Object> kwargs, CallContext ctx,
+                                        RpcTransport transport) throws IOException {
+        try {
+            Object[] args = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
+            return (RpcStream<?>) info.reflectMethod().invoke(impl, args);
+        } catch (Throwable t) {
+            Throwable initException = unwrap(t);
+            Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, initException, serverId);
+            transport.writer().flush();
+            // Drain the client's input IPC stream so subsequent requests aren't misparsed.
+            try (IpcStreamReader inputReader = new IpcStreamReader(transport.reader(), Allocators.root())) {
+                try { inputReader.drain(); } catch (IOException ignore) { /* best-effort */ }
+            }
+            return null;
+        }
+    }
+
+    /** Main tick loop: read input batch → resolve/cast → state.process → flush output, until EOS or finish. */
+    private void runTickLoop(IpcStreamReader inputReader, IpcStreamWriter outputWriter, RpcTransport transport,
+                             StreamState state, CallContext ctx, Schema outputSchema, Schema inputSchema,
+                             boolean isProducer) throws IOException {
+        while (true) {
+            Map<String, String> meta;
+            try {
+                meta = inputReader.readNextBatch();
+            } catch (IOException e) {
+                break;
+            }
+            if (meta == null) break;
+            if (meta.containsKey(Metadata.CANCEL)) {
+                try { state.onCancel(ctx); } catch (Exception ignore) { /* best-effort */ }
+                break;
+            }
+            if (!processOneTick(inputReader, outputWriter, transport, state, ctx,
+                    outputSchema, inputSchema, isProducer, meta)) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Handle one tick: resolve pointer / cast schema / invoke state.process / flush.
+     * Returns {@code true} to continue the loop, {@code false} on terminal state (error or finish).
+     */
+    private boolean processOneTick(IpcStreamReader inputReader, IpcStreamWriter outputWriter, RpcTransport transport,
+                                    StreamState state, CallContext ctx, Schema outputSchema, Schema inputSchema,
+                                    boolean isProducer, Map<String, String> meta) throws IOException {
+        VectorSchemaRoot inputRoot = inputReader.root();
+        VectorSchemaRoot resolvedRoot = null;
+        Map<String, String> effectiveMeta = meta;
+
+        if (locationResolver != null && LocationResolver.isPointer(inputRoot.getRowCount(), meta)) {
+            try {
+                LocationResolver.Resolved res = locationResolver.resolve(meta);
+                resolvedRoot = res.root();
+                inputRoot = resolvedRoot;
+                effectiveMeta = res.customMetadata();
+            } catch (Exception fetchExc) {
+                Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(fetchExc, serverId));
+                transport.writer().flush();
+                return false;
+            }
+        }
+
+        VectorSchemaRoot castRoot = null;
+        if (!isProducer && !inputRoot.getSchema().equals(inputSchema)) {
+            try {
+                castRoot = Marshalling.castRoot(inputRoot, inputSchema, Allocators.root());
+                inputRoot = castRoot;
+            } catch (Exception castExc) {
+                Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(
+                        new ClassCastException(castExc.getMessage()), serverId));
+                transport.writer().flush();
+                return false;
+            }
+        }
+
+        OutputCollector out = new OutputCollector(outputSchema, serverId, isProducer);
+        try {
+            state.process(new AnnotatedBatch(inputRoot, effectiveMeta), out, ctx);
+        } catch (Throwable t) {
+            Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(unwrap(t), serverId));
+            transport.writer().flush();
+            return false;
+        }
+        flushCollector(outputWriter, out);
+        transport.writer().flush();
+        if (castRoot != null) castRoot.close();
+        if (resolvedRoot != null) resolvedRoot.close();
+        return !out.finished();
+    }
+
+    /**
+     * Close the output FIRST (sends EOS to client), then drain the client's
+     * remaining input (until its EOS) so the transport is clean for the next
+     * request. Closing output first breaks the client out of its reader;
+     * otherwise draining deadlocks.
+     */
+    private static void closeStreamCleanly(IpcStreamWriter outputWriter, RpcTransport transport,
+                                            IpcStreamReader inputReader) {
+        try { outputWriter.close(); } catch (Exception ignore) { /* already-closed transport is fine */ }
+        try { transport.writer().flush(); } catch (Exception ignore) { /* already-closed transport is fine */ }
+        try { inputReader.drain(); } catch (IOException ignore) { /* client already gone */ }
     }
 
     private void flushCollector(IpcStreamWriter writer, OutputCollector out) throws IOException {

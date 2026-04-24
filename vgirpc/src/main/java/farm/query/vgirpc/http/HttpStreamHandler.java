@@ -11,6 +11,7 @@ import farm.query.vgirpc.RpcMethodInfo;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.StreamState;
+import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.marshal.ParameterBinder;
 import farm.query.vgirpc.marshal.RecordCodec;
@@ -21,7 +22,9 @@ import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ReadChannel;
 import org.apache.arrow.vector.ipc.WriteChannel;
 import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -30,15 +33,16 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.lang.reflect.Parameter;
 import java.nio.channels.Channels;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
  * Stateless HTTP streaming dispatch: each init / exchange request is a standalone
@@ -82,7 +86,6 @@ public final class HttpStreamHandler {
         RpcMethodInfo info = rpc.methods().get(method);
         if (info == null) return errorStream(new IllegalArgumentException("Unknown method: " + method));
 
-        // Parse request
         Map<String, Object> kwargs;
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(requestBody), Allocators.root())) {
             Map<String, String> meta = r.readNextBatch();
@@ -100,9 +103,7 @@ public final class HttpStreamHandler {
         }
 
         OutputCollectorSink sink = new OutputCollectorSink();
-        AuthScope.Scope scope = AuthScope.current();
-        CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                rpc.serverId(), method, rpc.protocolName(), "");
+        CallContext ctx = buildCallContext(method, sink);
 
         RpcStream<?> streamResult;
         try {
@@ -120,9 +121,7 @@ public final class HttpStreamHandler {
         if (streamResult.header() != null) {
             writeHeaderIpcStream(out, streamResult.header(), sink);
         }
-
-        boolean isProducer = streamResult.isProducer();
-        if (isProducer) {
+        if (streamResult.isProducer()) {
             writeProducerRun(out, streamResult, ctx, sink);
         } else {
             writeExchangeInitToken(out, streamResult, sink);
@@ -135,19 +134,15 @@ public final class HttpStreamHandler {
         RpcMethodInfo info = rpc.methods().get(method);
         if (info == null) return errorStream(new IllegalArgumentException("Unknown method: " + method));
 
-        VectorSchemaRoot inputRoot;
-        Map<String, String> meta;
-        try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(requestBody), Allocators.root())) {
-            meta = r.readNextBatch();
-            if (meta == null) return errorStream(new RuntimeException("empty exchange request"));
-            inputRoot = r.root();
-            // Copy the input because the reader is going out of scope
-            inputRoot = copyRoot(inputRoot);
+        ExchangeRequest req;
+        try {
+            req = parseExchangeRequest(requestBody);
+        } catch (IOException | RuntimeException e) {
+            return errorStream(e);
         }
 
-        // Own the freshly-copied inputRoot across all exit paths.
-        try (VectorSchemaRoot ownedInput = inputRoot) {
-            String tokenB64 = meta.get(Metadata.STREAM_STATE);
+        try (VectorSchemaRoot ownedInput = req.inputRoot()) {
+            String tokenB64 = req.meta().get(Metadata.STREAM_STATE);
             if (tokenB64 == null) {
                 return errorStream(new RuntimeException("Missing state token in exchange request"));
             }
@@ -157,32 +152,22 @@ public final class HttpStreamHandler {
             } catch (Exception e) {
                 return errorStream(e);
             }
-            Schema outputSchema = deserializeSchema(token.outputSchema());
-            Schema inputSchema = deserializeSchema(token.inputSchema());
-            boolean isProducer = inputSchema.getFields().isEmpty();
 
             Class<? extends StreamState> stateCls = stateTypes.get(method);
             if (stateCls == null) {
                 return errorStream(new IllegalStateException("No state class cached for '" + method + "'"));
             }
+            Schema outputSchema = deserializeSchema(token.outputSchema());
+            Schema inputSchema = deserializeSchema(token.inputSchema());
+            boolean isProducer = inputSchema.getFields().isEmpty();
             StreamState state = StateSerializer.deserialize(token.state(), stateCls);
 
-            OutputCollectorSink sink = new OutputCollectorSink();
-            AuthScope.Scope scope = AuthScope.current();
-            CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                    rpc.serverId(), method, rpc.protocolName(), "");
+            CallContext ctx = buildCallContext(method, new OutputCollectorSink());
 
-            // Handle cancel: invoke on_cancel, return empty stream (schema + EOS).
-            if (meta.containsKey(Metadata.CANCEL)) {
-                try { state.onCancel(ctx); } catch (Exception ignore) {}
-                ByteArrayOutputStream out = new ByteArrayOutputStream();
-                try (IpcStreamWriter w = new IpcStreamWriter(out)) {
-                    w.writeSchema(outputSchema);
-                }
-                return out.toByteArray();
+            if (req.meta().containsKey(Metadata.CANCEL)) {
+                return handleCancel(outputSchema, state, ctx);
             }
 
-            // Cast input schema for compatible widenings (int32 → float64 etc.).
             VectorSchemaRoot castInput = null;
             if (!isProducer && !ownedInput.getSchema().equals(inputSchema)) {
                 try {
@@ -196,54 +181,93 @@ public final class HttpStreamHandler {
                 VectorSchemaRoot actualInput = maybeCast != null ? maybeCast : ownedInput;
                 OutputCollector collector = new OutputCollector(outputSchema, rpc.serverId(), isProducer);
                 try {
-                    state.process(new AnnotatedBatch(actualInput, meta), collector, ctx);
+                    state.process(new AnnotatedBatch(actualInput, req.meta()), collector, ctx);
                     if (!collector.finished()) collector.validate();
                 } catch (Throwable t) {
                     return errorStream(t);
                 }
-
-                boolean finished = collector.finished();
-                ByteArrayOutputStream out = new ByteArrayOutputStream();
-                try (IpcStreamWriter w = new IpcStreamWriter(out)) {
-                    w.writeSchema(outputSchema);
-
-                    String newTokenStr = null;
-                    if (!finished) {
-                        byte[] newStateBytes = StateSerializer.serialize(state);
-                        StateToken newToken = new StateToken(newStateBytes, token.outputSchema(), token.inputSchema(),
-                                token.streamId(), System.currentTimeMillis() / 1000);
-                        newTokenStr = new String(newToken.pack(signingKey), StandardCharsets.US_ASCII);
-                    }
-
-                    // Producer continuation: data batch + separate zero-row state-token batch (matches init format).
-                    // Exchange: data batch carries the new state-token in its metadata.
-                    OutputCollector.Entry data = null;
-                    for (OutputCollector.Entry e : collector.entries()) {
-                        if (e.isData()) { data = e; continue; }
-                        w.writeBatch(e.root(), e.customMetadata());
-                        e.root().close();
-                    }
-                    if (!isProducer && data != null && newTokenStr != null) {
-                        Map<String, String> md = new LinkedHashMap<>();
-                        if (data.customMetadata() != null) md.putAll(data.customMetadata());
-                        md.put(Metadata.STREAM_STATE, newTokenStr);
-                        w.writeBatch(data.root(), md);
-                        data.root().close();
-                    } else {
-                        if (data != null) { w.writeBatch(data.root(), data.customMetadata()); data.root().close(); }
-                        if (newTokenStr != null) {
-                            Map<String, String> md = new LinkedHashMap<>();
-                            md.put(Metadata.STREAM_STATE, newTokenStr);
-                            Wire.writeZeroBatch(w, outputSchema, md);
-                        }
-                    }
-                }
-                return out.toByteArray();
+                return writeExchangeResponse(collector, state, token, outputSchema, isProducer);
             }
         }
     }
 
-    // --- Helpers ----------------------------------------------------------
+    // --- handleExchange sub-steps -----------------------------------------
+
+    /** Parsed exchange-request body: metadata (including the state token) plus the (owned) input batch. */
+    private record ExchangeRequest(Map<String, String> meta, VectorSchemaRoot inputRoot) {}
+
+    private static ExchangeRequest parseExchangeRequest(byte[] body) throws IOException {
+        try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(body), Allocators.root())) {
+            Map<String, String> meta = r.readNextBatch();
+            if (meta == null) throw new RuntimeException("empty exchange request");
+            // Copy the input because the reader is going out of scope.
+            VectorSchemaRoot copied = copyRoot(r.root());
+            return new ExchangeRequest(meta, copied);
+        }
+    }
+
+    private byte[] handleCancel(Schema outputSchema, StreamState state, CallContext ctx) throws IOException {
+        // on_cancel is best-effort; the client has already decided it's done.
+        try { state.onCancel(ctx); } catch (Exception ignore) { /* reported via onCancel contract */ }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (IpcStreamWriter w = new IpcStreamWriter(out)) {
+            w.writeSchema(outputSchema);
+        }
+        return out.toByteArray();
+    }
+
+    private byte[] writeExchangeResponse(OutputCollector collector, StreamState state, StateToken priorToken,
+                                         Schema outputSchema, boolean isProducer) throws IOException {
+        boolean finished = collector.finished();
+        String newTokenStr = finished ? null : serializeContinuationToken(state, priorToken);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (IpcStreamWriter w = new IpcStreamWriter(out)) {
+            w.writeSchema(outputSchema);
+
+            // Logs and other non-data entries flow through first; the data entry is held for token-attachment.
+            OutputCollector.Entry data = null;
+            for (OutputCollector.Entry e : collector.entries()) {
+                if (e.isData()) { data = e; continue; }
+                w.writeBatch(e.root(), e.customMetadata());
+                e.root().close();
+            }
+
+            if (!isProducer && data != null && newTokenStr != null) {
+                // Exchange continuation: piggy-back the new token on the data batch's metadata.
+                Map<String, String> md = new LinkedHashMap<>();
+                if (data.customMetadata() != null) md.putAll(data.customMetadata());
+                md.put(Metadata.STREAM_STATE, newTokenStr);
+                w.writeBatch(data.root(), md);
+                data.root().close();
+            } else {
+                // Producer continuation (or no data): emit the data batch as-is, token as a trailing zero-row batch.
+                if (data != null) {
+                    w.writeBatch(data.root(), data.customMetadata());
+                    data.root().close();
+                }
+                if (newTokenStr != null) {
+                    Wire.writeZeroBatch(w, outputSchema, Map.of(Metadata.STREAM_STATE, newTokenStr));
+                }
+            }
+        }
+        return out.toByteArray();
+    }
+
+    private String serializeContinuationToken(StreamState state, StateToken priorToken) {
+        byte[] newStateBytes = StateSerializer.serialize(state);
+        StateToken newToken = new StateToken(newStateBytes, priorToken.outputSchema(), priorToken.inputSchema(),
+                priorToken.streamId(), System.currentTimeMillis() / 1000);
+        return new String(newToken.pack(signingKey), StandardCharsets.US_ASCII);
+    }
+
+    private CallContext buildCallContext(String method, Consumer<Message> sink) {
+        AuthScope.Scope scope = AuthScope.current();
+        return new CallContext(scope.auth(), sink, scope.transportMetadata(),
+                rpc.serverId(), method, rpc.protocolName(), "");
+    }
+
+    // --- Init helpers -----------------------------------------------------
 
     private void writeProducerRun(ByteArrayOutputStream out, RpcStream<?> streamResult,
                                    CallContext ctx, OutputCollectorSink sink) throws IOException {
@@ -274,13 +298,13 @@ public final class HttpStreamHandler {
                 // If the producer isn't finished, append a zero-row state-token batch so the
                 // client knows to call /exchange to continue. Finished streams just EOS.
                 if (!coll.finished()) {
-                    byte[] stateBytes = StateSerializer.serialize(state);
-                    byte[] outputSchemaBytes = serializeSchema(outputSchema);
-                    byte[] inputSchemaBytes = serializeSchema(inputSchema);
-                    StateToken token = new StateToken(stateBytes, outputSchemaBytes, inputSchemaBytes,
-                            UUID.randomUUID().toString().replace("-", ""), System.currentTimeMillis() / 1000);
-                    Map<String, String> md = new LinkedHashMap<>();
-                    md.put(Metadata.STREAM_STATE, new String(token.pack(signingKey), StandardCharsets.US_ASCII));
+                    StateToken token = new StateToken(
+                            StateSerializer.serialize(state),
+                            serializeSchema(outputSchema),
+                            serializeSchema(inputSchema),
+                            newStreamId(), System.currentTimeMillis() / 1000);
+                    Map<String, String> md = Map.of(Metadata.STREAM_STATE,
+                            new String(token.pack(signingKey), StandardCharsets.US_ASCII));
                     Wire.writeZeroBatch(w, outputSchema, md);
                 }
             }
@@ -291,17 +315,16 @@ public final class HttpStreamHandler {
                                          OutputCollectorSink sink) throws IOException {
         Schema outputSchema = streamResult.outputSchema();
         Schema inputSchema = streamResult.inputSchema();
-        byte[] stateBytes = StateSerializer.serialize(streamResult.state());
-        byte[] outputSchemaBytes = serializeSchema(outputSchema);
-        byte[] inputSchemaBytes = serializeSchema(inputSchema);
-        StateToken token = new StateToken(stateBytes, outputSchemaBytes, inputSchemaBytes,
-                UUID.randomUUID().toString().replace("-", ""), System.currentTimeMillis() / 1000);
-        byte[] tokenB64 = token.pack(signingKey);
+        StateToken token = new StateToken(
+                StateSerializer.serialize(streamResult.state()),
+                serializeSchema(outputSchema),
+                serializeSchema(inputSchema),
+                newStreamId(), System.currentTimeMillis() / 1000);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
             sink.bind(w, outputSchema);
-            Map<String, String> md = new LinkedHashMap<>();
-            md.put(Metadata.STREAM_STATE, new String(tokenB64, StandardCharsets.US_ASCII));
+            Map<String, String> md = Map.of(Metadata.STREAM_STATE,
+                    new String(token.pack(signingKey), StandardCharsets.US_ASCII));
             Wire.writeZeroBatch(w, outputSchema, md);
         }
     }
@@ -330,21 +353,24 @@ public final class HttpStreamHandler {
         return out.toByteArray();
     }
 
+    private static String newStreamId() {
+        return UUID.randomUUID().toString().replace("-", "");
+    }
+
     private static byte[] serializeSchema(Schema schema) {
         try {
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             WriteChannel ch = new WriteChannel(Channels.newChannel(bos));
             MessageSerializer.serialize(ch, schema);
             return bos.toByteArray();
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (IOException e) { throw new IllegalStateException("schema serialize failed", e); }
     }
 
     private static Schema deserializeSchema(byte[] b) {
         try {
-            org.apache.arrow.vector.ipc.ReadChannel rc = new org.apache.arrow.vector.ipc.ReadChannel(
-                    Channels.newChannel(new ByteArrayInputStream(b)));
+            ReadChannel rc = new ReadChannel(Channels.newChannel(new ByteArrayInputStream(b)));
             return MessageSerializer.deserializeSchema(rc);
-        } catch (Exception e) { throw new RuntimeException(e); }
+        } catch (IOException e) { throw new IllegalStateException("schema deserialize failed", e); }
     }
 
     private static VectorSchemaRoot copyRoot(VectorSchemaRoot src) {
@@ -352,8 +378,8 @@ public final class HttpStreamHandler {
         dst.allocateNew();
         int rows = src.getRowCount();
         for (int c = 0; c < src.getSchema().getFields().size(); c++) {
-            org.apache.arrow.vector.FieldVector sv = src.getVector(c);
-            org.apache.arrow.vector.FieldVector dv = dst.getVector(c);
+            FieldVector sv = src.getVector(c);
+            FieldVector dv = dst.getVector(c);
             for (int r = 0; r < rows; r++) dv.copyFromSafe(r, r, sv);
         }
         dst.setRowCount(rows);
@@ -361,26 +387,28 @@ public final class HttpStreamHandler {
     }
 
     /** Collects log Messages during init so they can be flushed into the response stream. */
-    private final class OutputCollectorSink implements java.util.function.Consumer<farm.query.vgirpc.log.Message> {
-        private final java.util.List<farm.query.vgirpc.log.Message> buffer = new java.util.ArrayList<>();
+    private final class OutputCollectorSink implements Consumer<Message> {
+        private final List<Message> buffer = new ArrayList<>();
         private IpcStreamWriter writer;
         private Schema schema;
 
         void bind(IpcStreamWriter w, Schema s) throws IOException {
             this.writer = w; this.schema = s;
-            for (var msg : buffer) writeNow(msg);
+            for (Message msg : buffer) writeNow(msg);
             buffer.clear();
         }
         void detach() { this.writer = null; this.schema = null; }
 
         @Override
-        public void accept(farm.query.vgirpc.log.Message msg) {
+        public void accept(Message msg) {
             if (writer != null) {
                 try { writeNow(msg); } catch (IOException e) { throw new RuntimeException(e); }
-            } else buffer.add(msg);
+            } else {
+                buffer.add(msg);
+            }
         }
 
-        private void writeNow(farm.query.vgirpc.log.Message msg) throws IOException {
+        private void writeNow(Message msg) throws IOException {
             Map<String, String> md = msg.addToMetadata(null);
             md.put(Metadata.SERVER_ID, rpc.serverId());
             Wire.writeZeroBatch(writer, schema, md);

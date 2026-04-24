@@ -57,50 +57,21 @@ public final class HttpServer {
     private final String prefix;
     private int port;
 
+    /** Defaults: ephemeral port, no prefix, anonymous auth, no TTL, no pre-handlers. */
     public HttpServer(RpcServer rpc) {
-        this(rpc, "", 0, null, 0, null, null);
+        this(rpc, Config.defaults());
     }
 
-    public HttpServer(RpcServer rpc, String prefix, int port) {
-        this(rpc, prefix, port, null, 0, null, null);
-    }
-
-    public HttpServer(RpcServer rpc, String prefix, int port,
-                      byte[] signingKey, long tokenTtlSeconds) {
-        this(rpc, prefix, port, signingKey, tokenTtlSeconds, null, null);
-    }
-
-    public HttpServer(RpcServer rpc, String prefix, int port,
-                      byte[] signingKey, long tokenTtlSeconds,
-                      Authenticator authenticator) {
-        this(rpc, prefix, port, signingKey, tokenTtlSeconds, authenticator, null);
-    }
-
-    /**
-     * @param signingKey optional HMAC signing key for stream state tokens; when
-     *     {@code null} a random per-process key is generated. Stable keys let
-     *     clients resume streams across server restarts.
-     * @param tokenTtlSeconds maximum state-token age before it's rejected;
-     *     {@code 0} disables TTL enforcement.
-     * @param authenticator per-request authenticator; {@code null} means
-     *     anonymous (default).
-     * @param preHandlers optional list of pre-route handlers, run in order
-     *     before the default /health + /{method} + /{method}/init + /{method}/exchange
-     *     dispatch. Used to mount add-on routes (e.g. OAuth PKCE callback).
-     */
-    public HttpServer(RpcServer rpc, String prefix, int port,
-                      byte[] signingKey, long tokenTtlSeconds,
-                      Authenticator authenticator,
-                      List<HttpPreHandler> preHandlers) {
+    public HttpServer(RpcServer rpc, Config config) {
         this.rpc = rpc;
-        this.streamHandler = new HttpStreamHandler(rpc, signingKey, tokenTtlSeconds);
-        this.authenticator = authenticator != null ? authenticator : Authenticator.ANONYMOUS;
-        this.preHandlers = preHandlers != null ? List.copyOf(preHandlers) : List.of();
-        this.prefix = prefix;
+        this.streamHandler = new HttpStreamHandler(rpc, config.signingKey(), config.tokenTtlSeconds());
+        this.authenticator = config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
+        this.preHandlers = config.preHandlers();
+        this.prefix = config.prefix();
         this.jetty = new Server();
         ServerConnector connector = new ServerConnector(jetty);
         connector.setHost("127.0.0.1");
-        connector.setPort(port);
+        connector.setPort(config.port());
         jetty.addConnector(connector);
 
         ServletContextHandler ctx = new ServletContextHandler();
@@ -108,6 +79,59 @@ public final class HttpServer {
         String pattern = prefix.isEmpty() ? "/*" : prefix + "/*";
         ctx.addServlet(new ServletHolder(new RouterServlet()), pattern);
         jetty.setHandler(ctx);
+    }
+
+    /**
+     * Immutable configuration for {@link HttpServer}. Use {@link #defaults()} or
+     * {@link #builder()} to construct; prefer the builder for any non-default field.
+     *
+     * @param prefix          URL prefix (e.g. {@code "/vgi"}); empty for no prefix.
+     * @param port            listen port; {@code 0} for an OS-assigned ephemeral port.
+     * @param signingKey      HMAC signing key for stream state tokens; {@code null}
+     *                        generates a random per-process key (tokens won't
+     *                        survive restarts).
+     * @param tokenTtlSeconds maximum state-token age before it's rejected;
+     *                        {@code 0} disables TTL enforcement.
+     * @param authenticator   per-request authenticator; {@code null} means anonymous.
+     * @param preHandlers     pre-route handlers run in order before dispatch —
+     *                        used to mount add-on routes (e.g. OAuth PKCE callback).
+     */
+    public record Config(
+            String prefix,
+            int port,
+            byte[] signingKey,
+            long tokenTtlSeconds,
+            Authenticator authenticator,
+            List<HttpPreHandler> preHandlers) {
+
+        public Config {
+            prefix = prefix != null ? prefix : "";
+            signingKey = signingKey != null ? signingKey.clone() : null;
+            preHandlers = preHandlers != null ? List.copyOf(preHandlers) : List.of();
+        }
+
+        public static Config defaults() { return builder().build(); }
+        public static Builder builder() { return new Builder(); }
+
+        public static final class Builder {
+            private String prefix = "";
+            private int port = 0;
+            private byte[] signingKey;
+            private long tokenTtlSeconds = 0;
+            private Authenticator authenticator;
+            private List<HttpPreHandler> preHandlers = List.of();
+
+            public Builder prefix(String prefix) { this.prefix = prefix; return this; }
+            public Builder port(int port) { this.port = port; return this; }
+            public Builder signingKey(byte[] signingKey) { this.signingKey = signingKey; return this; }
+            public Builder tokenTtlSeconds(long tokenTtlSeconds) { this.tokenTtlSeconds = tokenTtlSeconds; return this; }
+            public Builder authenticator(Authenticator authenticator) { this.authenticator = authenticator; return this; }
+            public Builder preHandlers(List<HttpPreHandler> preHandlers) { this.preHandlers = preHandlers; return this; }
+
+            public Config build() {
+                return new Config(prefix, port, signingKey, tokenTtlSeconds, authenticator, preHandlers);
+            }
+        }
     }
 
     public void start() throws Exception {

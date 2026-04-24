@@ -8,6 +8,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -17,16 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 final class AuthenticatorTest {
 
     private static HttpServletRequest stubRequest() {
-        // Not used by the test authenticators below; a null-action proxy keeps compile-time happy.
-        return (HttpServletRequest) java.lang.reflect.Proxy.newProxyInstance(
-                AuthenticatorTest.class.getClassLoader(),
-                new Class<?>[]{HttpServletRequest.class},
-                (proxy, method, args) -> switch (method.getName()) {
-                    case "hashCode" -> 0;
-                    case "toString" -> "stub";
-                    case "equals" -> proxy == args[0];
-                    default -> null;
-                });
+        return HttpRequestStub.withHeaders(Map.of());
     }
 
     @Test

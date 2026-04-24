@@ -169,7 +169,12 @@ public final class Main {
     private static void serveHttp(RpcServer server, byte[] signingKey, long tokenTtl,
                                    Authenticator authenticator,
                                    List<HttpPreHandler> preHandlers) throws Exception {
-        HttpServer http = new HttpServer(server, "", 0, signingKey, tokenTtl, authenticator, preHandlers);
+        HttpServer http = new HttpServer(server, HttpServer.Config.builder()
+                .signingKey(signingKey)
+                .tokenTtlSeconds(tokenTtl)
+                .authenticator(authenticator)
+                .preHandlers(preHandlers)
+                .build());
         http.start();
         System.out.println("PORT:" + http.port());
         System.out.flush();

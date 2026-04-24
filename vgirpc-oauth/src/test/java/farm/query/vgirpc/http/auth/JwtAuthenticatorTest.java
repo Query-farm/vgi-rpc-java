@@ -3,7 +3,6 @@
 
 package farm.query.vgirpc.http.auth;
 
-import com.nimbusds.jose.JOSEException;
 import com.nimbusds.jose.JWSAlgorithm;
 import com.nimbusds.jose.JWSHeader;
 import com.nimbusds.jose.crypto.RSASSASigner;
@@ -14,6 +13,7 @@ import com.nimbusds.jwt.SignedJWT;
 import com.sun.net.httpserver.HttpServer;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.http.AuthException;
+import farm.query.vgirpc.http.HttpRequestStub;
 import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -22,11 +22,8 @@ import org.junit.jupiter.api.Test;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.interfaces.RSAPrivateKey;
-import java.security.interfaces.RSAPublicKey;
 import java.time.Instant;
 import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -39,6 +36,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * exercises the authenticator with valid, expired, and tampered tokens.
  */
 final class JwtAuthenticatorTest {
+
+    private static final String ISSUER = "https://issuer.example";
+    private static final String AUDIENCE = "my-api";
 
     private HttpServer jwksHttp;
     private int jwksPort;
@@ -85,42 +85,24 @@ final class JwtAuthenticatorTest {
         return jwt.serialize();
     }
 
-    private JwtAuthenticator buildAuthenticator(String issuer, String audience) {
+    private JwtAuthenticator buildAuthenticator() {
         return JwtAuthenticator.builder()
-                .issuer(issuer)
-                .audience(audience)
+                .issuer(ISSUER)
+                .audience(AUDIENCE)
                 .jwksUri("http://127.0.0.1:" + jwksPort + "/jwks.json")
                 .build();
     }
 
-    private static HttpServletRequest stub(String authHeader) {
-        Map<String, String> headers = new HashMap<>();
-        if (authHeader != null) headers.put("Authorization", authHeader);
-        return (HttpServletRequest) java.lang.reflect.Proxy.newProxyInstance(
-                JwtAuthenticatorTest.class.getClassLoader(),
-                new Class<?>[]{HttpServletRequest.class},
-                (proxy, method, args) -> {
-                    if ("getHeader".equals(method.getName()) && args != null && args.length == 1) {
-                        String key = (String) args[0];
-                        for (Map.Entry<String, String> e : headers.entrySet()) {
-                            if (e.getKey().equalsIgnoreCase(key)) return e.getValue();
-                        }
-                        return null;
-                    }
-                    return switch (method.getName()) {
-                        case "hashCode" -> 0;
-                        case "toString" -> "stub";
-                        case "equals" -> proxy == args[0];
-                        default -> null;
-                    };
-                });
+    private static HttpServletRequest bearer(String token) {
+        return token == null
+                ? HttpRequestStub.withHeaders(Map.of())
+                : HttpRequestStub.withBearer(token);
     }
 
     @Test
     void valid_token_authenticates() throws Exception {
-        String token = issueToken("https://issuer.example", "my-api", "alice", 300);
-        AuthContext ctx = buildAuthenticator("https://issuer.example", "my-api")
-                .authenticate(stub("Bearer " + token));
+        String token = issueToken(ISSUER, AUDIENCE, "alice", 300);
+        AuthContext ctx = buildAuthenticator().authenticate(bearer(token));
         assertTrue(ctx.authenticated());
         assertEquals("alice", ctx.principal());
         assertEquals("admin", ctx.claims().get("role"));
@@ -128,43 +110,35 @@ final class JwtAuthenticatorTest {
 
     @Test
     void missing_header_rejected() {
-        assertThrows(AuthException.class,
-                () -> buildAuthenticator("https://issuer.example", "my-api").authenticate(stub(null)));
+        assertThrows(AuthException.class, () -> buildAuthenticator().authenticate(bearer(null)));
     }
 
     @Test
     void wrong_issuer_rejected() throws Exception {
-        String token = issueToken("https://other.example", "my-api", "alice", 300);
-        assertThrows(AuthException.class, () -> buildAuthenticator("https://issuer.example", "my-api")
-                .authenticate(stub("Bearer " + token)));
+        String token = issueToken("https://other.example", AUDIENCE, "alice", 300);
+        assertThrows(AuthException.class, () -> buildAuthenticator().authenticate(bearer(token)));
     }
 
     @Test
     void wrong_audience_rejected() throws Exception {
-        String token = issueToken("https://issuer.example", "other-api", "alice", 300);
-        assertThrows(AuthException.class, () -> buildAuthenticator("https://issuer.example", "my-api")
-                .authenticate(stub("Bearer " + token)));
+        String token = issueToken(ISSUER, "other-api", "alice", 300);
+        assertThrows(AuthException.class, () -> buildAuthenticator().authenticate(bearer(token)));
     }
 
     @Test
     void expired_token_rejected() throws Exception {
-        String token = issueToken("https://issuer.example", "my-api", "alice", -60);
-        assertThrows(AuthException.class, () -> buildAuthenticator("https://issuer.example", "my-api")
-                .authenticate(stub("Bearer " + token)));
+        String token = issueToken(ISSUER, AUDIENCE, "alice", -60);
+        assertThrows(AuthException.class, () -> buildAuthenticator().authenticate(bearer(token)));
     }
 
     @Test
     void tampered_signature_rejected() throws Exception {
-        String token = issueToken("https://issuer.example", "my-api", "alice", 300);
-        // Tamper inside the signature (last segment) by flipping one character
-        // well inside the signature to something that definitely decodes
-        // differently — cheap and reliable.
-        int lastDot = token.lastIndexOf('.');
-        int idx = lastDot + 10; // well inside the signature
+        String token = issueToken(ISSUER, AUDIENCE, "alice", 300);
+        // Flip one character well inside the signature so it definitely decodes differently.
+        int idx = token.lastIndexOf('.') + 10;
         char orig = token.charAt(idx);
         char flipped = orig == 'x' ? 'y' : 'x';
         String tampered = token.substring(0, idx) + flipped + token.substring(idx + 1);
-        assertThrows(AuthException.class, () -> buildAuthenticator("https://issuer.example", "my-api")
-                .authenticate(stub("Bearer " + tampered)));
+        assertThrows(AuthException.class, () -> buildAuthenticator().authenticate(bearer(tampered)));
     }
 }
