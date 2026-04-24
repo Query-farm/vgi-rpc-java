@@ -38,7 +38,7 @@ public final class ConformanceServiceImpl implements ConformanceService {
     @Override public AllTypes echo_all_types(AllTypes data) { return data; }
 
     @Override public String inspect_point(Point point) {
-        return "Point(x=" + point.x() + ", y=" + point.y() + ")";
+        return "Point(" + point.x() + ", " + point.y() + ")";
     }
 
     @Override public int echo_int32(int value) { return value; }
@@ -69,20 +69,20 @@ public final class ConformanceServiceImpl implements ConformanceService {
     // --- Client-directed logging -------------------------------------------
 
     @Override public String echo_with_info_log(String value, CallContext ctx) {
-        ctx.clientLog(Level.INFO, "info log for " + value);
+        ctx.clientLog(Level.INFO, "info: " + value);
         return value;
     }
     @Override public String echo_with_multi_logs(String value, CallContext ctx) {
-        ctx.clientLog(Level.DEBUG, "debug log");
-        ctx.clientLog(Level.INFO, "info log");
-        ctx.clientLog(Level.WARN, "warn log");
+        ctx.clientLog(Level.DEBUG, "debug: " + value);
+        ctx.clientLog(Level.INFO, "info: " + value);
+        ctx.clientLog(Level.WARN, "warn: " + value);
         return value;
     }
     @Override public String echo_with_log_extras(String value, CallContext ctx) {
         Map<String, Object> extra = new LinkedHashMap<>();
-        extra.put("key1", "value1");
-        extra.put("key2", 42);
-        ctx.clientLog(Level.INFO, "log with extras", extra);
+        extra.put("source", "conformance");
+        extra.put("detail", value);
+        ctx.clientLog(Level.INFO, "info: " + value, extra);
         return value;
     }
 
@@ -107,16 +107,17 @@ public final class ConformanceServiceImpl implements ConformanceService {
         return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.ErrorAfterN(n));
     }
     @Override public Stream<? extends ProducerState> produce_error_on_init() {
-        throw new RuntimeException("intentional error during stream initialization");
+        throw new RuntimeException("intentional init error");
     }
 
     @Override public Stream<? extends ProducerState> produce_with_header(long count) {
         return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Counter(count),
-                new ConformanceHeader(count, "producer with header"));
+                new ConformanceHeader(count, "producing " + count + " batches"));
     }
-    @Override public Stream<? extends ProducerState> produce_with_header_and_logs(long count) {
+    @Override public Stream<? extends ProducerState> produce_with_header_and_logs(long count, CallContext ctx) {
+        ctx.clientLog(Level.INFO, "stream init log");
         return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.LoggingProducer(count),
-                new ConformanceHeader(count, "producer with header and logs"));
+                new ConformanceHeader(count, "producing " + count + " with logs"));
     }
 
     // --- Exchange streams ---------------------------------------------------
@@ -142,12 +143,12 @@ public final class ConformanceServiceImpl implements ConformanceService {
                 new StreamStates.ZeroColumns());
     }
     @Override public Stream<? extends ExchangeState> exchange_error_on_init() {
-        throw new RuntimeException("intentional error during exchange stream initialization");
+        throw new RuntimeException("intentional exchange init error");
     }
     @Override public Stream<? extends ExchangeState> exchange_with_header(double factor) {
         return Stream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
                 new StreamStates.Scale(factor),
-                new ConformanceHeader(0, "exchange with header"));
+                new ConformanceHeader(0, "scale by " + factor));
     }
 
     // --- Cancellation -------------------------------------------------------
@@ -156,7 +157,7 @@ public final class ConformanceServiceImpl implements ConformanceService {
         return Stream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.CancellableProducer());
     }
     @Override public Stream<? extends ExchangeState> cancellable_exchange() {
-        return Stream.exchange(StreamStates.COUNTER_SCHEMA, StreamStates.COUNTER_SCHEMA,
+        return Stream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
                 new StreamStates.CancellableExchange());
     }
     @Override public List<Long> cancel_probe_counters() {

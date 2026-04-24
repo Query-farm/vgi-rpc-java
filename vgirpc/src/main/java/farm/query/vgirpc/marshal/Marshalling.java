@@ -182,11 +182,27 @@ public final class Marshalling {
         if (e == null) { w.writeNull(); return; }
         ArrowType t = child.getType();
         switch (t.getTypeID()) {
-            case Int -> w.bigInt().writeBigInt(((Number) e).longValue());
-            case FloatingPoint -> w.float8().writeFloat8(((Number) e).doubleValue());
+            case Int -> {
+                int bits = ((ArrowType.Int) t).getBitWidth();
+                long lv = ((Number) e).longValue();
+                switch (bits) {
+                    case 8 -> w.tinyInt().writeTinyInt((byte) lv);
+                    case 16 -> w.smallInt().writeSmallInt((short) lv);
+                    case 32 -> w.integer().writeInt((int) lv);
+                    default -> w.bigInt().writeBigInt(lv);
+                }
+            }
+            case FloatingPoint -> {
+                double dv = ((Number) e).doubleValue();
+                switch (((ArrowType.FloatingPoint) t).getPrecision()) {
+                    case SINGLE -> w.float4().writeFloat4((float) dv);
+                    default -> w.float8().writeFloat8(dv);
+                }
+            }
             case Bool -> w.bit().writeBit(((Boolean) e) ? 1 : 0);
             case Utf8 -> {
-                byte[] bytes = ((String) e).getBytes(StandardCharsets.UTF_8);
+                String s = (e instanceof Enum<?> en) ? en.name() : e.toString();
+                byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
                 try (var buf = farm.query.vgirpc.wire.Allocators.root().buffer(bytes.length)) {
                     buf.setBytes(0, bytes);
                     w.varChar().writeVarChar(0, bytes.length, buf);
@@ -206,7 +222,89 @@ public final class Marshalling {
                 for (Object x : (List<?>) e) writeListElement(inner, grand, x);
                 inner.endList();
             }
+            case Struct -> {
+                org.apache.arrow.vector.complex.writer.BaseWriter.StructWriter sw = w.struct();
+                sw.start();
+                Map<String, Object> fields;
+                if (e instanceof Map<?, ?> m) {
+                    //noinspection unchecked
+                    fields = (Map<String, Object>) m;
+                } else if (e instanceof ArrowSerializableRecord r) {
+                    fields = RecordCodec.toRowMap(r);
+                } else {
+                    throw new IllegalArgumentException("struct list element must be record or Map: " + e.getClass());
+                }
+                for (Field f : child.getChildren()) {
+                    writeStructField(sw, f, fields.get(f.getName()));
+                }
+                sw.end();
+            }
             default -> throw new IllegalArgumentException("unsupported list element type: " + t);
+        }
+    }
+
+    private static void writeStructField(
+            org.apache.arrow.vector.complex.writer.BaseWriter.StructWriter sw,
+            Field f, Object v) {
+        String name = f.getName();
+        ArrowType t = f.getType();
+        if (v == null) {
+            // leave unset → null bit
+            return;
+        }
+        switch (t.getTypeID()) {
+            case Int -> {
+                int bits = ((ArrowType.Int) t).getBitWidth();
+                long lv = ((Number) v).longValue();
+                switch (bits) {
+                    case 8 -> sw.tinyInt(name).writeTinyInt((byte) lv);
+                    case 16 -> sw.smallInt(name).writeSmallInt((short) lv);
+                    case 32 -> sw.integer(name).writeInt((int) lv);
+                    default -> sw.bigInt(name).writeBigInt(lv);
+                }
+            }
+            case FloatingPoint -> {
+                double dv = ((Number) v).doubleValue();
+                switch (((ArrowType.FloatingPoint) t).getPrecision()) {
+                    case SINGLE -> sw.float4(name).writeFloat4((float) dv);
+                    default -> sw.float8(name).writeFloat8(dv);
+                }
+            }
+            case Bool -> sw.bit(name).writeBit(((Boolean) v) ? 1 : 0);
+            case Utf8 -> {
+                String s = (v instanceof Enum<?> en) ? en.name() : v.toString();
+                byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+                try (var buf = farm.query.vgirpc.wire.Allocators.root().buffer(bytes.length)) {
+                    buf.setBytes(0, bytes);
+                    sw.varChar(name).writeVarChar(0, bytes.length, buf);
+                }
+            }
+            case Binary -> {
+                byte[] bytes = (byte[]) v;
+                try (var buf = farm.query.vgirpc.wire.Allocators.root().buffer(bytes.length)) {
+                    buf.setBytes(0, bytes);
+                    sw.varBinary(name).writeVarBinary(0, bytes.length, buf);
+                }
+            }
+            case Struct -> {
+                org.apache.arrow.vector.complex.writer.BaseWriter.StructWriter inner = sw.struct(name);
+                inner.start();
+                Map<String, Object> nested;
+                if (v instanceof Map<?, ?> m) { //noinspection unchecked
+                    nested = (Map<String, Object>) m;
+                } else if (v instanceof ArrowSerializableRecord r) { nested = RecordCodec.toRowMap(r);
+                } else throw new IllegalArgumentException("struct field value must be record or Map: " + v.getClass());
+                for (Field c : f.getChildren()) writeStructField(inner, c, nested.get(c.getName()));
+                inner.end();
+            }
+            case List -> {
+                ListWriter lw = sw.list(name);
+                lw.startList();
+                Field child = f.getChildren().get(0);
+                for (Object e : (List<?>) v) writeListElement(lw, child, e);
+                lw.endList();
+            }
+            default -> throw new IllegalArgumentException("unsupported struct field type: " + t);
         }
     }
 
@@ -275,6 +373,101 @@ public final class Marshalling {
             FieldVector cv = sv.getChildrenFromFields().get(i);
             writeScalar(cv, row, child, fields.get(child.getName()));
         }
+    }
+
+    /**
+     * Cast a batch to a target schema by element-wise copy, allowing int→long,
+     * float→double, and other Arrow-compatible widenings. Returns the same root
+     * when the source schema already matches. Caller owns the returned root.
+     */
+    public static VectorSchemaRoot castRoot(VectorSchemaRoot source, Schema target, BufferAllocator alloc) {
+        if (source.getSchema().equals(target)) return source;
+        if (source.getSchema().getFields().size() != target.getFields().size()) {
+            throw new IllegalArgumentException(
+                    "Input schema mismatch: expected " + target.getFields().size()
+                            + " fields, got " + source.getSchema().getFields().size());
+        }
+        int rows = source.getRowCount();
+        VectorSchemaRoot out = VectorSchemaRoot.create(target, alloc);
+        out.allocateNew();
+        for (int i = 0; i < target.getFields().size(); i++) {
+            Field tf = target.getFields().get(i);
+            Field sf = source.getSchema().getFields().get(i);
+            if (!tf.getName().equals(sf.getName())) {
+                out.close();
+                throw new IllegalArgumentException("Input schema mismatch: expected field '"
+                        + tf.getName() + "', got '" + sf.getName() + "'");
+            }
+            FieldVector sv = source.getVector(i);
+            FieldVector tv = out.getVector(i);
+            copyCast(sv, sf, tv, tf, rows);
+        }
+        out.setRowCount(rows);
+        return out;
+    }
+
+    private static void copyCast(FieldVector sv, Field sf, FieldVector tv, Field tf, int rows) {
+        ArrowType st = sf.getType();
+        ArrowType tt = tf.getType();
+        if (st.equals(tt)) {
+            // Same type; transfer via copyFromSafe
+            for (int r = 0; r < rows; r++) tv.copyFromSafe(r, r, sv);
+            return;
+        }
+        // Numeric widening cases
+        if (st instanceof ArrowType.Int && tt instanceof ArrowType.FloatingPoint) {
+            for (int r = 0; r < rows; r++) {
+                if (sv.isNull(r)) { tv.setNull(r); continue; }
+                double d = asLong(sv, r);
+                if (tt instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE) {
+                    ((Float4Vector) tv).setSafe(r, (float) d);
+                } else {
+                    ((Float8Vector) tv).setSafe(r, d);
+                }
+            }
+            return;
+        }
+        if (st instanceof ArrowType.FloatingPoint && tt instanceof ArrowType.FloatingPoint) {
+            for (int r = 0; r < rows; r++) {
+                if (sv.isNull(r)) { tv.setNull(r); continue; }
+                double d = asDouble(sv, r);
+                if (tt instanceof ArrowType.FloatingPoint fp && fp.getPrecision() == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE) {
+                    ((Float4Vector) tv).setSafe(r, (float) d);
+                } else {
+                    ((Float8Vector) tv).setSafe(r, d);
+                }
+            }
+            return;
+        }
+        if (st instanceof ArrowType.Int && tt instanceof ArrowType.Int) {
+            for (int r = 0; r < rows; r++) {
+                if (sv.isNull(r)) { tv.setNull(r); continue; }
+                long v = asLong(sv, r);
+                int bits = ((ArrowType.Int) tt).getBitWidth();
+                switch (bits) {
+                    case 8 -> ((TinyIntVector) tv).setSafe(r, (int) v);
+                    case 16 -> ((SmallIntVector) tv).setSafe(r, (int) v);
+                    case 32 -> ((IntVector) tv).setSafe(r, (int) v);
+                    default -> ((BigIntVector) tv).setSafe(r, v);
+                }
+            }
+            return;
+        }
+        throw new IllegalArgumentException("Cannot cast field '" + tf.getName() + "' from " + st + " to " + tt);
+    }
+
+    private static long asLong(FieldVector v, int r) {
+        if (v instanceof TinyIntVector t) return t.get(r);
+        if (v instanceof SmallIntVector s) return s.get(r);
+        if (v instanceof IntVector i) return i.get(r);
+        if (v instanceof BigIntVector b) return b.get(r);
+        throw new IllegalStateException("not an int vector: " + v.getClass());
+    }
+
+    private static double asDouble(FieldVector v, int r) {
+        if (v instanceof Float4Vector f) return f.get(r);
+        if (v instanceof Float8Vector d) return d.get(r);
+        throw new IllegalStateException("not a float vector: " + v.getClass());
     }
 
     public static Object readScalar(FieldVector v, int row, Field f) {

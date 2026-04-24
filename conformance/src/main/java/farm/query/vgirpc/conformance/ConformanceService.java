@@ -98,7 +98,8 @@ public interface ConformanceService {
     farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_header(long count);
 
     @farm.query.vgirpc.schema.StreamHeader(ConformanceHeader.class)
-    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_header_and_logs(long count);
+    farm.query.vgirpc.Stream<? extends farm.query.vgirpc.ProducerState> produce_with_header_and_logs(
+            long count, farm.query.vgirpc.CallContext ctx);
 
     // --- Exchange streams ---------------------------------------------------
 

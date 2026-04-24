@@ -201,12 +201,12 @@ final class StreamStates {
 
     static Schema dynamicSchema(boolean includeStrings, boolean includeFloats) {
         java.util.List<Field> fields = new java.util.ArrayList<>();
-        fields.add(new Field("index", FieldType.notNullable(new ArrowType.Int(64, true)), null));
+        fields.add(new Field("index", FieldType.nullable(new ArrowType.Int(64, true)), null));
         if (includeStrings) {
-            fields.add(new Field("label", FieldType.notNullable(new ArrowType.Utf8()), null));
+            fields.add(new Field("label", FieldType.nullable(new ArrowType.Utf8()), null));
         }
         if (includeFloats) {
-            fields.add(new Field("score", FieldType.notNullable(new ArrowType.FloatingPoint(
+            fields.add(new Field("score", FieldType.nullable(new ArrowType.FloatingPoint(
                     org.apache.arrow.vector.types.FloatingPointPrecision.DOUBLE)), null));
         }
         return new Schema(fields);

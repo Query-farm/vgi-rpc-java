@@ -41,8 +41,9 @@ fi
 PYTEST_EXIT=$?
 
 echo "=== totals ==="
-# Final pytest line: "X failed, Y passed, Z skipped in T s"
-tail -n 5 "$OUT" | grep -E 'passed|failed|error' | tail -n 1
+# Pytest final summary line like "X failed, Y passed, Z skipped in T s".
+# Search the whole file since extra lines can follow in noisy runs.
+grep -E '^[0-9]+ (failed|passed|error)' "$OUT" | tail -n 1
 
 echo
 echo "=== failures by test (deduped, first 30) ==="

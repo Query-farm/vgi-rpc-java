@@ -238,7 +238,7 @@ public final class RpcServer {
         boolean isProducer = stream.isProducer();
 
         if (stream.header() != null) {
-            writeHeaderStream(transport.writer(), stream.header());
+            writeHeaderStream(transport.writer(), stream.header(), sink);
             transport.writer().flush();
         }
 
@@ -261,7 +261,25 @@ public final class RpcServer {
                         try { state.onCancel(ctx); } catch (Exception ignore) {}
                         break;
                     }
-                    AnnotatedBatch input = new AnnotatedBatch(inputReader.root(), meta);
+                    // Cast input schema when compatible (e.g. int32 → float64) so that
+                    // the state implementation always sees the declared input schema.
+                    VectorSchemaRoot inputRoot = inputReader.root();
+                    VectorSchemaRoot castRoot = null;
+                    if (!isProducer && !inputRoot.getSchema().equals(inputSchema)) {
+                        try {
+                            castRoot = Marshalling.castRoot(inputRoot, inputSchema, Allocators.root());
+                            inputRoot = castRoot;
+                        } catch (Exception castExc) {
+                            try (VectorSchemaRoot zero = VectorSchemaRoot.create(outputSchema, Allocators.root())) {
+                                zero.allocateNew(); zero.setRowCount(0);
+                                outputWriter.writeBatch(zero, Wire.errorMetadata(
+                                        new ClassCastException(castExc.getMessage()), serverId));
+                            }
+                            transport.writer().flush();
+                            break;
+                        }
+                    }
+                    AnnotatedBatch input = new AnnotatedBatch(inputRoot, meta);
                     OutputCollector out = new OutputCollector(outputSchema, serverId, isProducer);
                     try {
                         state.process(input, out, ctx);
@@ -277,6 +295,7 @@ public final class RpcServer {
                     }
                     flushCollector(outputWriter, out);
                     transport.writer().flush();
+                    if (castRoot != null) castRoot.close();
                     if (out.finished()) break;
                 }
             } finally {
@@ -311,12 +330,22 @@ public final class RpcServer {
         }
     }
 
-    private void writeHeaderStream(java.io.OutputStream os, ArrowSerializableRecord header) throws IOException {
+    private void writeHeaderStream(java.io.OutputStream os, ArrowSerializableRecord header,
+                                   ClientLogSink sink) throws IOException {
         Schema schema = farm.query.vgirpc.schema.SchemaDerivation.schemaForRecord(header.getClass());
         Map<String, Object> row = RecordCodec.toRowMap(header);
-        try (IpcStreamWriter w = new IpcStreamWriter(os);
-             VectorSchemaRoot root = Marshalling.encodeRow(schema, row, Allocators.root())) {
-            w.writeBatch(root, null);
+        IpcStreamWriter w = new IpcStreamWriter(os);
+        try {
+            w.writeSchema(schema);
+            // Flush buffered init-time log batches into the header IPC stream
+            // (matches the Python reference: log batches precede the header batch).
+            if (sink != null) sink.bind(w, schema);
+            try (VectorSchemaRoot root = Marshalling.encodeRow(schema, row, Allocators.root())) {
+                w.writeBatch(root, null);
+            }
+        } finally {
+            w.close();
+            if (sink != null) sink.detach();
         }
     }
 
@@ -383,6 +412,12 @@ public final class RpcServer {
             this.schema = schema;
             for (Message msg : buffer) writeNow(msg);
             buffer.clear();
+        }
+
+        /** Unbind so further logs are buffered again (used between header + main streams). */
+        void detach() {
+            this.writer = null;
+            this.schema = null;
         }
 
         @Override

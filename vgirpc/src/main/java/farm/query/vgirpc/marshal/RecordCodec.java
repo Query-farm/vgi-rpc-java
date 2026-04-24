@@ -84,7 +84,7 @@ public final class RecordCodec {
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(data), Allocators.root())) {
             r.readNextBatch();
             VectorSchemaRoot root = r.root();
-            Map<String, Object> row = Marshalling.decodeRow(root);
+            Map<String, Object> row = Marshalling.decodeRow(root, r.dictionaryProvider(), r.wireSchema());
             return fromRowMap(cls, row);
         } catch (Exception e) {
             throw new RuntimeException("record deserialize failed", e);
