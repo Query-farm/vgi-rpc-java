@@ -16,8 +16,13 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.eclipse.jetty.ee10.servlet.ServletContextHandler;
 import org.eclipse.jetty.ee10.servlet.ServletHolder;
+import org.eclipse.jetty.server.HttpConfiguration;
+import org.eclipse.jetty.server.HttpConnectionFactory;
+import org.eclipse.jetty.server.SecureRequestCustomizer;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
+import org.eclipse.jetty.server.SslConnectionFactory;
+import org.eclipse.jetty.util.ssl.SslContextFactory;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -55,24 +60,28 @@ public final class HttpServer {
     private final List<HttpPreHandler> preHandlers;
     private final Server jetty;
     private final String prefix;
+    private final long maxRequestBytes;
+    private final long maxResponseBytes;
+    private final int zstdLevel;
     private int port;
 
-    /** Defaults: ephemeral port, no prefix, anonymous auth, no TTL, no pre-handlers. */
+    /** Defaults: loopback bind, ephemeral port, no prefix, anonymous auth, 1-hour TTL, 16 MiB request/response cap. */
     public HttpServer(RpcServer rpc) {
         this(rpc, Config.defaults());
     }
 
     public HttpServer(RpcServer rpc, Config config) {
         this.rpc = rpc;
-        this.streamHandler = new HttpStreamHandler(rpc, config.signingKey(), config.tokenTtlSeconds());
+        this.streamHandler = new HttpStreamHandler(rpc, config.signingKey(),
+                config.tokenTtlSeconds(), config.maxResponseBytes());
         this.authenticator = config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
         this.preHandlers = config.preHandlers();
         this.prefix = config.prefix();
+        this.maxRequestBytes = config.maxRequestBytes();
+        this.maxResponseBytes = config.maxResponseBytes();
+        this.zstdLevel = config.zstdLevel();
         this.jetty = new Server();
-        ServerConnector connector = new ServerConnector(jetty);
-        connector.setHost("127.0.0.1");
-        connector.setPort(config.port());
-        jetty.addConnector(connector);
+        jetty.addConnector(buildConnector(jetty, config));
 
         ServletContextHandler ctx = new ServletContextHandler();
         ctx.setContextPath("/");
@@ -81,55 +90,124 @@ public final class HttpServer {
         jetty.setHandler(ctx);
     }
 
+    private static ServerConnector buildConnector(Server server, Config config) {
+        TlsConfig tls = config.tls();
+        ServerConnector connector;
+        if (tls == null) {
+            connector = new ServerConnector(server);
+        } else {
+            SslContextFactory.Server ssl = new SslContextFactory.Server();
+            ssl.setKeyStorePath(tls.keystorePath().toAbsolutePath().toString());
+            ssl.setKeyStorePassword(tls.keystorePassword());
+            if (tls.keyManagerPassword() != null) ssl.setKeyManagerPassword(tls.keyManagerPassword());
+            HttpConfiguration https = new HttpConfiguration();
+            https.setSecureScheme("https");
+            https.addCustomizer(new SecureRequestCustomizer());
+            connector = new ServerConnector(server,
+                    new SslConnectionFactory(ssl, "http/1.1"),
+                    new HttpConnectionFactory(https));
+        }
+        connector.setHost(config.host());
+        connector.setPort(config.port());
+        connector.setIdleTimeout(config.idleTimeoutMs());
+        return connector;
+    }
+
     /**
      * Immutable configuration for {@link HttpServer}. Use {@link #defaults()} or
      * {@link #builder()} to construct; prefer the builder for any non-default field.
      *
-     * @param prefix          URL prefix (e.g. {@code "/vgi"}); empty for no prefix.
-     * @param port            listen port; {@code 0} for an OS-assigned ephemeral port.
-     * @param signingKey      HMAC signing key for stream state tokens; {@code null}
-     *                        generates a random per-process key (tokens won't
-     *                        survive restarts).
-     * @param tokenTtlSeconds maximum state-token age before it's rejected;
-     *                        {@code 0} disables TTL enforcement.
-     * @param authenticator   per-request authenticator; {@code null} means anonymous.
-     * @param preHandlers     pre-route handlers run in order before dispatch —
-     *                        used to mount add-on routes (e.g. OAuth PKCE callback).
+     * @param host             listen address. Defaults to {@code "127.0.0.1"};
+     *                         set to {@code "0.0.0.0"} (or a specific interface)
+     *                         only when fronted by TLS or a TLS-terminating proxy.
+     * @param port             listen port; {@code 0} for an OS-assigned ephemeral port.
+     * @param prefix           URL prefix (e.g. {@code "/vgi"}); empty for no prefix.
+     * @param signingKey       HMAC signing key for stream state tokens; {@code null}
+     *                         generates a random per-process key (tokens won't
+     *                         survive restarts).
+     * @param tokenTtlSeconds  maximum state-token age before rejection; defaults to
+     *                         {@value #DEFAULT_TOKEN_TTL_SECONDS}s. {@code 0} disables
+     *                         enforcement (not recommended for multi-user deployments).
+     * @param authenticator    per-request authenticator; {@code null} = anonymous.
+     * @param preHandlers      pre-route handlers run in order before dispatch.
+     * @param maxRequestBytes  request body cap; defaults to
+     *                         {@value #DEFAULT_MAX_BYTES} bytes. Oversized requests
+     *                         get HTTP 413 — large batches must use the
+     *                         external-location protocol instead.
+     * @param maxResponseBytes response body cap; same rationale as request cap.
+     * @param idleTimeoutMs    Jetty connector idle timeout in milliseconds.
+     * @param zstdLevel        compression level for the {@code zstd}
+     *                         Content-Encoding (1=fastest, 22=max). Default 3.
+     * @param tls              TLS settings; {@code null} = plaintext (only safe
+     *                         on loopback or behind a TLS-terminating proxy).
      */
     public record Config(
-            String prefix,
+            String host,
             int port,
+            String prefix,
             byte[] signingKey,
             long tokenTtlSeconds,
             Authenticator authenticator,
-            List<HttpPreHandler> preHandlers) {
+            List<HttpPreHandler> preHandlers,
+            long maxRequestBytes,
+            long maxResponseBytes,
+            long idleTimeoutMs,
+            int zstdLevel,
+            TlsConfig tls) {
+
+        /** 1 hour. */
+        public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
+        /** 16 MiB applies to both request body and serialized response. */
+        public static final long DEFAULT_MAX_BYTES = 16L << 20;
+        /** 30 seconds. */
+        public static final long DEFAULT_IDLE_TIMEOUT_MS = 30_000;
+        /** Mid-range zstd level: solid ratio, modest CPU. */
+        public static final int DEFAULT_ZSTD_LEVEL = 3;
 
         public Config {
+            host = host != null ? host : "127.0.0.1";
             prefix = prefix != null ? prefix : "";
             signingKey = signingKey != null ? signingKey.clone() : null;
             preHandlers = preHandlers != null ? List.copyOf(preHandlers) : List.of();
+            if (maxRequestBytes <= 0) throw new IllegalArgumentException("maxRequestBytes must be > 0");
+            if (maxResponseBytes <= 0) throw new IllegalArgumentException("maxResponseBytes must be > 0");
+            if (idleTimeoutMs < 0) throw new IllegalArgumentException("idleTimeoutMs must be >= 0");
+            if (zstdLevel < 1 || zstdLevel > 22) throw new IllegalArgumentException("zstdLevel must be in [1, 22]");
         }
 
         public static Config defaults() { return builder().build(); }
         public static Builder builder() { return new Builder(); }
 
         public static final class Builder {
-            private String prefix = "";
+            private String host = "127.0.0.1";
             private int port = 0;
+            private String prefix = "";
             private byte[] signingKey;
-            private long tokenTtlSeconds = 0;
+            private long tokenTtlSeconds = DEFAULT_TOKEN_TTL_SECONDS;
             private Authenticator authenticator;
             private List<HttpPreHandler> preHandlers = List.of();
+            private long maxRequestBytes = DEFAULT_MAX_BYTES;
+            private long maxResponseBytes = DEFAULT_MAX_BYTES;
+            private long idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS;
+            private int zstdLevel = DEFAULT_ZSTD_LEVEL;
+            private TlsConfig tls;
 
-            public Builder prefix(String prefix) { this.prefix = prefix; return this; }
+            public Builder host(String host) { this.host = host; return this; }
             public Builder port(int port) { this.port = port; return this; }
+            public Builder prefix(String prefix) { this.prefix = prefix; return this; }
             public Builder signingKey(byte[] signingKey) { this.signingKey = signingKey; return this; }
             public Builder tokenTtlSeconds(long tokenTtlSeconds) { this.tokenTtlSeconds = tokenTtlSeconds; return this; }
             public Builder authenticator(Authenticator authenticator) { this.authenticator = authenticator; return this; }
             public Builder preHandlers(List<HttpPreHandler> preHandlers) { this.preHandlers = preHandlers; return this; }
+            public Builder maxRequestBytes(long maxRequestBytes) { this.maxRequestBytes = maxRequestBytes; return this; }
+            public Builder maxResponseBytes(long maxResponseBytes) { this.maxResponseBytes = maxResponseBytes; return this; }
+            public Builder idleTimeoutMs(long idleTimeoutMs) { this.idleTimeoutMs = idleTimeoutMs; return this; }
+            public Builder zstdLevel(int zstdLevel) { this.zstdLevel = zstdLevel; return this; }
+            public Builder tls(TlsConfig tls) { this.tls = tls; return this; }
 
             public Config build() {
-                return new Config(prefix, port, signingKey, tokenTtlSeconds, authenticator, preHandlers);
+                return new Config(host, port, prefix, signingKey, tokenTtlSeconds, authenticator,
+                        preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls);
             }
         }
     }
@@ -196,7 +274,13 @@ public final class HttpServer {
     }
 
     private void handleUnary(HttpServletRequest req, HttpServletResponse resp, String method) throws IOException {
-        byte[] body = readBody(req);
+        byte[] body;
+        try {
+            body = readBody(req);
+        } catch (PayloadTooLargeException e) {
+            writePayloadTooLarge(resp, e);
+            return;
+        }
 
         AuthContext auth;
         try {
@@ -206,10 +290,13 @@ public final class HttpServer {
             return;
         }
 
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         try (AutoCloseable ignored = AuthScope.push(auth, buildTransportMetadata(req));
              InMemoryTransport t = new InMemoryTransport(body, out)) {
             rpc.serveOne(t);
+        } catch (PayloadTooLargeException e) {
+            writePayloadTooLarge(resp, e);
+            return;
         } catch (Exception e) {
             throw new IOException(e);
         }
@@ -239,22 +326,48 @@ public final class HttpServer {
         resp.getOutputStream().write(JSON.writeValueAsBytes(body));
     }
 
-    private static byte[] readBody(HttpServletRequest req) throws IOException {
+    private byte[] readBody(HttpServletRequest req) throws IOException {
+        long contentLength = req.getContentLengthLong();
+        if (contentLength > maxRequestBytes) {
+            throw new PayloadTooLargeException("request body Content-Length " + contentLength
+                    + " exceeds maxRequestBytes=" + maxRequestBytes
+                    + "; large batches must use the external-location protocol");
+        }
         byte[] body;
-        try (InputStream in = req.getInputStream(); ByteArrayOutputStream buf = new ByteArrayOutputStream()) {
-            in.transferTo(buf);
+        try (InputStream in = req.getInputStream();
+             BoundedByteArrayOutputStream buf = new BoundedByteArrayOutputStream(maxRequestBytes)) {
+            copyBounded(in, buf, maxRequestBytes);
             body = buf.toByteArray();
         }
         return maybeDecodeRequestBody(req, body);
+    }
+
+    private static void copyBounded(InputStream in, OutputStream out, long limit) throws IOException {
+        byte[] chunk = new byte[8192];
+        long total = 0;
+        int n;
+        while ((n = in.read(chunk)) > 0) {
+            total += n;
+            if (total > limit) {
+                throw new PayloadTooLargeException("request body exceeds " + limit
+                        + " bytes; large batches must use the external-location protocol");
+            }
+            out.write(chunk, 0, n);
+        }
     }
 
     private void writeArrowResponse(HttpServletRequest req, HttpServletResponse resp, byte[] body) throws IOException {
         resp.setContentType(ARROW_CONTENT_TYPE);
         if (acceptsZstd(req)) {
             resp.setHeader(HttpHeaders.CONTENT_ENCODING, MediaTypes.ZSTD);
-            body = Zstd.compress(body, 3);
+            body = Zstd.compress(body, zstdLevel);
         }
         resp.getOutputStream().write(body);
+    }
+
+    private static void writePayloadTooLarge(HttpServletResponse resp, RuntimeException e) throws IOException {
+        writeJson(resp, HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE,
+                Map.of("error", e.getMessage()));
     }
 
     private static byte[] maybeDecodeRequestBody(HttpServletRequest req, byte[] body) throws IOException {
@@ -275,7 +388,13 @@ public final class HttpServer {
 
     private void handleStream(HttpServletRequest req, HttpServletResponse resp,
                                String method, boolean init) throws IOException {
-        byte[] body = readBody(req);
+        byte[] body;
+        try {
+            body = readBody(req);
+        } catch (PayloadTooLargeException e) {
+            writePayloadTooLarge(resp, e);
+            return;
+        }
 
         AuthContext auth;
         try {
@@ -288,6 +407,9 @@ public final class HttpServer {
         byte[] out;
         try (AutoCloseable ignored = AuthScope.push(auth, buildTransportMetadata(req))) {
             out = init ? streamHandler.handleInit(method, body) : streamHandler.handleExchange(method, body);
+        } catch (PayloadTooLargeException e) {
+            writePayloadTooLarge(resp, e);
+            return;
         } catch (Exception e) {
             // Serialise an error stream so the client can read it uniformly.
             ByteArrayOutputStream errOut = new ByteArrayOutputStream();

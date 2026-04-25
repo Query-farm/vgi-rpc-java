@@ -56,20 +56,27 @@ public final class HttpStreamHandler {
     private final RpcServer rpc;
     private final byte[] signingKey;
     private final long tokenTtlSeconds;
+    private final long maxResponseBytes;
     /** method name → concrete {@link StreamState} class, learned from the first init call. */
     private final Map<String, Class<? extends StreamState>> stateTypes = new ConcurrentHashMap<>();
 
-    public HttpStreamHandler(RpcServer rpc) { this(rpc, null, 0); }
+    public HttpStreamHandler(RpcServer rpc) { this(rpc, null, 0, Long.MAX_VALUE); }
 
     /**
-     * @param signingKey HMAC-SHA256 signing key; when {@code null} a random
+     * @param signingKey       HMAC-SHA256 signing key; when {@code null} a random
      *     per-process key is generated (tokens won't survive restarts).
-     * @param tokenTtlSeconds maximum token age in seconds; {@code 0} disables
+     * @param tokenTtlSeconds  maximum token age in seconds; {@code 0} disables
      *     TTL enforcement.
+     * @param maxResponseBytes per-call response cap. Exceeding it raises
+     *     {@link PayloadTooLargeException} which the caller maps to HTTP 413;
+     *     producers of large batches must use the external-location protocol.
      */
-    public HttpStreamHandler(RpcServer rpc, byte[] signingKey, long tokenTtlSeconds) {
+    public HttpStreamHandler(RpcServer rpc, byte[] signingKey, long tokenTtlSeconds, long maxResponseBytes) {
         if (tokenTtlSeconds < 0) {
             throw new IllegalArgumentException("tokenTtlSeconds must be >= 0, got " + tokenTtlSeconds);
+        }
+        if (maxResponseBytes <= 0) {
+            throw new IllegalArgumentException("maxResponseBytes must be > 0, got " + maxResponseBytes);
         }
         this.rpc = rpc;
         if (signingKey != null) {
@@ -79,6 +86,7 @@ public final class HttpStreamHandler {
             new SecureRandom().nextBytes(this.signingKey);
         }
         this.tokenTtlSeconds = tokenTtlSeconds;
+        this.maxResponseBytes = maxResponseBytes;
     }
 
     /** Handle {@code POST /{method}/init}. Returns response IPC bytes. */
@@ -117,7 +125,7 @@ public final class HttpStreamHandler {
         // Record the concrete state class for this method so /exchange can rehydrate.
         stateTypes.put(method, streamResult.state().getClass());
 
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         if (streamResult.header() != null) {
             writeHeaderIpcStream(out, streamResult.header(), sink);
         }
@@ -211,7 +219,7 @@ public final class HttpStreamHandler {
     private byte[] handleCancel(Schema outputSchema, StreamState state, CallContext ctx) throws IOException {
         // on_cancel is best-effort; the client has already decided it's done.
         try { state.onCancel(ctx); } catch (Exception ignore) { /* reported via onCancel contract */ }
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
         }
@@ -223,7 +231,7 @@ public final class HttpStreamHandler {
         boolean finished = collector.finished();
         String newTokenStr = finished ? null : serializeContinuationToken(state, priorToken, principal);
 
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
 
@@ -356,6 +364,8 @@ public final class HttpStreamHandler {
     }
 
     private byte[] errorStream(Throwable t) throws IOException {
+        // Error streams are zero-row metadata, well under the cap; use unbounded so we never lose
+        // the error message itself if a different code path tripped maxResponseBytes earlier.
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         Wire.writeErrorStream(out, RpcStream.EMPTY_SCHEMA, t, rpc.serverId());
         return out.toByteArray();
