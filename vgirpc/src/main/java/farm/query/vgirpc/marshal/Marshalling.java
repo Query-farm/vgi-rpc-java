@@ -221,6 +221,26 @@ public final class Marshalling {
         }
     }
 
+    /** Convert little-endian decimal bytes (Python wire format) to BigDecimal. */
+    static java.math.BigDecimal decimalBytesToBigDecimal(byte[] le, int scale) {
+        byte[] be = new byte[le.length];
+        for (int i = 0; i < le.length; i++) be[i] = le[le.length - 1 - i];
+        return new java.math.BigDecimal(new java.math.BigInteger(be), scale);
+    }
+
+    /** Convert BigDecimal back to little-endian bytes of given width. */
+    static byte[] bigDecimalToBytes(java.math.BigDecimal bd, int scale, int width) {
+        byte[] be = bd.setScale(scale, java.math.RoundingMode.UNNECESSARY).unscaledValue().toByteArray();
+        byte[] le = new byte[width];
+        // Sign-extend big-endian bytes into width-sized buffer, then reverse to LE.
+        byte sign = (byte) (be[0] < 0 ? 0xFF : 0x00);
+        for (int i = 0; i < width; i++) {
+            int srcIdx = be.length - 1 - i;
+            le[i] = srcIdx >= 0 ? be[srcIdx] : sign;
+        }
+        return le;
+    }
+
     /** Read decimal as little-endian bytes for round-trip echo. */
     private static byte[] readDecimalBytes(DecimalVector dv, int row) {
         int width = dv.getTypeWidth();
@@ -287,6 +307,29 @@ public final class Marshalling {
                 try (var buf = farm.query.vgirpc.wire.Allocators.root().buffer(bytes.length)) {
                     buf.setBytes(0, bytes);
                     w.varBinary().writeVarBinary(0, bytes.length, buf);
+                }
+            }
+            case Date -> w.dateDay().writeDateDay(((Number) e).intValue());
+            case Time -> w.timeMicro().writeTimeMicro(((Number) e).longValue());
+            case Timestamp -> {
+                long lv = ((Number) e).longValue();
+                if (((ArrowType.Timestamp) t).getTimezone() != null) {
+                    w.timeStampMicroTZ().writeTimeStampMicroTZ(lv);
+                } else {
+                    w.timeStampMicro().writeTimeStampMicro(lv);
+                }
+            }
+            case Duration -> w.duration().writeDuration(((Number) e).longValue());
+            case Decimal -> {
+                ArrowType.Decimal dec = (ArrowType.Decimal) t;
+                java.math.BigDecimal bd = decimalBytesToBigDecimal((byte[]) e, dec.getScale());
+                w.decimal().writeDecimal(bd);
+            }
+            case FixedSizeBinary -> {
+                byte[] bytes = (byte[]) e;
+                try (var buf = farm.query.vgirpc.wire.Allocators.root().buffer(bytes.length)) {
+                    buf.setBytes(0, bytes);
+                    w.fixedSizeBinary().writeFixedSizeBinary(buf);
                 }
             }
             case List -> {
@@ -371,12 +414,51 @@ public final class Marshalling {
                 for (Field c : f.getChildren()) writeStructField(inner, c, nested.get(c.getName()));
                 inner.end();
             }
+            case Date -> sw.dateDay(name).writeDateDay(((Number) v).intValue());
+            case Time -> sw.timeMicro(name).writeTimeMicro(((Number) v).longValue());
+            case Timestamp -> {
+                long lv = ((Number) v).longValue();
+                if (((ArrowType.Timestamp) t).getTimezone() != null) {
+                    sw.timeStampMicroTZ(name).writeTimeStampMicroTZ(lv);
+                } else {
+                    sw.timeStampMicro(name).writeTimeStampMicro(lv);
+                }
+            }
+            case Duration -> sw.duration(name).writeDuration(((Number) v).longValue());
+            case Decimal -> {
+                ArrowType.Decimal dec = (ArrowType.Decimal) t;
+                java.math.BigDecimal bd = decimalBytesToBigDecimal((byte[]) v, dec.getScale());
+                sw.decimal(name, dec.getScale(), dec.getPrecision()).writeDecimal(bd);
+            }
+            case FixedSizeBinary -> {
+                byte[] bytes = (byte[]) v;
+                int width = ((ArrowType.FixedSizeBinary) t).getByteWidth();
+                try (var buf = farm.query.vgirpc.wire.Allocators.root().buffer(bytes.length)) {
+                    buf.setBytes(0, bytes);
+                    sw.fixedSizeBinary(name, width).writeFixedSizeBinary(buf);
+                }
+            }
             case List -> {
                 ListWriter lw = sw.list(name);
                 lw.startList();
                 Field child = f.getChildren().get(0);
                 for (Object e : (List<?>) v) writeListElement(lw, child, e);
                 lw.endList();
+            }
+            case LargeUtf8 -> {
+                String s = (v instanceof Enum<?> en) ? en.name() : v.toString();
+                byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+                try (var buf = farm.query.vgirpc.wire.Allocators.root().buffer(bytes.length)) {
+                    buf.setBytes(0, bytes);
+                    sw.largeVarChar(name).writeLargeVarChar(0, bytes.length, buf);
+                }
+            }
+            case LargeBinary -> {
+                byte[] bytes = (byte[]) v;
+                try (var buf = farm.query.vgirpc.wire.Allocators.root().buffer(bytes.length)) {
+                    buf.setBytes(0, bytes);
+                    sw.largeVarBinary(name).writeLargeVarBinary(0, bytes.length, buf);
+                }
             }
             default -> throw new IllegalArgumentException("unsupported struct field type: " + t);
         }
@@ -414,7 +496,8 @@ public final class Marshalling {
     }
 
     private static void writeMapValue(MapWriter w, Field f, Object value) {
-        switch (f.getType().getTypeID()) {
+        ArrowType ty = f.getType();
+        switch (ty.getTypeID()) {
             case Int -> w.value().bigInt().writeBigInt(((Number) value).longValue());
             case Utf8 -> {
                 byte[] bytes = ((String) value).getBytes(StandardCharsets.UTF_8);
@@ -425,7 +508,12 @@ public final class Marshalling {
             }
             case FloatingPoint -> w.value().float8().writeFloat8(((Number) value).doubleValue());
             case Bool -> w.value().bit().writeBit(((Boolean) value) ? 1 : 0);
-            default -> throw new IllegalArgumentException("unsupported map value type: " + f.getType());
+            case Decimal -> {
+                ArrowType.Decimal dec = (ArrowType.Decimal) ty;
+                java.math.BigDecimal bd = decimalBytesToBigDecimal((byte[]) value, dec.getScale());
+                w.value().decimal().writeDecimal(bd);
+            }
+            default -> throw new IllegalArgumentException("unsupported map value type: " + ty);
         }
     }
 

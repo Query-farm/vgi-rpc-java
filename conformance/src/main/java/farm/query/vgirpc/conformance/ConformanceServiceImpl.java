@@ -58,6 +58,8 @@ public final class ConformanceServiceImpl implements ConformanceService {
     @Override public long echo_duration(long value) { return value; }
     @Override public byte[] echo_decimal(byte[] value) { return value; }
     @Override public byte[] echo_fixed_binary(byte[] value) { return value; }
+    @Override public WideTypes echo_wide_types(WideTypes data) { return data; }
+    @Override public ContainerWideTypes echo_container_wide_types(ContainerWideTypes data) { return data; }
 
     @Override public double add_floats(double a, double b) { return a + b; }
 

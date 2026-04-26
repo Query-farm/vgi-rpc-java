@@ -119,6 +119,9 @@ public interface ConformanceService {
     @ArrowField(ArrowFieldType.BINARY_8)
     byte[] echo_fixed_binary(@ArrowField(ArrowFieldType.BINARY_8) byte[] value);
 
+    WideTypes echo_wide_types(WideTypes data);
+    ContainerWideTypes echo_container_wide_types(ContainerWideTypes data);
+
     // --- Multi-param + defaults --------------------------------------------
 
     double add_floats(double a, double b);

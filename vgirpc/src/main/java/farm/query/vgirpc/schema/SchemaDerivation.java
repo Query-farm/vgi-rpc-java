@@ -118,6 +118,32 @@ public final class SchemaDerivation {
         Type unwrapped = unwrapOptional(type);
 
         ArrowField override = annSource.getAnnotation(ArrowField.class);
+        // If the override is attached to a List<T>/Map<K,V>, treat it as the
+        // *element* / *value* override rather than collapsing the whole field
+        // to a scalar — matches Python's `Annotated[list[T], ArrowType(pa.list_(...))]`.
+        if (override != null && unwrapped instanceof ParameterizedType pt) {
+            Class<?> rawC = (Class<?>) pt.getRawType();
+            if (List.class.isAssignableFrom(rawC) || Set.class.isAssignableFrom(rawC)) {
+                Field item = new Field("item",
+                        new FieldType(true, override.value().arrowType(), null),
+                        Collections.emptyList());
+                return new Field(name, new FieldType(nullable, new ArrowType.List(), null),
+                        List.of(item));
+            }
+            if (Map.class.isAssignableFrom(rawC)) {
+                Field key = buildField("key", pt.getActualTypeArguments()[0], NO_ANNS);
+                Field keyNonNull = new Field("key",
+                        new FieldType(false, key.getType(), null), key.getChildren());
+                Field val = new Field("value",
+                        new FieldType(true, override.value().arrowType(), null),
+                        Collections.emptyList());
+                Field entries = new Field("entries",
+                        new FieldType(false, new ArrowType.Struct(), null),
+                        List.of(keyNonNull, val));
+                return new Field(name, new FieldType(nullable, new ArrowType.Map(false), null),
+                        List.of(entries));
+            }
+        }
         ArrowType arrowType;
         List<Field> children;
         if (override != null) {
