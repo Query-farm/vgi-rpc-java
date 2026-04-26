@@ -25,6 +25,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
@@ -50,6 +51,7 @@ public final class RpcServer {
     private final boolean describeEnabled;
     private LocationResolver locationResolver;
     private ExternalLocationConfig externalConfig;
+    private DispatchHook dispatchHook;
 
     public RpcServer(Class<?> serviceInterface, Object impl) {
         this(serviceInterface, impl, UUID.randomUUID().toString().replace("-", "").substring(0, 12), true);
@@ -68,6 +70,9 @@ public final class RpcServer {
 
     /** Configure outgoing-batch externalisation. Uploaded via {@link farm.query.vgirpc.external.ExternalStorage}. */
     public void setExternalConfig(ExternalLocationConfig cfg) { this.externalConfig = cfg; }
+
+    /** Install an observability hook fired around each RPC dispatch. */
+    public void setDispatchHook(DispatchHook hook) { this.dispatchHook = hook; }
 
     public String serverId() { return serverId; }
     public String protocolName() { return serviceInterface.getSimpleName(); }
@@ -100,6 +105,27 @@ public final class RpcServer {
     }
 
     private static final class EndOfStream extends RuntimeException {}
+
+    /**
+     * Serialize a parameters {@link VectorSchemaRoot} (with its custom metadata) into a
+     * self-contained Arrow IPC stream — schema message followed by one record batch
+     * message — for inclusion in access-log {@code request_data}.
+     *
+     * <p>Best-effort: returns {@code null} on any failure so observability never fails
+     * dispatch.
+     */
+    private static byte[] serializeRequestBatch(VectorSchemaRoot root, Map<String, String> meta) {
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try (IpcStreamWriter w = new IpcStreamWriter(baos)) {
+                w.writeBatch(root, meta);
+                w.writeEos();
+            }
+            return baos.toByteArray();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
 
     /** Handle exactly one RPC call. */
     public void serveOne(RpcTransport transport) {
@@ -169,10 +195,52 @@ public final class RpcServer {
                     return;
                 }
                 Map<String, Object> kwargs = kwargsSnapshot;
-                if (info.methodType() == MethodType.UNARY) {
-                    serveUnary(transport, info, kwargs);
-                } else {
-                    serveStream(transport, info, kwargs);
+
+                // Build dispatch info + invoke hook
+                DispatchInfo dispatchInfo = null;
+                CallStatistics callStats = null;
+                Object hookToken = null;
+                Throwable handlerErr = null;
+                if (dispatchHook != null) {
+                    dispatchInfo = new DispatchInfo();
+                    dispatchInfo.method = method;
+                    dispatchInfo.methodType = info.methodType() == MethodType.UNARY ? "unary" : "stream";
+                    dispatchInfo.serverId = serverId;
+                    dispatchInfo.protocol = protocolName();
+                    AuthScope.Scope scope = AuthScope.current();
+                    dispatchInfo.principal = scope.auth() != null && scope.auth().principal() != null ? scope.auth().principal() : "";
+                    dispatchInfo.authDomain = scope.auth() != null && scope.auth().domain() != null ? scope.auth().domain() : "";
+                    dispatchInfo.authenticated = scope.auth() != null && scope.auth().authenticated();
+                    dispatchInfo.transportMetadata = scope.transportMetadata();
+                    dispatchInfo.requestData = serializeRequestBatch(paramsRoot, meta);
+                    if ("stream".equals(dispatchInfo.methodType)) {
+                        dispatchInfo.streamId = AccessLogHook.randomStreamId();
+                    }
+                    callStats = new CallStatistics();
+                    try {
+                        hookToken = dispatchHook.onDispatchStart(dispatchInfo);
+                    } catch (Throwable t) {
+                        LOG.warn("dispatch hook start error: {}", t.toString());
+                    }
+                }
+
+                try {
+                    if (info.methodType() == MethodType.UNARY) {
+                        serveUnary(transport, info, kwargs);
+                    } else {
+                        serveStream(transport, info, kwargs);
+                    }
+                } catch (Throwable t) {
+                    handlerErr = t;
+                    throw t;
+                } finally {
+                    if (dispatchHook != null && dispatchInfo != null) {
+                        try {
+                            dispatchHook.onDispatchEnd(hookToken, dispatchInfo, callStats, handlerErr);
+                        } catch (Throwable t) {
+                            LOG.warn("dispatch hook end error: {}", t.toString());
+                        }
+                    }
                 }
                 transport.writer().flush();
             } finally {

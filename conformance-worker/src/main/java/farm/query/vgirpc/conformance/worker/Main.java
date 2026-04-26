@@ -3,10 +3,13 @@
 
 package farm.query.vgirpc.conformance.worker;
 
+import farm.query.vgirpc.AccessLogHook;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.conformance.ConformanceService;
 import farm.query.vgirpc.conformance.ConformanceServiceImpl;
+import farm.query.vgirpc.external.ExternalLocationConfig;
+import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.http.Authenticator;
 import farm.query.vgirpc.http.HttpPreHandler;
 import farm.query.vgirpc.http.HttpServer;
@@ -18,7 +21,11 @@ import farm.query.vgirpc.http.auth.OidcMetadata;
 import farm.query.vgirpc.transport.StdioTransport;
 import farm.query.vgirpc.transport.UnixSocketTransport;
 
+import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -44,6 +51,12 @@ public final class Main {
         String unixPath = null;
         Authenticator authenticator = null;
         List<HttpPreHandler> preHandlers = new ArrayList<>();
+        String fakeStorageUrl = null;
+        long externalizeThreshold = 4096;
+        // -1 sentinel: "unset"; falls back to externalizeThreshold for backward compat.
+        long maxRequestBytes = -1;
+        String compression = "none";
+        String accessLogPath = null;
         ArgCursor c = new ArgCursor(args);
         while (c.hasNext()) {
             String a = c.next();
@@ -64,12 +77,39 @@ public final class Main {
                     authenticator = pkce.authenticator();
                     preHandlers.add(pkce.preHandler());
                 }
+                case "--fake-storage" -> fakeStorageUrl = c.requireValue(a);
+                case "--externalize-threshold" -> externalizeThreshold = Long.parseLong(c.requireValue(a));
+                case "--max-request-bytes" -> maxRequestBytes = Long.parseLong(c.requireValue(a));
+                case "--compression" -> compression = c.requireValue(a);
+                case "--access-log" -> accessLogPath = c.requireValue(a);
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
         }
+        FakeStorage fakeStorage = null;
+        if (fakeStorageUrl != null) {
+            if ("zstd".equalsIgnoreCase(compression)) {
+                System.err.println("warning: --compression zstd requested but ExternalLocationConfig "
+                        + "does not yet expose upload-side compression; bytes will be uploaded uncompressed.");
+            }
+            fakeStorage = new FakeStorage(fakeStorageUrl);
+            ExternalLocationConfig cfg = ExternalLocationConfig.builder()
+                    .storage(fakeStorage)
+                    .thresholdBytes(externalizeThreshold)
+                    .urlValidator(ExternalLocationConfig.permissiveValidator())
+                    .build();
+            server.setExternalConfig(cfg);
+            // Also wire the resolver so the server can transparently pull pointer
+            // batches that clients upload via the __upload_url__ flow.
+            server.setLocationResolver(new LocationResolver(cfg));
+        }
+        if (accessLogPath != null) {
+            OutputStream accessLogOut = new FileOutputStream(accessLogPath, true);
+            server.setDispatchHook(new AccessLogHook(accessLogOut, "vgi-rpc-java-conformance"));
+        }
         if (mode == null) { servePipe(server); return; }
         switch (mode) {
-            case "http" -> serveHttp(server, signingKey, tokenTtl, authenticator, preHandlers);
+            case "http" -> serveHttp(server, signingKey, tokenTtl, authenticator, preHandlers, fakeStorage,
+                    maxRequestBytes >= 0 ? maxRequestBytes : externalizeThreshold);
             case "unix" -> serveUnix(server, Path.of(unixPath));
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
         }
@@ -168,13 +208,28 @@ public final class Main {
 
     private static void serveHttp(RpcServer server, byte[] signingKey, long tokenTtl,
                                    Authenticator authenticator,
-                                   List<HttpPreHandler> preHandlers) throws Exception {
-        HttpServer http = new HttpServer(server, HttpServer.Config.builder()
+                                   List<HttpPreHandler> preHandlers,
+                                   FakeStorage fakeStorage,
+                                   long maxRequestBytes) throws Exception {
+        HttpServer.Config.Builder cb = HttpServer.Config.builder()
                 .signingKey(signingKey)
                 .tokenTtlSeconds(tokenTtl)
                 .authenticator(authenticator)
-                .preHandlers(preHandlers)
-                .build());
+                .preHandlers(preHandlers);
+        if (fakeStorage != null) {
+            // Match the Python conformance worker: a tight inline-request cap
+            // forces the client to discover capabilities and route oversized
+            // payloads through __upload_url__ + a pointer batch.  In the
+            // "externalize-always" variant the threshold is decoupled from
+            // the request cap (threshold=1, request cap=1 MiB) so every
+            // *response* batch externalizes while normal-sized inline
+            // *requests* still flow through.
+            cb.maxRequestBytes(maxRequestBytes)
+              .advertiseMaxRequestBytes(true)
+              .uploadUrlProvider(fakeStorage)
+              .maxUploadBytes(64L << 20);  // 64 MiB advisory upload ceiling
+        }
+        HttpServer http = new HttpServer(server, cb.build());
         http.start();
         System.out.println("PORT:" + http.port());
         System.out.flush();
