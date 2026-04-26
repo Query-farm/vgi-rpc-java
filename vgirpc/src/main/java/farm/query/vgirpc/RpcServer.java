@@ -52,6 +52,8 @@ public final class RpcServer {
     private LocationResolver locationResolver;
     private ExternalLocationConfig externalConfig;
     private DispatchHook dispatchHook;
+    private String protocolVersion = "";
+    private String protocolHash = "";
 
     public RpcServer(Class<?> serviceInterface, Object impl) {
         this(serviceInterface, impl, UUID.randomUUID().toString().replace("-", "").substring(0, 12), true);
@@ -73,6 +75,23 @@ public final class RpcServer {
 
     /** Install an observability hook fired around each RPC dispatch. */
     public void setDispatchHook(DispatchHook hook) { this.dispatchHook = hook; }
+
+    /** Operator-supplied free-form protocol-contract version label (optional). */
+    public void setProtocolVersion(String v) { this.protocolVersion = v == null ? "" : v; }
+    public String protocolVersion() { return protocolVersion; }
+
+    /** SHA-256 hex digest of the canonical __describe__ payload. */
+    public String protocolHash() {
+        if (protocolHash.isEmpty()) {
+            Introspect.Built b = Introspect.build(protocolName(), methods, serverId);
+            try {
+                protocolHash = b.customMetadata().getOrDefault(Metadata.PROTOCOL_HASH_KEY, "");
+            } finally {
+                b.root().close();
+            }
+        }
+        return protocolHash;
+    }
 
     public String serverId() { return serverId; }
     public String protocolName() { return serviceInterface.getSimpleName(); }
@@ -207,6 +226,8 @@ public final class RpcServer {
                     dispatchInfo.methodType = info.methodType() == MethodType.UNARY ? "unary" : "stream";
                     dispatchInfo.serverId = serverId;
                     dispatchInfo.protocol = protocolName();
+                    dispatchInfo.protocolHash = protocolHash();
+                    dispatchInfo.protocolVersion = protocolVersion;
                     AuthScope.Scope scope = AuthScope.current();
                     dispatchInfo.principal = scope.auth() != null && scope.auth().principal() != null ? scope.auth().principal() : "";
                     dispatchInfo.authDomain = scope.auth() != null && scope.auth().domain() != null ? scope.auth().domain() : "";

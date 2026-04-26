@@ -75,6 +75,7 @@ public final class AccessLogHook implements DispatchHook {
         rec.put("message", info.protocol + "." + info.method + " " + status);
         rec.put("server_id", info.serverId);
         rec.put("protocol", info.protocol);
+        rec.put("protocol_hash", info.protocolHash);
         rec.put("method", info.method);
         rec.put("method_type", info.methodType);
         rec.put("principal", info.principal);
@@ -87,6 +88,9 @@ public final class AccessLogHook implements DispatchHook {
 
         if (!errorMessage.isEmpty()) rec.put("error_message", errorMessage);
         if (!serverVersion.isEmpty()) rec.put("server_version", serverVersion);
+        if (info.protocolVersion != null && !info.protocolVersion.isEmpty()) {
+            rec.put("protocol_version", info.protocolVersion);
+        }
         if (info.requestId != null && !info.requestId.isEmpty()) rec.put("request_id", info.requestId);
         if (info.httpStatus > 0) rec.put("http_status", info.httpStatus);
         if (info.requestData != null && info.requestData.length > 0) {

@@ -3,8 +3,6 @@
 
 package farm.query.vgirpc;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.schema.ArrowSerializableRecord;
 import farm.query.vgirpc.schema.SchemaDerivation;
 import farm.query.vgirpc.transport.RpcTransport;
@@ -25,43 +23,40 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayOutputStream;
-import java.lang.reflect.ParameterizedType;
-import java.lang.reflect.Type;
 import java.nio.channels.Channels;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
+import java.security.MessageDigest;
 import java.util.Collections;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.TreeMap;
 
 /**
  * Implementation of the {@code __describe__} synthetic RPC method used for
  * runtime service introspection. Matches Python {@code vgi_rpc.introspect}
- * on the wire (describe-version 3, 12-field schema).
+ * on the wire: DESCRIBE_VERSION 4, slim 8-field schema, plus a SHA-256
+ * {@code protocol_hash} carried in batch custom_metadata.
+ *
+ * <p>Python-flavoured fields ({@code doc}, {@code param_types_json},
+ * {@code param_defaults_json}, {@code param_docs_json}) are not on the
+ * wire; the Arrow IPC schema bytes are the authoritative type information.
  */
 public final class Introspect {
 
     public static final String METHOD_NAME = "__describe__";
-    public static final String DESCRIBE_VERSION = "3";
-
-    private static final ObjectMapper JSON = new ObjectMapper();
+    public static final String DESCRIBE_VERSION = "4";
 
     public static final Schema DESCRIBE_SCHEMA = new Schema(List.of(
             field("name", new ArrowType.Utf8(), false),
             field("method_type", new ArrowType.Utf8(), false),
-            field("doc", new ArrowType.Utf8(), true),
             field("has_return", new ArrowType.Bool(), false),
             field("params_schema_ipc", new ArrowType.Binary(), false),
             field("result_schema_ipc", new ArrowType.Binary(), false),
-            field("param_types_json", new ArrowType.Utf8(), true),
-            field("param_defaults_json", new ArrowType.Utf8(), true),
             field("has_header", new ArrowType.Bool(), false),
             field("header_schema_ipc", new ArrowType.Binary(), true),
-            field("is_exchange", new ArrowType.Bool(), true),
-            field("param_docs_json", new ArrowType.Utf8(), true)));
+            field("is_exchange", new ArrowType.Bool(), true)));
 
     private static Field field(String name, ArrowType t, boolean nullable) {
         return new Field(name, new FieldType(nullable, t, null), Collections.emptyList());
@@ -71,48 +66,117 @@ public final class Introspect {
 
     /** Build the describe batch + metadata for an {@link RpcServer}. */
     public static Built build(String protocolName, Map<String, RpcMethodInfo> methods, String serverId) {
-        // Sort by method name to match Python behaviour.
         Map<String, RpcMethodInfo> sorted = new TreeMap<>(methods);
         VectorSchemaRoot root = VectorSchemaRoot.create(DESCRIBE_SCHEMA, Allocators.root());
         root.allocateNew();
+
+        // Track per-row canonical inputs to feed into the hash.
+        int n = sorted.size();
+        String[] hashNames = new String[n];
+        String[] hashMethodTypes = new String[n];
+        boolean[] hashHasReturns = new boolean[n];
+        boolean[] hashHasHeaders = new boolean[n];
+        Boolean[] hashIsExchanges = new Boolean[n];
+        byte[][] hashParamsIpc = new byte[n][];
+        byte[][] hashResultIpc = new byte[n][];
+        byte[][] hashHeaderIpc = new byte[n][];
+
         int i = 0;
         for (var e : sorted.entrySet()) {
             RpcMethodInfo info = e.getValue();
             setUtf8(root, 0, i, info.name());
-            setUtf8(root, 1, i, info.methodType().wireValue());
-            if (info.doc() != null) setUtf8(root, 2, i, info.doc()); else ((VarCharVector) root.getVector(2)).setNull(i);
-            ((BitVector) root.getVector(3)).setSafe(i, info.hasReturn() ? 1 : 0);
-            setBinary(root, 4, i, serializeSchema(info.paramsSchema()));
-            setBinary(root, 5, i, serializeSchema(info.resultSchema()));
-            // param_types_json
-            if (!info.paramTypes().isEmpty()) {
-                Map<String, String> pt = new LinkedHashMap<>();
-                for (var pe : info.paramTypes().entrySet()) pt.put(pe.getKey(), typeName(pe.getValue()));
-                setUtf8(root, 6, i, toJson(pt));
-            } else ((VarCharVector) root.getVector(6)).setNull(i);
-            // param_defaults_json: we don't currently surface defaults from Java interfaces.
-            ((VarCharVector) root.getVector(7)).setNull(i);
-            ((BitVector) root.getVector(8)).setSafe(i, info.headerType() != null ? 1 : 0);
-            if (info.headerType() != null && ArrowSerializableRecord.class.isAssignableFrom(info.headerType())) {
-                setBinary(root, 9, i, serializeSchema(SchemaDerivation.schemaForRecord(
-                        info.headerType().asSubclass(ArrowSerializableRecord.class))));
-            } else ((VarBinaryVector) root.getVector(9)).setNull(i);
-            switch (info.streamKind()) {
-                case EXCHANGE -> ((BitVector) root.getVector(10)).setSafe(i, 1);
-                case PRODUCER -> ((BitVector) root.getVector(10)).setSafe(i, 0);
-                case UNKNOWN  -> ((BitVector) root.getVector(10)).setNull(i);
+            String methodType = info.methodType().wireValue();
+            setUtf8(root, 1, i, methodType);
+            ((BitVector) root.getVector(2)).setSafe(i, info.hasReturn() ? 1 : 0);
+            byte[] paramsIpc = serializeSchema(info.paramsSchema());
+            byte[] resultIpc = serializeSchema(info.resultSchema());
+            setBinary(root, 3, i, paramsIpc);
+            setBinary(root, 4, i, resultIpc);
+            boolean hasHeader = info.headerType() != null;
+            ((BitVector) root.getVector(5)).setSafe(i, hasHeader ? 1 : 0);
+            byte[] headerIpc = null;
+            if (hasHeader && ArrowSerializableRecord.class.isAssignableFrom(info.headerType())) {
+                headerIpc = serializeSchema(SchemaDerivation.schemaForRecord(
+                        info.headerType().asSubclass(ArrowSerializableRecord.class)));
+                setBinary(root, 6, i, headerIpc);
+            } else {
+                ((VarBinaryVector) root.getVector(6)).setNull(i);
             }
-            ((VarCharVector) root.getVector(11)).setNull(i);
+            Boolean isExchange = null;
+            switch (info.streamKind()) {
+                case EXCHANGE -> { ((BitVector) root.getVector(7)).setSafe(i, 1); isExchange = Boolean.TRUE; }
+                case PRODUCER -> { ((BitVector) root.getVector(7)).setSafe(i, 0); isExchange = Boolean.FALSE; }
+                case UNKNOWN  -> ((BitVector) root.getVector(7)).setNull(i);
+            }
+
+            hashNames[i] = info.name();
+            hashMethodTypes[i] = methodType;
+            hashHasReturns[i] = info.hasReturn();
+            hashHasHeaders[i] = hasHeader;
+            hashIsExchanges[i] = isExchange;
+            hashParamsIpc[i] = paramsIpc;
+            hashResultIpc[i] = resultIpc;
+            hashHeaderIpc[i] = headerIpc;
             i++;
         }
-        root.setRowCount(sorted.size());
+        root.setRowCount(n);
+
+        String protocolHash = computeProtocolHash(
+                protocolName, hashNames, hashMethodTypes, hashHasReturns,
+                hashHasHeaders, hashIsExchanges, hashParamsIpc, hashResultIpc, hashHeaderIpc);
 
         Map<String, String> md = new LinkedHashMap<>();
         md.put(Metadata.PROTOCOL_NAME, protocolName);
         md.put(Metadata.REQUEST_VERSION_KEY, Metadata.REQUEST_VERSION);
         md.put(Metadata.DESCRIBE_VERSION_KEY, DESCRIBE_VERSION);
+        md.put(Metadata.PROTOCOL_HASH_KEY, protocolHash);
         md.put(Metadata.SERVER_ID, serverId);
         return new Built(root, md);
+    }
+
+    /**
+     * Compute the SHA-256 hex digest of the canonical describe payload.
+     * Mirrors Python {@code vgi_rpc.introspect.compute_protocol_hash}
+     * byte-for-byte.
+     */
+    public static String computeProtocolHash(
+            String protocolName,
+            String[] names, String[] methodTypes,
+            boolean[] hasReturns, boolean[] hasHeaders,
+            Boolean[] isExchanges,
+            byte[][] paramsIpc, byte[][] resultIpc, byte[][] headerIpc) {
+        try {
+            MessageDigest h = MessageDigest.getInstance("SHA-256");
+            h.update("vgi_rpc.describe.v".getBytes(StandardCharsets.UTF_8));
+            h.update(DESCRIBE_VERSION.getBytes(StandardCharsets.UTF_8));
+            h.update((byte) '|');
+            h.update(Metadata.REQUEST_VERSION.getBytes(StandardCharsets.UTF_8));
+            h.update((byte) '|');
+            h.update(protocolName.getBytes(StandardCharsets.UTF_8));
+            h.update((byte) '|');
+            for (int i = 0; i < names.length; i++) {
+                h.update((byte) 0x1f);
+                h.update(names[i].getBytes(StandardCharsets.UTF_8));
+                h.update((byte) 0x1e);
+                h.update(methodTypes[i].getBytes(StandardCharsets.UTF_8));
+                h.update((byte) 0x1e);
+                h.update((byte) (hasReturns[i] ? '1' : '0'));
+                h.update((byte) 0x1e);
+                h.update((byte) (hasHeaders[i] ? '1' : '0'));
+                h.update((byte) 0x1e);
+                if (isExchanges[i] == null) h.update((byte) '-');
+                else h.update((byte) (isExchanges[i] ? '1' : '0'));
+                h.update((byte) 0x1e);
+                h.update(paramsIpc[i]);
+                h.update((byte) 0x1e);
+                h.update(resultIpc[i]);
+                h.update((byte) 0x1e);
+                if (headerIpc[i] != null) h.update(headerIpc[i]);
+            }
+            return HexFormat.of().formatHex(h.digest());
+        } catch (Exception e) {
+            throw new RuntimeException("protocol_hash failed", e);
+        }
     }
 
     /** Result of {@link #build}. Caller owns {@link #root()} and must close it. */
@@ -137,38 +201,11 @@ public final class Introspect {
         }
     }
 
-    private static String toJson(Object v) {
-        try { return JSON.writeValueAsString(v); }
-        catch (Exception e) { throw new RuntimeException("json serialize failed", e); }
-    }
-
-    /** Produce a Python-style type name for a Java Type. */
-    public static String typeName(Type t) {
-        if (t == null || t == void.class || t == Void.class) return "None";
-        if (t instanceof ParameterizedType pt) {
-            Class<?> raw = (Class<?>) pt.getRawType();
-            Type[] args = pt.getActualTypeArguments();
-            if (raw == Optional.class) return typeName(args[0]) + " | None";
-            if (java.util.List.class.isAssignableFrom(raw)) return "list[" + typeName(args[0]) + "]";
-            if (java.util.Map.class.isAssignableFrom(raw)) return "dict[" + typeName(args[0]) + ", " + typeName(args[1]) + "]";
-        }
-        if (t instanceof Class<?> c) {
-            if (c == String.class) return "str";
-            if (c == byte[].class) return "bytes";
-            if (c == long.class || c == Long.class || c == int.class || c == Integer.class) return "int";
-            if (c == double.class || c == Double.class || c == float.class || c == Float.class) return "float";
-            if (c == boolean.class || c == Boolean.class) return "bool";
-            return c.getSimpleName();
-        }
-        return t.toString();
-    }
-
     // --- Client-side introspect(transport) --------------------------------
 
     /** Send a {@code __describe__} request over the transport. */
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static ServiceDescription introspect(RpcTransport transport) {
-        // Send request
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer())) {
             w.writeSchema(RpcStream.EMPTY_SCHEMA);
             try (VectorSchemaRoot zero = VectorSchemaRoot.create(RpcStream.EMPTY_SCHEMA, Allocators.root())) {
@@ -184,7 +221,6 @@ public final class Introspect {
         }
         try { transport.writer().flush(); } catch (Exception ignore) {}
 
-        // Read response
         try (IpcStreamReader r = new IpcStreamReader(transport.reader(), Allocators.root())) {
             while (true) {
                 Map<String, String> md = r.readNextBatch();
@@ -202,6 +238,7 @@ public final class Introspect {
         String protocolName = meta.getOrDefault(Metadata.PROTOCOL_NAME, "");
         String requestVersion = meta.getOrDefault(Metadata.REQUEST_VERSION_KEY, "");
         String describeVersion = meta.getOrDefault(Metadata.DESCRIBE_VERSION_KEY, "");
+        String protocolHash = meta.getOrDefault(Metadata.PROTOCOL_HASH_KEY, "");
         String serverId = meta.getOrDefault(Metadata.SERVER_ID, "");
 
         Map<String, MethodDescription> map = new LinkedHashMap<>();
@@ -209,28 +246,26 @@ public final class Introspect {
         for (int i = 0; i < rows; i++) {
             String name = new String(((VarCharVector) root.getVector(0)).get(i), StandardCharsets.UTF_8);
             String mt = new String(((VarCharVector) root.getVector(1)).get(i), StandardCharsets.UTF_8);
-            String doc = root.getVector(2).isNull(i) ? null
-                    : new String(((VarCharVector) root.getVector(2)).get(i), StandardCharsets.UTF_8);
-            boolean hasReturn = ((BitVector) root.getVector(3)).get(i) == 1;
-            byte[] paramsBytes = ((VarBinaryVector) root.getVector(4)).get(i);
-            byte[] resultBytes = ((VarBinaryVector) root.getVector(5)).get(i);
+            boolean hasReturn = ((BitVector) root.getVector(2)).get(i) == 1;
+            byte[] paramsBytes = ((VarBinaryVector) root.getVector(3)).get(i);
+            byte[] resultBytes = ((VarBinaryVector) root.getVector(4)).get(i);
             Schema params = deserializeSchema(paramsBytes);
             Schema result = deserializeSchema(resultBytes);
-            boolean hasHeader = ((BitVector) root.getVector(8)).get(i) == 1;
+            boolean hasHeader = ((BitVector) root.getVector(5)).get(i) == 1;
             Schema headerSchema = null;
-            if (hasHeader && !root.getVector(9).isNull(i)) {
-                byte[] b = ((VarBinaryVector) root.getVector(9)).get(i);
+            if (hasHeader && !root.getVector(6).isNull(i)) {
+                byte[] b = ((VarBinaryVector) root.getVector(6)).get(i);
                 headerSchema = deserializeSchema(b);
             }
             Boolean isExchange = null;
-            if (!root.getVector(10).isNull(i)) {
-                isExchange = ((BitVector) root.getVector(10)).get(i) == 1;
+            if (!root.getVector(7).isNull(i)) {
+                isExchange = ((BitVector) root.getVector(7)).get(i) == 1;
             }
             MethodType methodType = "stream".equals(mt) ? MethodType.STREAM : MethodType.UNARY;
-            map.put(name, new MethodDescription(name, methodType, doc, hasReturn, params, result,
+            map.put(name, new MethodDescription(name, methodType, hasReturn, params, result,
                     hasHeader, headerSchema, isExchange));
         }
-        return new ServiceDescription(protocolName, requestVersion, describeVersion, serverId, map);
+        return new ServiceDescription(protocolName, requestVersion, describeVersion, protocolHash, serverId, map);
     }
 
     private static Schema deserializeSchema(byte[] bytes) {
@@ -248,7 +283,6 @@ public final class Introspect {
     public record MethodDescription(
             String name,
             MethodType methodType,
-            String doc,
             boolean hasReturn,
             Schema paramsSchema,
             Schema resultSchema,
@@ -261,6 +295,7 @@ public final class Introspect {
             String protocolName,
             String requestVersion,
             String describeVersion,
+            String protocolHash,
             String serverId,
             Map<String, MethodDescription> methods
     ) {}

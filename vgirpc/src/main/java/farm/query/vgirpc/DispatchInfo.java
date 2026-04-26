@@ -17,6 +17,8 @@ public final class DispatchInfo {
     public String methodType = "unary";
     public String serverId = "";
     public String protocol = "";
+    public String protocolHash = "";
+    public String protocolVersion = "";
     public String requestId = "";
     public String principal = "";
     public String authDomain = "";
