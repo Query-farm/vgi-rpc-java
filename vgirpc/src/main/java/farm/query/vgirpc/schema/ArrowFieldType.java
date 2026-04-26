@@ -23,7 +23,9 @@ public enum ArrowFieldType {
     FLOAT32(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)),
     FLOAT64(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)),
     UTF8(new ArrowType.Utf8()),
+    LARGE_UTF8(new ArrowType.LargeUtf8()),
     BINARY(new ArrowType.Binary()),
+    LARGE_BINARY(new ArrowType.LargeBinary()),
     BOOL(new ArrowType.Bool());
 
     private final ArrowType arrowType;

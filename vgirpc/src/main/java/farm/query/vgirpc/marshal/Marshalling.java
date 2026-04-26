@@ -13,6 +13,12 @@ import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
 import org.apache.arrow.vector.TinyIntVector;
+import org.apache.arrow.vector.UInt1Vector;
+import org.apache.arrow.vector.UInt2Vector;
+import org.apache.arrow.vector.UInt4Vector;
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.LargeVarBinaryVector;
+import org.apache.arrow.vector.LargeVarCharVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -151,12 +157,22 @@ public final class Marshalling {
                 String s = (value instanceof Enum<?> e) ? e.name() : value.toString();
                 ((VarCharVector) v).setSafe(row, s.getBytes(StandardCharsets.UTF_8));
             }
+            case LargeUtf8 -> {
+                String s = (value instanceof Enum<?> e) ? e.name() : value.toString();
+                ((LargeVarCharVector) v).setSafe(row, s.getBytes(StandardCharsets.UTF_8));
+            }
             case Binary -> {
                 byte[] bytes;
                 if (value instanceof byte[] b) bytes = b;
                 else if (value instanceof ArrowSerializableRecord r) bytes = RecordCodec.serializeToBytes(r);
                 else throw new IllegalArgumentException("expected byte[] for Binary field, got " + value.getClass());
                 ((VarBinaryVector) v).setSafe(row, bytes);
+            }
+            case LargeBinary -> {
+                byte[] bytes;
+                if (value instanceof byte[] b) bytes = b;
+                else throw new IllegalArgumentException("expected byte[] for LargeBinary field, got " + value.getClass());
+                ((LargeVarBinaryVector) v).setSafe(row, bytes);
             }
             case List -> writeList(v, row, f, (List<?>) value);
             case Map -> writeMap(v, row, f, (Map<?, ?>) value);
@@ -475,13 +491,23 @@ public final class Marshalling {
         ArrowType t = f.getType();
         return switch (t.getTypeID()) {
             case Int -> {
-                int width = ((ArrowType.Int) t).getBitWidth();
+                ArrowType.Int it = (ArrowType.Int) t;
+                int width = it.getBitWidth();
+                if (it.getIsSigned()) {
+                    yield switch (width) {
+                        case 8 -> (long) ((TinyIntVector) v).get(row);
+                        case 16 -> (long) ((SmallIntVector) v).get(row);
+                        case 32 -> (long) ((IntVector) v).get(row);
+                        case 64 -> ((BigIntVector) v).get(row);
+                        default -> throw new IllegalArgumentException("int width: " + width);
+                    };
+                }
                 yield switch (width) {
-                    case 8 -> (long) ((TinyIntVector) v).get(row);
-                    case 16 -> (long) ((SmallIntVector) v).get(row);
-                    case 32 -> (long) ((IntVector) v).get(row);
-                    case 64 -> ((BigIntVector) v).get(row);
-                    default -> throw new IllegalArgumentException("int width: " + width);
+                    case 8 -> (long) (((UInt1Vector) v).get(row) & 0xFFL);
+                    case 16 -> (long) (((UInt2Vector) v).get(row) & 0xFFFFL);
+                    case 32 -> ((UInt4Vector) v).get(row) & 0xFFFFFFFFL;
+                    case 64 -> ((UInt8Vector) v).get(row);
+                    default -> throw new IllegalArgumentException("uint width: " + width);
                 };
             }
             case FloatingPoint -> switch (((ArrowType.FloatingPoint) t).getPrecision()) {
@@ -491,7 +517,9 @@ public final class Marshalling {
             };
             case Bool -> ((BitVector) v).get(row) == 1;
             case Utf8 -> new String(((VarCharVector) v).get(row), StandardCharsets.UTF_8);
+            case LargeUtf8 -> new String(((LargeVarCharVector) v).get(row), StandardCharsets.UTF_8);
             case Binary -> ((VarBinaryVector) v).get(row);
+            case LargeBinary -> ((LargeVarBinaryVector) v).get(row);
             case List -> readList((ListVector) v, row, f);
             case Map -> readMap((MapVector) v, row, f);
             case Struct -> readStruct((StructVector) v, row, f);

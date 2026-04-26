@@ -18,6 +18,8 @@ public final class ConformanceServiceImpl implements ConformanceService {
 
     @Override public String echo_string(String value) { return value; }
     @Override public byte[] echo_bytes(byte[] data) { return data; }
+    @Override public String echo_large_string(String value) { return value; }
+    @Override public byte[] echo_large_binary(byte[] value) { return value; }
     @Override public long echo_int(long value) { return value; }
     @Override public double echo_float(double value) { return value; }
     @Override public boolean echo_bool(boolean value) { return value; }
@@ -76,6 +78,14 @@ public final class ConformanceServiceImpl implements ConformanceService {
         ctx.clientLog(Level.DEBUG, "debug: " + value);
         ctx.clientLog(Level.INFO, "info: " + value);
         ctx.clientLog(Level.WARN, "warn: " + value);
+        return value;
+    }
+    @Override public String echo_with_all_log_levels(String value, CallContext ctx) {
+        ctx.clientLog(Level.TRACE, "trace: " + value);
+        ctx.clientLog(Level.DEBUG, "debug: " + value);
+        ctx.clientLog(Level.INFO, "info: " + value);
+        ctx.clientLog(Level.WARN, "warn: " + value);
+        ctx.clientLog(Level.ERROR, "error: " + value);
         return value;
     }
     @Override public String echo_with_log_extras(String value, CallContext ctx) {

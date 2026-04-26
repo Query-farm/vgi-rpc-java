@@ -31,6 +31,12 @@ public interface ConformanceService {
 
     String echo_string(String value);
     byte[] echo_bytes(byte[] data);
+
+    @ArrowField(ArrowFieldType.LARGE_UTF8)
+    String echo_large_string(@ArrowField(ArrowFieldType.LARGE_UTF8) String value);
+
+    @ArrowField(ArrowFieldType.LARGE_BINARY)
+    byte[] echo_large_binary(@ArrowField(ArrowFieldType.LARGE_BINARY) byte[] value);
     long echo_int(long value);
     double echo_float(double value);
     boolean echo_bool(boolean value);
@@ -87,6 +93,7 @@ public interface ConformanceService {
     String echo_with_info_log(String value, CallContext ctx);
     String echo_with_multi_logs(String value, CallContext ctx);
     String echo_with_log_extras(String value, CallContext ctx);
+    String echo_with_all_log_levels(String value, CallContext ctx);
 
     // --- Producer streams ---------------------------------------------------
 

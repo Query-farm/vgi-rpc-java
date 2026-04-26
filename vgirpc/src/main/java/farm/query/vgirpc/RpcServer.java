@@ -114,45 +114,70 @@ public final class RpcServer {
                 throw new EndOfStream();
             }
             VectorSchemaRoot paramsRoot = reader.root();
-            // Snapshot the kwargs immediately, before draining mutates the reader's root.
-            Map<String, Object> kwargsSnapshot;
+            // If the outer batch is an external-location pointer, fetch the inner batch
+            // and decode kwargs from it. Dispatch metadata still comes from the outer batch.
+            VectorSchemaRoot resolvedParams = null;
             try {
-                kwargsSnapshot = paramsRoot.getRowCount() == 0
-                        ? new LinkedHashMap<>()
-                        : Marshalling.decodeRow(paramsRoot, reader.dictionaryProvider(), reader.wireSchema());
-            } catch (IOException ioe) {
-                throw new RuntimeException(ioe);
-            }
-            // Drain remaining batches in this request stream so the next call sees a fresh stream
-            try { reader.drain(); } catch (IOException ignore) {}
-            String method;
-            try {
-                Wire.validateRequestVersion(meta);
-                method = Wire.requireMethodName(meta);
-            } catch (RuntimeException pe) {
-                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, pe, serverId);
+                if (locationResolver != null && LocationResolver.isPointer(paramsRoot.getRowCount(), meta)) {
+                    try {
+                        LocationResolver.Resolved res = locationResolver.resolve(meta);
+                        resolvedParams = res.root();
+                        paramsRoot = resolvedParams;
+                    } catch (Exception fetchExc) {
+                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, fetchExc, serverId);
+                        transport.writer().flush();
+                        return;
+                    }
+                }
+                // Snapshot the kwargs immediately, before draining mutates the reader's root.
+                // Decode errors must be reported as an error response so the (possibly shared)
+                // transport stays framed correctly for the next call.
+                Map<String, Object> kwargsSnapshot;
+                try {
+                    kwargsSnapshot = paramsRoot.getRowCount() == 0
+                            ? new LinkedHashMap<>()
+                            : (resolvedParams != null
+                                ? Marshalling.decodeRow(paramsRoot, null, paramsRoot.getSchema())
+                                : Marshalling.decodeRow(paramsRoot, reader.dictionaryProvider(), reader.wireSchema()));
+                } catch (Exception decodeExc) {
+                    try { reader.drain(); } catch (IOException ignore) {}
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, decodeExc, serverId);
+                    transport.writer().flush();
+                    return;
+                }
+                // Drain remaining batches in this request stream so the next call sees a fresh stream
+                try { reader.drain(); } catch (IOException ignore) {}
+                String method;
+                try {
+                    Wire.validateRequestVersion(meta);
+                    method = Wire.requireMethodName(meta);
+                } catch (RuntimeException pe) {
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, pe, serverId);
+                    transport.writer().flush();
+                    return;
+                }
+                if (describeEnabled && Introspect.METHOD_NAME.equals(method)) {
+                    serveDescribe(transport);
+                    return;
+                }
+                RpcMethodInfo info = methods.get(method);
+                if (info == null) {
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                            new IllegalArgumentException("Unknown method: '" + method + "'. Available: " + methods.keySet()),
+                            serverId);
+                    transport.writer().flush();
+                    return;
+                }
+                Map<String, Object> kwargs = kwargsSnapshot;
+                if (info.methodType() == MethodType.UNARY) {
+                    serveUnary(transport, info, kwargs);
+                } else {
+                    serveStream(transport, info, kwargs);
+                }
                 transport.writer().flush();
-                return;
+            } finally {
+                if (resolvedParams != null) resolvedParams.close();
             }
-            if (describeEnabled && Introspect.METHOD_NAME.equals(method)) {
-                serveDescribe(transport);
-                return;
-            }
-            RpcMethodInfo info = methods.get(method);
-            if (info == null) {
-                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
-                        new IllegalArgumentException("Unknown method: '" + method + "'. Available: " + methods.keySet()),
-                        serverId);
-                transport.writer().flush();
-                return;
-            }
-            Map<String, Object> kwargs = kwargsSnapshot;
-            if (info.methodType() == MethodType.UNARY) {
-                serveUnary(transport, info, kwargs);
-            } else {
-                serveStream(transport, info, kwargs);
-            }
-            transport.writer().flush();
         } catch (EndOfStream e) {
             throw e;
         } catch (Exception e) {
