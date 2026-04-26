@@ -121,12 +121,12 @@ public final class SchemaDerivation {
         // If the override is attached to a List<T>/Map<K,V>, treat it as the
         // *element* / *value* override rather than collapsing the whole field
         // to a scalar — matches Python's `Annotated[list[T], ArrowType(pa.list_(...))]`.
+        // Recurses for List<List<T>> so nested-container overrides land on the
+        // innermost element type.
         if (override != null && unwrapped instanceof ParameterizedType pt) {
             Class<?> rawC = (Class<?>) pt.getRawType();
             if (List.class.isAssignableFrom(rawC) || Set.class.isAssignableFrom(rawC)) {
-                Field item = new Field("item",
-                        new FieldType(true, override.value().arrowType(), null),
-                        Collections.emptyList());
+                Field item = buildOverriddenChild("item", pt.getActualTypeArguments()[0], override);
                 return new Field(name, new FieldType(nullable, new ArrowType.List(), null),
                         List.of(item));
             }
@@ -134,9 +134,7 @@ public final class SchemaDerivation {
                 Field key = buildField("key", pt.getActualTypeArguments()[0], NO_ANNS);
                 Field keyNonNull = new Field("key",
                         new FieldType(false, key.getType(), null), key.getChildren());
-                Field val = new Field("value",
-                        new FieldType(true, override.value().arrowType(), null),
-                        Collections.emptyList());
+                Field val = buildOverriddenChild("value", pt.getActualTypeArguments()[1], override);
                 Field entries = new Field("entries",
                         new FieldType(false, new ArrowType.Struct(), null),
                         List.of(keyNonNull, val));
@@ -165,6 +163,20 @@ public final class SchemaDerivation {
         }
         FieldType ft = new FieldType(nullable, arrowType, /*dictionary=*/null);
         return new Field(name, ft, children);
+    }
+
+    /** Build a list-element / map-value field, recursing the override through nested lists. */
+    private static Field buildOverriddenChild(String name, Type elemType, ArrowField override) {
+        if (elemType instanceof ParameterizedType ept) {
+            Class<?> rawC = (Class<?>) ept.getRawType();
+            if (List.class.isAssignableFrom(rawC) || Set.class.isAssignableFrom(rawC)) {
+                Field inner = buildOverriddenChild("item", ept.getActualTypeArguments()[0], override);
+                return new Field(name, new FieldType(true, new ArrowType.List(), null), List.of(inner));
+            }
+        }
+        return new Field(name,
+                new FieldType(true, override.value().arrowType(), null),
+                Collections.emptyList());
     }
 
     /** Unwrap {@code Optional<T>} to {@code T}. */

@@ -132,22 +132,38 @@ public final class IpcStreamReader implements AutoCloseable {
             throw new IOException("Expected schema as first IPC message");
         }
         Schema raw = MessageSerializer.deserializeSchema(msg);
-        // Materialise dict-encoded fields as their index type vectors; we resolve
-        // values via the dictionary provider during decode. Track the original
-        // field (with DictionaryEncoding) in `schema` so callers can detect dict fields.
+        // Materialise dict-encoded fields as their index type vectors anywhere
+        // they appear (top-level OR nested inside list/map/struct), so the
+        // VectorSchemaRoot's buffer count matches the wire batch. We resolve
+        // values via the dictionary provider during decode. The original
+        // schema (with DictionaryEncoding) is kept on `schema` for callers.
         java.util.List<Field> rootFields = new java.util.ArrayList<>();
         for (Field f : raw.getFields()) {
-            DictionaryEncoding de = f.getDictionary();
-            if (de != null) {
-                FieldType ft = new FieldType(f.isNullable(), de.getIndexType(), null);
-                rootFields.add(new Field(f.getName(), ft, java.util.Collections.emptyList()));
-            } else {
-                rootFields.add(f);
-            }
+            rootFields.add(stripDictEncoding(f));
         }
         Schema rootSchema = new Schema(rootFields, raw.getCustomMetadata());
         this.schema = raw;
         this.root = VectorSchemaRoot.create(rootSchema, allocator);
+    }
+
+    private static Field stripDictEncoding(Field f) {
+        DictionaryEncoding de = f.getDictionary();
+        if (de != null) {
+            return new Field(f.getName(),
+                    new FieldType(f.isNullable(), de.getIndexType(), null),
+                    java.util.Collections.emptyList());
+        }
+        java.util.List<Field> kids = f.getChildren();
+        if (kids.isEmpty()) return f;
+        java.util.List<Field> rewritten = new java.util.ArrayList<>(kids.size());
+        boolean changed = false;
+        for (Field c : kids) {
+            Field nc = stripDictEncoding(c);
+            if (nc != c) changed = true;
+            rewritten.add(nc);
+        }
+        if (!changed) return f;
+        return new Field(f.getName(), f.getFieldType(), rewritten);
     }
 
     private static Map<String, String> readCustomMetadata(Message msg) {
@@ -225,8 +241,18 @@ public final class IpcStreamReader implements AutoCloseable {
     private Field findFieldByDictId(long id) {
         if (schema == null) return null;
         for (Field f : schema.getFields()) {
-            DictionaryEncoding de = f.getDictionary();
-            if (de != null && de.getId() == id) return f;
+            Field hit = findFieldByDictIdRecursive(f, id);
+            if (hit != null) return hit;
+        }
+        return null;
+    }
+
+    private static Field findFieldByDictIdRecursive(Field f, long id) {
+        DictionaryEncoding de = f.getDictionary();
+        if (de != null && de.getId() == id) return f;
+        for (Field c : f.getChildren()) {
+            Field hit = findFieldByDictIdRecursive(c, id);
+            if (hit != null) return hit;
         }
         return null;
     }

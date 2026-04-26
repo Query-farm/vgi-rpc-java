@@ -98,14 +98,24 @@ public final class Marshalling {
             Schema wireSchema) {
         Map<String, Object> result = new LinkedHashMap<>();
         Schema rootSchema = root.getSchema();
-        for (int i = 0; i < rootSchema.getFields().size(); i++) {
-            Field rootField = rootSchema.getFields().get(i);
-            Field schemaField = wireSchema != null ? wireSchema.getFields().get(i) : rootField;
-            FieldVector v = root.getVector(i);
-            result.put(schemaField.getName(), readWithDict(v, 0, schemaField, provider));
+        org.apache.arrow.vector.dictionary.DictionaryProvider prev = ACTIVE_DICT_PROVIDER.get();
+        ACTIVE_DICT_PROVIDER.set(provider);
+        try {
+            for (int i = 0; i < rootSchema.getFields().size(); i++) {
+                Field rootField = rootSchema.getFields().get(i);
+                Field schemaField = wireSchema != null ? wireSchema.getFields().get(i) : rootField;
+                FieldVector v = root.getVector(i);
+                result.put(schemaField.getName(), readWithDict(v, 0, schemaField, provider));
+            }
+        } finally {
+            ACTIVE_DICT_PROVIDER.set(prev);
         }
         return result;
     }
+
+    /** Active dictionary provider for nested-read dispatch. Set by decodeRow. */
+    private static final ThreadLocal<org.apache.arrow.vector.dictionary.DictionaryProvider>
+            ACTIVE_DICT_PROVIDER = new ThreadLocal<>();
 
     private static Object readWithDict(FieldVector v, int row, Field f,
             org.apache.arrow.vector.dictionary.DictionaryProvider provider) {
@@ -634,6 +644,17 @@ public final class Marshalling {
 
     public static Object readScalar(FieldVector v, int row, Field f) {
         if (v.isNull(row)) return null;
+        org.apache.arrow.vector.types.pojo.DictionaryEncoding de = f.getDictionary();
+        if (de != null) {
+            org.apache.arrow.vector.dictionary.DictionaryProvider provider = ACTIVE_DICT_PROVIDER.get();
+            if (provider != null) {
+                int idx = readIntIndex(v, row);
+                org.apache.arrow.vector.dictionary.Dictionary d = provider.lookup(de.getId());
+                if (d != null && d.getVector() instanceof VarCharVector vc) {
+                    return new String(vc.get(idx), java.nio.charset.StandardCharsets.UTF_8);
+                }
+            }
+        }
         ArrowType t = f.getType();
         return switch (t.getTypeID()) {
             case Int -> {

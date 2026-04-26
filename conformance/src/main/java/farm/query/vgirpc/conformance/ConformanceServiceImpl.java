@@ -60,6 +60,9 @@ public final class ConformanceServiceImpl implements ConformanceService {
     @Override public byte[] echo_fixed_binary(byte[] value) { return value; }
     @Override public WideTypes echo_wide_types(WideTypes data) { return data; }
     @Override public ContainerWideTypes echo_container_wide_types(ContainerWideTypes data) { return data; }
+    @Override public DeepNested echo_deep_nested(DeepNested data) { return data; }
+    @Override public EmbeddedArrow echo_embedded_arrow(EmbeddedArrow data) { return data; }
+    @Override public String echo_dict_encoded_string(String value) { return value; }
 
     @Override public double add_floats(double a, double b) { return a + b; }
 

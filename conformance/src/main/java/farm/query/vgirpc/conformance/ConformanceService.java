@@ -121,6 +121,11 @@ public interface ConformanceService {
 
     WideTypes echo_wide_types(WideTypes data);
     ContainerWideTypes echo_container_wide_types(ContainerWideTypes data);
+    DeepNested echo_deep_nested(DeepNested data);
+    EmbeddedArrow echo_embedded_arrow(EmbeddedArrow data);
+
+    @ArrowField(ArrowFieldType.DICT_INT16_UTF8)
+    String echo_dict_encoded_string(@ArrowField(ArrowFieldType.DICT_INT16_UTF8) String value);
 
     // --- Multi-param + defaults --------------------------------------------
 
