@@ -3,7 +3,9 @@
 
 package farm.query.vgirpc.schema;
 
+import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 
 /**
@@ -26,7 +28,15 @@ public enum ArrowFieldType {
     LARGE_UTF8(new ArrowType.LargeUtf8()),
     BINARY(new ArrowType.Binary()),
     LARGE_BINARY(new ArrowType.LargeBinary()),
-    BOOL(new ArrowType.Bool());
+    BOOL(new ArrowType.Bool()),
+    DATE32(new ArrowType.Date(DateUnit.DAY)),
+    TIME64_US(new ArrowType.Time(TimeUnit.MICROSECOND, 64)),
+    TIMESTAMP_US(new ArrowType.Timestamp(TimeUnit.MICROSECOND, null)),
+    TIMESTAMP_US_UTC(new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")),
+    DURATION_US(new ArrowType.Duration(TimeUnit.MICROSECOND)),
+    DECIMAL128_20_4(new ArrowType.Decimal(20, 4, 128)),
+    BINARY_8(new ArrowType.FixedSizeBinary(8)),
+    DICT_INT16_UTF8(new ArrowType.Utf8());
 
     private final ArrowType arrowType;
     ArrowFieldType(ArrowType t) { this.arrowType = t; }

@@ -45,6 +45,19 @@ public final class ConformanceServiceImpl implements ConformanceService {
 
     @Override public int echo_int32(int value) { return value; }
     @Override public float echo_float32(float value) { return value; }
+    @Override public long echo_int8(long value) { return value; }
+    @Override public long echo_int16(long value) { return value; }
+    @Override public long echo_uint8(long value) { return value; }
+    @Override public long echo_uint16(long value) { return value; }
+    @Override public long echo_uint32(long value) { return value; }
+    @Override public long echo_uint64(long value) { return value; }
+    @Override public int echo_date(int value) { return value; }
+    @Override public long echo_time(long value) { return value; }
+    @Override public long echo_timestamp(long value) { return value; }
+    @Override public long echo_timestamp_utc(long value) { return value; }
+    @Override public long echo_duration(long value) { return value; }
+    @Override public byte[] echo_decimal(byte[] value) { return value; }
+    @Override public byte[] echo_fixed_binary(byte[] value) { return value; }
 
     @Override public double add_floats(double a, double b) { return a + b; }
 

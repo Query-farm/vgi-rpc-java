@@ -76,6 +76,49 @@ public interface ConformanceService {
     @ArrowField(ArrowFieldType.FLOAT32)
     float echo_float32(@ArrowField(ArrowFieldType.FLOAT32) float value);
 
+    // --- Wide integer widths ----------------------------------------------
+
+    @ArrowField(ArrowFieldType.INT8)
+    long echo_int8(@ArrowField(ArrowFieldType.INT8) long value);
+
+    @ArrowField(ArrowFieldType.INT16)
+    long echo_int16(@ArrowField(ArrowFieldType.INT16) long value);
+
+    @ArrowField(ArrowFieldType.UINT8)
+    long echo_uint8(@ArrowField(ArrowFieldType.UINT8) long value);
+
+    @ArrowField(ArrowFieldType.UINT16)
+    long echo_uint16(@ArrowField(ArrowFieldType.UINT16) long value);
+
+    @ArrowField(ArrowFieldType.UINT32)
+    long echo_uint32(@ArrowField(ArrowFieldType.UINT32) long value);
+
+    @ArrowField(ArrowFieldType.UINT64)
+    long echo_uint64(@ArrowField(ArrowFieldType.UINT64) long value);
+
+    // --- Temporal + decimal + fixed-binary --------------------------------
+
+    @ArrowField(ArrowFieldType.DATE32)
+    int echo_date(@ArrowField(ArrowFieldType.DATE32) int value);
+
+    @ArrowField(ArrowFieldType.TIME64_US)
+    long echo_time(@ArrowField(ArrowFieldType.TIME64_US) long value);
+
+    @ArrowField(ArrowFieldType.TIMESTAMP_US)
+    long echo_timestamp(@ArrowField(ArrowFieldType.TIMESTAMP_US) long value);
+
+    @ArrowField(ArrowFieldType.TIMESTAMP_US_UTC)
+    long echo_timestamp_utc(@ArrowField(ArrowFieldType.TIMESTAMP_US_UTC) long value);
+
+    @ArrowField(ArrowFieldType.DURATION_US)
+    long echo_duration(@ArrowField(ArrowFieldType.DURATION_US) long value);
+
+    @ArrowField(ArrowFieldType.DECIMAL128_20_4)
+    byte[] echo_decimal(@ArrowField(ArrowFieldType.DECIMAL128_20_4) byte[] value);
+
+    @ArrowField(ArrowFieldType.BINARY_8)
+    byte[] echo_fixed_binary(@ArrowField(ArrowFieldType.BINARY_8) byte[] value);
+
     // --- Multi-param + defaults --------------------------------------------
 
     double add_floats(double a, double b);

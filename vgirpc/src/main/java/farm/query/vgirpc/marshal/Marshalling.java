@@ -17,8 +17,15 @@ import org.apache.arrow.vector.UInt1Vector;
 import org.apache.arrow.vector.UInt2Vector;
 import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.DateDayVector;
+import org.apache.arrow.vector.DecimalVector;
+import org.apache.arrow.vector.DurationVector;
+import org.apache.arrow.vector.FixedSizeBinaryVector;
 import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.LargeVarCharVector;
+import org.apache.arrow.vector.TimeMicroVector;
+import org.apache.arrow.vector.TimeStampMicroTZVector;
+import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -135,12 +142,22 @@ public final class Marshalling {
             case Int -> {
                 ArrowType.Int it = (ArrowType.Int) type;
                 long lv = ((Number) value).longValue();
-                switch (it.getBitWidth()) {
-                    case 8 -> ((TinyIntVector) v).setSafe(row, (int) lv);
-                    case 16 -> ((SmallIntVector) v).setSafe(row, (int) lv);
-                    case 32 -> ((IntVector) v).setSafe(row, (int) lv);
-                    case 64 -> ((BigIntVector) v).setSafe(row, lv);
-                    default -> throw new IllegalArgumentException("unsupported int width: " + it.getBitWidth());
+                if (it.getIsSigned()) {
+                    switch (it.getBitWidth()) {
+                        case 8 -> ((TinyIntVector) v).setSafe(row, (int) lv);
+                        case 16 -> ((SmallIntVector) v).setSafe(row, (int) lv);
+                        case 32 -> ((IntVector) v).setSafe(row, (int) lv);
+                        case 64 -> ((BigIntVector) v).setSafe(row, lv);
+                        default -> throw new IllegalArgumentException("unsupported int width: " + it.getBitWidth());
+                    }
+                } else {
+                    switch (it.getBitWidth()) {
+                        case 8 -> ((UInt1Vector) v).setSafe(row, (int) lv);
+                        case 16 -> ((UInt2Vector) v).setSafe(row, (int) lv);
+                        case 32 -> ((UInt4Vector) v).setSafe(row, (int) lv);
+                        case 64 -> ((UInt8Vector) v).setSafe(row, lv);
+                        default -> throw new IllegalArgumentException("unsupported uint width: " + it.getBitWidth());
+                    }
                 }
             }
             case FloatingPoint -> {
@@ -174,11 +191,52 @@ public final class Marshalling {
                 else throw new IllegalArgumentException("expected byte[] for LargeBinary field, got " + value.getClass());
                 ((LargeVarBinaryVector) v).setSafe(row, bytes);
             }
+            case Date -> ((DateDayVector) v).setSafe(row, ((Number) value).intValue());
+            case Time -> ((TimeMicroVector) v).setSafe(row, ((Number) value).longValue());
+            case Timestamp -> {
+                long lv = ((Number) value).longValue();
+                if (((ArrowType.Timestamp) type).getTimezone() != null) {
+                    ((TimeStampMicroTZVector) v).setSafe(row, lv);
+                } else {
+                    ((TimeStampMicroVector) v).setSafe(row, lv);
+                }
+            }
+            case Duration -> ((DurationVector) v).setSafe(row, ((Number) value).longValue());
+            case Decimal -> {
+                if (!(value instanceof byte[] db)) {
+                    throw new IllegalArgumentException("expected byte[] for Decimal field, got " + value.getClass());
+                }
+                writeDecimalBytes((DecimalVector) v, row, db);
+            }
+            case FixedSizeBinary -> {
+                if (!(value instanceof byte[] fb)) {
+                    throw new IllegalArgumentException("expected byte[] for FixedSizeBinary field, got " + value.getClass());
+                }
+                ((FixedSizeBinaryVector) v).setSafe(row, fb);
+            }
             case List -> writeList(v, row, f, (List<?>) value);
             case Map -> writeMap(v, row, f, (Map<?, ?>) value);
             case Struct -> writeStruct(v, row, f, value);
             default -> throw new IllegalArgumentException("unsupported Arrow type: " + type);
         }
+    }
+
+    /** Read decimal as little-endian bytes for round-trip echo. */
+    private static byte[] readDecimalBytes(DecimalVector dv, int row) {
+        int width = dv.getTypeWidth();
+        byte[] out = new byte[width];
+        dv.getDataBuffer().getBytes((long) row * width, out, 0, width);
+        return out;
+    }
+
+    /** Write little-endian decimal bytes (Python wire format) to a DecimalVector. */
+    private static void writeDecimalBytes(DecimalVector dv, int row, byte[] le) {
+        int width = dv.getTypeWidth();
+        if (le.length != width) {
+            throw new IllegalArgumentException("Decimal byte length " + le.length + " != vector width " + width);
+        }
+        dv.setIndexDefined(row);
+        dv.getDataBuffer().setBytes((long) row * width, le);
     }
 
     private static void writeList(FieldVector v, int row, Field f, List<?> values) {
@@ -520,6 +578,14 @@ public final class Marshalling {
             case LargeUtf8 -> new String(((LargeVarCharVector) v).get(row), StandardCharsets.UTF_8);
             case Binary -> ((VarBinaryVector) v).get(row);
             case LargeBinary -> ((LargeVarBinaryVector) v).get(row);
+            case Date -> ((DateDayVector) v).get(row);
+            case Time -> ((TimeMicroVector) v).get(row);
+            case Timestamp -> ((ArrowType.Timestamp) t).getTimezone() != null
+                    ? ((TimeStampMicroTZVector) v).get(row)
+                    : ((TimeStampMicroVector) v).get(row);
+            case Duration -> DurationVector.get(((DurationVector) v).getDataBuffer(), row);
+            case Decimal -> readDecimalBytes((DecimalVector) v, row);
+            case FixedSizeBinary -> ((FixedSizeBinaryVector) v).getObject(row);
             case List -> readList((ListVector) v, row, f);
             case Map -> readMap((MapVector) v, row, f);
             case Struct -> readStruct((StructVector) v, row, f);
