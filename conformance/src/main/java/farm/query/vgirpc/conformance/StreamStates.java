@@ -113,6 +113,30 @@ final class StreamStates {
         }
     }
 
+    /** Emits one batch of {@code rowsPerBatch} int64 rows then finishes.  Used
+     *  by the HTTP-only conformance tests to deliberately overshoot the
+     *  configured response cap in a single producer iteration. */
+    static final class OversizedBatch extends ProducerState {
+        final long rowsPerBatch;
+        boolean emitted;
+        OversizedBatch(long rowsPerBatch) { this.rowsPerBatch = rowsPerBatch; }
+        @Override public void produce(OutputCollector out, CallContext ctx) {
+            if (emitted) { out.finish(); return; }
+            out.emit(counterRows(0, rowsPerBatch));
+            emitted = true;
+        }
+    }
+
+    /** Companion to {@link OversizedBatch} for the lockstep exchange path —
+     *  emits a fixed-size oversized output for any input. */
+    static final class OversizedExchange extends ExchangeState {
+        final long rowsPerBatch;
+        OversizedExchange(long rowsPerBatch) { this.rowsPerBatch = rowsPerBatch; }
+        @Override public void exchange(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
+            out.emit(counterRows(0, rowsPerBatch));
+        }
+    }
+
     static final class ErrorAfterN extends ProducerState {
         final long emitBeforeError;
         long current;

@@ -57,6 +57,11 @@ public final class Main {
         long maxRequestBytes = -1;
         String compression = "none";
         String accessLogPath = null;
+        boolean strictMode = false;
+        // 0 = unbounded; --strict bumps both to 1 MiB to mirror Python's
+        // tests/serve_conformance_http_strict.py.
+        long maxResponseBytes = 0;
+        long maxExternalizedResponseBytes = 0;
         ArgCursor c = new ArgCursor(args);
         while (c.hasNext()) {
             String a = c.next();
@@ -82,6 +87,10 @@ public final class Main {
                 case "--max-request-bytes" -> maxRequestBytes = Long.parseLong(c.requireValue(a));
                 case "--compression" -> compression = c.requireValue(a);
                 case "--access-log" -> accessLogPath = c.requireValue(a);
+                case "--strict" -> strictMode = true;
+                case "--max-response-bytes" -> maxResponseBytes = Long.parseLong(c.requireValue(a));
+                case "--max-externalized-response-bytes" ->
+                        maxExternalizedResponseBytes = Long.parseLong(c.requireValue(a));
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
         }
@@ -107,9 +116,14 @@ public final class Main {
             server.setDispatchHook(new AccessLogHook(accessLogOut, "vgi-rpc-java-conformance"));
         }
         if (mode == null) { servePipe(server); return; }
+        if (strictMode) {
+            if (maxResponseBytes <= 0) maxResponseBytes = 1024L * 1024L;
+            if (maxExternalizedResponseBytes <= 0) maxExternalizedResponseBytes = 1024L * 1024L;
+        }
         switch (mode) {
             case "http" -> serveHttp(server, signingKey, tokenTtl, authenticator, preHandlers, fakeStorage,
-                    maxRequestBytes >= 0 ? maxRequestBytes : externalizeThreshold);
+                    maxRequestBytes >= 0 ? maxRequestBytes : externalizeThreshold,
+                    maxResponseBytes, maxExternalizedResponseBytes);
             case "unix" -> serveUnix(server, Path.of(unixPath));
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
         }
@@ -210,12 +224,17 @@ public final class Main {
                                    Authenticator authenticator,
                                    List<HttpPreHandler> preHandlers,
                                    FakeStorage fakeStorage,
-                                   long maxRequestBytes) throws Exception {
+                                   long maxRequestBytes,
+                                   long maxResponseBytes,
+                                   long maxExternalizedResponseBytes) throws Exception {
         HttpServer.Config.Builder cb = HttpServer.Config.builder()
                 .signingKey(signingKey)
                 .tokenTtlSeconds(tokenTtl)
                 .authenticator(authenticator)
                 .preHandlers(preHandlers);
+        if (maxResponseBytes > 0) cb.advertisedMaxResponseBytes(maxResponseBytes);
+        if (maxExternalizedResponseBytes > 0)
+            cb.advertisedMaxExternalizedResponseBytes(maxExternalizedResponseBytes);
         if (fakeStorage != null) {
             // Match the Python conformance worker: a tight inline-request cap
             // forces the client to discover capabilities and route oversized

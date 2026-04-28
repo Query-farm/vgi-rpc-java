@@ -18,6 +18,10 @@ public final class ConformanceServiceImpl implements ConformanceService {
 
     @Override public String echo_string(String value) { return value; }
     @Override public byte[] echo_bytes(byte[] data) { return data; }
+    @Override public byte[] oversized_unary(long target_bytes) {
+        if (target_bytes < 0) throw new IllegalArgumentException("target_bytes must be non-negative");
+        return new byte[(int) target_bytes];
+    }
     @Override public String echo_large_string(String value) { return value; }
     @Override public byte[] echo_large_binary(byte[] value) { return value; }
     @Override public long echo_int(long value) { return value; }
@@ -137,6 +141,9 @@ public final class ConformanceServiceImpl implements ConformanceService {
     @Override public RpcStream<? extends ProducerState> produce_error_on_init() {
         throw new RuntimeException("intentional init error");
     }
+    @Override public RpcStream<? extends ProducerState> produce_oversized_batch(long rows_per_batch) {
+        return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.OversizedBatch(rows_per_batch));
+    }
 
     @Override public RpcStream<? extends ProducerState> produce_with_header(long count) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Counter(count),
@@ -172,6 +179,10 @@ public final class ConformanceServiceImpl implements ConformanceService {
     }
     @Override public RpcStream<? extends ExchangeState> exchange_error_on_init() {
         throw new RuntimeException("intentional exchange init error");
+    }
+    @Override public RpcStream<? extends ExchangeState> exchange_oversized(long rows_per_batch) {
+        return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.COUNTER_SCHEMA,
+                new StreamStates.OversizedExchange(rows_per_batch));
     }
     @Override public RpcStream<? extends ExchangeState> exchange_with_header(double factor) {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,

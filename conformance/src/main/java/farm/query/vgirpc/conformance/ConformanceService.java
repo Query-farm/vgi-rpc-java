@@ -31,6 +31,7 @@ public interface ConformanceService {
 
     String echo_string(String value);
     byte[] echo_bytes(byte[] data);
+    byte[] oversized_unary(long target_bytes);
 
     @ArrowField(ArrowFieldType.LARGE_UTF8)
     String echo_large_string(@ArrowField(ArrowFieldType.LARGE_UTF8) String value);
@@ -155,6 +156,7 @@ public interface ConformanceService {
     RpcStream<? extends ProducerState> produce_with_logs(long count);
     RpcStream<? extends ProducerState> produce_error_mid_stream(long emit_before_error);
     RpcStream<? extends ProducerState> produce_error_on_init();
+    RpcStream<? extends ProducerState> produce_oversized_batch(long rows_per_batch);
 
     // --- Producer streams with headers --------------------------------------
 
@@ -172,6 +174,7 @@ public interface ConformanceService {
     RpcStream<? extends ExchangeState> exchange_error_on_nth(long fail_on);
     RpcStream<? extends ExchangeState> exchange_zero_columns();
     RpcStream<? extends ExchangeState> exchange_error_on_init();
+    RpcStream<? extends ExchangeState> exchange_oversized(long rows_per_batch);
 
     // --- Exchange with header ----------------------------------------------
 

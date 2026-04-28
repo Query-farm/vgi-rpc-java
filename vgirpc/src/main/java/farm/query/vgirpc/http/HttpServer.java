@@ -72,6 +72,10 @@ public final class HttpServer {
     public static final String MAX_REQUEST_BYTES_HEADER = "VGI-Max-Request-Bytes";
     public static final String UPLOAD_URL_HEADER = "VGI-Upload-URL-Support";
     public static final String MAX_UPLOAD_BYTES_HEADER = "VGI-Max-Upload-Bytes";
+    public static final String MAX_RESPONSE_BYTES_HEADER = "VGI-Max-Response-Bytes";
+    public static final String MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER = "VGI-Max-Externalized-Response-Bytes";
+    public static final String EXTERNALIZATION_ENABLED_HEADER = "VGI-Externalization-Enabled";
+    public static final String RPC_ERROR_HEADER = "X-VGI-RPC-Error";
 
     /** The synthetic method name used by the {@code __upload_url__} endpoint. */
     private static final String UPLOAD_URL_METHOD = "__upload_url__";
@@ -100,6 +104,12 @@ public final class HttpServer {
     private final int zstdLevel;
     private final UploadUrlProvider uploadUrlProvider;
     private final Long maxUploadBytes;
+    /** Operator-facing response caps (advertised via VGI-Max-* headers and
+     *  enforced post-flush as Arrow EXCEPTION + 200 + X-VGI-RPC-Error).
+     *  0 = unbounded.  Distinct from {@link #maxResponseBytes}, which is the
+     *  in-process memory bound. */
+    private final long advertisedMaxResponseBytes;
+    private final long advertisedMaxExternalizedResponseBytes;
     private int port;
 
     /** Defaults: loopback bind, ephemeral port, no prefix, anonymous auth, 1-hour TTL, 16 MiB request/response cap. */
@@ -120,6 +130,8 @@ public final class HttpServer {
         this.zstdLevel = config.zstdLevel();
         this.uploadUrlProvider = config.uploadUrlProvider();
         this.maxUploadBytes = config.maxUploadBytes();
+        this.advertisedMaxResponseBytes = config.advertisedMaxResponseBytes();
+        this.advertisedMaxExternalizedResponseBytes = config.advertisedMaxExternalizedResponseBytes();
         this.jetty = new Server();
         jetty.addConnector(buildConnector(jetty, config));
 
@@ -196,7 +208,9 @@ public final class HttpServer {
             TlsConfig tls,
             boolean advertiseMaxRequestBytes,
             UploadUrlProvider uploadUrlProvider,
-            Long maxUploadBytes) {
+            Long maxUploadBytes,
+            long advertisedMaxResponseBytes,
+            long advertisedMaxExternalizedResponseBytes) {
 
         /** 1 hour. */
         public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
@@ -237,6 +251,8 @@ public final class HttpServer {
             private boolean advertiseMaxRequestBytes;
             private UploadUrlProvider uploadUrlProvider;
             private Long maxUploadBytes;
+            private long advertisedMaxResponseBytes;
+            private long advertisedMaxExternalizedResponseBytes;
 
             public Builder host(String host) { this.host = host; return this; }
             public Builder port(int port) { this.port = port; return this; }
@@ -256,11 +272,22 @@ public final class HttpServer {
             public Builder uploadUrlProvider(UploadUrlProvider p) { this.uploadUrlProvider = p; return this; }
             /** Advertised via {@code VGI-Max-Upload-Bytes}; informational only. */
             public Builder maxUploadBytes(Long v) { this.maxUploadBytes = v; return this; }
+            /** Advertised via {@code VGI-Max-Response-Bytes} and enforced
+             *  post-flush as a hard cap for unary and stream-exchange.
+             *  Pass {@code 0} to disable. */
+            public Builder advertisedMaxResponseBytes(long v) { this.advertisedMaxResponseBytes = v; return this; }
+            /** Advertised via {@code VGI-Max-Externalized-Response-Bytes}.  Java's
+             *  HTTP transport does not yet externalise stream output, so the
+             *  cap is advertisement-only today. */
+            public Builder advertisedMaxExternalizedResponseBytes(long v) {
+                this.advertisedMaxExternalizedResponseBytes = v; return this;
+            }
 
             public Config build() {
                 return new Config(host, port, prefix, signingKey, tokenTtlSeconds, authenticator,
                         preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls,
-                        advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes);
+                        advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
+                        advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes);
             }
         }
     }
@@ -355,6 +382,17 @@ public final class HttpServer {
         if (advertiseMaxRequestBytes) {
             resp.setHeader(MAX_REQUEST_BYTES_HEADER, Long.toString(maxRequestBytes));
         }
+        if (advertisedMaxResponseBytes > 0) {
+            resp.setHeader(MAX_RESPONSE_BYTES_HEADER, Long.toString(advertisedMaxResponseBytes));
+        }
+        if (advertisedMaxExternalizedResponseBytes > 0) {
+            resp.setHeader(MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER,
+                    Long.toString(advertisedMaxExternalizedResponseBytes));
+        }
+        // Always present so capability-aware clients can decide whether to
+        // expect externalised payloads.
+        resp.setHeader(EXTERNALIZATION_ENABLED_HEADER,
+                rpc.externalConfig() != null ? "true" : "false");
         if (uploadUrlProvider != null) {
             resp.setHeader(UPLOAD_URL_HEADER, "true");
             if (maxUploadBytes != null) {
@@ -489,7 +527,32 @@ public final class HttpServer {
         } catch (Exception e) {
             throw new IOException(e);
         }
+        // Operator-facing response cap: post-flush enforcement.  Mirrors the
+        // Python reference's strict-fail — overshoot replaces the body with
+        // an Arrow EXCEPTION batch carrying the literal "max_response_bytes"
+        // token, surfaced via 200 + X-VGI-RPC-Error: true so RPC clients
+        // observe RpcError, not a transport failure.
+        if (advertisedMaxResponseBytes > 0 && out.size() > advertisedMaxResponseBytes) {
+            writeResponseCapError(req, resp, method, out.size(), advertisedMaxResponseBytes);
+            return;
+        }
         writeArrowResponse(req, resp, out.toByteArray());
+    }
+
+    /** Replace the response with an Arrow EXCEPTION-batch IPC stream when the
+     *  body overshoots the operator-facing response cap. */
+    private void writeResponseCapError(HttpServletRequest req, HttpServletResponse resp,
+                                       String method, long actual, long limit) throws IOException {
+        RuntimeException overshoot = new RuntimeException(
+                "HTTP body exceeds max_response_bytes (" + actual + " > " + limit
+                        + ") for method '" + method + "'");
+        ByteArrayOutputStream errOut = new ByteArrayOutputStream();
+        Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, overshoot, rpc.serverId());
+        // 200 + X-VGI-RPC-Error so clients that discard 5xx bodies still parse
+        // the IPC error batch.  Matches Python's _set_http_status.
+        resp.setStatus(HttpServletResponse.SC_OK);
+        resp.setHeader(RPC_ERROR_HEADER, "true");
+        writeArrowResponse(req, resp, errOut.toByteArray());
     }
 
     private static Map<String, Object> buildTransportMetadata(HttpServletRequest req) {
@@ -605,6 +668,15 @@ public final class HttpServer {
             Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, e, rpc.serverId());
             out = errOut.toByteArray();
             resp.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+        }
+        // Hard wire-cap enforcement for stream-exchange.  Producer streams
+        // would normally use a soft cap with continuation tokens; today the
+        // Java handler returns the full producer run in one response, so the
+        // cap fails closed for both shapes.  Conformance treats this as the
+        // exchange strict-fail path.
+        if (advertisedMaxResponseBytes > 0 && out.length > advertisedMaxResponseBytes) {
+            writeResponseCapError(req, resp, method, out.length, advertisedMaxResponseBytes);
+            return;
         }
         writeArrowResponse(req, resp, out);
     }

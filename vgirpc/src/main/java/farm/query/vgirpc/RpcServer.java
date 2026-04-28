@@ -73,6 +73,10 @@ public final class RpcServer {
     /** Configure outgoing-batch externalisation. Uploaded via {@link farm.query.vgirpc.external.ExternalStorage}. */
     public void setExternalConfig(ExternalLocationConfig cfg) { this.externalConfig = cfg; }
 
+    /** Read-only accessor used by the HTTP transport to decide whether the
+     *  server should advertise {@code VGI-Externalization-Enabled: true}. */
+    public ExternalLocationConfig externalConfig() { return externalConfig; }
+
     /** Install an observability hook fired around each RPC dispatch. */
     public void setDispatchHook(DispatchHook hook) { this.dispatchHook = hook; }
 
