@@ -99,10 +99,113 @@ def java_unix_path() -> Iterator[str]:
         proc.wait(timeout=5)
 
 
+@pytest.fixture(scope="session")
+def conformance_http_port(java_http_port: int) -> int:
+    """Reuse the no-auth HTTP worker for the TestHealth conformance contract."""
+    return java_http_port
+
+
+@pytest.fixture(scope="session")
+def conformance_http_auth_port() -> Iterator[int]:
+    """Spawn an HTTP worker with bearer auth so every RPC POST returns 401."""
+    proc = subprocess.Popen(
+        [JAVA_WORKER, "--http", "--auth-bearer", "secret=alice"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_fake_storage() -> Iterator[str]:
+    """Run the in-process Python fake-storage HTTP service."""
+    from vgi_rpc.conformance.fake_storage import serve_in_thread
+
+    base_url, shutdown = serve_in_thread()
+    try:
+        yield base_url
+    finally:
+        shutdown()
+
+
+@pytest.fixture(scope="session")
+def conformance_http_with_storage_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Spawn a Java HTTP worker wired to the fake-storage service (no compression)."""
+    proc = subprocess.Popen(
+        [JAVA_WORKER, "--http", "--fake-storage", conformance_fake_storage],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_externalize_always_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Spawn a Java HTTP worker that externalizes EVERY non-empty response batch.
+
+    Sets ``--externalize-threshold 1`` so every data-bearing response batch
+    routes through the upload-URL pointer flow, while keeping
+    ``--max-request-bytes 1048576`` loose enough that normal-sized inline
+    *requests* still flow through.  Used as a transport variant in
+    ``conformance_conn`` so the entire conformance suite double-checks that
+    externalization is observationally indistinguishable from inline
+    transmission for every protocol method.
+    """
+    proc = subprocess.Popen(
+        [
+            JAVA_WORKER,
+            "--http",
+            "--fake-storage",
+            conformance_fake_storage,
+            "--externalize-threshold",
+            "1",
+            "--max-request-bytes",
+            "1048576",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_with_zstd_storage_port() -> Iterator[int]:
+    """Java's ExternalLocationConfig does not yet expose upload-side zstd compression."""
+    pytest.skip("vgirpc-java does not yet support zstd compression on externalized batches")
+    yield 0  # unreachable, keeps mypy happy
+
+
 ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
 
 
-@pytest.fixture(params=["pipe", "subprocess", "http", "unix"])
+@pytest.fixture(params=["pipe", "subprocess", "http", "http_externalize_always", "unix"])
 def conformance_conn(
     request: pytest.FixtureRequest,
     java_transport: SubprocessTransport,
@@ -132,6 +235,18 @@ def conformance_conn(
                 ConformanceService,
                 f"http://127.0.0.1:{java_http_port}",
                 on_log=on_log,
+            )
+        elif request.param == "http_externalize_always":
+            from vgi_rpc.external import ExternalLocationConfig
+
+            ext_port: int = request.getfixturevalue("conformance_http_externalize_always_port")
+            return http_connect(
+                ConformanceService,
+                f"http://127.0.0.1:{ext_port}",
+                on_log=on_log,
+                # Server uses http://127.0.0.1 download URLs from the
+                # in-process fake storage; disable the HTTPS-only validator.
+                external_location=ExternalLocationConfig(url_validator=None),
             )
         elif request.param == "unix":
             return unix_connect(ConformanceService, java_unix_path, on_log=on_log)

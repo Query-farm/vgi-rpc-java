@@ -17,8 +17,10 @@ import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-/** Unix-domain-socket server transport: one client connection at a time. */
+/** Unix-domain-socket server transport. One instance wraps a single accepted connection. */
 public final class UnixSocketTransport implements RpcTransport {
 
     private final InputStream in;
@@ -38,25 +40,32 @@ public final class UnixSocketTransport implements RpcTransport {
     }
 
     /**
-     * Bind to the given socket path, then serve connections sequentially using
-     * {@code server.serve(transport)}. Each accepted connection gets its own
-     * {@link UnixSocketTransport}.
+     * Bind to the given socket path and serve each accepted connection on a
+     * dedicated virtual thread, so multiple clients can be active concurrently.
+     * The caller's {@link RpcServer} must be safe for concurrent dispatch
+     * (the default {@code RpcServer} is — the user's service impl must be
+     * too).
      */
     public static void serveForever(Path socketPath, RpcServer server) throws IOException {
         Files.deleteIfExists(socketPath);
         UnixDomainSocketAddress addr = UnixDomainSocketAddress.of(socketPath);
+        ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
         try (ServerSocketChannel ssc = ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
             ssc.bind(addr);
             System.out.println("UNIX:" + socketPath);
             System.out.flush();
             while (true) {
                 SocketChannel channel = ssc.accept();
-                try (UnixSocketTransport t = new UnixSocketTransport(channel)) {
-                    server.serve(t);
-                } catch (Exception e) {
-                    // Continue accepting next connection
-                }
+                workers.submit(() -> {
+                    try (UnixSocketTransport t = new UnixSocketTransport(channel)) {
+                        server.serve(t);
+                    } catch (Exception ignore) {
+                        // Per-connection failure must not take the accept loop down.
+                    }
+                });
             }
+        } finally {
+            workers.shutdown();
         }
     }
 }

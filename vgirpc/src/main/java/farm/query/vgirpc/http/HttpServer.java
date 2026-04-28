@@ -9,8 +9,22 @@ import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
+import farm.query.vgirpc.external.UploadUrlProvider;
 import farm.query.vgirpc.transport.RpcTransport;
+import farm.query.vgirpc.wire.Allocators;
+import farm.query.vgirpc.wire.IpcStreamReader;
+import farm.query.vgirpc.wire.IpcStreamWriter;
+import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
+import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.TimeStampMicroTZVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.TimeUnit;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -29,6 +43,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -52,7 +68,25 @@ public final class HttpServer {
 
     public static final String ARROW_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 
+    /** Capability response headers (mirrors {@code vgi_rpc/http/_common.py}). */
+    public static final String MAX_REQUEST_BYTES_HEADER = "VGI-Max-Request-Bytes";
+    public static final String UPLOAD_URL_HEADER = "VGI-Upload-URL-Support";
+    public static final String MAX_UPLOAD_BYTES_HEADER = "VGI-Max-Upload-Bytes";
+
+    /** The synthetic method name used by the {@code __upload_url__} endpoint. */
+    private static final String UPLOAD_URL_METHOD = "__upload_url__";
+    /** Cap on the {@code count} parameter to one {@code __upload_url__/init} call. */
+    private static final int MAX_UPLOAD_URL_COUNT = 100;
+
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** Schema for the upload-URL response batch. */
+    private static final Schema UPLOAD_URL_SCHEMA = new Schema(List.of(
+            new Field("upload_url", FieldType.nullable(new ArrowType.Utf8()), null),
+            new Field("download_url", FieldType.nullable(new ArrowType.Utf8()), null),
+            new Field("expires_at",
+                    FieldType.nullable(new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")),
+                    null)));
 
     private final RpcServer rpc;
     private final HttpStreamHandler streamHandler;
@@ -62,7 +96,10 @@ public final class HttpServer {
     private final String prefix;
     private final long maxRequestBytes;
     private final long maxResponseBytes;
+    private final boolean advertiseMaxRequestBytes;
     private final int zstdLevel;
+    private final UploadUrlProvider uploadUrlProvider;
+    private final Long maxUploadBytes;
     private int port;
 
     /** Defaults: loopback bind, ephemeral port, no prefix, anonymous auth, 1-hour TTL, 16 MiB request/response cap. */
@@ -79,7 +116,10 @@ public final class HttpServer {
         this.prefix = config.prefix();
         this.maxRequestBytes = config.maxRequestBytes();
         this.maxResponseBytes = config.maxResponseBytes();
+        this.advertiseMaxRequestBytes = config.advertiseMaxRequestBytes();
         this.zstdLevel = config.zstdLevel();
+        this.uploadUrlProvider = config.uploadUrlProvider();
+        this.maxUploadBytes = config.maxUploadBytes();
         this.jetty = new Server();
         jetty.addConnector(buildConnector(jetty, config));
 
@@ -153,7 +193,10 @@ public final class HttpServer {
             long maxResponseBytes,
             long idleTimeoutMs,
             int zstdLevel,
-            TlsConfig tls) {
+            TlsConfig tls,
+            boolean advertiseMaxRequestBytes,
+            UploadUrlProvider uploadUrlProvider,
+            Long maxUploadBytes) {
 
         /** 1 hour. */
         public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
@@ -191,6 +234,9 @@ public final class HttpServer {
             private long idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS;
             private int zstdLevel = DEFAULT_ZSTD_LEVEL;
             private TlsConfig tls;
+            private boolean advertiseMaxRequestBytes;
+            private UploadUrlProvider uploadUrlProvider;
+            private Long maxUploadBytes;
 
             public Builder host(String host) { this.host = host; return this; }
             public Builder port(int port) { this.port = port; return this; }
@@ -204,10 +250,17 @@ public final class HttpServer {
             public Builder idleTimeoutMs(long idleTimeoutMs) { this.idleTimeoutMs = idleTimeoutMs; return this; }
             public Builder zstdLevel(int zstdLevel) { this.zstdLevel = zstdLevel; return this; }
             public Builder tls(TlsConfig tls) { this.tls = tls; return this; }
+            /** Advertise {@code VGI-Max-Request-Bytes} on every response. */
+            public Builder advertiseMaxRequestBytes(boolean v) { this.advertiseMaxRequestBytes = v; return this; }
+            /** Wire the {@code __upload_url__/init} endpoint and advertise {@code VGI-Upload-URL-Support: true}. */
+            public Builder uploadUrlProvider(UploadUrlProvider p) { this.uploadUrlProvider = p; return this; }
+            /** Advertised via {@code VGI-Max-Upload-Bytes}; informational only. */
+            public Builder maxUploadBytes(Long v) { this.maxUploadBytes = v; return this; }
 
             public Config build() {
                 return new Config(host, port, prefix, signingKey, tokenTtlSeconds, authenticator,
-                        preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls);
+                        preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls,
+                        advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes);
             }
         }
     }
@@ -227,6 +280,26 @@ public final class HttpServer {
 
     /** Single servlet that dispatches health / unary / stream sub-paths. */
     private final class RouterServlet extends HttpServlet {
+
+        @Override
+        protected void service(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            // Set capability headers on every response (parity with the Python
+            // _CapabilitiesMiddleware: announce externalisation contract upfront).
+            applyCapabilityHeaders(req, resp);
+            try {
+                super.service(req, resp);
+            } catch (jakarta.servlet.ServletException se) {
+                throw new IOException(se);
+            }
+        }
+
+        @Override
+        protected void doOptions(HttpServletRequest req, HttpServletResponse resp) {
+            // Used by clients as the canonical capability-discovery target.
+            resp.setHeader("Cache-Control", "public, max-age=300");
+            resp.setStatus(HttpServletResponse.SC_OK);
+        }
+
         @Override
         protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
             if (runPreHandlers(req, resp)) return;
@@ -247,6 +320,10 @@ public final class HttpServer {
             String rest = pathInfo(req);
             if (rest.isEmpty() || "health".equals(rest)) {
                 resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+                return;
+            }
+            if (UPLOAD_URL_METHOD.equals(rest) || (UPLOAD_URL_METHOD + "/init").equals(rest)) {
+                handleUploadUrl(req, resp);
                 return;
             }
             if (rest.endsWith("/init") || rest.endsWith("/exchange")) {
@@ -270,6 +347,118 @@ public final class HttpServer {
             if (pi == null) return "";
             if (pi.startsWith("/")) pi = pi.substring(1);
             return pi;
+        }
+    }
+
+    /** Set capability-advertisement headers on every response. */
+    private void applyCapabilityHeaders(HttpServletRequest req, HttpServletResponse resp) {
+        if (advertiseMaxRequestBytes) {
+            resp.setHeader(MAX_REQUEST_BYTES_HEADER, Long.toString(maxRequestBytes));
+        }
+        if (uploadUrlProvider != null) {
+            resp.setHeader(UPLOAD_URL_HEADER, "true");
+            if (maxUploadBytes != null) {
+                resp.setHeader(MAX_UPLOAD_BYTES_HEADER, Long.toString(maxUploadBytes));
+            }
+        }
+    }
+
+    /**
+     * True when the request path should bypass the {@code maxRequestBytes} cap.
+     * Mirrors the Python {@code _MaxRequestBytesMiddleware.exempt_prefixes}:
+     * {@code __upload_url__} and {@code health} payloads are intrinsically tiny.
+     */
+    private boolean isMaxBytesExempt(String pathRest) {
+        return pathRest.equals("health")
+                || pathRest.equals(UPLOAD_URL_METHOD)
+                || pathRest.startsWith(UPLOAD_URL_METHOD + "/");
+    }
+
+    private void handleUploadUrl(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        if (uploadUrlProvider == null) {
+            resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+            return;
+        }
+        // Read & validate the request batch (carries vgi_rpc.method=__upload_url__ and a count column)
+        byte[] body;
+        try {
+            // Exempt from maxRequestBytes — _MaxRequestBytesMiddleware skips this prefix.
+            body = readBodyUnbounded(req);
+        } catch (IOException ioe) {
+            resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "could not read request body");
+            return;
+        }
+        int count = 1;
+        try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(body), Allocators.root())) {
+            Map<String, String> meta = r.readNextBatch();
+            if (meta == null) {
+                resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "empty request body");
+                return;
+            }
+            String mname = meta.get(Metadata.RPC_METHOD);
+            if (!UPLOAD_URL_METHOD.equals(mname)) {
+                resp.sendError(HttpServletResponse.SC_BAD_REQUEST,
+                        "method mismatch: expected " + UPLOAD_URL_METHOD);
+                return;
+            }
+            VectorSchemaRoot root = r.root();
+            if (root.getRowCount() > 0) {
+                org.apache.arrow.vector.FieldVector v = root.getVector("count");
+                if (v instanceof BigIntVector bi && !bi.isNull(0)) {
+                    long c = bi.get(0);
+                    if (c > 0) count = (int) Math.min(c, MAX_UPLOAD_URL_COUNT);
+                }
+            }
+        } catch (IOException ioe) {
+            resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "invalid Arrow IPC body");
+            return;
+        }
+        count = Math.max(1, Math.min(count, MAX_UPLOAD_URL_COUNT));
+
+        // Generate the URLs and write the response IPC stream.
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(UPLOAD_URL_SCHEMA, Allocators.root());
+             IpcStreamWriter w = new IpcStreamWriter(out)) {
+            VarCharVector uploadVec = (VarCharVector) root.getVector("upload_url");
+            VarCharVector downloadVec = (VarCharVector) root.getVector("download_url");
+            TimeStampMicroTZVector expiresVec = (TimeStampMicroTZVector) root.getVector("expires_at");
+            uploadVec.allocateNew();
+            downloadVec.allocateNew();
+            expiresVec.allocateNew(count);
+            try {
+                for (int i = 0; i < count; i++) {
+                    UploadUrlProvider.UploadUrl url;
+                    try {
+                        url = uploadUrlProvider.generateUploadUrl();
+                    } catch (Exception e) {
+                        throw new IOException("upload URL generation failed: " + e.getMessage(), e);
+                    }
+                    uploadVec.setSafe(i, url.uploadUrl().getBytes(StandardCharsets.UTF_8));
+                    downloadVec.setSafe(i, url.downloadUrl().getBytes(StandardCharsets.UTF_8));
+                    Instant exp = url.expiresAt() != null ? url.expiresAt() : Instant.now().plusSeconds(3600);
+                    long micros = exp.getEpochSecond() * 1_000_000L + exp.getNano() / 1_000L;
+                    expiresVec.setSafe(i, micros);
+                }
+                root.setRowCount(count);
+                w.writeBatch(root, null);
+            } catch (IOException ioe) {
+                // Fall through: an empty (or partial) IPC body is a server error
+                resp.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+                Wire.writeErrorStream(out, UPLOAD_URL_SCHEMA, ioe, rpc.serverId());
+                writeArrowResponse(req, resp, out.toByteArray());
+                return;
+            }
+        }
+        writeArrowResponse(req, resp, out.toByteArray());
+    }
+
+    private byte[] readBodyUnbounded(HttpServletRequest req) throws IOException {
+        try (InputStream in = req.getInputStream();
+             ByteArrayOutputStream buf = new ByteArrayOutputStream()) {
+            byte[] chunk = new byte[8192];
+            int n;
+            while ((n = in.read(chunk)) > 0) buf.write(chunk, 0, n);
+            return maybeDecodeRequestBody(req, buf.toByteArray());
         }
     }
 
