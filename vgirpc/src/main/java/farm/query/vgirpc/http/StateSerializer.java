@@ -6,6 +6,7 @@ package farm.query.vgirpc.http;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import farm.query.vgirpc.PortableStreamState;
 import farm.query.vgirpc.StreamState;
 
 import java.lang.reflect.Constructor;
@@ -31,6 +32,13 @@ public final class StateSerializer {
     private StateSerializer() {}
 
     public static byte[] serialize(StreamState state) {
+        if (state instanceof PortableStreamState pss) {
+            try {
+                return pss.encode();
+            } catch (Exception e) {
+                throw new RuntimeException("state encode failed: " + state.getClass().getName(), e);
+            }
+        }
         try {
             ObjectNode root = JSON.createObjectNode();
             for (Field f : declaredFields(state.getClass())) {
@@ -45,6 +53,15 @@ public final class StateSerializer {
     }
 
     public static <S extends StreamState> S deserialize(byte[] data, Class<S> cls) {
+        if (PortableStreamState.class.isAssignableFrom(cls)) {
+            try {
+                S instance = newInstance(cls);
+                ((PortableStreamState) instance).decode(data);
+                return instance;
+            } catch (Exception e) {
+                throw new RuntimeException("state decode failed: " + cls.getName(), e);
+            }
+        }
         try {
             JsonNode root = JSON.readTree(data);
             S instance = newInstance(cls);
@@ -62,7 +79,10 @@ public final class StateSerializer {
                 else if (t == short.class  || t == Short.class)   f.setShort(instance, (short) node.asInt());
                 else if (t == String.class)                       f.set(instance, node.asText());
                 // Generic types (List, Map, custom records) round-trip via Jackson; they must be JSON-friendly.
-                else f.set(instance, JSON.treeToValue(node, t));
+                // Use the field's generic type (List<Long>, Map<String,Double>, ...) so collection
+                // values come back with their declared component types, not stringly-typed JSON nodes.
+                else f.set(instance, JSON.convertValue(node,
+                        JSON.getTypeFactory().constructType(f.getGenericType())));
             }
             return instance;
         } catch (Exception e) {
