@@ -137,6 +137,11 @@ public final class IpcStreamReader implements AutoCloseable {
         // VectorSchemaRoot's buffer count matches the wire batch. We resolve
         // values via the dictionary provider during decode. The original
         // schema (with DictionaryEncoding) is kept on `schema` for callers.
+        // Build a schema whose Field-level storage type matches the index
+        // type for dict-encoded columns (so the VectorLoader allocates
+        // index-typed vectors), but keep the DictionaryEncoding metadata
+        // attached so the original column type is recoverable for
+        // round-tripping through downstream writers.
         java.util.List<Field> rootFields = new java.util.ArrayList<>();
         for (Field f : raw.getFields()) {
             rootFields.add(stripDictEncoding(f));
@@ -146,11 +151,17 @@ public final class IpcStreamReader implements AutoCloseable {
         this.root = VectorSchemaRoot.create(rootSchema, allocator);
     }
 
+    /**
+     * Replace a dict-encoded {@link Field} with one whose storage type is
+     * the dictionary's index type, keeping the DictionaryEncoding attached
+     * so writers can re-emit the proper schema/dict-batch pair. Recurses
+     * into children for nested dict-encoded fields.
+     */
     private static Field stripDictEncoding(Field f) {
         DictionaryEncoding de = f.getDictionary();
         if (de != null) {
             return new Field(f.getName(),
-                    new FieldType(f.isNullable(), de.getIndexType(), null),
+                    new FieldType(f.isNullable(), de.getIndexType(), de),
                     java.util.Collections.emptyList());
         }
         java.util.List<Field> kids = f.getChildren();

@@ -454,7 +454,7 @@ public final class RpcServer {
             transport.writer().flush();
             return false;
         }
-        flushCollector(outputWriter, out);
+        flushCollector(outputWriter, out, inputReader.dictionaryProvider());
         transport.writer().flush();
         if (castRoot != null) castRoot.close();
         if (resolvedRoot != null) resolvedRoot.close();
@@ -475,6 +475,20 @@ public final class RpcServer {
     }
 
     private void flushCollector(IpcStreamWriter writer, OutputCollector out) throws IOException {
+        flushCollector(writer, out, null);
+    }
+
+    /**
+     * Variant that threads the inbound stream's {@link
+     * org.apache.arrow.vector.dictionary.DictionaryProvider} through to the
+     * writer, so dict-encoded columns (DuckDB ENUMs) round-trip through
+     * passthrough handlers like {@code echo} with their dictionaries
+     * intact. Without this the consumer sees raw index columns and renders
+     * them as unbound nulls.
+     */
+    private void flushCollector(IpcStreamWriter writer, OutputCollector out,
+                                  org.apache.arrow.vector.dictionary.DictionaryProvider dictProvider)
+            throws IOException {
         for (OutputCollector.Entry e : out.entries()) {
             try {
                 if (e.isData() && externalConfig != null && externalConfig.storage() != null) {
@@ -483,7 +497,7 @@ public final class RpcServer {
                                 e.root(), e.customMetadata(), externalConfig);
                         if (ptr != null) {
                             try (VectorSchemaRoot pr = ptr.root()) {
-                                writer.writeBatch(pr, ptr.customMetadata());
+                                writer.writeBatch(pr, ptr.customMetadata(), dictProvider);
                             }
                             continue;
                         }
@@ -492,7 +506,7 @@ public final class RpcServer {
                         // failing the stream. The client will still receive valid data.
                     }
                 }
-                writer.writeBatch(e.root(), e.customMetadata());
+                writer.writeBatch(e.root(), e.customMetadata(), dictProvider);
             } finally {
                 e.root().close();
             }
