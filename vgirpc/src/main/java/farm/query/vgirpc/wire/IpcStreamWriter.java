@@ -41,7 +41,17 @@ import java.util.Map;
 public final class IpcStreamWriter implements AutoCloseable {
 
     private final WritableByteChannel rawChannel;
-    private final WriteChannel out;
+    /**
+     * Shared {@link WriteChannel}. Once {@link #delegate} is constructed, this
+     * field is replaced with the delegate's internal WriteChannel so the
+     * per-WriteChannel {@code currentPosition} counter — which drives 8-byte
+     * message alignment via {@code align()} — stays consistent across the
+     * stock writer's schema/dict emission and our hand-rolled record-batch
+     * emission. Two independent WriteChannels on the same underlying byte
+     * channel would desync (each starts at position 0), corrupting the
+     * stream's alignment padding for record batches that follow dict batches.
+     */
+    private WriteChannel out;
     private ArrowStreamWriter delegate;
     private Schema declaredSchema;
     private boolean schemaEmittedDirect;
@@ -147,6 +157,31 @@ public final class IpcStreamWriter implements AutoCloseable {
         delegate = new ArrowStreamWriter(root, p, rawChannel);
         delegate.start();
         declaredSchema = null;
+        // Adopt the delegate's WriteChannel so currentPosition (which drives
+        // 8-byte message-frame alignment via WriteChannel.align()) stays
+        // consistent across the stock writer's schema/dict emission and our
+        // hand-rolled record-batch emission. Two independent WriteChannels
+        // on the same underlying byte channel would each start at position 0
+        // and pad inconsistently.
+        this.out = delegateWriteChannel(delegate);
+    }
+
+    /**
+     * Pull the stock writer's internal {@link WriteChannel} (field
+     * {@code ArrowWriter.out}) so that record batches written through us
+     * share the delegate's position counter. Reflection is the only path —
+     * the field is package-private with no accessor.
+     */
+    private static WriteChannel delegateWriteChannel(ArrowStreamWriter delegate) {
+        try {
+            java.lang.reflect.Field f =
+                    org.apache.arrow.vector.ipc.ArrowWriter.class.getDeclaredField("out");
+            f.setAccessible(true);
+            return (WriteChannel) f.get(delegate);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException("Cannot access ArrowWriter.out reflectively; "
+                    + "Arrow Java API likely changed", e);
+        }
     }
 
     private static VectorUnloader unloaderFor(VectorSchemaRoot root) {
