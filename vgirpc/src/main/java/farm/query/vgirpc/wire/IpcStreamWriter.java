@@ -8,143 +8,180 @@ import org.apache.arrow.flatbuf.KeyValue;
 import org.apache.arrow.flatbuf.Message;
 import org.apache.arrow.flatbuf.MessageHeader;
 import org.apache.arrow.flatbuf.MetadataVersion;
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.compression.NoCompressionCodec;
-import org.apache.arrow.vector.dictionary.Dictionary;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.ipc.WriteChannel;
-import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.ipc.message.IpcOption;
 import org.apache.arrow.vector.ipc.message.MessageSerializer;
-import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
-import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.channels.Channels;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
+import java.nio.channels.WritableByteChannel;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Arrow IPC stream writer that supports per-batch {@code custom_metadata}.
- * The high-level {@link org.apache.arrow.vector.ipc.ArrowStreamWriter} does not
- * expose custom_metadata, so we construct the Message flatbuffer ourselves.
+ *
+ * <p>Stock {@link ArrowStreamWriter} handles schema messages, dictionary
+ * batches and the EOS marker for free, but its {@code writeBatch()} method
+ * is tied to the {@link VectorSchemaRoot} given at construction time — VGI
+ * emits multiple distinct VSRs into one stream (each batch from a producer
+ * may be a freshly-allocated root), so we use the stock writer only for
+ * {@link ArrowStreamWriter#start()} (schema + dict batches via
+ * {@code ensureDictionariesWritten}) and emit each record batch ourselves
+ * with optional {@code custom_metadata} on the Message header.</p>
  */
 public final class IpcStreamWriter implements AutoCloseable {
 
-    private static final int IPC_CONTINUATION_TOKEN = MessageSerializer.IPC_CONTINUATION_TOKEN;
-
+    private final WritableByteChannel rawChannel;
     private final WriteChannel out;
-    private boolean schemaWritten;
+    private ArrowStreamWriter delegate;
+    private Schema declaredSchema;
+    private boolean schemaEmittedDirect;
     private boolean closed;
-    private final Set<Long> dictionariesWritten = new HashSet<>();
 
     public IpcStreamWriter(OutputStream raw) {
-        this.out = new WriteChannel(Channels.newChannel(raw));
+        this.rawChannel = Channels.newChannel(raw);
+        this.out = new WriteChannel(rawChannel);
     }
 
+    /**
+     * Record the schema this stream will carry. Actual emission is deferred:
+     * if a {@link #writeBatch(VectorSchemaRoot, Map, DictionaryProvider)}
+     * follows, the underlying {@link ArrowStreamWriter} emits the batch's
+     * own schema (which must match the declared schema). If only an
+     * {@link #writeBatch(ArrowRecordBatch, Map)} follows, this schema is
+     * emitted just-in-time. If neither follows, {@link #close()} emits the
+     * declared schema as a zero-batch stream.
+     */
     public void writeSchema(Schema schema) throws IOException {
-        if (schemaWritten) throw new IllegalStateException("schema already written");
-        MessageSerializer.serialize(out, schema);
-        schemaWritten = true;
+        if (delegate != null) throw new IllegalStateException("batches already emitted");
+        if (declaredSchema != null) throw new IllegalStateException("schema already declared");
+        declaredSchema = schema;
     }
 
-    /** Convenience: serialise the contents of a {@link VectorSchemaRoot} as a batch. */
     public void writeBatch(VectorSchemaRoot root, Map<String, String> customMetadata) throws IOException {
         writeBatch(root, customMetadata, null);
     }
 
     /**
-     * Variant that emits dictionary batches before the first record batch
-     * for any dict-encoded fields in {@code root}'s schema. Without this
-     * the consumer sees dict-index columns with no dictionary bound to
-     * resolve them against; ENUM-style round-trips collapse to zero rows.
+     * Write a record batch. On the first call: emits the schema and any
+     * required dictionary batches via the stock {@link ArrowStreamWriter}
+     * (which handles nested fields, idempotent dict emission, and provider
+     * lookups). Subsequent calls bypass the stock writer's per-batch path
+     * (which would re-unload the constructor's VSR and ignore {@code root})
+     * and emit the caller's batch directly.
      */
     public void writeBatch(VectorSchemaRoot root, Map<String, String> customMetadata,
                             DictionaryProvider provider) throws IOException {
-        if (!schemaWritten) writeSchema(root.getSchema());
-        if (provider != null) writeDictionariesIfNeeded(root.getSchema(), provider);
-        VectorUnloader unloader = new VectorUnloader(root, true,
-                NoCompressionCodec.INSTANCE, true);
+        ensureSchemaAndDictsStarted(root, provider);
+        VectorUnloader unloader = unloaderFor(root);
         try (ArrowRecordBatch batch = unloader.getRecordBatch()) {
-            writeBatch(batch, customMetadata);
+            writeRecordBatch(batch, customMetadata);
         }
     }
 
     /**
-     * Walk the schema, collect every {@link DictionaryEncoding} id referenced,
-     * and emit one DictionaryBatch per id (looking the actual dictionary up
-     * in {@code provider}). Idempotent across multiple calls — a dict-id is
-     * only written once per stream. Quiet no-op if the provider doesn't have
-     * the dict (the consumer's loader will fail loudly if the index column
-     * still reaches it; better to fail with a missing-dict than a stale one).
-     */
-    private void writeDictionariesIfNeeded(Schema schema, DictionaryProvider provider) throws IOException {
-        for (Field f : schema.getFields()) writeDictionaryFor(f, provider);
-    }
-
-    private void writeDictionaryFor(Field f, DictionaryProvider provider) throws IOException {
-        DictionaryEncoding enc = f.getDictionary();
-        if (enc != null && dictionariesWritten.add(enc.getId())) {
-            Dictionary dict = provider.lookup(enc.getId());
-            if (dict != null) {
-                FieldVector dv = dict.getVector();
-                Schema dictSchema = new Schema(List.of(dv.getField()));
-                try (VectorSchemaRoot dictRoot = new VectorSchemaRoot(dictSchema, List.of(dv), dv.getValueCount())) {
-                    VectorUnloader unloader = new VectorUnloader(dictRoot, true,
-                            NoCompressionCodec.INSTANCE, true);
-                    try (ArrowRecordBatch rb = unloader.getRecordBatch()) {
-                        ArrowDictionaryBatch dictBatch = new ArrowDictionaryBatch(enc.getId(), rb, false);
-                        try {
-                            MessageSerializer.serialize(out, dictBatch);
-                        } finally {
-                            dictBatch.close();
-                        }
-                    }
-                }
-            }
-        }
-        // Recurse into nested fields so dict-encoded children inside structs /
-        // lists / maps are also emitted.
-        for (Field child : f.getChildren()) writeDictionaryFor(child, provider);
-    }
-
-    /**
-     * Write an existing {@link ArrowRecordBatch} message with optional custom metadata.
-     * Reproduces the wire layout produced by Arrow's reference Python writer.
+     * Write an existing {@link ArrowRecordBatch}. The schema is emitted
+     * just-in-time if not already; no dictionary batches are emitted here
+     * (callers using this path do not have dict-encoded fields, since they
+     * pass a pre-built record batch with no provider context).
      */
     public void writeBatch(ArrowRecordBatch batch, Map<String, String> customMetadata) throws IOException {
+        if (delegate == null && !schemaEmittedDirect) {
+            if (declaredSchema == null) {
+                throw new IllegalStateException("writeSchema(Schema) must be called before writeBatch(ArrowRecordBatch, ...)");
+            }
+            MessageSerializer.serialize(out, declaredSchema);
+            schemaEmittedDirect = true;
+            declaredSchema = null;
+        }
+        writeRecordBatch(batch, customMetadata);
+    }
+
+    /** Write the EOS marker. Idempotent on close. */
+    public void writeEos() throws IOException {
+        ArrowStreamWriter.writeEndOfStream(out, IpcOption.DEFAULT);
+    }
+
+    @Override
+    public void close() throws IOException {
+        if (closed) return;
+        closed = true;
+        if (delegate != null) {
+            // Write EOS via the stock writer's end(), but do NOT call
+            // delegate.close() — that would close the underlying channel
+            // (the per-connection socket), but in VGI the channel persists
+            // across many RPCs on the same connection.
+            delegate.end();
+            return;
+        }
+        if (!schemaEmittedDirect) {
+            Schema s = declaredSchema != null ? declaredSchema : new Schema(java.util.Collections.emptyList());
+            MessageSerializer.serialize(out, s);
+        }
+        writeEos();
+    }
+
+    /**
+     * On the first batch, construct the stock {@link ArrowStreamWriter} and
+     * call {@code start()} so it emits the schema and any dictionary
+     * batches. We then take over record-batch emission ourselves; the stock
+     * writer's record-batch path is tied to {@code root} and would ignore
+     * subsequent VSRs.
+     */
+    private void ensureSchemaAndDictsStarted(VectorSchemaRoot root, DictionaryProvider provider) throws IOException {
+        if (delegate != null) return;
+        if (schemaEmittedDirect) {
+            throw new IllegalStateException("schema already emitted via writeBatch(ArrowRecordBatch, ...)");
+        }
+        DictionaryProvider p = provider != null ? provider
+                : new org.apache.arrow.vector.dictionary.DictionaryProvider.MapDictionaryProvider();
+        delegate = new ArrowStreamWriter(root, p, rawChannel);
+        delegate.start();
+        declaredSchema = null;
+    }
+
+    private static VectorUnloader unloaderFor(VectorSchemaRoot root) {
+        return new VectorUnloader(root, /*includeNullCount*/ true,
+                NoCompressionCodec.INSTANCE, /*alignBuffers*/ true);
+    }
+
+    private void writeRecordBatch(ArrowRecordBatch batch, Map<String, String> customMetadata) throws IOException {
+        if (customMetadata == null || customMetadata.isEmpty()) {
+            MessageSerializer.serialize(out, batch);
+        } else {
+            writeRecordBatchWithMetadata(out, batch, customMetadata);
+        }
+    }
+
+    /**
+     * Build a {@link Message} flatbuffer for {@code batch} with
+     * {@code custom_metadata} attached and emit it (header frame + body).
+     * Mirrors what {@code MessageSerializer.serialize(WriteChannel,
+     * ArrowRecordBatch)} does internally; the only delta is the extra
+     * {@code custom_metadata} vector on the Message.
+     */
+    private static void writeRecordBatchWithMetadata(WriteChannel out, ArrowRecordBatch batch,
+                                                      Map<String, String> customMetadata) throws IOException {
         FlatBufferBuilder builder = new FlatBufferBuilder();
         int header = batch.writeTo(builder);
         long bodyLength = batch.computeBodyLength();
-        int customMetaOffset = customMetadata == null || customMetadata.isEmpty()
-                ? 0
-                : buildKeyValueVector(builder, customMetadata);
+        int customMetaOffset = buildKeyValueVector(builder, customMetadata);
         int messageOffset = Message.createMessage(builder, MetadataVersion.V5,
                 MessageHeader.RecordBatch, header, bodyLength, customMetaOffset);
         builder.finish(messageOffset);
         ByteBuffer messageBytes = builder.dataBuffer();
 
-        writeMessageFrame(messageBytes);
+        MessageSerializer.writeMessageBuffer(out, messageBytes.remaining(), messageBytes);
         MessageSerializer.writeBatchBuffers(out, batch);
-    }
-
-    /** Schema with custom_metadata is currently unsupported by writers in this implementation. */
-    public void writeEos() throws IOException {
-        ByteBuffer eos = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
-        eos.putInt(IPC_CONTINUATION_TOKEN);
-        eos.putInt(0);
-        eos.flip();
-        out.write(eos);
     }
 
     private static int buildKeyValueVector(FlatBufferBuilder b, Map<String, String> meta) {
@@ -156,35 +193,5 @@ public final class IpcStreamWriter implements AutoCloseable {
             entries[i++] = KeyValue.createKeyValue(b, key, val);
         }
         return Message.createCustomMetadataVector(b, entries);
-    }
-
-    /**
-     * Write the framing for a Message: continuation token, 4-byte little-endian
-     * length, the metadata bytes, then padding to 8 bytes.
-     */
-    private void writeMessageFrame(ByteBuffer messageBytes) throws IOException {
-        int len = messageBytes.remaining();
-        int padded = (len + 7) & ~7;
-        int padding = padded - len;
-
-        ByteBuffer header = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
-        header.putInt(IPC_CONTINUATION_TOKEN);
-        header.putInt(padded);
-        header.flip();
-        out.write(header);
-        out.write(messageBytes);
-        if (padding > 0) {
-            out.write(ByteBuffer.allocate(padding));
-        }
-    }
-
-    @Override
-    public void close() throws IOException {
-        if (closed) return;
-        closed = true;
-        if (!schemaWritten) {
-            writeSchema(new Schema(java.util.Collections.emptyList()));
-        }
-        writeEos();
     }
 }
