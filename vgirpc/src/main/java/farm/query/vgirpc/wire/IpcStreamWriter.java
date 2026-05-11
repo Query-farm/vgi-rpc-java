@@ -155,7 +155,16 @@ public final class IpcStreamWriter implements AutoCloseable {
         DictionaryProvider p = provider != null ? provider
                 : new org.apache.arrow.vector.dictionary.DictionaryProvider.MapDictionaryProvider();
         delegate = new ArrowStreamWriter(root, p, rawChannel);
+        // start() writes the schema only. ArrowWriter.writeBatch() normally
+        // calls ensureDictionariesWritten next, but we bypass writeBatch
+        // (its record-batch path is tied to the constructor's VSR). Trigger
+        // the dict-batch emission ourselves so dict-encoded columns survive
+        // the round-trip — without this the consumer sees a schema that
+        // declares dict<int, utf8> but no preceding dict batch, and
+        // pyarrow/Arrow C++ rejects the stream with "IPC stream did not
+        // have the expected number of dictionaries at the start".
         delegate.start();
+        invokeEnsureDictionariesWritten(delegate);
         declaredSchema = null;
         // Adopt the delegate's WriteChannel so currentPosition (which drives
         // 8-byte message-frame alignment via WriteChannel.align()) stays
@@ -181,6 +190,30 @@ public final class IpcStreamWriter implements AutoCloseable {
         } catch (ReflectiveOperationException e) {
             throw new RuntimeException("Cannot access ArrowWriter.out reflectively; "
                     + "Arrow Java API likely changed", e);
+        }
+    }
+
+    /**
+     * Invoke {@code ArrowWriter.ensureDictionariesWritten(provider,
+     * dictionaryIdsUsed)} reflectively. Stock's {@code writeBatch()} does
+     * this between {@code ensureStarted()} and {@code writeRecordBatch()};
+     * we replicate that step because we don't go through {@code writeBatch}.
+     */
+    private static void invokeEnsureDictionariesWritten(ArrowStreamWriter delegate) {
+        try {
+            Class<?> writerCls = org.apache.arrow.vector.ipc.ArrowWriter.class;
+            java.lang.reflect.Field providerField = writerCls.getDeclaredField("dictionaryProvider");
+            providerField.setAccessible(true);
+            java.lang.reflect.Field idsField = writerCls.getDeclaredField("dictionaryIdsUsed");
+            idsField.setAccessible(true);
+            java.lang.reflect.Method ensure = writerCls.getDeclaredMethod(
+                    "ensureDictionariesWritten", DictionaryProvider.class, java.util.Set.class);
+            ensure.setAccessible(true);
+            ensure.invoke(delegate, providerField.get(delegate), idsField.get(delegate));
+        } catch (ReflectiveOperationException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new RuntimeException("Cannot invoke ArrowWriter.ensureDictionariesWritten; "
+                    + "Arrow Java API likely changed", cause);
         }
     }
 
