@@ -554,6 +554,7 @@ public final class Marshalling {
      */
     public static VectorSchemaRoot castRoot(VectorSchemaRoot source, Schema target, BufferAllocator alloc) {
         if (source.getSchema().equals(target)) return source;
+        if (schemasEquivalentModuloDictMemory(source.getSchema(), target)) return source;
         if (source.getSchema().getFields().size() != target.getFields().size()) {
             throw new IllegalArgumentException(
                     "Input schema mismatch: expected " + target.getFields().size()
@@ -576,6 +577,35 @@ public final class Marshalling {
         }
         out.setRowCount(rows);
         return out;
+    }
+
+    /**
+     * Returns {@code true} when {@code source} is the memory-format counterpart
+     * of {@code target} — same field count, same names, and each pair is either
+     * equal or differs only in the dict-encoded representation (memory format
+     * carries the {@link DictionaryEncoding#getIndexType index type} on the
+     * field while wire format carries the value type plus the
+     * {@code DictionaryEncoding}). The vectors are usable as-is in either
+     * representation; downstream emit picks up the wire schema from each
+     * vector's preserved {@code Field}.
+     */
+    private static boolean schemasEquivalentModuloDictMemory(Schema source, Schema target) {
+        if (source.getFields().size() != target.getFields().size()) return false;
+        for (int i = 0; i < source.getFields().size(); i++) {
+            Field sf = source.getFields().get(i);
+            Field tf = target.getFields().get(i);
+            if (sf.equals(tf)) continue;
+            if (!sf.getName().equals(tf.getName())) return false;
+            org.apache.arrow.vector.types.pojo.DictionaryEncoding senc = sf.getDictionary();
+            org.apache.arrow.vector.types.pojo.DictionaryEncoding tenc = tf.getDictionary();
+            if (senc == null || tenc == null) return false;
+            if (senc.getId() != tenc.getId()) return false;
+            // Memory-format source carries the index type on the field; wire-
+            // format target carries the value type. Confirm the source type
+            // matches the dictionary's index type.
+            if (!sf.getType().equals(tenc.getIndexType())) return false;
+        }
+        return true;
     }
 
     private static void copyCast(FieldVector sv, Field sf, FieldVector tv, Field tf, int rows) {
