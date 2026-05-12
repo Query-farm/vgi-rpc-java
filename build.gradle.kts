@@ -13,6 +13,21 @@ allprojects {
 
 subprojects {
     apply(plugin = "java")
+    apply(plugin = "maven-publish")
+
+    afterEvaluate {
+        // Only publish modules that produce a Java component (skip
+        // platform-only or test-only projects that don't define one).
+        if (components.findByName("java") != null) {
+            extensions.configure<PublishingExtension> {
+                publications {
+                    create<MavenPublication>("maven") {
+                        from(components["java"])
+                    }
+                }
+            }
+        }
+    }
 
     extensions.configure<JavaPluginExtension> {
         toolchain {
