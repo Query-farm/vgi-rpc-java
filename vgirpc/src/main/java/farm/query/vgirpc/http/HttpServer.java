@@ -133,6 +133,11 @@ public final class HttpServer {
         this.advertisedMaxResponseBytes = config.advertisedMaxResponseBytes();
         this.advertisedMaxExternalizedResponseBytes = config.advertisedMaxExternalizedResponseBytes();
         this.jetty = new Server();
+        // Graceful-shutdown window: Jetty.stop() waits up to this many ms for
+        // in-flight requests to finish before forcing closes. 15s is enough
+        // for a worker tick to complete (NS API timeout is 10s) without
+        // dragging out PaaS-side rolling restarts.
+        jetty.setStopTimeout(15_000L);
         jetty.addConnector(buildConnector(jetty, config));
 
         ServletContextHandler ctx = new ServletContextHandler();
