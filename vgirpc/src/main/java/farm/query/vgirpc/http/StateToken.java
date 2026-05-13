@@ -11,27 +11,31 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 /**
- * HTTP streaming state token: HMAC-SHA256 signed envelope holding stream state,
+ * HTTP streaming state token: AEAD-sealed envelope holding stream state,
  * schemas, and a stream id so the server can recover on the next exchange.
  *
- * <p>Wire-compatible with Python {@code vgi_rpc.http.server._state_token} (v3):
+ * <p>Wire format (v4):
  * <pre>
- *   [1 byte:  version=3]
- *   [8 bytes: created_at uint64 LE]
- *   [4 bytes: state_len uint32 LE] [state bytes]
- *   [4 bytes: schema_len uint32 LE] [output_schema bytes]
- *   [4 bytes: input_schema_len uint32 LE] [input_schema bytes]
- *   [4 bytes: stream_id_len uint32 LE] [stream_id utf8]
- *   [32 bytes: HMAC-SHA256(perPrincipalKey, all above)]
+ *   base64(
+ *     [1 byte:  version = 4]
+ *     [12 bytes: ChaCha20-Poly1305 nonce (random)]
+ *     [..]      ciphertext + Poly1305 tag
+ *               plaintext:
+ *                 [8 bytes:  created_at uint64 LE]
+ *                 [4 bytes:  state_len uint32 LE]   [state bytes]
+ *                 [4 bytes:  schema_len uint32 LE]  [output_schema bytes]
+ *                 [4 bytes:  input_schema_len LE]   [input_schema bytes]
+ *                 [4 bytes:  stream_id_len LE]      [stream_id utf8]
+ *   )
  * </pre>
- * The whole thing is base64 encoded for UTF-8-safe Arrow custom metadata.
  *
- * <p>The MAC is keyed by {@link Crypto#deriveStateTokenKey}(signingKey, principal)
- * rather than by {@code signingKey} directly. This binds the token to the
- * authenticated principal: an attacker who sniffs or exfiltrates user A's token
- * cannot replay it as user B — the verifier derives B's key and HMAC fails.
- * Anonymous streams bind to the empty string; as long as {@code /init} and
- * {@code /exchange} agree on the principal, the token round-trips.</p>
+ * <p>The {@code created_at} timestamp lives inside the ciphertext so TTL
+ * enforcement runs after authenticity is established. The version byte is
+ * informational (a self-describing format marker); a tampered version byte
+ * still fails decryption because we use the matching algorithm for that
+ * version. The {@code principal} is bound via AEAD associated data —
+ * a token minted for one identity fails decryption when presented by
+ * another, with no per-principal key derivation needed.</p>
  */
 public record StateToken(
         byte[] state,
@@ -40,8 +44,11 @@ public record StateToken(
         String streamId,
         long createdAt) {
 
-    private static final byte VERSION = 3;
-    private static final int HMAC_LEN = 32;
+    private static final byte VERSION = 4;
+    private static final int VERSION_LEN = 1;
+
+    /** Prefix mixed into AEAD AAD to bind tokens to a format generation. */
+    private static final byte[] AAD_PREFIX = "vgi_rpc.state.v4\0".getBytes(StandardCharsets.UTF_8);
 
     public StateToken {
         state = state.clone();
@@ -55,57 +62,65 @@ public record StateToken(
     @Override public byte[] inputSchema()  { return inputSchema.clone(); }
 
     /**
-     * Serialise + HMAC-sign + base64-encode the token. The signing key is
-     * derived per-{@code principal} so the token cannot be replayed by a
-     * different user; pass {@code ""} for anonymous streams.
+     * Serialise, AEAD-seal, and base64-encode the token. The AAD binds the
+     * token to {@code principal} so it cannot be opened by a different
+     * caller; pass {@code ""} (or {@code null}) for anonymous streams.
      */
-    public byte[] pack(byte[] signingKey, String principal) {
+    public byte[] pack(byte[] tokenKey, String principal) {
         byte[] streamIdBytes = streamId.getBytes(StandardCharsets.UTF_8);
-        int payloadLen = 1 + 8
+        int payloadLen = 8
                 + 4 + state.length
                 + 4 + outputSchema.length
                 + 4 + inputSchema.length
                 + 4 + streamIdBytes.length;
         ByteBuffer payload = ByteBuffer.allocate(payloadLen).order(ByteOrder.LITTLE_ENDIAN);
-        payload.put(VERSION);
         payload.putLong(createdAt);
         putSegment(payload, state);
         putSegment(payload, outputSchema);
         putSegment(payload, inputSchema);
         putSegment(payload, streamIdBytes);
-        byte[] payloadBytes = payload.array();
-        byte[] mac = Crypto.hmacSha256(Crypto.deriveStateTokenKey(signingKey, principal), payloadBytes);
-        byte[] full = new byte[payloadBytes.length + HMAC_LEN];
-        System.arraycopy(payloadBytes, 0, full, 0, payloadBytes.length);
-        System.arraycopy(mac, 0, full, payloadBytes.length, HMAC_LEN);
-        return Base64.getEncoder().encode(full);
+        byte[] sealed = Crypto.chacha20Poly1305Seal(tokenKey, payload.array(), aad(principal));
+        byte[] wire = new byte[VERSION_LEN + sealed.length];
+        wire[0] = VERSION;
+        System.arraycopy(sealed, 0, wire, VERSION_LEN, sealed.length);
+        return Base64.getEncoder().encode(wire);
     }
 
     /**
-     * Decode + verify + unpack the token. The verifier derives the same
-     * per-{@code principal} key as {@link #pack}; a mismatched principal
-     * fails HMAC verification identically to any other tamper.
+     * Decode + open + unpack the token. Decryption (which checks the
+     * Poly1305 tag) authenticates the payload; any tampering, wrong key,
+     * or AAD mismatch (e.g. cross-principal replay) surfaces as an
+     * IllegalArgumentException with a uniform "signature" message so
+     * callers cannot distinguish failure modes via timing or message.
      * TTL disabled when {@code ttlSeconds <= 0}.
      */
-    public static StateToken unpack(byte[] b64, byte[] signingKey, long ttlSeconds, String principal) {
-        byte[] raw = Base64.getDecoder().decode(b64);
-        if (raw.length < 1 + 8 + 4 * 4 + HMAC_LEN) {
+    public static StateToken unpack(byte[] b64, byte[] tokenKey, long ttlSeconds, String principal) {
+        byte[] raw;
+        try {
+            raw = Base64.getDecoder().decode(b64);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Malformed state token", e);
+        }
+        if (raw.length < VERSION_LEN + Crypto.AEAD_NONCE_LEN + Crypto.AEAD_TAG_LEN) {
             throw new IllegalArgumentException("Malformed state token");
         }
-        int payloadEnd = raw.length - HMAC_LEN;
-        byte[] payloadBytes = new byte[payloadEnd];
-        System.arraycopy(raw, 0, payloadBytes, 0, payloadEnd);
-        byte[] receivedMac = new byte[HMAC_LEN];
-        System.arraycopy(raw, payloadEnd, receivedMac, 0, HMAC_LEN);
-        byte[] expectedMac = Crypto.hmacSha256(Crypto.deriveStateTokenKey(signingKey, principal), payloadBytes);
-        if (!Crypto.constantTimeEquals(receivedMac, expectedMac)) {
-            throw new IllegalArgumentException("State token signature verification failed");
-        }
-        ByteBuffer bb = ByteBuffer.wrap(payloadBytes).order(ByteOrder.LITTLE_ENDIAN);
-        byte version = bb.get();
+        byte version = raw[0];
         if (version != VERSION) {
-            throw new IllegalArgumentException("Unsupported state token version " + version + " (expected " + VERSION + ")");
+            throw new IllegalArgumentException("Unsupported state token version " + version
+                    + " (expected " + VERSION + ")");
         }
+        byte[] sealed = new byte[raw.length - VERSION_LEN];
+        System.arraycopy(raw, VERSION_LEN, sealed, 0, sealed.length);
+        byte[] plaintext;
+        try {
+            plaintext = Crypto.chacha20Poly1305Open(tokenKey, sealed, aad(principal));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("State token signature verification failed", e);
+        }
+        if (plaintext.length < 8) {
+            throw new IllegalArgumentException("Malformed state token");
+        }
+        ByteBuffer bb = ByteBuffer.wrap(plaintext).order(ByteOrder.LITTLE_ENDIAN);
         long createdAt = bb.getLong();
         if (ttlSeconds > 0) {
             long now = System.currentTimeMillis() / 1000;
@@ -120,6 +135,28 @@ public record StateToken(
         byte[] streamIdBytes = getSegment(bb);
         return new StateToken(state, outputSchema, inputSchema,
                 new String(streamIdBytes, StandardCharsets.UTF_8), createdAt);
+    }
+
+    /**
+     * Build the AAD that binds a state token to its caller. Anonymous and
+     * authenticated tokens produce distinct AAD strings so an anonymous
+     * token cannot be presented under a named identity (and vice versa).
+     */
+    private static byte[] aad(String principal) {
+        String p = principal != null ? principal : "";
+        byte[] tail;
+        if (p.isEmpty()) {
+            tail = new byte[]{0x00, 'a', 'n', 'o', 'n', 'y', 'm', 'o', 'u', 's'};
+        } else {
+            byte[] pBytes = p.getBytes(StandardCharsets.UTF_8);
+            tail = new byte[1 + pBytes.length];
+            tail[0] = 0x01;
+            System.arraycopy(pBytes, 0, tail, 1, pBytes.length);
+        }
+        byte[] out = new byte[AAD_PREFIX.length + tail.length];
+        System.arraycopy(AAD_PREFIX, 0, out, 0, AAD_PREFIX.length);
+        System.arraycopy(tail, 0, out, AAD_PREFIX.length, tail.length);
+        return out;
     }
 
     private static void putSegment(ByteBuffer b, byte[] seg) {

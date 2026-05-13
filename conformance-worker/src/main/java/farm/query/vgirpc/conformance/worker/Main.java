@@ -45,7 +45,7 @@ public final class Main {
         ConformanceService impl = new ConformanceServiceImpl();
         RpcServer server = new RpcServer(ConformanceService.class, impl);
 
-        byte[] signingKey = null;
+        byte[] tokenKey = null;
         long tokenTtl = 0;
         String mode = null;
         String unixPath = null;
@@ -68,7 +68,7 @@ public final class Main {
             switch (a) {
                 case "--http" -> mode = "http";
                 case "--unix" -> { mode = "unix"; unixPath = c.requireValue(a); }
-                case "--signing-key" -> signingKey = HexFormat.of().parseHex(c.requireValue(a));
+                case "--token-key" -> tokenKey = HexFormat.of().parseHex(c.requireValue(a));
                 case "--token-ttl" -> tokenTtl = Long.parseLong(c.requireValue(a));
                 case "--auth-bearer" -> authenticator = buildBearer(c.requireValue(a));
                 case "--auth-mtls" -> {
@@ -121,7 +121,7 @@ public final class Main {
             if (maxExternalizedResponseBytes <= 0) maxExternalizedResponseBytes = 1024L * 1024L;
         }
         switch (mode) {
-            case "http" -> serveHttp(server, signingKey, tokenTtl, authenticator, preHandlers, fakeStorage,
+            case "http" -> serveHttp(server, tokenKey, tokenTtl, authenticator, preHandlers, fakeStorage,
                     maxRequestBytes >= 0 ? maxRequestBytes : externalizeThreshold,
                     maxResponseBytes, maxExternalizedResponseBytes);
             case "unix" -> serveUnix(server, Path.of(unixPath));
@@ -220,7 +220,7 @@ public final class Main {
         try (StdioTransport t = new StdioTransport()) { server.serve(t); }
     }
 
-    private static void serveHttp(RpcServer server, byte[] signingKey, long tokenTtl,
+    private static void serveHttp(RpcServer server, byte[] tokenKey, long tokenTtl,
                                    Authenticator authenticator,
                                    List<HttpPreHandler> preHandlers,
                                    FakeStorage fakeStorage,
@@ -228,7 +228,7 @@ public final class Main {
                                    long maxResponseBytes,
                                    long maxExternalizedResponseBytes) throws Exception {
         HttpServer.Config.Builder cb = HttpServer.Config.builder()
-                .signingKey(signingKey)
+                .tokenKey(tokenKey)
                 .tokenTtlSeconds(tokenTtl)
                 .authenticator(authenticator)
                 .preHandlers(preHandlers);

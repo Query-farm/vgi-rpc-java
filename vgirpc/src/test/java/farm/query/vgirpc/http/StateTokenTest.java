@@ -5,6 +5,8 @@ package farm.query.vgirpc.http;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Base64;
+
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -63,15 +65,50 @@ final class StateTokenTest {
     }
 
     @Test
-    void tampered_signature_rejected() {
+    void tampered_ciphertext_rejected() {
         StateToken src = new StateToken(new byte[]{1, 2, 3}, new byte[0], new byte[0], "",
                 System.currentTimeMillis() / 1000);
         byte[] packed = src.pack(KEY, ANON);
-        // Flip one payload byte before re-decoding
-        packed[packed.length - 1] ^= 0x01;
+        // Decode, flip a byte inside the ciphertext, re-encode.
+        byte[] raw = Base64.getDecoder().decode(packed);
+        // 1 byte version + 12 byte nonce = 13. Hit the ciphertext.
+        raw[13] ^= 0x01;
+        byte[] tampered = Base64.getEncoder().encode(raw);
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-                () -> StateToken.unpack(packed, KEY, 0, ANON));
+                () -> StateToken.unpack(tampered, KEY, 0, ANON));
         assertTrue(e.getMessage().contains("signature"));
+    }
+
+    @Test
+    void tampered_nonce_rejected() {
+        StateToken src = new StateToken(new byte[]{1, 2, 3}, new byte[0], new byte[0], "",
+                System.currentTimeMillis() / 1000);
+        byte[] packed = src.pack(KEY, ANON);
+        byte[] raw = Base64.getDecoder().decode(packed);
+        raw[1] ^= 0x01;  // first nonce byte
+        byte[] tampered = Base64.getEncoder().encode(raw);
+        assertThrows(IllegalArgumentException.class,
+                () -> StateToken.unpack(tampered, KEY, 0, ANON));
+    }
+
+    @Test
+    void unknown_version_rejected() {
+        StateToken src = new StateToken(new byte[]{1, 2, 3}, new byte[0], new byte[0], "",
+                System.currentTimeMillis() / 1000);
+        byte[] packed = src.pack(KEY, ANON);
+        byte[] raw = Base64.getDecoder().decode(packed);
+        raw[0] = (byte) 0x99;
+        byte[] tampered = Base64.getEncoder().encode(raw);
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> StateToken.unpack(tampered, KEY, 0, ANON));
+        assertTrue(e.getMessage().contains("Unsupported state token version"));
+    }
+
+    @Test
+    void malformed_base64_rejected() {
+        byte[] junk = "not!base64!".getBytes();
+        assertThrows(IllegalArgumentException.class,
+                () -> StateToken.unpack(junk, KEY, 0, ANON));
     }
 
     @Test
@@ -98,7 +135,7 @@ final class StateTokenTest {
         StateToken src = new StateToken(new byte[]{7, 7}, new byte[0], new byte[0], "s",
                 System.currentTimeMillis() / 1000);
         byte[] packed = src.pack(KEY, "alice");
-        // Bob presents Alice's token: HMAC verification uses Bob's derived key, which differs.
+        // Bob presents Alice's token: AAD mismatch fails decryption.
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> StateToken.unpack(packed, KEY, 0, "bob"));
         assertTrue(e.getMessage().contains("signature"));

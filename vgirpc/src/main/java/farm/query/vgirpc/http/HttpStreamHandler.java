@@ -54,7 +54,7 @@ import java.util.function.Consumer;
 public final class HttpStreamHandler {
 
     private final RpcServer rpc;
-    private final byte[] signingKey;
+    private final byte[] tokenKey;
     private final long tokenTtlSeconds;
     private final long maxResponseBytes;
     /** method name → concrete {@link StreamState} class, learned from the first init call. */
@@ -63,15 +63,16 @@ public final class HttpStreamHandler {
     public HttpStreamHandler(RpcServer rpc) { this(rpc, null, 0, Long.MAX_VALUE); }
 
     /**
-     * @param signingKey       HMAC-SHA256 signing key; when {@code null} a random
-     *     per-process key is generated (tokens won't survive restarts).
+     * @param tokenKey       AEAD master key (32 bytes) for stream state
+     *     tokens; when {@code null} a random per-process key is generated
+     *     (tokens won't survive restarts or load-balance across workers).
      * @param tokenTtlSeconds  maximum token age in seconds; {@code 0} disables
      *     TTL enforcement.
      * @param maxResponseBytes per-call response cap. Exceeding it raises
      *     {@link PayloadTooLargeException} which the caller maps to HTTP 413;
      *     producers of large batches must use the external-location protocol.
      */
-    public HttpStreamHandler(RpcServer rpc, byte[] signingKey, long tokenTtlSeconds, long maxResponseBytes) {
+    public HttpStreamHandler(RpcServer rpc, byte[] tokenKey, long tokenTtlSeconds, long maxResponseBytes) {
         if (tokenTtlSeconds < 0) {
             throw new IllegalArgumentException("tokenTtlSeconds must be >= 0, got " + tokenTtlSeconds);
         }
@@ -79,11 +80,11 @@ public final class HttpStreamHandler {
             throw new IllegalArgumentException("maxResponseBytes must be > 0, got " + maxResponseBytes);
         }
         this.rpc = rpc;
-        if (signingKey != null) {
-            this.signingKey = signingKey.clone();
+        if (tokenKey != null) {
+            this.tokenKey = tokenKey.clone();
         } else {
-            this.signingKey = new byte[32];
-            new SecureRandom().nextBytes(this.signingKey);
+            this.tokenKey = new byte[32];
+            new SecureRandom().nextBytes(this.tokenKey);
         }
         this.tokenTtlSeconds = tokenTtlSeconds;
         this.maxResponseBytes = maxResponseBytes;
@@ -158,7 +159,7 @@ public final class HttpStreamHandler {
             StateToken token;
             try {
                 token = StateToken.unpack(tokenB64.getBytes(StandardCharsets.US_ASCII),
-                        signingKey, tokenTtlSeconds, principal);
+                        tokenKey, tokenTtlSeconds, principal);
             } catch (Exception e) {
                 return errorStream(e);
             }
@@ -268,7 +269,7 @@ public final class HttpStreamHandler {
         byte[] newStateBytes = StateSerializer.serialize(state);
         StateToken newToken = new StateToken(newStateBytes, priorToken.outputSchema(), priorToken.inputSchema(),
                 priorToken.streamId(), System.currentTimeMillis() / 1000);
-        return new String(newToken.pack(signingKey, principal), StandardCharsets.US_ASCII);
+        return new String(newToken.pack(tokenKey, principal), StandardCharsets.US_ASCII);
     }
 
     private CallContext buildCallContext(String method, Consumer<Message> sink) {
@@ -320,7 +321,7 @@ public final class HttpStreamHandler {
                             serializeSchema(inputSchema),
                             newStreamId(), System.currentTimeMillis() / 1000);
                     Map<String, String> md = Map.of(Metadata.STREAM_STATE,
-                            new String(token.pack(signingKey, currentPrincipal()), StandardCharsets.US_ASCII));
+                            new String(token.pack(tokenKey, currentPrincipal()), StandardCharsets.US_ASCII));
                     Wire.writeZeroBatch(w, outputSchema, md);
                 }
             }
@@ -340,7 +341,7 @@ public final class HttpStreamHandler {
             w.writeSchema(outputSchema);
             sink.bind(w, outputSchema);
             Map<String, String> md = Map.of(Metadata.STREAM_STATE,
-                    new String(token.pack(signingKey, currentPrincipal()), StandardCharsets.US_ASCII));
+                    new String(token.pack(tokenKey, currentPrincipal()), StandardCharsets.US_ASCII));
             Wire.writeZeroBatch(w, outputSchema, md);
         }
     }

@@ -119,7 +119,7 @@ public final class HttpServer {
 
     public HttpServer(RpcServer rpc, Config config) {
         this.rpc = rpc;
-        this.streamHandler = new HttpStreamHandler(rpc, config.signingKey(),
+        this.streamHandler = new HttpStreamHandler(rpc, config.tokenKey(),
                 config.tokenTtlSeconds(), config.maxResponseBytes());
         this.authenticator = config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
         this.preHandlers = config.preHandlers();
@@ -179,9 +179,10 @@ public final class HttpServer {
      *                         only when fronted by TLS or a TLS-terminating proxy.
      * @param port             listen port; {@code 0} for an OS-assigned ephemeral port.
      * @param prefix           URL prefix (e.g. {@code "/vgi"}); empty for no prefix.
-     * @param signingKey       HMAC signing key for stream state tokens; {@code null}
-     *                         generates a random per-process key (tokens won't
-     *                         survive restarts).
+     * @param tokenKey         AEAD master key (32 bytes) used to seal stream
+     *                         state tokens; {@code null} generates a random
+     *                         per-process key (tokens won't survive restarts
+     *                         or load-balance across workers).
      * @param tokenTtlSeconds  maximum state-token age before rejection; defaults to
      *                         {@value #DEFAULT_TOKEN_TTL_SECONDS}s. {@code 0} disables
      *                         enforcement (not recommended for multi-user deployments).
@@ -202,7 +203,7 @@ public final class HttpServer {
             String host,
             int port,
             String prefix,
-            byte[] signingKey,
+            byte[] tokenKey,
             long tokenTtlSeconds,
             Authenticator authenticator,
             List<HttpPreHandler> preHandlers,
@@ -229,7 +230,7 @@ public final class HttpServer {
         public Config {
             host = host != null ? host : "127.0.0.1";
             prefix = prefix != null ? prefix : "";
-            signingKey = signingKey != null ? signingKey.clone() : null;
+            tokenKey = tokenKey != null ? tokenKey.clone() : null;
             preHandlers = preHandlers != null ? List.copyOf(preHandlers) : List.of();
             if (maxRequestBytes <= 0) throw new IllegalArgumentException("maxRequestBytes must be > 0");
             if (maxResponseBytes <= 0) throw new IllegalArgumentException("maxResponseBytes must be > 0");
@@ -244,7 +245,7 @@ public final class HttpServer {
             private String host = "127.0.0.1";
             private int port = 0;
             private String prefix = "";
-            private byte[] signingKey;
+            private byte[] tokenKey;
             private long tokenTtlSeconds = DEFAULT_TOKEN_TTL_SECONDS;
             private Authenticator authenticator;
             private List<HttpPreHandler> preHandlers = List.of();
@@ -262,7 +263,7 @@ public final class HttpServer {
             public Builder host(String host) { this.host = host; return this; }
             public Builder port(int port) { this.port = port; return this; }
             public Builder prefix(String prefix) { this.prefix = prefix; return this; }
-            public Builder signingKey(byte[] signingKey) { this.signingKey = signingKey; return this; }
+            public Builder tokenKey(byte[] tokenKey) { this.tokenKey = tokenKey; return this; }
             public Builder tokenTtlSeconds(long tokenTtlSeconds) { this.tokenTtlSeconds = tokenTtlSeconds; return this; }
             public Builder authenticator(Authenticator authenticator) { this.authenticator = authenticator; return this; }
             public Builder preHandlers(List<HttpPreHandler> preHandlers) { this.preHandlers = preHandlers; return this; }
@@ -289,7 +290,7 @@ public final class HttpServer {
             }
 
             public Config build() {
-                return new Config(host, port, prefix, signingKey, tokenTtlSeconds, authenticator,
+                return new Config(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator,
                         preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls,
                         advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
                         advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes);

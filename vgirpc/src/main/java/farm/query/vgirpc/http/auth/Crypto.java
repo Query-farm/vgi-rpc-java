@@ -3,20 +3,34 @@
 
 package farm.query.vgirpc.http.auth;
 
+import javax.crypto.AEADBadTagException;
+import javax.crypto.Cipher;
 import javax.crypto.Mac;
+import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.Objects;
 
 /**
- * Shared HMAC-SHA256 + constant-time-equality primitives used by
- * {@link SignedCookie}, {@link Pkce}, and {@code StateToken}. Kept in one place
- * so there is a single copy of "JVM broken — SHA-256 missing" handling.
+ * Shared crypto primitives. HMAC-SHA256 + constant-time-equality remain in
+ * use by {@link SignedCookie} and {@link Pkce}; ChaCha20-Poly1305 AEAD seals
+ * HTTP stream-state tokens.  All "JVM broken" handling is centralised here
+ * so callers only have to think about IllegalArgumentException on tampered
+ * input vs. IllegalStateException on a misconfigured runtime.
  */
 public final class Crypto {
 
     private static final String HMAC_ALG = "HmacSHA256";
+    private static final String AEAD_ALG = "ChaCha20-Poly1305";
+    private static final String CHACHA_KEY_ALG = "ChaCha20";
+
+    /** JDK ChaCha20-Poly1305 requires a 12-byte nonce. */
+    public static final int AEAD_NONCE_LEN = 12;
+    /** Poly1305 tag length appended by the AEAD construction. */
+    public static final int AEAD_TAG_LEN = 16;
+
+    private static final SecureRandom RNG = new SecureRandom();
 
     private Crypto() {}
 
@@ -39,18 +53,71 @@ public final class Crypto {
     }
 
     /**
-     * Derive a per-principal key for HTTP stream-state tokens so that a token
-     * minted for principal A cannot be presented by principal B. Uses HMAC-SHA256
-     * as a KDF (NIST SP 800-108) with a fixed domain-separation label to prevent
-     * cross-use with other HMACs that happen to share the signing key.
+     * Seal {@code plaintext} with ChaCha20-Poly1305 under {@code key} and
+     * {@code aad}.  Generates a fresh random 12-byte nonce; the returned
+     * blob is {@code nonce || ciphertext_with_tag}.
      *
-     * @param signingKey base HMAC key; same across principals.
-     * @param principal  authenticated principal; {@code null} is treated as {@code ""}
-     *                   (anonymous). Bytes are UTF-8.
+     * @throws IllegalArgumentException if the key length is not 32.
+     * @throws IllegalStateException if the JDK lacks ChaCha20-Poly1305.
      */
-    public static byte[] deriveStateTokenKey(byte[] signingKey, String principal) {
-        String label = "vgi-rpc/state-token/v1\0";
-        String p = principal != null ? principal : "";
-        return hmacSha256(signingKey, (label + p).getBytes(StandardCharsets.UTF_8));
+    public static byte[] chacha20Poly1305Seal(byte[] key, byte[] plaintext, byte[] aad) {
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(plaintext, "plaintext");
+        Objects.requireNonNull(aad, "aad");
+        if (key.length != 32) {
+            throw new IllegalArgumentException("ChaCha20-Poly1305 key must be 32 bytes");
+        }
+        byte[] nonce = new byte[AEAD_NONCE_LEN];
+        RNG.nextBytes(nonce);
+        try {
+            Cipher cipher = Cipher.getInstance(AEAD_ALG);
+            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, CHACHA_KEY_ALG),
+                    new IvParameterSpec(nonce));
+            cipher.updateAAD(aad);
+            byte[] ciphertext = cipher.doFinal(plaintext);
+            byte[] out = new byte[nonce.length + ciphertext.length];
+            System.arraycopy(nonce, 0, out, 0, nonce.length);
+            System.arraycopy(ciphertext, 0, out, nonce.length, ciphertext.length);
+            return out;
+        } catch (Exception e) {
+            throw new IllegalStateException("ChaCha20-Poly1305 unavailable — JVM broken", e);
+        }
+    }
+
+    /**
+     * Open a {@code nonce || ciphertext_with_tag} blob produced by
+     * {@link #chacha20Poly1305Seal}.  AAD must match exactly.
+     *
+     * @throws IllegalArgumentException on any authenticity failure (bad
+     *         tag, wrong key, wrong AAD, truncated/malformed blob).
+     * @throws IllegalStateException if the JDK lacks ChaCha20-Poly1305.
+     */
+    public static byte[] chacha20Poly1305Open(byte[] key, byte[] sealed, byte[] aad) {
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(sealed, "sealed");
+        Objects.requireNonNull(aad, "aad");
+        if (key.length != 32) {
+            throw new IllegalArgumentException("ChaCha20-Poly1305 key must be 32 bytes");
+        }
+        if (sealed.length < AEAD_NONCE_LEN + AEAD_TAG_LEN) {
+            throw new IllegalArgumentException("Malformed sealed payload");
+        }
+        byte[] nonce = new byte[AEAD_NONCE_LEN];
+        System.arraycopy(sealed, 0, nonce, 0, AEAD_NONCE_LEN);
+        byte[] ciphertext = new byte[sealed.length - AEAD_NONCE_LEN];
+        System.arraycopy(sealed, AEAD_NONCE_LEN, ciphertext, 0, ciphertext.length);
+        try {
+            Cipher cipher = Cipher.getInstance(AEAD_ALG);
+            cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, CHACHA_KEY_ALG),
+                    new IvParameterSpec(nonce));
+            cipher.updateAAD(aad);
+            return cipher.doFinal(ciphertext);
+        } catch (AEADBadTagException e) {
+            throw new IllegalArgumentException("Authentication failed", e);
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("ChaCha20-Poly1305 unavailable — JVM broken", e);
+        }
     }
 }
