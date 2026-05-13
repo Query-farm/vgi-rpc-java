@@ -7,6 +7,7 @@ import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.wire.Metadata;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.ArrayList;
@@ -23,8 +24,20 @@ import java.util.Map;
  */
 public final class OutputCollector {
 
-    /** A buffered batch entry — either a log/zero-row metadata batch or the single data batch. */
-    public record Entry(VectorSchemaRoot root, Map<String, String> customMetadata, boolean isData) {}
+    /**
+     * A buffered batch entry — either a log/zero-row metadata batch or the
+     * single data batch. {@code dictionaryProvider} carries the dictionaries
+     * referenced by any {@code DictionaryEncoding}-tagged field on
+     * {@code root}; {@code null} when the batch has no dict-encoded columns,
+     * in which case callers fall back to a stream-level provider (e.g. the
+     * input-reader's dicts on the TIO/echo path).
+     */
+    public record Entry(VectorSchemaRoot root, Map<String, String> customMetadata,
+                          boolean isData, DictionaryProvider dictionaryProvider) {
+        public Entry(VectorSchemaRoot root, Map<String, String> customMetadata, boolean isData) {
+            this(root, customMetadata, isData, null);
+        }
+    }
 
     private final Schema outputSchema;
     private final String serverId;
@@ -49,14 +62,28 @@ public final class OutputCollector {
     }
 
     /** Emit the (single) data batch for this call. Ownership of {@code root} transfers to the collector. */
-    public void emit(VectorSchemaRoot root) { emit(root, null); }
+    public void emit(VectorSchemaRoot root) { emit(root, null, null); }
 
     public void emit(VectorSchemaRoot root, Map<String, String> customMetadata) {
+        emit(root, customMetadata, null);
+    }
+
+    /**
+     * Variant that carries a per-batch {@link DictionaryProvider} — required
+     * when {@code root}'s schema declares any {@code DictionaryEncoding}
+     * fields. The provider must hold a {@link
+     * org.apache.arrow.vector.dictionary.Dictionary} for every dictionary id
+     * referenced by the schema; the framework hands it to
+     * {@link farm.query.vgirpc.wire.IpcStreamWriter#writeBatch(VectorSchemaRoot, Map, DictionaryProvider)}
+     * so the dict batches go out on the wire alongside the data.
+     */
+    public void emit(VectorSchemaRoot root, Map<String, String> customMetadata,
+                       DictionaryProvider dictionaryProvider) {
         if (dataIdx >= 0) {
             throw new IllegalStateException("only one data batch may be emitted per call");
         }
         dataIdx = entries.size();
-        entries.add(new Entry(root, customMetadata, true));
+        entries.add(new Entry(root, customMetadata, true, dictionaryProvider));
     }
 
     /** Append a zero-row client-directed log batch. */
@@ -70,7 +97,7 @@ public final class OutputCollector {
         VectorSchemaRoot zeroRow = VectorSchemaRoot.create(outputSchema, farm.query.vgirpc.wire.Allocators.root());
         zeroRow.allocateNew();
         zeroRow.setRowCount(0);
-        entries.add(new Entry(zeroRow, md, false));
+        entries.add(new Entry(zeroRow, md, false, null));
     }
 
     /** Producer-only: signal end of stream. */

@@ -490,6 +490,13 @@ public final class RpcServer {
                                   org.apache.arrow.vector.dictionary.DictionaryProvider dictProvider)
             throws IOException {
         for (OutputCollector.Entry e : out.entries()) {
+            // Per-entry provider (set when a producer emits dict-encoded
+            // batches) wins over the stream-level dictProvider (set by the
+            // TIO/echo path so input dicts round-trip). Either is sufficient
+            // for IpcStreamWriter to emit the dict batches alongside the
+            // record batch.
+            org.apache.arrow.vector.dictionary.DictionaryProvider effective =
+                    e.dictionaryProvider() != null ? e.dictionaryProvider() : dictProvider;
             try {
                 if (e.isData() && externalConfig != null && externalConfig.storage() != null) {
                     try {
@@ -497,7 +504,7 @@ public final class RpcServer {
                                 e.root(), e.customMetadata(), externalConfig);
                         if (ptr != null) {
                             try (VectorSchemaRoot pr = ptr.root()) {
-                                writer.writeBatch(pr, ptr.customMetadata(), dictProvider);
+                                writer.writeBatch(pr, ptr.customMetadata(), effective);
                             }
                             continue;
                         }
@@ -506,9 +513,22 @@ public final class RpcServer {
                         // failing the stream. The client will still receive valid data.
                     }
                 }
-                writer.writeBatch(e.root(), e.customMetadata(), dictProvider);
+                writer.writeBatch(e.root(), e.customMetadata(), effective);
             } finally {
                 e.root().close();
+                // Per-entry providers own their dictionary vectors (the
+                // producer that built them transferred ownership via emit).
+                // The stream-level dictProvider is *not* closed here — its
+                // lifecycle is owned by the input reader on the TIO path.
+                if (e.dictionaryProvider() != null) {
+                    for (long id : e.dictionaryProvider().getDictionaryIds()) {
+                        org.apache.arrow.vector.dictionary.Dictionary d =
+                                e.dictionaryProvider().lookup(id);
+                        if (d != null && d.getVector() != null) {
+                            try { d.getVector().close(); } catch (Exception ignore) {}
+                        }
+                    }
+                }
             }
         }
     }
