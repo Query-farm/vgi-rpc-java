@@ -16,6 +16,7 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.io.IOException;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
@@ -124,8 +125,12 @@ public final class RpcConnection implements AutoCloseable {
                     if (kind == Wire.BatchKind.LOG) { onLog.accept(Wire.messageFromMetadata(md)); continue; }
                     if (kind == Wire.BatchKind.ERROR) throw Wire.errorFromMetadata(md);
                     Map<String, Object> row = Marshalling.decodeRow(r.root(), r.dictionaryProvider(), r.wireSchema());
-                    return RecordCodec.fromRowMap(
+                    ArrowSerializableRecord header = RecordCodec.fromRowMap(
                             (Class<? extends ArrowSerializableRecord>) headerType, row);
+                    // Consume the header stream's trailing EOS so the main
+                    // output stream that follows starts at a clean boundary.
+                    drainQuietly(r);
+                    return header;
                 }
             }
         }
@@ -188,13 +193,38 @@ public final class RpcConnection implements AutoCloseable {
                                             + ": " + fe.getMessage(), "");
                         }
                         try {
-                            return decodeResult(info, resolved.root());
+                            Object result = decodeResult(info, resolved.root());
+                            drainQuietly(r);
+                            return result;
                         } finally {
                             resolved.root().close();
                         }
                     }
-                    return decodeResult(info, root);
+                    Object result = decodeResult(info, root);
+                    drainQuietly(r);
+                    return result;
                 }
+            }
+        }
+
+        /**
+         * Consume the response stream's trailing EOS marker so a reused
+         * (persistent) transport — subprocess / pipe / Unix socket, where
+         * {@code transport.reader()} hands back the same stream every call —
+         * presents a clean stream to the next call. Without this, the next
+         * call's {@link IpcStreamReader} reads the stale EOS first and fails
+         * with "Unexpected end of input. Missing schema".
+         *
+         * <p>Best-effort: a drain failure must never fail an
+         * otherwise-successful call (mirrors {@code RpcServer}'s server-side
+         * {@code reader.drain()} handling).
+         */
+        private static void drainQuietly(IpcStreamReader r) {
+            try {
+                r.drain();
+            } catch (IOException ignore) {
+                // Transport already drained / closed (e.g. HTTP, where each
+                // request is its own connection) — nothing to clean up.
             }
         }
 
@@ -229,11 +259,19 @@ public final class RpcConnection implements AutoCloseable {
         @SuppressWarnings({"rawtypes", "unchecked"})
         private Object decodeResult(RpcMethodInfo info, VectorSchemaRoot root) {
             if (!info.hasReturn()) return null;
-            if (root.getRowCount() == 0) return null;
+            Class<?> returnRaw = rawClass(info.resultType());
+            // A method declared to return Optional<T> must never hand back a raw
+            // null — an absent value is Optional.empty(). (bindArgs unwraps
+            // Optional args to null on the way out; this is the symmetric
+            // re-wrap on the way back.)
+            if (root.getRowCount() == 0) {
+                return returnRaw == Optional.class ? Optional.empty() : null;
+            }
             Map<String, Object> row = Marshalling.decodeRow(root);
             Object value = row.get("result");
-            if (value == null) return null;
-            Class<?> returnRaw = rawClass(info.resultType());
+            if (value == null) {
+                return returnRaw == Optional.class ? Optional.empty() : null;
+            }
             if (returnRaw == Optional.class) return Optional.ofNullable(value);
             if (returnRaw != null && returnRaw.isEnum() && value instanceof String s) {
                 return Enum.valueOf((Class<Enum>) returnRaw.asSubclass(Enum.class), s);
