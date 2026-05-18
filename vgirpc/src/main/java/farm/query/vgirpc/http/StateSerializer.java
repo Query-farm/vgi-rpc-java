@@ -6,6 +6,7 @@ package farm.query.vgirpc.http;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.dataformat.cbor.databind.CBORMapper;
 import farm.query.vgirpc.PortableStreamState;
 import farm.query.vgirpc.StreamState;
 
@@ -17,17 +18,24 @@ import java.util.Base64;
 import java.util.List;
 
 /**
- * Reflection-based JSON serialisation for {@link StreamState} subclasses.
+ * Reflection-based CBOR serialisation for {@link StreamState} subclasses.
  *
- * <p>State is serialised as a JSON object containing every non-static,
+ * <p>State is serialised as a CBOR object containing every non-static,
  * non-transient instance field. Subclasses must expose a public no-arg
  * constructor (either directly or on their enclosing class for anonymous
  * inner classes). The state blob is opaque to clients — only this JVM
- * reads its own blobs back out, so using JSON here is wire-safe.</p>
+ * reads its own blobs back out — and CBOR (RFC 8949) buys us native
+ * {@code byte[]} encoding (no base64 inflation for IPC schemas, filter
+ * bytes, join keys) and ~30–50% smaller tokens than JSON, while keeping
+ * Jackson's familiar tree/databind API and the same data model.
+ *
+ * <p>State classes whose fields are not naturally Jackson-friendly — Arrow
+ * batches, complex binary structures — should implement
+ * {@link PortableStreamState} to take over their own encoding.</p>
  */
 public final class StateSerializer {
 
-    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final ObjectMapper CBOR = new CBORMapper();
 
     private StateSerializer() {}
 
@@ -40,13 +48,13 @@ public final class StateSerializer {
             }
         }
         try {
-            ObjectNode root = JSON.createObjectNode();
+            ObjectNode root = CBOR.createObjectNode();
             for (Field f : declaredFields(state.getClass())) {
                 if (!f.canAccess(state)) f.setAccessible(true);
                 Object value = f.get(state);
-                root.set(f.getName(), JSON.valueToTree(value));
+                root.set(f.getName(), CBOR.valueToTree(value));
             }
-            return JSON.writeValueAsBytes(root);
+            return CBOR.writeValueAsBytes(root);
         } catch (Exception e) {
             throw new RuntimeException("state serialize failed: " + state.getClass().getName(), e);
         }
@@ -63,7 +71,7 @@ public final class StateSerializer {
             }
         }
         try {
-            JsonNode root = JSON.readTree(data);
+            JsonNode root = CBOR.readTree(data);
             S instance = newInstance(cls);
             for (Field f : declaredFields(cls)) {
                 if (!f.canAccess(instance)) f.setAccessible(true);
@@ -78,11 +86,11 @@ public final class StateSerializer {
                 else if (t == byte.class   || t == Byte.class)    f.setByte(instance, (byte) node.asInt());
                 else if (t == short.class  || t == Short.class)   f.setShort(instance, (short) node.asInt());
                 else if (t == String.class)                       f.set(instance, node.asText());
-                // Generic types (List, Map, custom records) round-trip via Jackson; they must be JSON-friendly.
-                // Use the field's generic type (List<Long>, Map<String,Double>, ...) so collection
-                // values come back with their declared component types, not stringly-typed JSON nodes.
-                else f.set(instance, JSON.convertValue(node,
-                        JSON.getTypeFactory().constructType(f.getGenericType())));
+                // Generic types (List, Map, custom records, byte[]) round-trip via Jackson's
+                // CBOR databind. Use the field's generic type (List<Long>, Map<String,Double>, ...)
+                // so collection values come back with their declared component types, not raw nodes.
+                else f.set(instance, CBOR.convertValue(node,
+                        CBOR.getTypeFactory().constructType(f.getGenericType())));
             }
             return instance;
         } catch (Exception e) {

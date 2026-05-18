@@ -14,6 +14,7 @@ dependencies {
     api("org.slf4j:slf4j-api:$slf4jVersion")
 
     implementation("com.fasterxml.jackson.core:jackson-databind:$jacksonVersion")
+    implementation("com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:$jacksonVersion")
     implementation("com.github.luben:zstd-jni:1.5.6-8")
 
     // OAuth JWT / JWKS support lives in the optional `vgirpc-oauth` module so
