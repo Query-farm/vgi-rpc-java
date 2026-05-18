@@ -5,3 +5,7 @@ build/
 out/
 bin/
 /test_smoke.py
+
+# Python bytecode caches from the pytest conformance driver.
+__pycache__/
+*.pyc
