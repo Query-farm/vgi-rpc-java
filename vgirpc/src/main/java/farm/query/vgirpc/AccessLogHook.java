@@ -101,6 +101,12 @@ public final class AccessLogHook implements DispatchHook {
                     ? "00000000000000000000000000000000" : info.streamId);
         }
         if (info.cancelled) rec.put("cancelled", true);
+        if (info.sessionId != null && !info.sessionId.isEmpty()) {
+            rec.put("session_id", info.sessionId);
+        }
+        if (info.sessionAction != null && !info.sessionAction.isEmpty()) {
+            rec.put("session_action", info.sessionAction);
+        }
         if (stats != null && stats.nonZero()) {
             rec.put("input_batches", stats.inputBatches);
             rec.put("output_batches", stats.outputBatches);

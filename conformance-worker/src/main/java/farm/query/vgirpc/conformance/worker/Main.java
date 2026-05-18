@@ -62,6 +62,10 @@ public final class Main {
         // tests/serve_conformance_http_strict.py.
         long maxResponseBytes = 0;
         long maxExternalizedResponseBytes = 0;
+        // Sticky sessions are ON by default to mirror the Python conformance
+        // worker; --no-sticky disables them.
+        boolean stickyEnabled = true;
+        long stickyTtl = 300;
         ArgCursor c = new ArgCursor(args);
         while (c.hasNext()) {
             String a = c.next();
@@ -91,21 +95,25 @@ public final class Main {
                 case "--max-response-bytes" -> maxResponseBytes = Long.parseLong(c.requireValue(a));
                 case "--max-externalized-response-bytes" ->
                         maxExternalizedResponseBytes = Long.parseLong(c.requireValue(a));
+                case "--no-sticky" -> stickyEnabled = false;
+                case "--sticky-ttl" -> stickyTtl = Long.parseLong(c.requireValue(a));
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
         }
         FakeStorage fakeStorage = null;
         if (fakeStorageUrl != null) {
-            if ("zstd".equalsIgnoreCase(compression)) {
-                System.err.println("warning: --compression zstd requested but ExternalLocationConfig "
-                        + "does not yet expose upload-side compression; bytes will be uploaded uncompressed.");
-            }
             fakeStorage = new FakeStorage(fakeStorageUrl);
-            ExternalLocationConfig cfg = ExternalLocationConfig.builder()
+            ExternalLocationConfig.Builder cfgB = ExternalLocationConfig.builder()
                     .storage(fakeStorage)
                     .thresholdBytes(externalizeThreshold)
-                    .urlValidator(ExternalLocationConfig.permissiveValidator())
-                    .build();
+                    .urlValidator(ExternalLocationConfig.permissiveValidator());
+            if ("zstd".equalsIgnoreCase(compression)) {
+                cfgB.compression(ExternalLocationConfig.Compression.zstd());
+            } else if (!"none".equalsIgnoreCase(compression)) {
+                System.err.println("unknown --compression value: " + compression);
+                System.exit(2);
+            }
+            ExternalLocationConfig cfg = cfgB.build();
             server.setExternalConfig(cfg);
             // Also wire the resolver so the server can transparently pull pointer
             // batches that clients upload via the __upload_url__ flow.
@@ -123,7 +131,8 @@ public final class Main {
         switch (mode) {
             case "http" -> serveHttp(server, tokenKey, tokenTtl, authenticator, preHandlers, fakeStorage,
                     maxRequestBytes >= 0 ? maxRequestBytes : externalizeThreshold,
-                    maxResponseBytes, maxExternalizedResponseBytes);
+                    maxResponseBytes, maxExternalizedResponseBytes,
+                    stickyEnabled, stickyTtl);
             case "unix" -> serveUnix(server, Path.of(unixPath));
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
         }
@@ -226,7 +235,9 @@ public final class Main {
                                    FakeStorage fakeStorage,
                                    long maxRequestBytes,
                                    long maxResponseBytes,
-                                   long maxExternalizedResponseBytes) throws Exception {
+                                   long maxExternalizedResponseBytes,
+                                   boolean stickyEnabled,
+                                   long stickyTtl) throws Exception {
         HttpServer.Config.Builder cb = HttpServer.Config.builder()
                 .tokenKey(tokenKey)
                 .tokenTtlSeconds(tokenTtl)
@@ -235,6 +246,14 @@ public final class Main {
         if (maxResponseBytes > 0) cb.advertisedMaxResponseBytes(maxResponseBytes);
         if (maxExternalizedResponseBytes > 0)
             cb.advertisedMaxExternalizedResponseBytes(maxExternalizedResponseBytes);
+        if (stickyEnabled) {
+            cb.stickyEnabled(true)
+              .stickyDefaultTtlSeconds(stickyTtl)
+              // Fixed echo header keeps the conformance ``TestSticky``
+              // echo-roundtrip contract testable across ports.
+              .stickyEchoHeaders(Map.of("x-vgi-conformance-echo", "conformance-fixed-marker"))
+              .exposeTestDrainAdmin(true);
+        }
         if (fakeStorage != null) {
             // Match the Python conformance worker: a tight inline-request cap
             // forces the client to discover capabilities and route oversized

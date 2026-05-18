@@ -3,6 +3,8 @@
 
 package farm.query.vgirpc;
 
+import farm.query.vgirpc.http.SessionRegistry;
+import farm.query.vgirpc.http.SessionScope;
 import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.log.Message;
 
@@ -59,4 +61,87 @@ public final class CallContext {
     }
 
     public void emitClientLog(Message m) { emitClientLog.accept(m); }
+
+    // --- Sticky-session API (HTTP-only) ---------------------------------
+    //
+    // Bound to the {@link SessionScope} thread-local installed by the HTTP
+    // sticky middleware. Outside the HTTP transport these methods raise
+    // {@link RuntimeException}.
+
+    /**
+     * Register {@code state} in the per-worker sticky-session registry.
+     * On response the server emits a {@code VGI-Session} header carrying
+     * an AEAD-sealed token; subsequent client calls echoing the token
+     * resume the same session.
+     *
+     * @param state user-owned state object; may implement
+     *     {@link AutoCloseable} to receive an explicit close on eviction
+     * @param ttlSecondsOrNull optional per-session TTL override; {@code null}
+     *     uses the server's default TTL.
+     * @throws RuntimeException if the server doesn't have sticky enabled or
+     *     the client failed to send {@code VGI-Session-Accept: true}
+     * @throws ServerDrainingError if the server is in drain mode
+     */
+    public void openSession(Object state, Long ttlSecondsOrNull) {
+        SessionScope s = SessionScope.current();
+        if (s == null || !s.stickyEnabled) {
+            throw new RuntimeException("ctx.openSession requires sticky sessions to be enabled on the server");
+        }
+        if (!s.clientOptedIn) {
+            throw new RuntimeException("ctx.openSession requires VGI-Session-Accept: true on the request");
+        }
+        if (s.entry() != null) {
+            throw new RuntimeException("a session is already bound to this request");
+        }
+        // Registry holds the canonical Entry (with the per-session lock and
+        // authoritative expiry); bind it directly into the scope.
+        SessionRegistry.Entry entry = s.registry.open(state, ttlSecondsOrNull, s.principalKey);
+        // Acquire the session lock so any *other* concurrent request for the
+        // same session (only possible if the client races a fresh call against
+        // the in-flight one) serializes behind us. The matching unlock runs
+        // when the SessionScope is popped in HttpServer.
+        entry.lock().lock();
+        long now = System.currentTimeMillis() / 1000;
+        s.bindEntry(entry, SessionScope.ACTION_OPEN);
+        String tokenB64 = s.mintSessionToken(entry.sessionId, now, entry.expiresAtSeconds);
+        s.setMintTokenB64(tokenB64);
+    }
+
+    /**
+     * The state bound to this request's sticky session, or {@code null}
+     * when no session is active.
+     */
+    public Object session() {
+        SessionScope s = SessionScope.current();
+        if (s == null) return null;
+        SessionRegistry.Entry e = s.entry();
+        return e == null ? null : e.state();
+    }
+
+    /** Hex-encoded 12-byte session id, or {@code null} when no session is bound. */
+    public String sessionId() {
+        SessionScope s = SessionScope.current();
+        return s == null ? null : s.sessionIdHex();
+    }
+
+    /**
+     * Evict the current sticky session from the registry and arrange for
+     * the server to emit {@code VGI-Session-Close: true} on the response.
+     * Idempotent: a no-op when no session is bound.
+     */
+    public void closeSession() {
+        SessionScope s = SessionScope.current();
+        if (s == null) return;
+        SessionRegistry.Entry entry = s.entry();
+        if (entry != null) {
+            s.registry.close(entry.sessionId, s.principalKey);
+            // Release the per-session lock held by either open/resume so other
+            // calls (including a later close on the same thread) don't deadlock.
+            try { entry.lock().unlock(); } catch (IllegalMonitorStateException ignore) { }
+        }
+        s.clearEntry();
+        s.setAction(SessionScope.ACTION_CLOSE);
+        s.setCloseSignal(true);
+        s.setMintTokenB64(null);
+    }
 }

@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc.external;
 
+import com.github.luben.zstd.Zstd;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
@@ -57,9 +58,20 @@ public final class Externalizer {
             w.writeEos();
         }
         byte[] body = bos.toByteArray();
+        // SHA-256 is computed over the *raw* (pre-compression) IPC bytes so
+        // both sides can verify the payload after the fetcher transparently
+        // decompresses on download — matches the Python reference.
         byte[] sha256 = MessageDigest.getInstance("SHA-256").digest(body);
 
-        URI url = config.storage().upload(body, /* contentEncoding */ null);
+        String contentEncoding = null;
+        byte[] uploadBody = body;
+        ExternalLocationConfig.Compression comp = config.compression();
+        if (comp != null && "zstd".equalsIgnoreCase(comp.algorithm())) {
+            uploadBody = Zstd.compress(body, comp.level());
+            contentEncoding = "zstd";
+        }
+
+        URI url = config.storage().upload(uploadBody, contentEncoding);
 
         // Build a zero-row pointer root with the same schema.
         VectorSchemaRoot pointer = VectorSchemaRoot.create(root.getSchema(), Allocators.root());

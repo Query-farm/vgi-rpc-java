@@ -126,7 +126,19 @@ public final class HttpStreamHandler {
         // Record the concrete state class for this method so /exchange can rehydrate.
         stateTypes.put(method, streamResult.state().getClass());
 
-        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
+        // The /init response is soft-capped: producer streams may emit a single
+        // batch larger than maxResponseBytes and follow it with a continuation
+        // token so the client picks up the rest via /exchange.  Exchange-init
+        // responses are tiny (just a token) and never overflow.
+        //
+        // The bound here is a runaway-producer guard, not a contract: 16x the
+        // configured cap (or 256 MiB if no cap is set) is generous enough for
+        // any reasonable single-emit producer but stops {@code rows=Long.MAX}
+        // from OOM-ing the worker.
+        long hardCeiling = maxResponseBytes < Long.MAX_VALUE / 16
+                ? Math.max(maxResponseBytes * 16, 256L << 20)
+                : Long.MAX_VALUE;
+        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(hardCeiling);
         if (streamResult.header() != null) {
             writeHeaderIpcStream(out, streamResult.header(), sink);
         }

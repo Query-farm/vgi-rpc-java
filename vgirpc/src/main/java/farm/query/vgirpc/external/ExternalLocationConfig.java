@@ -35,6 +35,8 @@ public final class ExternalLocationConfig {
     private final Consumer<URI> urlValidator;
     /** Max concurrent range requests for a single fetch (1 = no ranges). */
     private final int maxRangeParallelism;
+    /** Upload-side compression. {@code null} disables. */
+    private final Compression compression;
 
     private ExternalLocationConfig(Builder b) {
         this.storage = b.storage;
@@ -45,6 +47,7 @@ public final class ExternalLocationConfig {
         this.httpTimeout = b.httpTimeout;
         this.urlValidator = b.urlValidator;
         this.maxRangeParallelism = b.maxRangeParallelism;
+        this.compression = b.compression;
     }
 
     public ExternalStorage storage() { return storage; }
@@ -55,6 +58,14 @@ public final class ExternalLocationConfig {
     public Duration httpTimeout() { return httpTimeout; }
     public Consumer<URI> urlValidator() { return urlValidator; }
     public int maxRangeParallelism() { return maxRangeParallelism; }
+    public Compression compression() { return compression; }
+
+    /** Upload-side compression spec. {@code algorithm} is currently always
+     * {@code "zstd"}; {@code level} maps to libzstd compression levels (1–22). */
+    public record Compression(String algorithm, int level) {
+        public static Compression zstd() { return new Compression("zstd", 3); }
+        public static Compression zstd(int level) { return new Compression("zstd", level); }
+    }
 
     /** HTTPS-only URL validator; throws {@link IllegalArgumentException} otherwise. */
     public static Consumer<URI> httpsOnlyValidator() {
@@ -82,6 +93,7 @@ public final class ExternalLocationConfig {
         private Duration httpTimeout = Duration.ofSeconds(30);
         private Consumer<URI> urlValidator = httpsOnlyValidator();
         private int maxRangeParallelism = 1; // simple path by default; set >1 to enable ranges
+        private Compression compression; // null = upload raw
 
         public Builder storage(ExternalStorage s) { this.storage = s; return this; }
         public Builder thresholdBytes(long v) { this.thresholdBytes = v; return this; }
@@ -91,6 +103,7 @@ public final class ExternalLocationConfig {
         public Builder httpTimeout(Duration d) { this.httpTimeout = d; return this; }
         public Builder urlValidator(Consumer<URI> v) { this.urlValidator = v; return this; }
         public Builder maxRangeParallelism(int n) { this.maxRangeParallelism = n; return this; }
+        public Builder compression(Compression c) { this.compression = c; return this; }
 
         public ExternalLocationConfig build() { return new ExternalLocationConfig(this); }
     }

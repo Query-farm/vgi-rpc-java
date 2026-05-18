@@ -230,4 +230,41 @@ public final class ConformanceServiceImpl implements ConformanceService {
                 new StreamStates.Scale(factor),
                 RichHeader.build(seed));
     }
+
+    // --- Sticky-session conformance ------------------------------------------
+
+    @Override public long open_counter(long initial, CallContext ctx) {
+        ctx.openSession(new StreamStates.StickyCounter(initial), null);
+        return initial;
+    }
+
+    @Override public long increment_counter(long by, CallContext ctx) {
+        Object sess = ctx.session();
+        if (!(sess instanceof StreamStates.StickyCounter counter)) {
+            throw new RuntimeException("no sticky counter bound to this request");
+        }
+        counter.value += by;
+        return counter.value;
+    }
+
+    @Override public long close_counter(CallContext ctx) {
+        Object sess = ctx.session();
+        if (!(sess instanceof StreamStates.StickyCounter counter)) {
+            throw new RuntimeException("no sticky counter bound to this request");
+        }
+        long finalValue = counter.value;
+        ctx.closeSession();
+        return finalValue;
+    }
+
+    @Override public RpcStream<? extends ProducerState> stream_session_counter(long count) {
+        return RpcStream.producer(StreamStates.COUNTER_SINGLE_SCHEMA,
+                new StreamStates.SessionCounterProducer(count));
+    }
+
+    @Override public RpcStream<? extends ExchangeState> exchange_session_counter() {
+        return RpcStream.exchange(StreamStates.SESSION_COUNTER_BY_SCHEMA,
+                StreamStates.COUNTER_SINGLE_SCHEMA,
+                new StreamStates.SessionCounterExchange());
+    }
 }

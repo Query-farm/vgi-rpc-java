@@ -9,6 +9,7 @@ import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
+import farm.query.vgirpc.SessionLostError;
 import farm.query.vgirpc.external.UploadUrlProvider;
 import farm.query.vgirpc.transport.RpcTransport;
 import farm.query.vgirpc.wire.Allocators;
@@ -110,6 +111,12 @@ public final class HttpServer {
      *  in-process memory bound. */
     private final long advertisedMaxResponseBytes;
     private final long advertisedMaxExternalizedResponseBytes;
+    private final boolean stickyEnabled;
+    private final long stickyDefaultTtlSeconds;
+    private final Map<String, String> stickyEchoHeaders;
+    private final boolean exposeTestDrainAdmin;
+    private final byte[] sessionTokenKey;
+    private final SessionRegistry sessionRegistry;
     private int port;
 
     /** Defaults: loopback bind, ephemeral port, no prefix, anonymous auth, 1-hour TTL, 16 MiB request/response cap. */
@@ -132,6 +139,26 @@ public final class HttpServer {
         this.maxUploadBytes = config.maxUploadBytes();
         this.advertisedMaxResponseBytes = config.advertisedMaxResponseBytes();
         this.advertisedMaxExternalizedResponseBytes = config.advertisedMaxExternalizedResponseBytes();
+        this.stickyEnabled = config.stickyEnabled();
+        this.stickyDefaultTtlSeconds = config.stickyDefaultTtlSeconds();
+        this.stickyEchoHeaders = config.stickyEchoHeaders();
+        this.exposeTestDrainAdmin = config.exposeTestDrainAdmin();
+        // Sticky tokens reuse the per-process state-token key when one is
+        // configured; otherwise a random 32-byte key is generated on the fly
+        // (tokens won't survive worker restarts or load-balance, but the
+        // conformance worker is a single process so that's fine).
+        if (this.stickyEnabled) {
+            if (config.tokenKey() != null) {
+                this.sessionTokenKey = config.tokenKey().clone();
+            } else {
+                this.sessionTokenKey = new byte[32];
+                new java.security.SecureRandom().nextBytes(this.sessionTokenKey);
+            }
+            this.sessionRegistry = new SessionRegistry(this.stickyDefaultTtlSeconds);
+        } else {
+            this.sessionTokenKey = null;
+            this.sessionRegistry = null;
+        }
         this.jetty = new Server();
         // Graceful-shutdown window: Jetty.stop() waits up to this many ms for
         // in-flight requests to finish before forcing closes. 15s is enough
@@ -216,7 +243,11 @@ public final class HttpServer {
             UploadUrlProvider uploadUrlProvider,
             Long maxUploadBytes,
             long advertisedMaxResponseBytes,
-            long advertisedMaxExternalizedResponseBytes) {
+            long advertisedMaxExternalizedResponseBytes,
+            boolean stickyEnabled,
+            long stickyDefaultTtlSeconds,
+            Map<String, String> stickyEchoHeaders,
+            boolean exposeTestDrainAdmin) {
 
         /** 1 hour. */
         public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
@@ -232,10 +263,14 @@ public final class HttpServer {
             prefix = prefix != null ? prefix : "";
             tokenKey = tokenKey != null ? tokenKey.clone() : null;
             preHandlers = preHandlers != null ? List.copyOf(preHandlers) : List.of();
+            stickyEchoHeaders = stickyEchoHeaders != null ? Map.copyOf(stickyEchoHeaders) : Map.of();
             if (maxRequestBytes <= 0) throw new IllegalArgumentException("maxRequestBytes must be > 0");
             if (maxResponseBytes <= 0) throw new IllegalArgumentException("maxResponseBytes must be > 0");
             if (idleTimeoutMs < 0) throw new IllegalArgumentException("idleTimeoutMs must be >= 0");
             if (zstdLevel < 1 || zstdLevel > 22) throw new IllegalArgumentException("zstdLevel must be in [1, 22]");
+            if (stickyEnabled && stickyDefaultTtlSeconds <= 0) {
+                throw new IllegalArgumentException("stickyDefaultTtlSeconds must be > 0 when sticky is enabled");
+            }
         }
 
         public static Config defaults() { return builder().build(); }
@@ -259,6 +294,10 @@ public final class HttpServer {
             private Long maxUploadBytes;
             private long advertisedMaxResponseBytes;
             private long advertisedMaxExternalizedResponseBytes;
+            private boolean stickyEnabled;
+            private long stickyDefaultTtlSeconds = 300;
+            private Map<String, String> stickyEchoHeaders = Map.of();
+            private boolean exposeTestDrainAdmin;
 
             public Builder host(String host) { this.host = host; return this; }
             public Builder port(int port) { this.port = port; return this; }
@@ -288,12 +327,21 @@ public final class HttpServer {
             public Builder advertisedMaxExternalizedResponseBytes(long v) {
                 this.advertisedMaxExternalizedResponseBytes = v; return this;
             }
+            /** Enable opt-in HTTP sticky sessions. */
+            public Builder stickyEnabled(boolean v) { this.stickyEnabled = v; return this; }
+            /** Default TTL for new sticky sessions, in seconds. */
+            public Builder stickyDefaultTtlSeconds(long v) { this.stickyDefaultTtlSeconds = v; return this; }
+            /** Header-name → value map echoed back to clients on session opens. */
+            public Builder stickyEchoHeaders(Map<String, String> m) { this.stickyEchoHeaders = m; return this; }
+            /** Conformance-only: expose POST/DELETE {@code /__test_drain__} for tests. */
+            public Builder exposeTestDrainAdmin(boolean v) { this.exposeTestDrainAdmin = v; return this; }
 
             public Config build() {
                 return new Config(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator,
                         preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls,
                         advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
-                        advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes);
+                        advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
+                        stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin);
             }
         }
     }
@@ -355,6 +403,10 @@ public final class HttpServer {
                 resp.sendError(HttpServletResponse.SC_NOT_FOUND);
                 return;
             }
+            if (exposeTestDrainAdmin && StickyHeaders.TEST_DRAIN_PATH.equals(rest)) {
+                handleTestDrain(req, resp, true);
+                return;
+            }
             if (UPLOAD_URL_METHOD.equals(rest) || (UPLOAD_URL_METHOD + "/init").equals(rest)) {
                 handleUploadUrl(req, resp);
                 return;
@@ -366,6 +418,21 @@ public final class HttpServer {
                 return;
             }
             handleUnary(req, resp, rest);
+        }
+
+        @Override
+        protected void doDelete(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            if (runPreHandlers(req, resp)) return;
+            String rest = pathInfo(req);
+            if (StickyHeaders.SESSION_PATH.equals(rest)) {
+                handleSessionDelete(req, resp);
+                return;
+            }
+            if (exposeTestDrainAdmin && StickyHeaders.TEST_DRAIN_PATH.equals(rest)) {
+                handleTestDrain(req, resp, false);
+                return;
+            }
+            resp.sendError(HttpServletResponse.SC_NOT_FOUND);
         }
 
         private boolean runPreHandlers(HttpServletRequest req, HttpServletResponse resp) throws IOException {
@@ -403,6 +470,14 @@ public final class HttpServer {
             resp.setHeader(UPLOAD_URL_HEADER, "true");
             if (maxUploadBytes != null) {
                 resp.setHeader(MAX_UPLOAD_BYTES_HEADER, Long.toString(maxUploadBytes));
+            }
+        }
+        if (stickyEnabled) {
+            resp.setHeader(StickyHeaders.STICKY_ENABLED, "true");
+            resp.setHeader(StickyHeaders.STICKY_TTL, Long.toString(stickyDefaultTtlSeconds));
+            if (!stickyEchoHeaders.isEmpty()) {
+                resp.setHeader(StickyHeaders.STICKY_ECHO,
+                        String.join(",", stickyEchoHeaders.keySet()));
             }
         }
     }
@@ -523,16 +598,34 @@ public final class HttpServer {
             return;
         }
 
-        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
-        try (AutoCloseable ignored = AuthScope.push(auth, buildTransportMetadata(req));
-             InMemoryTransport t = new InMemoryTransport(body, out)) {
-            rpc.serveOne(t);
-        } catch (PayloadTooLargeException e) {
-            writePayloadTooLarge(resp, e);
+        // Build sticky scope (after auth so we have the principal for AAD).
+        SessionScope scope;
+        try {
+            scope = buildSessionScope(req, auth);
+        } catch (SessionLostError e) {
+            writeSessionLostResponse(req, resp, e);
             return;
-        } catch (Exception e) {
-            throw new IOException(e);
         }
+
+        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
+        try {
+            try (AutoCloseable authPop = AuthScope.push(auth, buildTransportMetadata(req));
+                 AutoCloseable sessPop = SessionScope.push(scope);
+                 InMemoryTransport t = new InMemoryTransport(body, out)) {
+                rpc.serveOne(t);
+            } catch (PayloadTooLargeException e) {
+                writePayloadTooLarge(resp, e);
+                return;
+            } catch (Exception e) {
+                throw new IOException(e);
+            }
+        } finally {
+            // Release the per-session lock acquired in buildSessionScope or
+            // CallContext.openSession; idempotent — closeSession may have
+            // released it already on the close path.
+            releaseSessionLock(scope);
+        }
+        emitSessionResponseHeaders(resp, scope);
         // Operator-facing response cap: post-flush enforcement.  Mirrors the
         // Python reference's strict-fail — overshoot replaces the body with
         // an Arrow EXCEPTION batch carrying the literal "max_response_bytes"
@@ -543,6 +636,145 @@ public final class HttpServer {
             return;
         }
         writeArrowResponse(req, resp, out.toByteArray());
+    }
+
+    /** Build the per-request sticky scope. Throws {@link SessionLostError}
+     *  with a uniform message when a {@code VGI-Session} header was
+     *  presented but doesn't match a live registry entry (no probing). */
+    private SessionScope buildSessionScope(HttpServletRequest req, AuthContext auth) {
+        String principal = auth != null && auth.principal() != null ? auth.principal() : "";
+        String principalKey = computePrincipalKey(auth);
+        boolean optIn = "true".equalsIgnoreCase(req.getHeader(StickyHeaders.SESSION_ACCEPT));
+        SessionScope scope = new SessionScope(optIn, stickyEnabled, principalKey, principal,
+                rpc.serverId(), sessionTokenKey, sessionRegistry);
+        if (!stickyEnabled) return scope;
+        sessionRegistry.ensureReaperStarted();
+        String tokenStr = req.getHeader(StickyHeaders.SESSION);
+        if (tokenStr == null) return scope;
+        SessionToken parsed;
+        try {
+            parsed = SessionToken.unpack(tokenStr.getBytes(StandardCharsets.US_ASCII),
+                    sessionTokenKey, principal);
+        } catch (IllegalArgumentException e) {
+            // Uniform failure message regardless of why the token didn't open
+            // (closes the timing / log side-channel between tag-fail, AAD-fail,
+            // wrong-server, expired-entry, and miss).
+            throw new SessionLostError("session token rejected");
+        }
+        if (!parsed.serverId().equals(rpc.serverId())) {
+            throw new SessionLostError("session token rejected");
+        }
+        SessionRegistry.Entry entry = sessionRegistry.get(parsed.sessionId(), principalKey);
+        if (entry == null) {
+            throw new SessionLostError("session token rejected");
+        }
+        // Serialize concurrent calls on the same session: acquire the
+        // per-entry lock before dispatch. Released by releaseSessionLock()
+        // in the response-cleanup path.
+        entry.lock().lock();
+        scope.bindEntry(entry, SessionScope.ACTION_RESUME);
+        return scope;
+    }
+
+    /** Release the per-session lock held while dispatch ran. Safe to call
+     *  on any path — drops silently when the current thread isn't the
+     *  holder (e.g. {@code CallContext.closeSession} already released it). */
+    private static void releaseSessionLock(SessionScope scope) {
+        if (scope == null) return;
+        SessionRegistry.Entry entry = scope.entry();
+        if (entry == null) return;
+        java.util.concurrent.locks.ReentrantLock lock = entry.lock();
+        if (lock != null && lock.isHeldByCurrentThread()) {
+            try { lock.unlock(); } catch (IllegalMonitorStateException ignore) { }
+        }
+    }
+
+    private static String computePrincipalKey(AuthContext auth) {
+        if (auth == null || !auth.authenticated()) return "\0anonymous";
+        String domain = auth.domain() != null ? auth.domain() : "";
+        String principal = auth.principal() != null ? auth.principal() : "";
+        return "\1" + domain + "\0" + principal;
+    }
+
+    /** Mint response headers for sticky-session opens / closes. */
+    private void emitSessionResponseHeaders(HttpServletResponse resp, SessionScope scope) {
+        if (scope == null) return;
+        if (scope.mintTokenB64() != null) {
+            resp.setHeader(StickyHeaders.SESSION, scope.mintTokenB64());
+            for (Map.Entry<String, String> e : stickyEchoHeaders.entrySet()) {
+                resp.setHeader(StickyHeaders.ECHO_PREFIX + e.getKey(), e.getValue());
+            }
+        }
+        if (scope.closeSignal()) {
+            resp.setHeader(StickyHeaders.SESSION_CLOSE, "true");
+        }
+    }
+
+    /** Replace the response with an Arrow EXCEPTION-batch stream carrying
+     *  {@link SessionLostError} so the client receives the typed error
+     *  with {@code error_kind = "session_lost"} just like a dispatch-time raise. */
+    private void writeSessionLostResponse(HttpServletRequest req, HttpServletResponse resp,
+                                           SessionLostError e) throws IOException {
+        ByteArrayOutputStream errOut = new ByteArrayOutputStream();
+        Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, e, rpc.serverId());
+        resp.setStatus(HttpServletResponse.SC_OK);
+        resp.setHeader(RPC_ERROR_HEADER, "true");
+        writeArrowResponse(req, resp, errOut.toByteArray());
+    }
+
+    /** {@code DELETE /__session__}: best-effort eviction. Always 200, no
+     *  information leak (clients can't probe whether a session existed). */
+    private void handleSessionDelete(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        if (!stickyEnabled) {
+            resp.setStatus(HttpServletResponse.SC_OK);
+            return;
+        }
+        String tokenStr = req.getHeader(StickyHeaders.SESSION);
+        if (tokenStr == null || tokenStr.isEmpty()) {
+            resp.setStatus(HttpServletResponse.SC_OK);
+            return;
+        }
+        AuthContext auth;
+        try { auth = authenticator.authenticate(req); }
+        catch (AuthException e) { resp.setStatus(HttpServletResponse.SC_OK); return; }
+        String principal = auth != null && auth.principal() != null ? auth.principal() : "";
+        String principalKey = computePrincipalKey(auth);
+        try {
+            SessionToken parsed = SessionToken.unpack(
+                    tokenStr.getBytes(StandardCharsets.US_ASCII), sessionTokenKey, principal);
+            if (parsed.serverId().equals(rpc.serverId())) {
+                // Pass the principalKey so close refuses cross-principal eviction
+                // (defense-in-depth on top of the AAD binding in the token).
+                sessionRegistry.close(parsed.sessionId(), principalKey);
+            }
+        } catch (RuntimeException ignore) {
+            // Wrong key / tampered / wrong server — silently no-op (no probing).
+        }
+        resp.setStatus(HttpServletResponse.SC_OK);
+        resp.setHeader(StickyHeaders.SESSION_CLOSE, "true");
+    }
+
+    /** {@code POST/DELETE /__test_drain__}: test-only admin endpoint flipping
+     *  the drain flag. Exposed only when {@code exposeTestDrainAdmin=true},
+     *  and additionally restricted to loopback callers so an operator who
+     *  accidentally ships the flag enabled can't be DoS'd by an external
+     *  drain trigger. */
+    private void handleTestDrain(HttpServletRequest req, HttpServletResponse resp, boolean drain) throws IOException {
+        if (!stickyEnabled) { resp.sendError(HttpServletResponse.SC_NOT_FOUND); return; }
+        if (!isLoopbackRequest(req)) {
+            resp.sendError(HttpServletResponse.SC_FORBIDDEN);
+            return;
+        }
+        sessionRegistry.setDraining(drain);
+        resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
+    }
+
+    private static boolean isLoopbackRequest(HttpServletRequest req) {
+        String remote = req.getRemoteAddr();
+        if (remote == null) return false;
+        // Cover IPv4 + IPv6 loopback forms and the IPv4-mapped IPv6 variant.
+        return remote.equals("127.0.0.1") || remote.equals("0:0:0:0:0:0:0:1")
+                || remote.equals("::1") || remote.equals("::ffff:127.0.0.1");
     }
 
     /** Replace the response with an Arrow EXCEPTION-batch IPC stream when the
@@ -662,25 +894,40 @@ public final class HttpServer {
             return;
         }
 
-        byte[] out;
-        try (AutoCloseable ignored = AuthScope.push(auth, buildTransportMetadata(req))) {
-            out = init ? streamHandler.handleInit(method, body) : streamHandler.handleExchange(method, body);
-        } catch (PayloadTooLargeException e) {
-            writePayloadTooLarge(resp, e);
+        SessionScope scope;
+        try {
+            scope = buildSessionScope(req, auth);
+        } catch (SessionLostError e) {
+            writeSessionLostResponse(req, resp, e);
             return;
-        } catch (Exception e) {
-            // Serialise an error stream so the client can read it uniformly.
-            ByteArrayOutputStream errOut = new ByteArrayOutputStream();
-            Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, e, rpc.serverId());
-            out = errOut.toByteArray();
-            resp.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
         }
-        // Hard wire-cap enforcement for stream-exchange.  Producer streams
-        // would normally use a soft cap with continuation tokens; today the
-        // Java handler returns the full producer run in one response, so the
-        // cap fails closed for both shapes.  Conformance treats this as the
-        // exchange strict-fail path.
-        if (advertisedMaxResponseBytes > 0 && out.length > advertisedMaxResponseBytes) {
+
+        byte[] out;
+        try {
+            try (AutoCloseable authPop = AuthScope.push(auth, buildTransportMetadata(req));
+                 AutoCloseable sessPop = SessionScope.push(scope)) {
+                out = init ? streamHandler.handleInit(method, body) : streamHandler.handleExchange(method, body);
+            } catch (PayloadTooLargeException e) {
+                writePayloadTooLarge(resp, e);
+                return;
+            } catch (Exception e) {
+                // Serialise an error stream so the client can read it uniformly.
+                ByteArrayOutputStream errOut = new ByteArrayOutputStream();
+                Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, e, rpc.serverId());
+                out = errOut.toByteArray();
+                resp.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+            }
+        } finally {
+            releaseSessionLock(scope);
+        }
+        emitSessionResponseHeaders(resp, scope);
+        // Wire-cap enforcement: /exchange strict-fails on overshoot (mirrors
+        // Python's TestHttpResponseCap.test_exchange_strict_fail), while /init
+        // is soft-capped — a producer that emits one batch larger than the
+        // cap is allowed through because HttpStreamHandler appends a
+        // continuation token so the client can resume via /exchange
+        // (TestHttpResponseCapSoftWire.test_producer_overshoot_uses_continuation).
+        if (!init && advertisedMaxResponseBytes > 0 && out.length > advertisedMaxResponseBytes) {
             writeResponseCapError(req, resp, method, out.length, advertisedMaxResponseBytes);
             return;
         }

@@ -39,4 +39,9 @@ public final class Metadata {
 
     public static final String TRACEPARENT = "traceparent";
     public static final String TRACESTATE  = "tracestate";
+
+    /** Top-level batch metadata key carrying a stable error category
+     *  (e.g. "session_lost", "server_draining", "method_not_implemented")
+     *  so clients can pattern-match without substring-searching message text. */
+    public static final String ERROR_KIND = "vgi_rpc.error_kind";
 }

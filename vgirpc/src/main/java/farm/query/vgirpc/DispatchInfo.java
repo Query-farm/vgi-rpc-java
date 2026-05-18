@@ -31,4 +31,9 @@ public final class DispatchInfo {
     public String streamId = "";
     public boolean cancelled;
     public Map<String, ?> transportMetadata;
+
+    /** Sticky-session id (hex), or null when no session was bound. */
+    public String sessionId;
+    /** Sticky-session action: {@code "none" | "resume" | "open" | "close"}. */
+    public String sessionAction;
 }

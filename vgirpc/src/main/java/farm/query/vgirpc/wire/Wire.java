@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc.wire;
 
+import farm.query.vgirpc.HasErrorKind;
 import farm.query.vgirpc.RpcError;
 import farm.query.vgirpc.VersionError;
 import farm.query.vgirpc.log.Level;
@@ -84,6 +85,9 @@ public final class Wire {
         Message msg = Message.fromException(t);
         Map<String, String> md = msg.addToMetadata(null);
         if (serverId != null) md.put(Metadata.SERVER_ID, serverId);
+        if (t instanceof HasErrorKind hk) {
+            md.put(Metadata.ERROR_KIND, hk.errorKind());
+        }
         return md;
     }
 
@@ -115,7 +119,11 @@ public final class Wire {
                 if (trace != null) tb = trace.toString();
             } catch (Exception ignore) {}
         }
-        return new RpcError(exType, text != null ? text : "", tb);
+        // Hoist the stable error_kind metadata into RpcError so Java-to-Java
+        // callers can pattern-match without parsing message text — parity
+        // with the Python client's RpcError.error_kind attribute.
+        String kind = meta.get(Metadata.ERROR_KIND);
+        return new RpcError(exType, text != null ? text : "", tb, "", kind);
     }
 
     /** Construct a {@link Message} from non-exception log-batch metadata. */

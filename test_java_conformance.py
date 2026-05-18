@@ -126,6 +126,26 @@ def conformance_http_auth_port() -> Iterator[int]:
 
 
 @pytest.fixture(scope="session")
+def conformance_http_strict_cap_port() -> Iterator[int]:
+    """Spawn an HTTP worker with strict response caps (1 MiB) for cap-overshoot tests."""
+    proc = subprocess.Popen(
+        [JAVA_WORKER, "--http", "--strict"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
 def conformance_fake_storage() -> Iterator[str]:
     """Run the in-process Python fake-storage HTTP service."""
     from vgi_rpc.conformance.fake_storage import serve_in_thread
@@ -196,10 +216,30 @@ def conformance_http_externalize_always_port(conformance_fake_storage: str) -> I
 
 
 @pytest.fixture(scope="session")
-def conformance_http_with_zstd_storage_port() -> Iterator[int]:
-    """Java's ExternalLocationConfig does not yet expose upload-side zstd compression."""
-    pytest.skip("vgirpc-java does not yet support zstd compression on externalized batches")
-    yield 0  # unreachable, keeps mypy happy
+def conformance_http_with_zstd_storage_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Spawn a Java HTTP worker wired to fake-storage with zstd upload compression."""
+    proc = subprocess.Popen(
+        [
+            JAVA_WORKER,
+            "--http",
+            "--fake-storage",
+            conformance_fake_storage,
+            "--compression",
+            "zstd",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
 
 
 ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]

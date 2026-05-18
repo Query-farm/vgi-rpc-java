@@ -40,7 +40,61 @@ final class StreamStates {
     static final Schema SCALE_SCHEMA   = new Schema(List.of(f64("value")));
     static final Schema ACCUM_SCHEMA   = new Schema(List.of(f64("running_sum"), i64("exchange_count")));
 
+    /** Single int64 column {@code value} — used by the sticky session streams. */
+    static final Schema COUNTER_SINGLE_SCHEMA = new Schema(List.of(i64("value")));
+    /** Single int64 column {@code by} — input for {@code exchange_session_counter}. */
+    static final Schema SESSION_COUNTER_BY_SCHEMA = new Schema(List.of(i64("by")));
+
     static final Schema EMPTY_SCHEMA = new Schema(List.of());
+
+    /** Sticky-session state object: a mutable counter shared across requests. */
+    static final class StickyCounter implements AutoCloseable {
+        long value;
+        boolean closed;
+        StickyCounter(long initial) { this.value = initial; }
+        @Override public void close() { this.closed = true; }
+    }
+
+    private static VectorSchemaRoot singleI64(long v) {
+        VectorSchemaRoot root = VectorSchemaRoot.create(COUNTER_SINGLE_SCHEMA, Allocators.root());
+        root.allocateNew();
+        ((BigIntVector) root.getVector(0)).setSafe(0, v);
+        root.setRowCount(1);
+        return root;
+    }
+
+    /** Producer stream emitting one increment of the sticky-session counter per turn. */
+    static final class SessionCounterProducer extends ProducerState {
+        final long count;
+        long current;
+        SessionCounterProducer(long count) { this.count = count; }
+        @Override public void produce(OutputCollector out, CallContext ctx) {
+            if (current >= count) { out.finish(); return; }
+            Object sess = ctx.session();
+            if (!(sess instanceof StickyCounter counter)) {
+                throw new RuntimeException("no sticky counter bound to this request");
+            }
+            counter.value += 1;
+            out.emit(singleI64(counter.value));
+            current++;
+        }
+    }
+
+    /** Exchange stream that adds each input ``by`` column to the sticky counter. */
+    static final class SessionCounterExchange extends ExchangeState {
+        @Override public void exchange(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
+            Object sess = ctx.session();
+            if (!(sess instanceof StickyCounter counter)) {
+                throw new RuntimeException("no sticky counter bound to this request");
+            }
+            BigIntVector byVec = (BigIntVector) input.root().getVector("by");
+            long sum = 0;
+            int rows = input.root().getRowCount();
+            for (int i = 0; i < rows; i++) sum += byVec.get(i);
+            counter.value += sum;
+            out.emit(singleI64(counter.value));
+        }
+    }
 
     static VectorSchemaRoot counterRow(long index, long value) {
         VectorSchemaRoot root = VectorSchemaRoot.create(COUNTER_SCHEMA, Allocators.root());

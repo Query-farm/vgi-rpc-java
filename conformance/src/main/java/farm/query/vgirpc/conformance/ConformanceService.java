@@ -201,4 +201,22 @@ public interface ConformanceService {
 
     @StreamHeader(RichHeader.class)
     RpcStream<? extends ExchangeState> exchange_with_rich_header(long seed, double factor);
+
+    // --- Sticky session — Unary ---------------------------------------------
+    //
+    // The three counter methods register, mutate, and tear down a sticky
+    // session on the conformance server.  Together they exercise the
+    // open / resume / close lifecycle described in
+    // ``docs/sticky-sessions-spec.md``.  Servers without sticky support
+    // raise an appropriate exception when ``ctx.openSession`` is invoked;
+    // the capability-gated ``TestSticky`` conformance group skips them.
+
+    long open_counter(long initial, CallContext ctx);
+    long increment_counter(long by, CallContext ctx);
+    long close_counter(CallContext ctx);
+
+    // --- Sticky session — Streaming ----------------------------------------
+
+    RpcStream<? extends ProducerState> stream_session_counter(long count);
+    RpcStream<? extends ExchangeState> exchange_session_counter();
 }

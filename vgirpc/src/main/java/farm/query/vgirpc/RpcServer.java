@@ -6,6 +6,7 @@ package farm.query.vgirpc;
 import farm.query.vgirpc.external.ExternalLocationConfig;
 import farm.query.vgirpc.external.Externalizer;
 import farm.query.vgirpc.external.LocationResolver;
+import farm.query.vgirpc.http.SessionScope;
 import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.marshal.ParameterBinder;
@@ -260,6 +261,13 @@ public final class RpcServer {
                     throw t;
                 } finally {
                     if (dispatchHook != null && dispatchInfo != null) {
+                        // Snapshot sticky-session state at end-of-dispatch so the access
+                        // log reflects open/resume/close that happened during the call.
+                        SessionScope scope = SessionScope.current();
+                        if (scope != null) {
+                            dispatchInfo.sessionId = scope.sessionIdHex();
+                            dispatchInfo.sessionAction = scope.action();
+                        }
                         try {
                             dispatchHook.onDispatchEnd(hookToken, dispatchInfo, callStats, handlerErr);
                         } catch (Throwable t) {
