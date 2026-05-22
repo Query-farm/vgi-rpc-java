@@ -588,22 +588,61 @@ public final class Marshalling {
      * {@code DictionaryEncoding}). The vectors are usable as-is in either
      * representation; downstream emit picks up the wire schema from each
      * vector's preserved {@code Field}.
+     *
+     * <p>Recurses through container types (LIST, LARGE_LIST, FIXED_SIZE_LIST,
+     * MAP, STRUCT) so a {@code list<dict<…>>} (or any nesting) is also
+     * recognised as memory↔wire-equivalent. Without this recursion {@code
+     * castRoot} falls through to {@code copyCast} on the nested case and
+     * mangles a dict-encoded list child into a {@code SparseUnion<value, index>}
+     * shape, which crashes a downstream Arrow-C-Data-Interface consumer
+     * (DuckDB's {@code ColumnArrowToDuckDBDictionary} derefs the null
+     * {@code dictionary} pointer on what's really a union array).
      */
     private static boolean schemasEquivalentModuloDictMemory(Schema source, Schema target) {
         if (source.getFields().size() != target.getFields().size()) return false;
         for (int i = 0; i < source.getFields().size(); i++) {
-            Field sf = source.getFields().get(i);
-            Field tf = target.getFields().get(i);
-            if (sf.equals(tf)) continue;
-            if (!sf.getName().equals(tf.getName())) return false;
-            org.apache.arrow.vector.types.pojo.DictionaryEncoding senc = sf.getDictionary();
-            org.apache.arrow.vector.types.pojo.DictionaryEncoding tenc = tf.getDictionary();
-            if (senc == null || tenc == null) return false;
+            if (!fieldEquivalentModuloDictMemory(
+                    source.getFields().get(i), target.getFields().get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Per-field counterpart of {@link #schemasEquivalentModuloDictMemory},
+     *  applied recursively through container-type children. */
+    private static boolean fieldEquivalentModuloDictMemory(Field sf, Field tf) {
+        if (sf.equals(tf)) return true;
+        if (!sf.getName().equals(tf.getName())) return false;
+
+        org.apache.arrow.vector.types.pojo.DictionaryEncoding senc = sf.getDictionary();
+        org.apache.arrow.vector.types.pojo.DictionaryEncoding tenc = tf.getDictionary();
+        if (senc != null && tenc != null) {
+            // Both dict-encoded — memory↔wire variant of the same dictionary.
             if (senc.getId() != tenc.getId()) return false;
             // Memory-format source carries the index type on the field; wire-
             // format target carries the value type. Confirm the source type
             // matches the dictionary's index type.
             if (!sf.getType().equals(tenc.getIndexType())) return false;
+            // Dict-encoded leaves don't normally have children, but recurse
+            // defensively so e.g. dict<struct<…>> would still descend.
+            return childrenEquivalentModuloDictMemory(sf, tf);
+        }
+        if (senc != null || tenc != null) return false;  // dict on only one side
+
+        // No dict encoding at this level — container types must match and we
+        // recurse into children (LIST/MAP/STRUCT/etc. carry their nested-dict
+        // distinctions on the children, not on the container itself).
+        if (!sf.getType().equals(tf.getType())) return false;
+        return childrenEquivalentModuloDictMemory(sf, tf);
+    }
+
+    private static boolean childrenEquivalentModuloDictMemory(Field sf, Field tf) {
+        if (sf.getChildren().size() != tf.getChildren().size()) return false;
+        for (int i = 0; i < sf.getChildren().size(); i++) {
+            if (!fieldEquivalentModuloDictMemory(sf.getChildren().get(i), tf.getChildren().get(i))) {
+                return false;
+            }
         }
         return true;
     }
