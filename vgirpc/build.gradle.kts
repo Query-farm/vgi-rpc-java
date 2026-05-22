@@ -31,6 +31,7 @@ dependencies {
 
     testImplementation(platform("org.junit:junit-bom:5.11.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 
     // Shared test helpers (HttpRequestStub) consumed by vgirpc-oauth tests too.
     testFixturesApi("jakarta.servlet:jakarta.servlet-api:6.0.0")
