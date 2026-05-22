@@ -72,7 +72,13 @@ public final class Message {
         extra.put("exception_type", typeName);
         extra.put("exception_message", t.getMessage() != null ? t.getMessage() : "");
         extra.put("traceback", tb);
-        String summary = typeName + ": " + (t.getMessage() != null ? t.getMessage() : "");
+        // Type name lives in the wire extras (and clients read it from there
+        // as RpcError.error_type). Keeping it as a prose prefix duplicates it
+        // for humans — readers see "VGI Worker Exception: ValueError: <msg>"
+        // and the type adds no information they don't already have. Use the
+        // type name only as a fallback when there is no message.
+        String summary = t.getMessage() != null && !t.getMessage().isEmpty()
+                ? t.getMessage() : typeName;
         return new Message(Level.EXCEPTION, summary, extra);
     }
 
