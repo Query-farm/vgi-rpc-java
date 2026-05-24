@@ -131,6 +131,14 @@ public final class IpcStreamWriter implements AutoCloseable {
             // (the per-connection socket), but in VGI the channel persists
             // across many RPCs on the same connection.
             delegate.end();
+            // ArrowStreamWriter.ensureDictionariesWritten() stashes a *copy* of
+            // each dictionary vector in its private previousDictionaries map
+            // (used to detect dict changes across batches). Those copies are
+            // allocated from the worker's allocator and are only freed by
+            // ArrowStreamWriter.close() — which we skip to keep the channel
+            // open. Release them here so dict-encoded responses don't leak a
+            // dictionary copy per emit.
+            releaseDelegateDictionaryCopies(delegate);
             return;
         }
         if (!schemaEmittedDirect) {
@@ -214,6 +222,37 @@ public final class IpcStreamWriter implements AutoCloseable {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw new RuntimeException("Cannot invoke ArrowWriter.ensureDictionariesWritten; "
                     + "Arrow Java API likely changed", cause);
+        }
+    }
+
+    /**
+     * Close and clear {@code ArrowStreamWriter.previousDictionaries} — the
+     * per-dictionary copies the stock writer retains across batches — without
+     * closing the writer (which would close the shared channel). The field is
+     * private with no accessor, so reflection is the only path; if Arrow's
+     * internals change we swallow the error rather than break the write path
+     * (worst case reverts to the prior leak, never a crash).
+     */
+    private static void releaseDelegateDictionaryCopies(ArrowStreamWriter delegate) {
+        try {
+            java.lang.reflect.Field f =
+                    org.apache.arrow.vector.ipc.ArrowStreamWriter.class.getDeclaredField("previousDictionaries");
+            f.setAccessible(true);
+            Object value = f.get(delegate);
+            if (value instanceof Map<?, ?> prev) {
+                for (Object v : prev.values()) {
+                    if (v instanceof AutoCloseable c) {
+                        try {
+                            c.close();
+                        } catch (Exception ignore) {
+                            // best-effort; continue closing the rest
+                        }
+                    }
+                }
+                prev.clear();
+            }
+        } catch (ReflectiveOperationException e) {
+            // Arrow API likely changed; leave previousDictionaries to the GC.
         }
     }
 
