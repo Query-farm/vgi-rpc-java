@@ -252,7 +252,7 @@ public final class HttpStreamHandler {
             OutputCollector.Entry data = null;
             for (OutputCollector.Entry e : collector.entries()) {
                 if (e.isData()) { data = e; continue; }
-                w.writeBatch(e.root(), e.customMetadata());
+                w.writeBatch(e.root(), e.customMetadata(), e.dictionaryProvider());
                 e.root().close();
             }
 
@@ -261,12 +261,12 @@ public final class HttpStreamHandler {
                 Map<String, String> md = new LinkedHashMap<>();
                 if (data.customMetadata() != null) md.putAll(data.customMetadata());
                 md.put(Metadata.STREAM_STATE, newTokenStr);
-                w.writeBatch(data.root(), md);
+                w.writeBatch(data.root(), md, data.dictionaryProvider());
                 data.root().close();
             } else {
                 // Producer continuation (or no data): emit the data batch as-is, token as a trailing zero-row batch.
                 if (data != null) {
-                    w.writeBatch(data.root(), data.customMetadata());
+                    w.writeBatch(data.root(), data.customMetadata(), data.dictionaryProvider());
                     data.root().close();
                 }
                 if (newTokenStr != null) {
@@ -321,7 +321,7 @@ public final class HttpStreamHandler {
             if (!error) {
                 // Emit all buffered entries (logs + at most one data batch) in order.
                 for (OutputCollector.Entry e : coll.entries()) {
-                    w.writeBatch(e.root(), e.customMetadata());
+                    w.writeBatch(e.root(), e.customMetadata(), e.dictionaryProvider());
                     e.root().close();
                 }
                 // If the producer isn't finished, append a zero-row state-token batch so the
