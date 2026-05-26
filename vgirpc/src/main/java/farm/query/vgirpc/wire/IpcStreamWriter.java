@@ -62,6 +62,14 @@ public final class IpcStreamWriter implements AutoCloseable {
         this.out = new WriteChannel(rawChannel);
     }
 
+    /** Write directly to a {@link WritableByteChannel} (e.g. a shared-memory
+     *  segment channel), bypassing the {@code Channels.newChannel} adapter's
+     *  heap-{@code byte[]} bounce. */
+    public IpcStreamWriter(WritableByteChannel channel) {
+        this.rawChannel = channel;
+        this.out = new WriteChannel(channel);
+    }
+
     /**
      * Record the schema this stream will carry. Actual emission is deferred:
      * if a {@link #writeBatch(VectorSchemaRoot, Map, DictionaryProvider)}

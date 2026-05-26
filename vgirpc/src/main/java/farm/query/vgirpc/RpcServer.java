@@ -13,6 +13,9 @@ import farm.query.vgirpc.marshal.ParameterBinder;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgirpc.schema.ArrowSerializableRecord;
 import farm.query.vgirpc.schema.SchemaDerivation;
+import farm.query.vgirpc.shm.ShmResolver;
+import farm.query.vgirpc.shm.ShmSegment;
+import farm.query.vgirpc.shm.ShmSession;
 import farm.query.vgirpc.transport.RpcTransport;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
@@ -107,22 +110,27 @@ public final class RpcServer {
 
     /** Loop serving requests until the transport closes. */
     public void serve(RpcTransport transport) {
-        while (true) {
-            try {
-                serveOne(transport);
-            } catch (EndOfStream e) {
-                return;
-            } catch (Throwable t) {
-                // Don't take the whole loop down on a single bad request — try to surface
-                // the error to the client and continue serving subsequent calls.
-                LOG.warn("recoverable serve error: {}", t.toString(), t);
-                t.printStackTrace(System.err);
+        // One shared-memory session per connection: lazily attaches when the
+        // client advertises a segment, and is munmap'd/closed when the loop
+        // exits (never unlinked — the client owns the segment).
+        try (ShmSession shm = new ShmSession()) {
+            while (true) {
                 try {
-                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, t, serverId);
-                    transport.writer().flush();
-                } catch (Exception ignore) {
-                    // If we can't even write back, the transport is dead — exit.
+                    serveOne(transport, shm);
+                } catch (EndOfStream e) {
                     return;
+                } catch (Throwable t) {
+                    // Don't take the whole loop down on a single bad request — try to surface
+                    // the error to the client and continue serving subsequent calls.
+                    LOG.warn("recoverable serve error: {}", t.toString(), t);
+                    t.printStackTrace(System.err);
+                    try {
+                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, t, serverId);
+                        transport.writer().flush();
+                    } catch (Exception ignore) {
+                        // If we can't even write back, the transport is dead — exit.
+                        return;
+                    }
                 }
             }
         }
@@ -151,8 +159,13 @@ public final class RpcServer {
         }
     }
 
-    /** Handle exactly one RPC call. */
+    /** Handle exactly one RPC call (no shared-memory session — used by the HTTP transport). */
     public void serveOne(RpcTransport transport) {
+        serveOne(transport, null);
+    }
+
+    /** Handle exactly one RPC call, attaching/using the connection's shm session if present. */
+    private void serveOne(RpcTransport transport, ShmSession shmSession) {
         try (IpcStreamReader reader = new IpcStreamReader(transport.reader(), Allocators.root())) {
             Map<String, String> meta;
             try {
@@ -163,12 +176,28 @@ public final class RpcServer {
             if (meta == null) {
                 throw new EndOfStream();
             }
+            if (shmSession != null) shmSession.attachIfAdvertised(meta);
+            ShmSegment shm = shmSession != null ? shmSession.segment() : null;
             VectorSchemaRoot paramsRoot = reader.root();
-            // If the outer batch is an external-location pointer, fetch the inner batch
-            // and decode kwargs from it. Dispatch metadata still comes from the outer batch.
+            // If the outer batch is a shm or external-location pointer, resolve the
+            // inner batch and decode kwargs from it. Dispatch metadata still comes
+            // from the (merged) outer batch metadata.
             VectorSchemaRoot resolvedParams = null;
             try {
-                if (locationResolver != null && LocationResolver.isPointer(paramsRoot.getRowCount(), meta)) {
+                if (shm != null && ShmResolver.isPointer(paramsRoot.getRowCount(), meta)) {
+                    try {
+                        shm.inShmBatches++;
+                        shm.inShmBytes += Long.parseLong(meta.get(Metadata.SHM_LENGTH));
+                        ShmResolver.Resolved res = ShmResolver.resolve(shm, paramsRoot, meta);
+                        resolvedParams = res.root();
+                        paramsRoot = resolvedParams;
+                        meta = res.customMetadata();
+                    } catch (Exception shmExc) {
+                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, shmExc, serverId);
+                        transport.writer().flush();
+                        return;
+                    }
+                } else if (locationResolver != null && LocationResolver.isPointer(paramsRoot.getRowCount(), meta)) {
                     try {
                         LocationResolver.Resolved res = locationResolver.resolve(meta);
                         resolvedParams = res.root();
@@ -252,9 +281,9 @@ public final class RpcServer {
 
                 try {
                     if (info.methodType() == MethodType.UNARY) {
-                        serveUnary(transport, info, kwargs);
+                        serveUnary(transport, info, kwargs, shm);
                     } else {
-                        serveStream(transport, info, kwargs);
+                        serveStream(transport, info, kwargs, shm);
                     }
                 } catch (Throwable t) {
                     handlerErr = t;
@@ -287,7 +316,8 @@ public final class RpcServer {
         }
     }
 
-    private void serveUnary(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs) throws Exception {
+    private void serveUnary(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs,
+                            ShmSegment shm) throws Exception {
         Schema schema = info.resultSchema();
         ClientLogSink sink = new ClientLogSink(serverId);
         AuthScope.Scope scope = AuthScope.current();
@@ -299,7 +329,7 @@ public final class RpcServer {
             try {
                 Object[] callArgs = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
                 Object result = info.reflectMethod().invoke(impl, callArgs);
-                writeResult(w, info, result);
+                writeResult(w, info, result, shm);
             } catch (Throwable t) {
                 Throwable inner = unwrap(t);
                 Wire.writeZeroBatch(w, schema, Wire.errorMetadata(inner, serverId));
@@ -307,7 +337,7 @@ public final class RpcServer {
         }
     }
 
-    private void writeResult(IpcStreamWriter w, RpcMethodInfo info, Object result) throws Exception {
+    private void writeResult(IpcStreamWriter w, RpcMethodInfo info, Object result, ShmSegment shm) throws Exception {
         Schema schema = info.resultSchema();
         if (schema.getFields().isEmpty()) {
             Wire.writeZeroBatch(w, schema, null);
@@ -317,6 +347,17 @@ public final class RpcServer {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put(resultField.getName(), convertResult(result, info.resultType(), resultField));
         try (VectorSchemaRoot root = Marshalling.encodeRow(schema, row, Allocators.root())) {
+            // Prefer the shared-memory side-channel; fall back to external-location,
+            // then inline. The client resolves unary-response shm pointers on the
+            // FunctionConnection path (ResolveUnaryShm); connections that never
+            // advertise a segment (catalog, bind) get shm == null → inline.
+            ShmResolver.ShmPointer sp = ShmResolver.maybeWriteToShm(shm, root, null);
+            if (sp != null) {
+                try (VectorSchemaRoot pr = sp.root()) {
+                    w.writeBatch(pr, sp.customMetadata());
+                }
+                return;
+            }
             Externalizer.Pointer ptr = Externalizer.maybeExternalize(root, null, externalConfig);
             if (ptr != null) {
                 try (VectorSchemaRoot pr = ptr.root()) {
@@ -338,7 +379,8 @@ public final class RpcServer {
         return value;
     }
 
-    private void serveStream(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs) throws Exception {
+    private void serveStream(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs,
+                             ShmSegment shm) throws Exception {
         ClientLogSink sink = new ClientLogSink(serverId);
         AuthScope.Scope scope = AuthScope.current();
         CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
@@ -365,7 +407,7 @@ public final class RpcServer {
                 sink.bind(outputWriter, outputSchema);
 
                 runTickLoop(inputReader, outputWriter, transport, state, ctx,
-                        outputSchema, inputSchema, isProducer);
+                        outputSchema, inputSchema, isProducer, shm);
             } finally {
                 closeStreamCleanly(outputWriter, transport, inputReader);
             }
@@ -397,23 +439,29 @@ public final class RpcServer {
     /** Main tick loop: read input batch → resolve/cast → state.process → flush output, until EOS or finish. */
     private void runTickLoop(IpcStreamReader inputReader, IpcStreamWriter outputWriter, RpcTransport transport,
                              StreamState state, CallContext ctx, Schema outputSchema, Schema inputSchema,
-                             boolean isProducer) throws IOException {
+                             boolean isProducer, ShmSegment shm) throws IOException {
         while (true) {
             Map<String, String> meta;
+            // Time spent blocked here is the worker idle waiting for the client to
+            // send the next input — under lockstep that equals the client's own
+            // (encode/consume) work + handoff latency.
+            long tIdle0 = System.nanoTime();
             try {
                 meta = inputReader.readNextBatch();
             } catch (IOException e) {
                 break;
             }
+            if (shm != null) shm.idleNs += System.nanoTime() - tIdle0;
             if (meta == null) break;
             if (meta.containsKey(Metadata.CANCEL)) {
                 try { state.onCancel(ctx); } catch (Exception ignore) { /* best-effort */ }
                 break;
             }
-            if (!processOneTick(inputReader, outputWriter, transport, state, ctx,
-                    outputSchema, inputSchema, isProducer, meta)) {
-                break;
-            }
+            long tBusy0 = System.nanoTime();
+            boolean cont = processOneTick(inputReader, outputWriter, transport, state, ctx,
+                    outputSchema, inputSchema, isProducer, meta, shm);
+            if (shm != null) shm.busyNs += System.nanoTime() - tBusy0;
+            if (!cont) break;
         }
     }
 
@@ -423,12 +471,28 @@ public final class RpcServer {
      */
     private boolean processOneTick(IpcStreamReader inputReader, IpcStreamWriter outputWriter, RpcTransport transport,
                                     StreamState state, CallContext ctx, Schema outputSchema, Schema inputSchema,
-                                    boolean isProducer, Map<String, String> meta) throws IOException {
+                                    boolean isProducer, Map<String, String> meta, ShmSegment shm) throws IOException {
         VectorSchemaRoot inputRoot = inputReader.root();
         VectorSchemaRoot resolvedRoot = null;
         Map<String, String> effectiveMeta = meta;
 
-        if (locationResolver != null && LocationResolver.isPointer(inputRoot.getRowCount(), meta)) {
+        boolean inboundViaShm = shm != null && ShmResolver.isPointer(inputRoot.getRowCount(), meta);
+        if (inboundViaShm) {
+            try {
+                shm.inShmBatches++;
+                shm.inShmBytes += Long.parseLong(meta.get(Metadata.SHM_LENGTH));
+                long tr0 = System.nanoTime();
+                ShmResolver.Resolved res = ShmResolver.resolve(shm, inputRoot, meta);
+                shm.resolveNs += System.nanoTime() - tr0;
+                resolvedRoot = res.root();
+                inputRoot = resolvedRoot;
+                effectiveMeta = res.customMetadata();
+            } catch (Exception shmExc) {
+                Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(shmExc, serverId));
+                transport.writer().flush();
+                return false;
+            }
+        } else if (locationResolver != null && LocationResolver.isPointer(inputRoot.getRowCount(), meta)) {
             try {
                 LocationResolver.Resolved res = locationResolver.resolve(meta);
                 resolvedRoot = res.root();
@@ -439,6 +503,10 @@ public final class RpcServer {
                 transport.writer().flush();
                 return false;
             }
+        } else if (shm != null && resolvedRoot == null && inputRoot.getRowCount() > 0) {
+            // A non-empty data batch arrived inline even though shm is active —
+            // the client chose not to (or couldn't) put it in the segment.
+            shm.inInlineDataBatches++;
         }
 
         VectorSchemaRoot castRoot = null;
@@ -455,6 +523,7 @@ public final class RpcServer {
         }
 
         OutputCollector out = new OutputCollector(outputSchema, serverId, isProducer);
+        long tp0 = System.nanoTime();
         try {
             state.process(new AnnotatedBatch(inputRoot, effectiveMeta), out, ctx);
         } catch (Throwable t) {
@@ -462,8 +531,11 @@ public final class RpcServer {
             transport.writer().flush();
             return false;
         }
-        flushCollector(outputWriter, out, inputReader.dictionaryProvider());
+        if (shm != null) shm.processNs += System.nanoTime() - tp0;
+        long te0 = System.nanoTime();
+        flushCollector(outputWriter, out, inputReader.dictionaryProvider(), shm);
         transport.writer().flush();
+        if (shm != null) shm.emitNs += System.nanoTime() - te0;
         if (castRoot != null) castRoot.close();
         if (resolvedRoot != null) resolvedRoot.close();
         return !out.finished();
@@ -482,20 +554,18 @@ public final class RpcServer {
         try { inputReader.drain(); } catch (IOException ignore) { /* client already gone */ }
     }
 
-    private void flushCollector(IpcStreamWriter writer, OutputCollector out) throws IOException {
-        flushCollector(writer, out, null);
-    }
-
     /**
-     * Variant that threads the inbound stream's {@link
+     * Threads the inbound stream's {@link
      * org.apache.arrow.vector.dictionary.DictionaryProvider} through to the
      * writer, so dict-encoded columns (DuckDB ENUMs) round-trip through
      * passthrough handlers like {@code echo} with their dictionaries
      * intact. Without this the consumer sees raw index columns and renders
-     * them as unbound nulls.
+     * them as unbound nulls. {@code shm}, when present, offloads non-dict data
+     * batches to the shared-memory segment as zero-row pointer batches.
      */
     private void flushCollector(IpcStreamWriter writer, OutputCollector out,
-                                  org.apache.arrow.vector.dictionary.DictionaryProvider dictProvider)
+                                  org.apache.arrow.vector.dictionary.DictionaryProvider dictProvider,
+                                  ShmSegment shm)
             throws IOException {
         for (OutputCollector.Entry e : out.entries()) {
             // Per-entry provider (set when a producer emits dict-encoded
@@ -506,6 +576,23 @@ public final class RpcServer {
             org.apache.arrow.vector.dictionary.DictionaryProvider effective =
                     e.dictionaryProvider() != null ? e.dictionaryProvider() : dictProvider;
             try {
+                if (e.isData() && shm != null) {
+                    ShmResolver.ShmPointer sp =
+                            ShmResolver.maybeWriteToShm(shm, e.root(), e.customMetadata());
+                    if (sp != null) {
+                        shm.outShmBatches++;
+                        shm.outShmBytes += Long.parseLong(sp.customMetadata().get(Metadata.SHM_LENGTH));
+                        try (VectorSchemaRoot pr = sp.root()) {
+                            writer.writeBatch(pr, sp.customMetadata(), effective);
+                        }
+                        continue;   // finally still closes e.root()
+                    }
+                    // Eligible for shm but fell back to inline (segment full / serialize
+                    // failed) — the signal that intended-shm output leaked to the pipe.
+                    if (ShmResolver.shmEligible(e.root())) {
+                        shm.outInlineEligibleBatches++;
+                    }
+                }
                 if (e.isData() && externalConfig != null && externalConfig.storage() != null) {
                     try {
                         Externalizer.Pointer ptr = Externalizer.maybeExternalize(

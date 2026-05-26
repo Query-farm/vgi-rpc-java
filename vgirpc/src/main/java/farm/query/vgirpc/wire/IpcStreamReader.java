@@ -18,6 +18,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -41,8 +42,15 @@ public final class IpcStreamReader implements AutoCloseable {
     private boolean schemaInitialized = false;
 
     public IpcStreamReader(InputStream raw, BufferAllocator allocator) {
+        this(Channels.newChannel(raw), allocator);
+    }
+
+    /** Read directly from a {@link ReadableByteChannel} (e.g. a shared-memory
+     *  segment channel), bypassing the {@code Channels.newChannel} adapter's
+     *  heap-{@code byte[]} bounce. */
+    public IpcStreamReader(ReadableByteChannel channel, BufferAllocator allocator) {
         this.allocator = allocator;
-        ReadChannel rc = new ReadChannel(Channels.newChannel(raw));
+        ReadChannel rc = new ReadChannel(channel);
         this.messageReader = new CapturingMessageReader(rc, allocator);
         this.inner = new StreamReaderImpl(messageReader, allocator);
     }

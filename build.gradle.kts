@@ -31,12 +31,12 @@ subprojects {
 
     extensions.configure<JavaPluginExtension> {
         toolchain {
-            languageVersion.set(JavaLanguageVersion.of(21))
+            languageVersion.set(JavaLanguageVersion.of(25))
         }
     }
 
     tasks.withType<JavaCompile>().configureEach {
-        options.release.set(21)
+        options.release.set(25)
         options.compilerArgs.addAll(
             listOf(
                 "-Xlint:all,-serial,-processing",
@@ -48,7 +48,11 @@ subprojects {
 
     tasks.withType<Test>().configureEach {
         useJUnitPlatform()
-        // Arrow's memory module needs access to java.nio internals.
-        jvmArgs("--add-opens=java.base/java.nio=ALL-UNNAMED")
+        // Arrow's memory module needs access to java.nio internals;
+        // FFM (shm_open/mmap) needs native access without warnings.
+        jvmArgs(
+            "--add-opens=java.base/java.nio=ALL-UNNAMED",
+            "--enable-native-access=ALL-UNNAMED",
+        )
     }
 }

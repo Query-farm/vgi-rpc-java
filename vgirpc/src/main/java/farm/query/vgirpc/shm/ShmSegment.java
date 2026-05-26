@@ -4,23 +4,28 @@
 package farm.query.vgirpc.shm;
 
 import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.lang.foreign.Arena;
+import java.lang.foreign.FunctionDescriptor;
+import java.lang.foreign.Linker;
+import java.lang.foreign.MemoryLayout;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SymbolLookup;
+import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.MappedByteBuffer;
-import java.nio.channels.FileChannel;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 
 /**
- * POSIX-style shared memory region exposing a bump-pointer allocator stored
- * in a fixed-size header. Wire-compatible with the Python reference
- * ({@code vgi_rpc.shm}):
+ * POSIX named shared-memory region exposing a bump-pointer allocator stored in
+ * a fixed-size header. Wire-compatible with the C++ ({@code vgi_shm_segment}),
+ * Go ({@code vgirpc/shm.go}) and Python ({@code vgi_rpc.shm}) implementations:
  *
  * <pre>
  *   Offset  Size  Field
@@ -36,11 +41,12 @@ import java.util.Objects;
  * the allocator tracks only occupied regions, so freeing a neighbour widens
  * the usable gap with no explicit coalescing step.</p>
  *
- * <p>This implementation backs the region with a normal {@link MappedByteBuffer}
- * over a file (on Linux {@code /dev/shm} gives POSIX SHM semantics; on macOS
- * use {@code /tmp}). Inter-process use requires both peers to know the same
- * file path; Python's {@code multiprocessing.shared_memory.SharedMemory}
- * places its segments under {@code /dev/shm} on Linux.</p>
+ * <p>The region is backed by POSIX {@code shm_open} + {@code mmap} via the
+ * {@code java.lang.foreign} FFM API so it interoperates with the C++/Go/Python
+ * peers, which use named POSIX shared memory (not file-backed mmap). The VGI
+ * worker is always an <em>attacher</em>: the C++ client creates and owns the
+ * segment (and {@code shm_unlink}s it); {@link #attach} maps it read-write and
+ * never unlinks. {@link #create} exists for unit tests.</p>
  */
 public final class ShmSegment implements AutoCloseable {
 
@@ -51,75 +57,190 @@ public final class ShmSegment implements AutoCloseable {
     private static final int ALLOC_ENTRY_LEN = 16;      // offset(8) + length(8)
     public static final int MAX_ALLOCS = (HEADER_SIZE - HEADER_FIXED_LEN) / ALLOC_ENTRY_LEN;
 
-    private final String name;
-    private final Path file;
-    private final RandomAccessFile raf;
-    private final FileChannel channel;
-    private final MappedByteBuffer buffer;
-    private final long size;
+    // --- libc bindings (FFM) ---------------------------------------------
+
+    private static final boolean DEBUG = System.getenv("VGI_RPC_SHM_DEBUG") != null;
+    private static final boolean IS_MAC =
+            System.getProperty("os.name", "").toLowerCase().contains("mac");
+
+    // open(2) flags diverge between Linux and Darwin; O_RDWR is identical.
+    private static final int O_RDWR = 0x0002;
+    private static final int O_CREAT = IS_MAC ? 0x0200 : 0x40;
+    private static final int O_EXCL = IS_MAC ? 0x0800 : 0x80;
+    // mmap(2) prot/flags are identical on both platforms.
+    private static final int PROT_READ = 0x1;
+    private static final int PROT_WRITE = 0x2;
+    private static final int MAP_SHARED = 0x1;
+
+    private static final ValueLayout.OfInt I32 =
+            ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfLong I64 =
+            ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+    private static final Linker LINKER = Linker.nativeLinker();
+    private static final SymbolLookup LIBC = LINKER.defaultLookup();
+    private static final MemoryLayout CAPTURE = Linker.Option.captureStateLayout();
+    private static final VarHandle ERRNO =
+            CAPTURE.varHandle(MemoryLayout.PathElement.groupElement("errno"));
+
+    // int shm_open(const char *name, int oflag, mode_t mode)  [mode is variadic]
+    private static final MethodHandle SHM_OPEN = LINKER.downcallHandle(
+            LIBC.find("shm_open").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT),
+            Linker.Option.captureCallState("errno"),
+            Linker.Option.firstVariadicArg(2));   // mode_t passed variadically (aarch64 ABI)
+    // int shm_unlink(const char *name)
+    private static final MethodHandle SHM_UNLINK = LINKER.downcallHandle(
+            LIBC.find("shm_unlink").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+    // int ftruncate(int fd, off_t length)
+    private static final MethodHandle FTRUNCATE = LINKER.downcallHandle(
+            LIBC.find("ftruncate").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG),
+            Linker.Option.captureCallState("errno"));
+    // void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
+    private static final MethodHandle MMAP = LINKER.downcallHandle(
+            LIBC.find("mmap").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG),
+            Linker.Option.captureCallState("errno"));
+    // int munmap(void *addr, size_t len)
+    private static final MethodHandle MUNMAP = LINKER.downcallHandle(
+            LIBC.find("munmap").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+    // int close(int fd)
+    private static final MethodHandle CLOSE = LINKER.downcallHandle(
+            LIBC.find("close").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+
+    // --- instance state --------------------------------------------------
+
+    private final String name;          // POSIX name without leading slash
+    private final Arena arena;
+    private final MemorySegment mapped;  // sized view of the mapping
+    private final long mappedAddr;
+    private final int fd;
+    private final long size;            // mapped length in bytes
+    private final long dataEnd;         // HEADER_SIZE + data_size (allocator bound)
     private final boolean owner;
     private volatile boolean closed;
 
-    private ShmSegment(String name, Path file, RandomAccessFile raf, FileChannel channel,
-                       MappedByteBuffer buffer, long size, boolean owner) {
+    // Worker-side usage counters for this connection. The segment is touched by
+    // exactly one thread under the lockstep protocol, so plain longs suffice.
+    // "inline-eligible" = a data batch that *should* have used shm (non-empty,
+    // non-dict) but didn't — the signal that something leaked to the pipe.
+    public long inShmBatches, inShmBytes, inInlineDataBatches;
+    public long outShmBatches, outShmBytes, outInlineEligibleBatches;
+    // Lockstep timeline (nanos): worker busy (resolve+process+emit) vs idle
+    // (blocked waiting for the client = client work + handoff).
+    public long busyNs, idleNs, resolveNs, processNs, emitNs;
+
+    private ShmSegment(String name, Arena arena, MemorySegment mapped, int fd,
+                       long size, long dataEnd, boolean owner) {
         this.name = name;
-        this.file = file;
-        this.raf = raf;
-        this.channel = channel;
-        this.buffer = buffer;
-        this.buffer.order(ByteOrder.LITTLE_ENDIAN);
+        this.arena = arena;
+        this.mapped = mapped;
+        this.mappedAddr = mapped.address();
+        this.fd = fd;
         this.size = size;
+        this.dataEnd = dataEnd;
         this.owner = owner;
     }
 
     public String name() { return name; }
     public long size() { return size; }
-    public Path path() { return file; }
 
-    /** Create (truncate + initialise) a new segment at {@code path} of {@code size} bytes. */
-    public static ShmSegment create(Path path, long size) throws IOException {
-        Objects.requireNonNull(path, "path");
+    // --- create / attach -------------------------------------------------
+
+    /** Create a fresh segment of {@code size} bytes (unit-test/owner path). */
+    public static ShmSegment create(String name, long size) throws IOException {
+        Objects.requireNonNull(name, "name");
         if (size <= HEADER_SIZE) {
             throw new IllegalArgumentException("size must exceed HEADER_SIZE=" + HEADER_SIZE);
         }
-        Files.deleteIfExists(path);
-        RandomAccessFile raf = new RandomAccessFile(path.toFile(), "rw");
-        raf.setLength(size);
-        FileChannel ch = raf.getChannel();
-        MappedByteBuffer mb = ch.map(FileChannel.MapMode.READ_WRITE, 0, size);
-        ShmSegment seg = new ShmSegment(path.getFileName().toString(), path, raf, ch, mb, size, true);
-        seg.writeHeader(0);
-        return seg;
+        Arena arena = Arena.ofShared();
+        try {
+            MemorySegment cName = arena.allocateFrom(withSlash(name));
+            MemorySegment cap = arena.allocate(CAPTURE);
+            int fd = (int) SHM_OPEN.invoke(cap, cName, O_RDWR | O_CREAT | O_EXCL, 0600);
+            if (fd < 0) throw new IOException("shm_open(create " + name + ") errno=" + errno(cap));
+            try {
+                if ((int) FTRUNCATE.invoke(cap, fd, size) < 0) {
+                    throw new IOException("ftruncate(" + name + ", " + size + ") errno=" + errno(cap));
+                }
+                MemorySegment mapped = doMmap(arena, cap, size, fd, name);
+                ShmSegment seg = new ShmSegment(name, arena, mapped, fd, size, size, true);
+                seg.writeHeader(0, size - HEADER_SIZE);
+                return seg;
+            } catch (Throwable t) {
+                CLOSE.invoke(fd);
+                throw t;
+            }
+        } catch (IOException e) {
+            arena.close();
+            throw e;
+        } catch (Throwable t) {
+            arena.close();
+            throw new IOException("shm create failed: " + t, t);
+        }
     }
 
-    /** Attach to an existing segment at {@code path}. */
-    public static ShmSegment attach(Path path) throws IOException {
-        Objects.requireNonNull(path, "path");
-        RandomAccessFile raf = new RandomAccessFile(path.toFile(), "rw");
-        long size = raf.length();
-        FileChannel ch = raf.getChannel();
-        MappedByteBuffer mb = ch.map(FileChannel.MapMode.READ_WRITE, 0, size);
-        ShmSegment seg = new ShmSegment(path.getFileName().toString(), path, raf, ch, mb, size, false);
-        seg.validateHeader();
-        return seg;
+    /**
+     * Attach (read-write) to an existing segment advertised by a peer. {@code name}
+     * is the POSIX name <em>without</em> leading slash (as the C++ client sends it);
+     * {@code advertisedSize} is the peer's mapped (page-rounded) byte size.
+     */
+    public static ShmSegment attach(String name, long advertisedSize) throws IOException {
+        Objects.requireNonNull(name, "name");
+        Arena arena = Arena.ofShared();
+        try {
+            MemorySegment cName = arena.allocateFrom(withSlash(name));
+            MemorySegment cap = arena.allocate(CAPTURE);
+            int fd = (int) SHM_OPEN.invoke(cap, cName, O_RDWR, 0);
+            if (fd < 0) throw new IOException("shm_open(attach " + name + ") errno=" + errno(cap));
+            try {
+                long mapLen = Math.max(advertisedSize, HEADER_SIZE);
+                MemorySegment mapped = doMmap(arena, cap, mapLen, fd, name);
+                validateMagicVersion(mapped, name);
+                long dataSize = mapped.get(I64, 8);
+                long needed = HEADER_SIZE + dataSize;
+                if (needed > mapLen) {
+                    // Peer's page-rounded size exceeded our guess; re-map larger.
+                    munmap(mapped.address(), mapLen);
+                    mapped = doMmap(arena, cap, needed, fd, name);
+                    mapLen = needed;
+                }
+                ShmSegment seg = new ShmSegment(name, arena, mapped, fd, mapLen, needed, false);
+                if (DEBUG) {
+                    System.err.println("[vgi-shm] attached " + name + " size=" + mapLen
+                            + " data_size=" + dataSize);
+                }
+                return seg;
+            } catch (Throwable t) {
+                CLOSE.invoke(fd);
+                throw t;
+            }
+        } catch (IOException e) {
+            arena.close();
+            throw e;
+        } catch (Throwable t) {
+            arena.close();
+            throw new IOException("shm attach(" + name + ") failed: " + t, t);
+        }
     }
 
-    // --- Allocation ------------------------------------------------------
+    // --- allocation ------------------------------------------------------
 
     /** Allocate {@code length} bytes; returns the absolute offset in the segment. */
     public synchronized long allocate(long length) {
         if (length <= 0) throw new IllegalArgumentException("length must be positive");
         List<long[]> allocs = readAllocs();
-        long dataStart = HEADER_SIZE;
-        long dataEnd = size;
-        // Treat allocations as occupied intervals; find the first gap large enough.
-        long cursor = dataStart;
+        long cursor = HEADER_SIZE;
         for (long[] a : allocs) {
             long aoff = a[0], alen = a[1];
-            if (aoff - cursor >= length) {
-                // fits in the gap
-                break;
-            }
+            if (aoff - cursor >= length) break;             // fits in the gap
             cursor = Math.max(cursor, aoff + alen);
         }
         if (cursor + length > dataEnd) {
@@ -144,77 +265,163 @@ public final class ShmSegment implements AutoCloseable {
 
     /** Write {@code data} into the segment at {@code offset} (must be within an allocation). */
     public void writeAt(long offset, byte[] data) {
-        ByteBuffer view = buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN);
-        view.position((int) offset);
-        view.put(data);
+        MemorySegment.copy(data, 0, mapped, ValueLayout.JAVA_BYTE, offset, data.length);
     }
 
     /** Read {@code length} bytes starting at {@code offset}. */
     public byte[] readAt(long offset, long length) {
         byte[] out = new byte[(int) length];
-        ByteBuffer view = buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN);
-        view.position((int) offset);
-        view.get(out);
+        MemorySegment.copy(mapped, ValueLayout.JAVA_BYTE, offset, out, 0, (int) length);
         return out;
     }
 
-    // --- Header helpers --------------------------------------------------
-
-    private void writeHeader(int numAllocs) {
-        ByteBuffer b = buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN);
-        b.position(0);
-        b.put(MAGIC);
-        b.putInt(VERSION);
-        b.putLong(size - HEADER_SIZE);
-        b.putInt(numAllocs);
-        b.putInt(0); // padding
+    /**
+     * A {@link WritableByteChannel} that writes {@link ByteBuffer}s straight into
+     * the mapped segment at {@code offset}, capped at {@code capacity}. Feeding
+     * this directly to Arrow's {@code WriteChannel} (instead of wrapping an
+     * {@code OutputStream} via {@code Channels.newChannel}) avoids the JDK
+     * adapter's heap-{@code byte[]} bounce — each {@code write} is one bulk
+     * {@code MemorySegment.copy} into shm. {@link #written()} reports the exact
+     * serialized length after the writer closes.
+     */
+    public SegmentWriteChannel writeChannelAt(long offset, long capacity) {
+        return new SegmentWriteChannel(offset, capacity);
     }
 
-    private void validateHeader() throws IOException {
-        ByteBuffer b = buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN);
-        byte[] magic = new byte[4];
-        b.position(0);
-        b.get(magic);
-        for (int i = 0; i < 4; i++) {
-            if (magic[i] != MAGIC[i]) throw new IOException("bad SHM magic");
+    /** A {@link ReadableByteChannel} over {@code [offset, offset+length)} of the
+     *  mapped segment, so Arrow's {@code ReadChannel} reads each buffer with one
+     *  bulk {@code MemorySegment.copy} — no {@code Channels} adapter, no {@code byte[]}. */
+    public ReadableByteChannel readChannelAt(long offset, long length) {
+        return new SegmentReadChannel(offset, length);
+    }
+
+    public final class SegmentWriteChannel implements WritableByteChannel {
+        private final long base;
+        private final long cap;
+        private long pos;
+        private boolean open = true;
+
+        SegmentWriteChannel(long base, long cap) { this.base = base; this.cap = cap; }
+
+        /** Bytes written so far (the actual serialized length). */
+        public long written() { return pos; }
+
+        @Override public int write(ByteBuffer src) {
+            int n = src.remaining();
+            if (pos + n > cap) throw new IndexOutOfBoundsException("shm write overflow");
+            MemorySegment.copy(MemorySegment.ofBuffer(src), 0L, mapped, base + pos, n);
+            src.position(src.position() + n);
+            pos += n;
+            return n;
         }
-        int version = b.getInt();
-        if (version != VERSION) throw new IOException("unsupported SHM version: " + version);
+
+        @Override public boolean isOpen() { return open; }
+        @Override public void close() { open = false; }
+    }
+
+    private final class SegmentReadChannel implements ReadableByteChannel {
+        private final long base;
+        private final long len;
+        private long pos;
+        private boolean open = true;
+
+        SegmentReadChannel(long base, long len) { this.base = base; this.len = len; }
+
+        @Override public int read(ByteBuffer dst) {
+            if (pos >= len) return -1;
+            int n = (int) Math.min(dst.remaining(), len - pos);
+            if (n == 0) return 0;
+            MemorySegment.copy(mapped, base + pos, MemorySegment.ofBuffer(dst), 0L, n);
+            dst.position(dst.position() + n);
+            pos += n;
+            return n;
+        }
+
+        @Override public boolean isOpen() { return open; }
+        @Override public void close() { open = false; }
+    }
+
+    // --- header helpers --------------------------------------------------
+
+    private void writeHeader(int numAllocs, long dataSize) {
+        MemorySegment.copy(MAGIC, 0, mapped, ValueLayout.JAVA_BYTE, 0, 4);
+        mapped.set(I32, 4, VERSION);
+        mapped.set(I64, 8, dataSize);
+        mapped.set(I32, 16, numAllocs);
+        mapped.set(I32, 20, 0);
+    }
+
+    private static void validateMagicVersion(MemorySegment m, String name) throws IOException {
+        byte[] magic = new byte[4];
+        MemorySegment.copy(m, ValueLayout.JAVA_BYTE, 0, magic, 0, 4);
+        for (int i = 0; i < 4; i++) {
+            if (magic[i] != MAGIC[i]) throw new IOException("bad SHM magic for " + name);
+        }
+        int version = m.get(I32, 4);
+        if (version != VERSION) throw new IOException("unsupported SHM version " + version + " for " + name);
     }
 
     private List<long[]> readAllocs() {
-        ByteBuffer b = buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN);
-        b.position(16);
-        int n = b.getInt();
-        b.position(HEADER_FIXED_LEN);
+        int n = mapped.get(I32, 16);
+        // Corrupt num_allocs: trusting it would walk the entry table past the
+        // header. Mirrors the C++ guard (vgi_shm_segment.cpp). n is read as a
+        // signed int, so a high-bit value is also caught by the < 0 check.
+        if (n < 0 || n > MAX_ALLOCS) {
+            throw new IllegalStateException("ShmSegment corrupt header: num_allocs=" + n
+                    + " exceeds max " + MAX_ALLOCS);
+        }
         List<long[]> out = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            long off = b.getLong();
-            long len = b.getLong();
-            out.add(new long[]{off, len});
+            long base = HEADER_FIXED_LEN + (long) i * ALLOC_ENTRY_LEN;
+            out.add(new long[]{mapped.get(I64, base), mapped.get(I64, base + 8)});
         }
         return out;
     }
 
     private void writeAllocs(List<long[]> allocs) {
-        ByteBuffer b = buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN);
-        b.position(16);
-        b.putInt(allocs.size());
-        b.position(HEADER_FIXED_LEN);
-        for (long[] a : allocs) {
-            b.putLong(a[0]);
-            b.putLong(a[1]);
+        mapped.set(I32, 16, allocs.size());
+        for (int i = 0; i < allocs.size(); i++) {
+            long base = HEADER_FIXED_LEN + (long) i * ALLOC_ENTRY_LEN;
+            mapped.set(I64, base, allocs.get(i)[0]);
+            mapped.set(I64, base + 8, allocs.get(i)[1]);
         }
+    }
+
+    // --- FFM plumbing ----------------------------------------------------
+
+    private static String withSlash(String name) {
+        return name.startsWith("/") ? name : "/" + name;
+    }
+
+    private static int errno(MemorySegment cap) {
+        return (int) ERRNO.get(cap, 0L);
+    }
+
+    private static MemorySegment doMmap(Arena arena, MemorySegment cap, long len, int fd, String name)
+            throws Throwable {
+        MemorySegment addr = (MemorySegment) MMAP.invoke(
+                cap, MemorySegment.NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0L);
+        if (addr.address() == -1L) {           // MAP_FAILED
+            throw new IOException("mmap(" + name + ", " + len + ") errno=" + errno(cap));
+        }
+        return addr.reinterpret(len, arena, null);
+    }
+
+    private static void munmap(long addr, long len) throws Throwable {
+        MUNMAP.invoke(MemorySegment.ofAddress(addr), len);
     }
 
     @Override
     public void close() {
         if (closed) return;
         closed = true;
-        try { channel.close(); } catch (Exception ignore) {}
-        try { raf.close(); } catch (Exception ignore) {}
+        try { munmap(mappedAddr, size); } catch (Throwable ignore) {}
+        try { CLOSE.invoke(fd); } catch (Throwable ignore) {}
         if (owner) {
-            try { Files.deleteIfExists(file); } catch (Exception ignore) {}
+            try (Arena a = Arena.ofConfined()) {
+                SHM_UNLINK.invoke(a.allocateFrom(withSlash(name)));
+            } catch (Throwable ignore) {}
         }
+        try { arena.close(); } catch (Throwable ignore) {}
     }
 }

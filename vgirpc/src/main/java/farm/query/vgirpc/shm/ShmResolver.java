@@ -1,0 +1,193 @@
+// Copyright 2025-2026 Query.Farm LLC
+// SPDX-License-Identifier: Apache-2.0
+
+package farm.query.vgirpc.shm;
+
+import farm.query.vgirpc.wire.Allocators;
+import farm.query.vgirpc.wire.IpcStreamReader;
+import farm.query.vgirpc.wire.IpcStreamWriter;
+import farm.query.vgirpc.wire.Metadata;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.TransferPair;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Detect, resolve and produce shared-memory "pointer batches" — the local
+ * analogue of {@link farm.query.vgirpc.external.LocationResolver} /
+ * {@link farm.query.vgirpc.external.Externalizer}, but the payload lives in a
+ * {@link ShmSegment} rather than at an HTTP URL.
+ *
+ * <p>A pointer batch is a zero-row batch (same schema as the real batch) whose
+ * custom metadata carries {@code vgi_rpc.shm_offset} + {@code vgi_rpc.shm_length}.
+ * The original batch's custom metadata rides the pointer batch on the pipe; the
+ * segment slice holds only the Arrow data (a standalone IPC stream:
+ * schema + record batch + EOS), byte-compatible with the C++/Go/Python peers
+ * (see {@code vgi_shm_segment.cpp::MaybeResolveBatch}).</p>
+ *
+ * <p>Dictionary-encoded batches (DuckDB ENUMs) are <em>not</em> routed through
+ * shm — a zero-row pointer batch with a dict schema and no preceding dictionary
+ * batch trips the consumer's "expected dictionaries at the start" check. Those
+ * fall back to inline transfer, which already round-trips correctly. This keeps
+ * results identical to the inline path while accelerating the common case.</p>
+ */
+public final class ShmResolver {
+
+    private static final boolean DEBUG = System.getenv("VGI_RPC_SHM_DEBUG") != null;
+
+    private ShmResolver() {}
+
+    /** Resolved inbound batch — caller owns {@code root} and must close it. */
+    public record Resolved(VectorSchemaRoot root, Map<String, String> customMetadata) {}
+
+    /** Outbound pointer to write in place of the real batch — caller owns {@code root}. */
+    public record ShmPointer(VectorSchemaRoot root, Map<String, String> customMetadata) {}
+
+    /** True iff the metadata describes a shm pointer batch (and is not a log batch). */
+    public static boolean isPointer(int rowCount, Map<String, String> meta) {
+        return rowCount == 0 && meta != null
+                && meta.get(Metadata.SHM_OFFSET) != null
+                && meta.get(Metadata.LOG_LEVEL) == null;
+    }
+
+    /** True iff this data batch is one we intend to route over shm (non-empty,
+     *  non-dict) — i.e. it should become a pointer batch when a segment is present.
+     *  Used to detect unintended inline fallback. */
+    public static boolean shmEligible(VectorSchemaRoot root) {
+        return root.getRowCount() > 0 && !hasDictionary(root.getSchema());
+    }
+
+    /**
+     * Resolve an inbound pointer batch to its underlying data batch, reading the
+     * IPC bytes from the segment and freeing the allocation. The returned root is
+     * caller-owned. {@code pointerRoot}'s schema supplies the read schema.
+     */
+    public static Resolved resolve(ShmSegment seg, VectorSchemaRoot pointerRoot,
+                                   Map<String, String> meta) throws Exception {
+        long offset = Long.parseLong(meta.get(Metadata.SHM_OFFSET));
+        long length = Long.parseLong(meta.get(Metadata.SHM_LENGTH));
+        // Validate the peer-supplied pointer against the mapping before reading —
+        // offset/length are untrusted metadata crossing a trust boundary. Mirrors
+        // the C++ side (vgi_shm_segment.cpp MaybeResolveBatch). Written so a huge
+        // or negative value can't underflow past the guard; offset<HEADER_SIZE
+        // also rejects negatives and any pointer into the header region.
+        long size = seg.size();
+        if (offset < ShmSegment.HEADER_SIZE || offset > size || length < 0 || length > size - offset) {
+            throw new IOException("shm pointer out of range: offset=" + offset
+                    + " length=" + length + " size=" + size);
+        }
+        VectorSchemaRoot copy;
+        // Decode straight from the segment via a MemorySegment-backed channel —
+        // no readAt() byte[] copy and no Channels.newChannel adapter bounce.
+        try (IpcStreamReader r = new IpcStreamReader(seg.readChannelAt(offset, length), Allocators.root())) {
+            if (r.readNextBatch() == null) {
+                throw new IOException("shm slice contained no data batch");
+            }
+            // Label the resolved batch with the pointer batch's schema. The pointer
+            // arrived over the same stream an inline batch would, so its schema is
+            // exactly what the caller compares against (the bind-time input schema);
+            // a schema rederived from the transferred vectors can differ in field
+            // metadata (e.g. TIMESTAMP_TZ) and trip the downstream cast.
+            copy = copyRoot(r.root(), pointerRoot.getSchema());
+        }
+        seg.free(offset);
+        if (DEBUG) {
+            System.err.println("[vgi-shm] resolved inbound off=" + offset + " len=" + length
+                    + " rows=" + copy.getRowCount());
+        }
+        Map<String, String> merged = new LinkedHashMap<>(meta);
+        merged.remove(Metadata.SHM_OFFSET);
+        merged.remove(Metadata.SHM_LENGTH);
+        merged.put(Metadata.SHM_SOURCE, seg.name());
+        return new Resolved(copy, merged);
+    }
+
+    /**
+     * Possibly write {@code root} into the segment and return a zero-row pointer
+     * batch to send in its place. Returns {@code null} to mean "keep inline":
+     * no segment, zero-row batch, dict-encoded schema, serialization failure, or
+     * the segment is full (the C++ client frees outbound allocations as it
+     * consumes them; until it does, allocation may fail and we fall back).
+     */
+    public static ShmPointer maybeWriteToShm(ShmSegment seg, VectorSchemaRoot root,
+                                             Map<String, String> existingMeta) {
+        if (seg == null || root.getRowCount() == 0) return null;
+        if (hasDictionary(root.getSchema())) return null;
+
+        // Upper-bound the IPC stream size (buffer bytes + framing slack) so we can
+        // allocate once and serialize STRAIGHT into the segment — no intermediate
+        // byte[] (drops the old toByteArray() + writeAt() double copy). If the
+        // encode overflows the estimate we free and fall back to inline.
+        long dataBytes = 0;
+        for (FieldVector v : root.getFieldVectors()) dataBytes += v.getBufferSize();
+        long capacity = dataBytes + (dataBytes >> 6)
+                + 16384L + 256L * root.getSchema().getFields().size();
+
+        long off;
+        try {
+            off = seg.allocate(capacity);
+        } catch (RuntimeException full) {     // segment / alloc-table full
+            return null;
+        }
+        long written;
+        try {
+            ShmSegment.SegmentWriteChannel ch = seg.writeChannelAt(off, capacity);
+            try (IpcStreamWriter w = new IpcStreamWriter(ch)) {
+                w.writeBatch(root, null);     // bare data; metadata rides the pointer
+                w.writeEos();
+            }
+            written = ch.written();
+        } catch (Exception serializeFailed) { // overflow or encode error → inline
+            seg.free(off);
+            return null;
+        }
+
+        VectorSchemaRoot pointer = VectorSchemaRoot.create(root.getSchema(), Allocators.root());
+        pointer.allocateNew();
+        pointer.setRowCount(0);
+        Map<String, String> meta = new LinkedHashMap<>();
+        if (existingMeta != null) meta.putAll(existingMeta);
+        meta.put(Metadata.SHM_OFFSET, Long.toString(off));
+        meta.put(Metadata.SHM_LENGTH, Long.toString(written));
+        return new ShmPointer(pointer, meta);
+    }
+
+    private static boolean hasDictionary(Schema s) {
+        for (Field f : s.getFields()) {
+            if (fieldHasDictionary(f)) return true;
+        }
+        return false;
+    }
+
+    private static boolean fieldHasDictionary(Field f) {
+        if (f.getDictionary() != null) return true;
+        for (Field c : f.getChildren()) {
+            if (fieldHasDictionary(c)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Move each vector out of the reader's (recycled-on-close) root into a fresh
+     * caller-owned root via {@link TransferPair} — a zero-copy ownership transfer
+     * that handles every Arrow type, including nested lists of TIMESTAMP_TZ that
+     * row-wise {@code copyFromSafe}/{@code ComplexCopier} rejects. After transfer
+     * the source vectors are empty, so the reader closes cleanly.
+     */
+    private static VectorSchemaRoot copyRoot(VectorSchemaRoot src, Schema schema) {
+        List<FieldVector> moved = new ArrayList<>(src.getFieldVectors().size());
+        for (FieldVector sv : src.getFieldVectors()) {
+            TransferPair tp = sv.getTransferPair(sv.getAllocator());
+            tp.transfer();
+            moved.add((FieldVector) tp.getTo());
+        }
+        return new VectorSchemaRoot(schema, moved, src.getRowCount());
+    }
+}
