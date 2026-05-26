@@ -7,8 +7,17 @@ import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
+import org.apache.arrow.flatbuf.MessageHeader;
+import org.apache.arrow.memory.ArrowBuf;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.ForeignAllocation;
 import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ReadChannel;
+import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.ipc.message.MessageMetadataResult;
+import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.TransferPair;
@@ -41,6 +50,20 @@ import java.util.Map;
 public final class ShmResolver {
 
     private static final boolean DEBUG = System.getenv("VGI_RPC_SHM_DEBUG") != null;
+    // Zero-copy inbound decode: wrap the segment region as a foreign ArrowBuf
+    // instead of allocating+zeroing+copying. **Opt-in (VGI_RPC_SHM_ZEROCOPY=1),
+    // off by default** — it's a wash-to-slight-loss in practice:
+    //   * It defers the input free to batch close, so the segment must hold input
+    //     AND output simultaneously (~2x the size). If undersized, the output
+    //     allocation fails and falls back to the pipe — a large regression that is
+    //     a sizing artifact, not the transport.
+    //   * With an adequate segment it's ~12% SLOWER than the copy path for a
+    //     passthrough (echo, large in / large out), because re-serializing reads
+    //     the input back out of shm rather than from a cache-warm JVM copy.
+    //   * It's a modest ~5-10% WIN only for large-input / small-output functions
+    //     that don't re-emit the bulk (filters/aggregations/scalar predicates).
+    // Measurements 2026-05-26 (Apple M3, threads=1).
+    private static final boolean ZEROCOPY = "1".equals(System.getenv("VGI_RPC_SHM_ZEROCOPY"));
 
     private ShmResolver() {}
 
@@ -83,30 +106,91 @@ public final class ShmResolver {
             throw new IOException("shm pointer out of range: offset=" + offset
                     + " length=" + length + " size=" + size);
         }
-        VectorSchemaRoot copy;
-        // Decode straight from the segment via a MemorySegment-backed channel —
-        // no readAt() byte[] copy and no Channels.newChannel adapter bounce.
-        try (IpcStreamReader r = new IpcStreamReader(seg.readChannelAt(offset, length), Allocators.root())) {
-            if (r.readNextBatch() == null) {
-                throw new IOException("shm slice contained no data batch");
-            }
-            // Label the resolved batch with the pointer batch's schema. The pointer
-            // arrived over the same stream an inline batch would, so its schema is
-            // exactly what the caller compares against (the bind-time input schema);
-            // a schema rederived from the transferred vectors can differ in field
-            // metadata (e.g. TIMESTAMP_TZ) and trip the downstream cast.
-            copy = copyRoot(r.root(), pointerRoot.getSchema());
-        }
-        seg.free(offset);
+        // Label the resolved batch with the pointer batch's schema. The pointer
+        // arrived over the same stream an inline batch would, so its schema is
+        // exactly what the caller compares against (the bind-time input schema);
+        // a schema rederived from the data can differ in field metadata (e.g.
+        // TIMESTAMP_TZ) and trip the downstream cast.
+        Schema schema = pointerRoot.getSchema();
+        VectorSchemaRoot root = (ZEROCOPY && !hasDictionary(schema))
+                ? resolveZeroCopy(seg, offset, length, schema)
+                : resolveCopy(seg, offset, length, schema);
         if (DEBUG) {
             System.err.println("[vgi-shm] resolved inbound off=" + offset + " len=" + length
-                    + " rows=" + copy.getRowCount());
+                    + " rows=" + root.getRowCount() + (ZEROCOPY ? " (zero-copy)" : " (copy)"));
         }
         Map<String, String> merged = new LinkedHashMap<>(meta);
         merged.remove(Metadata.SHM_OFFSET);
         merged.remove(Metadata.SHM_LENGTH);
         merged.put(Metadata.SHM_SOURCE, seg.name());
-        return new Resolved(copy, merged);
+        return new Resolved(root, merged);
+    }
+
+    /**
+     * Zero-copy decode: wrap the record-batch body region of the segment as a
+     * foreign {@link ArrowBuf} (no allocation, no zeroing, no memcpy) and load the
+     * vectors over it. The segment slot is freed when the returned root is closed
+     * (release0 → seg.free) — safe under lockstep, since the client cannot reuse
+     * the region until the worker has replied. Buffer ownership mirrors Arrow's
+     * own {@code MessageSerializer.deserializeRecordBatch(ReadChannel, allocator)}:
+     * the slices retain the body, so we release our initial wrap reference.
+     */
+    static VectorSchemaRoot resolveZeroCopy(ShmSegment seg, long offset, long length, Schema schema)
+            throws Exception {
+        BufferAllocator alloc = Allocators.root();
+        ReadChannel in = new ReadChannel(seg.readChannelAt(offset, length));
+        MessageMetadataResult schemaMsg = MessageSerializer.readMessage(in);
+        if (schemaMsg == null) {
+            throw new IOException("shm slice: missing schema message");
+        }
+        MessageMetadataResult rbMsg = MessageSerializer.readMessage(in);
+        if (rbMsg == null || rbMsg.getMessage().headerType() != MessageHeader.RecordBatch) {
+            throw new IOException("shm slice: expected record batch message");
+        }
+        long bodyLen = rbMsg.getMessageBodyLength();
+        long bodyAddr = seg.addressAt(offset + in.bytesRead());
+        ArrowBuf body = alloc.wrapForeignAllocation(new ForeignAllocation(bodyLen, bodyAddr) {
+            @Override protected void release0() { seg.free(offset); }
+        });
+        // deserializeRecordBatch takes ownership of `body`: its per-buffer slices
+        // retain the underlying allocation and it drops the incoming reference. So
+        // we must NOT release `body` ourselves on the success path (that's a
+        // double-release). On a failure before ownership transfers, release it.
+        ArrowRecordBatch batch;
+        try {
+            batch = MessageSerializer.deserializeRecordBatch(rbMsg, body);
+        } catch (Throwable t) {
+            body.getReferenceManager().release();   // release0 -> seg.free
+            throw t;
+        }
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, alloc);
+        boolean ok = false;
+        try {
+            // load() retains the buffers into the vectors; once batch is closed the
+            // foreign allocation lives exactly as long as the loaded vectors, and
+            // its refcount hits 0 (-> release0 -> seg.free) when `root` is closed.
+            new VectorLoader(root).load(batch);
+            ok = true;
+        } finally {
+            batch.close();
+            if (!ok) root.close();
+        }
+        return root;
+    }
+
+    /** Copy decode (fallback): read the IPC stream from the segment into fresh
+     *  JVM buffers and free the slot immediately. */
+    static VectorSchemaRoot resolveCopy(ShmSegment seg, long offset, long length, Schema schema)
+            throws Exception {
+        VectorSchemaRoot copy;
+        try (IpcStreamReader r = new IpcStreamReader(seg.readChannelAt(offset, length), Allocators.root())) {
+            if (r.readNextBatch() == null) {
+                throw new IOException("shm slice contained no data batch");
+            }
+            copy = copyRoot(r.root(), schema);
+        }
+        seg.free(offset);
+        return copy;
     }
 
     /**

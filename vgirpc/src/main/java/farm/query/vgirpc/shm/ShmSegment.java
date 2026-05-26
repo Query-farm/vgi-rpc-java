@@ -152,6 +152,10 @@ public final class ShmSegment implements AutoCloseable {
     public String name() { return name; }
     public long size() { return size; }
 
+    /** Native address of byte {@code offset} within the mapping — used to wrap a
+     *  segment region as a foreign Arrow buffer for zero-copy inbound decode. */
+    public long addressAt(long offset) { return mappedAddr + offset; }
+
     // --- create / attach -------------------------------------------------
 
     /** Create a fresh segment of {@code size} bytes (unit-test/owner path). */
