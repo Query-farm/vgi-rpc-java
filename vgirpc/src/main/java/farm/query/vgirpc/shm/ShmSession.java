@@ -25,11 +25,11 @@ public final class ShmSession implements AutoCloseable {
     // overhead, unlike DEBUG's per-batch prints). Implied by DEBUG.
     private static final boolean STATS = DEBUG || System.getenv("VGI_RPC_SHM_STATS") != null;
 
-    private ShmSegment segment;
+    private Shm segment;
     private boolean failed;
 
     /** The attached segment, or {@code null} if shm is not in use on this connection. */
-    public ShmSegment segment() { return segment; }
+    public Shm segment() { return segment; }
 
     /**
      * Attach to the advertised segment if a request carries the segment
@@ -41,7 +41,11 @@ public final class ShmSession implements AutoCloseable {
         String size = meta.get(Metadata.SHM_SEGMENT_SIZE);
         if (name == null || size == null) return;       // not advertised on this request
         try {
-            segment = ShmSegment.attach(name, Long.parseLong(size));
+            // null on Java 21 / non-POSIX / native-access-denied: shm unavailable,
+            // stay disabled and use inline transfer. A real attach failure on a
+            // capable JVM throws and is caught below.
+            segment = ShmFactory.attach(name, Long.parseLong(size));
+            if (segment == null) failed = true;
         } catch (Exception e) {
             failed = true;                               // don't retry a doomed name
             if (DEBUG) {

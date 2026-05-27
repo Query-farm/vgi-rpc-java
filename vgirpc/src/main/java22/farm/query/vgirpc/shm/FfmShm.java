@@ -16,16 +16,16 @@ import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.ReadableByteChannel;
-import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 
 /**
- * POSIX named shared-memory region exposing a bump-pointer allocator stored in
- * a fixed-size header. Wire-compatible with the C++ ({@code vgi_shm_segment}),
- * Go ({@code vgirpc/shm.go}) and Python ({@code vgi_rpc.shm}) implementations:
+ * FFM-backed {@link Shm}: a POSIX named shared-memory region exposing a
+ * bump-pointer allocator stored in a fixed-size header. Wire-compatible with the
+ * C++ ({@code vgi_shm_segment}), Go ({@code vgirpc/shm.go}) and Python
+ * ({@code vgi_rpc.shm}) implementations:
  *
  * <pre>
  *   Offset  Size  Field
@@ -37,20 +37,16 @@ import java.util.Objects;
  *   24      N*16  allocations: (offset: uint64, length: uint64), sorted by offset
  * </pre>
  *
- * <p>All integers little-endian. Adjacent free regions coalesce implicitly —
- * the allocator tracks only occupied regions, so freeing a neighbour widens
- * the usable gap with no explicit coalescing step.</p>
- *
- * <p>The region is backed by POSIX {@code shm_open} + {@code mmap} via the
- * {@code java.lang.foreign} FFM API so it interoperates with the C++/Go/Python
- * peers, which use named POSIX shared memory (not file-backed mmap). The VGI
- * worker is always an <em>attacher</em>: the C++ client creates and owns the
- * segment (and {@code shm_unlink}s it); {@link #attach} maps it read-write and
- * never unlinks. {@link #create} exists for unit tests.</p>
+ * <p>All integers little-endian. Backed by POSIX {@code shm_open} + {@code mmap}
+ * via the {@code java.lang.foreign} FFM API (GA in JDK&nbsp;22), so this class
+ * is compiled into the Java&nbsp;22 multi-release overlay and only loaded on
+ * JDK&nbsp;&ge;&nbsp;22. The worker is always an <em>attacher</em>: the C++
+ * client creates and owns the segment (and {@code shm_unlink}s it);
+ * {@link #attach} maps it read-write and never unlinks. {@link #create} exists
+ * for unit tests.</p>
  */
-public final class ShmSegment implements AutoCloseable {
+public final class FfmShm extends Shm {
 
-    public static final int HEADER_SIZE = 65_536;
     private static final byte[] MAGIC = {'V', 'G', 'I', 'S'};
     private static final int VERSION = 1;
     private static final int HEADER_FIXED_LEN = 24;     // magic(4)+ver(4)+data_size(8)+n(4)+pad(4)
@@ -127,18 +123,8 @@ public final class ShmSegment implements AutoCloseable {
     private final boolean owner;
     private volatile boolean closed;
 
-    // Worker-side usage counters for this connection. The segment is touched by
-    // exactly one thread under the lockstep protocol, so plain longs suffice.
-    // "inline-eligible" = a data batch that *should* have used shm (non-empty,
-    // non-dict) but didn't — the signal that something leaked to the pipe.
-    public long inShmBatches, inShmBytes, inInlineDataBatches;
-    public long outShmBatches, outShmBytes, outInlineEligibleBatches;
-    // Lockstep timeline (nanos): worker busy (resolve+process+emit) vs idle
-    // (blocked waiting for the client = client work + handoff).
-    public long busyNs, idleNs, resolveNs, processNs, emitNs;
-
-    private ShmSegment(String name, Arena arena, MemorySegment mapped, int fd,
-                       long size, long dataEnd, boolean owner) {
+    private FfmShm(String name, Arena arena, MemorySegment mapped, int fd,
+                   long size, long dataEnd, boolean owner) {
         this.name = name;
         this.arena = arena;
         this.mapped = mapped;
@@ -149,17 +135,15 @@ public final class ShmSegment implements AutoCloseable {
         this.owner = owner;
     }
 
-    public String name() { return name; }
-    public long size() { return size; }
+    @Override public String name() { return name; }
+    @Override public long size() { return size; }
 
-    /** Native address of byte {@code offset} within the mapping — used to wrap a
-     *  segment region as a foreign Arrow buffer for zero-copy inbound decode. */
-    public long addressAt(long offset) { return mappedAddr + offset; }
+    @Override public long addressAt(long offset) { return mappedAddr + offset; }
 
     // --- create / attach -------------------------------------------------
 
     /** Create a fresh segment of {@code size} bytes (unit-test/owner path). */
-    public static ShmSegment create(String name, long size) throws IOException {
+    public static FfmShm create(String name, long size) throws IOException {
         Objects.requireNonNull(name, "name");
         if (size <= HEADER_SIZE) {
             throw new IllegalArgumentException("size must exceed HEADER_SIZE=" + HEADER_SIZE);
@@ -175,7 +159,7 @@ public final class ShmSegment implements AutoCloseable {
                     throw new IOException("ftruncate(" + name + ", " + size + ") errno=" + errno(cap));
                 }
                 MemorySegment mapped = doMmap(arena, cap, size, fd, name);
-                ShmSegment seg = new ShmSegment(name, arena, mapped, fd, size, size, true);
+                FfmShm seg = new FfmShm(name, arena, mapped, fd, size, size, true);
                 seg.writeHeader(0, size - HEADER_SIZE);
                 return seg;
             } catch (Throwable t) {
@@ -196,7 +180,7 @@ public final class ShmSegment implements AutoCloseable {
      * is the POSIX name <em>without</em> leading slash (as the C++ client sends it);
      * {@code advertisedSize} is the peer's mapped (page-rounded) byte size.
      */
-    public static ShmSegment attach(String name, long advertisedSize) throws IOException {
+    public static FfmShm attach(String name, long advertisedSize) throws IOException {
         Objects.requireNonNull(name, "name");
         Arena arena = Arena.ofShared();
         try {
@@ -216,7 +200,7 @@ public final class ShmSegment implements AutoCloseable {
                     mapped = doMmap(arena, cap, needed, fd, name);
                     mapLen = needed;
                 }
-                ShmSegment seg = new ShmSegment(name, arena, mapped, fd, mapLen, needed, false);
+                FfmShm seg = new FfmShm(name, arena, mapped, fd, mapLen, needed, false);
                 if (DEBUG) {
                     System.err.println("[vgi-shm] attached " + name + " size=" + mapLen
                             + " data_size=" + dataSize);
@@ -238,7 +222,7 @@ public final class ShmSegment implements AutoCloseable {
     // --- allocation ------------------------------------------------------
 
     /** Allocate {@code length} bytes; returns the absolute offset in the segment. */
-    public synchronized long allocate(long length) {
+    @Override public synchronized long allocate(long length) {
         if (length <= 0) throw new IllegalArgumentException("length must be positive");
         List<long[]> allocs = readAllocs();
         long cursor = HEADER_SIZE;
@@ -261,26 +245,34 @@ public final class ShmSegment implements AutoCloseable {
     }
 
     /** Free an allocation by its offset; no-op if no allocation matches. */
-    public synchronized void free(long offset) {
+    @Override public synchronized void free(long offset) {
         List<long[]> allocs = readAllocs();
         allocs.removeIf(a -> a[0] == offset);
         writeAllocs(allocs);
     }
 
     /** Write {@code data} into the segment at {@code offset} (must be within an allocation). */
-    public void writeAt(long offset, byte[] data) {
+    @Override public void writeAt(long offset, byte[] data) {
         MemorySegment.copy(data, 0, mapped, ValueLayout.JAVA_BYTE, offset, data.length);
     }
 
     /** Read {@code length} bytes starting at {@code offset}. */
-    public byte[] readAt(long offset, long length) {
+    @Override public byte[] readAt(long offset, long length) {
         byte[] out = new byte[(int) length];
         MemorySegment.copy(mapped, ValueLayout.JAVA_BYTE, offset, out, 0, (int) length);
         return out;
     }
 
+    @Override public ShmWriteChannel writeChannelAt(long offset, long capacity) {
+        return new SegmentWriteChannel(offset, capacity);
+    }
+
+    @Override public ReadableByteChannel readChannelAt(long offset, long length) {
+        return new SegmentReadChannel(offset, length);
+    }
+
     /**
-     * A {@link WritableByteChannel} that writes {@link ByteBuffer}s straight into
+     * A {@link ShmWriteChannel} that writes {@link ByteBuffer}s straight into
      * the mapped segment at {@code offset}, capped at {@code capacity}. Feeding
      * this directly to Arrow's {@code WriteChannel} (instead of wrapping an
      * {@code OutputStream} via {@code Channels.newChannel}) avoids the JDK
@@ -288,18 +280,7 @@ public final class ShmSegment implements AutoCloseable {
      * {@code MemorySegment.copy} into shm. {@link #written()} reports the exact
      * serialized length after the writer closes.
      */
-    public SegmentWriteChannel writeChannelAt(long offset, long capacity) {
-        return new SegmentWriteChannel(offset, capacity);
-    }
-
-    /** A {@link ReadableByteChannel} over {@code [offset, offset+length)} of the
-     *  mapped segment, so Arrow's {@code ReadChannel} reads each buffer with one
-     *  bulk {@code MemorySegment.copy} — no {@code Channels} adapter, no {@code byte[]}. */
-    public ReadableByteChannel readChannelAt(long offset, long length) {
-        return new SegmentReadChannel(offset, length);
-    }
-
-    public final class SegmentWriteChannel implements WritableByteChannel {
+    public final class SegmentWriteChannel implements ShmWriteChannel {
         private final long base;
         private final long cap;
         private long pos;
@@ -307,8 +288,7 @@ public final class ShmSegment implements AutoCloseable {
 
         SegmentWriteChannel(long base, long cap) { this.base = base; this.cap = cap; }
 
-        /** Bytes written so far (the actual serialized length). */
-        public long written() { return pos; }
+        @Override public long written() { return pos; }
 
         @Override public int write(ByteBuffer src) {
             int n = src.remaining();

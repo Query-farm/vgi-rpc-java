@@ -14,7 +14,7 @@ import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgirpc.schema.ArrowSerializableRecord;
 import farm.query.vgirpc.schema.SchemaDerivation;
 import farm.query.vgirpc.shm.ShmResolver;
-import farm.query.vgirpc.shm.ShmSegment;
+import farm.query.vgirpc.shm.Shm;
 import farm.query.vgirpc.shm.ShmSession;
 import farm.query.vgirpc.transport.RpcTransport;
 import farm.query.vgirpc.wire.Allocators;
@@ -177,7 +177,7 @@ public final class RpcServer {
                 throw new EndOfStream();
             }
             if (shmSession != null) shmSession.attachIfAdvertised(meta);
-            ShmSegment shm = shmSession != null ? shmSession.segment() : null;
+            Shm shm = shmSession != null ? shmSession.segment() : null;
             VectorSchemaRoot paramsRoot = reader.root();
             // If the outer batch is a shm or external-location pointer, resolve the
             // inner batch and decode kwargs from it. Dispatch metadata still comes
@@ -207,6 +207,17 @@ public final class RpcServer {
                         transport.writer().flush();
                         return;
                     }
+                } else if (ShmResolver.isPointer(paramsRoot.getRowCount(), meta)) {
+                    // An inbound shm pointer arrived but no segment is attached. This
+                    // can only happen if the client used shm without honoring the
+                    // __transport_options__ handshake (e.g. a worker that reported
+                    // shm-unavailable, or a capable worker whose attach failed). Fail
+                    // loudly rather than silently decoding the 0-row pointer as empty.
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                            new IOException("received shm pointer batch but no segment is attached "
+                                    + "(transport negotiation mismatch)"), serverId);
+                    transport.writer().flush();
+                    return;
                 }
                 // Snapshot the kwargs immediately, before draining mutates the reader's root.
                 // Decode errors must be reported as an error response so the (possibly shared)
@@ -237,6 +248,10 @@ public final class RpcServer {
                 }
                 if (describeEnabled && Introspect.METHOD_NAME.equals(method)) {
                     serveDescribe(transport);
+                    return;
+                }
+                if (TransportOptions.METHOD_NAME.equals(method)) {
+                    serveTransportOptions(transport);
                     return;
                 }
                 RpcMethodInfo info = methods.get(method);
@@ -317,7 +332,7 @@ public final class RpcServer {
     }
 
     private void serveUnary(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs,
-                            ShmSegment shm) throws Exception {
+                            Shm shm) throws Exception {
         Schema schema = info.resultSchema();
         ClientLogSink sink = new ClientLogSink(serverId);
         AuthScope.Scope scope = AuthScope.current();
@@ -337,7 +352,7 @@ public final class RpcServer {
         }
     }
 
-    private void writeResult(IpcStreamWriter w, RpcMethodInfo info, Object result, ShmSegment shm) throws Exception {
+    private void writeResult(IpcStreamWriter w, RpcMethodInfo info, Object result, Shm shm) throws Exception {
         Schema schema = info.resultSchema();
         if (schema.getFields().isEmpty()) {
             Wire.writeZeroBatch(w, schema, null);
@@ -380,7 +395,7 @@ public final class RpcServer {
     }
 
     private void serveStream(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs,
-                             ShmSegment shm) throws Exception {
+                             Shm shm) throws Exception {
         ClientLogSink sink = new ClientLogSink(serverId);
         AuthScope.Scope scope = AuthScope.current();
         CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
@@ -439,7 +454,7 @@ public final class RpcServer {
     /** Main tick loop: read input batch → resolve/cast → state.process → flush output, until EOS or finish. */
     private void runTickLoop(IpcStreamReader inputReader, IpcStreamWriter outputWriter, RpcTransport transport,
                              StreamState state, CallContext ctx, Schema outputSchema, Schema inputSchema,
-                             boolean isProducer, ShmSegment shm) throws IOException {
+                             boolean isProducer, Shm shm) throws IOException {
         while (true) {
             Map<String, String> meta;
             // Time spent blocked here is the worker idle waiting for the client to
@@ -471,7 +486,7 @@ public final class RpcServer {
      */
     private boolean processOneTick(IpcStreamReader inputReader, IpcStreamWriter outputWriter, RpcTransport transport,
                                     StreamState state, CallContext ctx, Schema outputSchema, Schema inputSchema,
-                                    boolean isProducer, Map<String, String> meta, ShmSegment shm) throws IOException {
+                                    boolean isProducer, Map<String, String> meta, Shm shm) throws IOException {
         VectorSchemaRoot inputRoot = inputReader.root();
         VectorSchemaRoot resolvedRoot = null;
         Map<String, String> effectiveMeta = meta;
@@ -565,7 +580,7 @@ public final class RpcServer {
      */
     private void flushCollector(IpcStreamWriter writer, OutputCollector out,
                                   org.apache.arrow.vector.dictionary.DictionaryProvider dictProvider,
-                                  ShmSegment shm)
+                                  Shm shm)
             throws IOException {
         for (OutputCollector.Entry e : out.entries()) {
             // Per-entry provider (set when a producer emits dict-encoded
@@ -633,6 +648,20 @@ public final class RpcServer {
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer());
              VectorSchemaRoot root = built.root()) {
             w.writeBatch(root, built.customMetadata());
+        } finally {
+            transport.writer().flush();
+        }
+    }
+
+    private void serveTransportOptions(RpcTransport transport) throws IOException {
+        // Worker capabilities ride as metadata; the response batch is empty.
+        Map<String, String> md = new LinkedHashMap<>(TransportOptions.workerCapabilities());
+        md.put(Metadata.REQUEST_VERSION_KEY, Metadata.REQUEST_VERSION);
+        if (serverId != null) md.put(Metadata.SERVER_ID, serverId);
+        try (IpcStreamWriter w = new IpcStreamWriter(transport.writer());
+             VectorSchemaRoot root = VectorSchemaRoot.create(RpcStream.EMPTY_SCHEMA, Allocators.root())) {
+            root.setRowCount(0);
+            w.writeBatch(root, md);
         } finally {
             transport.writer().flush();
         }

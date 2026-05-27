@@ -92,7 +92,7 @@ public final class ShmResolver {
      * IPC bytes from the segment and freeing the allocation. The returned root is
      * caller-owned. {@code pointerRoot}'s schema supplies the read schema.
      */
-    public static Resolved resolve(ShmSegment seg, VectorSchemaRoot pointerRoot,
+    public static Resolved resolve(Shm seg, VectorSchemaRoot pointerRoot,
                                    Map<String, String> meta) throws Exception {
         long offset = Long.parseLong(meta.get(Metadata.SHM_OFFSET));
         long length = Long.parseLong(meta.get(Metadata.SHM_LENGTH));
@@ -102,7 +102,7 @@ public final class ShmResolver {
         // or negative value can't underflow past the guard; offset<HEADER_SIZE
         // also rejects negatives and any pointer into the header region.
         long size = seg.size();
-        if (offset < ShmSegment.HEADER_SIZE || offset > size || length < 0 || length > size - offset) {
+        if (offset < Shm.HEADER_SIZE || offset > size || length < 0 || length > size - offset) {
             throw new IOException("shm pointer out of range: offset=" + offset
                     + " length=" + length + " size=" + size);
         }
@@ -135,7 +135,7 @@ public final class ShmResolver {
      * own {@code MessageSerializer.deserializeRecordBatch(ReadChannel, allocator)}:
      * the slices retain the body, so we release our initial wrap reference.
      */
-    static VectorSchemaRoot resolveZeroCopy(ShmSegment seg, long offset, long length, Schema schema)
+    static VectorSchemaRoot resolveZeroCopy(Shm seg, long offset, long length, Schema schema)
             throws Exception {
         BufferAllocator alloc = Allocators.root();
         ReadChannel in = new ReadChannel(seg.readChannelAt(offset, length));
@@ -180,7 +180,7 @@ public final class ShmResolver {
 
     /** Copy decode (fallback): read the IPC stream from the segment into fresh
      *  JVM buffers and free the slot immediately. */
-    static VectorSchemaRoot resolveCopy(ShmSegment seg, long offset, long length, Schema schema)
+    static VectorSchemaRoot resolveCopy(Shm seg, long offset, long length, Schema schema)
             throws Exception {
         VectorSchemaRoot copy;
         try (IpcStreamReader r = new IpcStreamReader(seg.readChannelAt(offset, length), Allocators.root())) {
@@ -200,7 +200,7 @@ public final class ShmResolver {
      * the segment is full (the C++ client frees outbound allocations as it
      * consumes them; until it does, allocation may fail and we fall back).
      */
-    public static ShmPointer maybeWriteToShm(ShmSegment seg, VectorSchemaRoot root,
+    public static ShmPointer maybeWriteToShm(Shm seg, VectorSchemaRoot root,
                                              Map<String, String> existingMeta) {
         if (seg == null || root.getRowCount() == 0) return null;
         if (hasDictionary(root.getSchema())) return null;
@@ -222,7 +222,7 @@ public final class ShmResolver {
         }
         long written;
         try {
-            ShmSegment.SegmentWriteChannel ch = seg.writeChannelAt(off, capacity);
+            ShmWriteChannel ch = seg.writeChannelAt(off, capacity);
             try (IpcStreamWriter w = new IpcStreamWriter(ch)) {
                 w.writeBatch(root, null);     // bare data; metadata rides the pointer
                 w.writeEos();
