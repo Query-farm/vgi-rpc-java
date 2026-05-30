@@ -404,17 +404,23 @@ public final class HttpStreamHandler {
         } catch (IOException e) { throw new IllegalStateException("schema deserialize failed", e); }
     }
 
+    /**
+     * Detach {@code src}'s columns into a new root that outlives the reader.
+     * Uses {@link TransferPair} (a zero-copy buffer move) rather than row-wise
+     * {@code copyFromSafe}: the latter throws {@code UnsupportedOperationException}
+     * for TIMESTAMP_TZ and misindexes union children (see the same TransferPair
+     * fix on the shm resolve path). After {@code transfer()} the reader's source
+     * vectors are empty and close cleanly.
+     */
     private static VectorSchemaRoot copyRoot(VectorSchemaRoot src) {
-        VectorSchemaRoot dst = VectorSchemaRoot.create(src.getSchema(), Allocators.root());
-        dst.allocateNew();
         int rows = src.getRowCount();
-        for (int c = 0; c < src.getSchema().getFields().size(); c++) {
-            FieldVector sv = src.getVector(c);
-            FieldVector dv = dst.getVector(c);
-            for (int r = 0; r < rows; r++) dv.copyFromSafe(r, r, sv);
+        List<FieldVector> moved = new ArrayList<>();
+        for (FieldVector sv : src.getFieldVectors()) {
+            org.apache.arrow.vector.util.TransferPair tp = sv.getTransferPair(Allocators.root());
+            tp.transfer();
+            moved.add((FieldVector) tp.getTo());
         }
-        dst.setRowCount(rows);
-        return dst;
+        return new VectorSchemaRoot(src.getSchema().getFields(), moved, rows);
     }
 
     /** Collects log Messages during init so they can be flushed into the response stream. */

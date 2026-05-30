@@ -52,7 +52,7 @@ public final class StateSerializer {
             for (Field f : declaredFields(state.getClass())) {
                 if (!f.canAccess(state)) f.setAccessible(true);
                 Object value = f.get(state);
-                root.set(f.getName(), CBOR.valueToTree(value));
+                root.set(fieldKey(f), CBOR.valueToTree(value));
             }
             return CBOR.writeValueAsBytes(root);
         } catch (Exception e) {
@@ -75,7 +75,7 @@ public final class StateSerializer {
             S instance = newInstance(cls);
             for (Field f : declaredFields(cls)) {
                 if (!f.canAccess(instance)) f.setAccessible(true);
-                JsonNode node = root.get(f.getName());
+                JsonNode node = root.get(fieldKey(f));
                 if (node == null || node.isNull()) continue;
                 Class<?> t = f.getType();
                 if      (t == int.class    || t == Integer.class) f.setInt(instance, node.asInt());
@@ -96,6 +96,19 @@ public final class StateSerializer {
         } catch (Exception e) {
             throw new RuntimeException("state deserialize failed: " + cls.getName(), e);
         }
+    }
+
+    /**
+     * Unique CBOR key for a field, qualified by its declaring class. A subclass
+     * may legally shadow a superclass field of the same name (e.g. a table
+     * producer state that redeclares {@code outputSchema}); keying by the bare
+     * field name would let the two collide in the flat CBOR object — the
+     * superclass's (often null) value clobbering the subclass's — and the value
+     * would round-trip back as null. Qualifying by declaring class keeps both
+     * fields independent.
+     */
+    private static String fieldKey(Field f) {
+        return f.getDeclaringClass().getName() + '#' + f.getName();
     }
 
     private static List<Field> declaredFields(Class<?> cls) {
