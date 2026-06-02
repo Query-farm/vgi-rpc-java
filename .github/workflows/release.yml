@@ -1,0 +1,72 @@
+name: Release to Maven Central
+
+# Publishes the library modules (vgirpc, vgirpc-oauth, vgirpc-s3, vgirpc-gcs)
+# to the Sonatype Central Portal when a GitHub Release is published.
+#
+# Required repository secrets:
+#   MAVEN_CENTRAL_USERNAME  - Central Portal user-token username
+#   MAVEN_CENTRAL_PASSWORD  - Central Portal user-token password
+#   SIGNING_KEY             - ASCII-armored GPG private key (full block)
+#   SIGNING_PASSWORD        - passphrase for that GPG key
+#
+# These live as repo-level secrets. To gate releases behind manual approval,
+# create a GitHub Environment (e.g. "maven-central") with a required reviewer,
+# move the secrets into it, and add `environment: maven-central` to the job.
+#
+# To cut a release: bump `version` in build.gradle.kts, push, then create a
+# GitHub Release whose tag is the version (with or without a leading "v"),
+# e.g. tag "v0.8.0" for version 0.8.0.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 25 is the build toolchain: it compiles the release-21 baseline and
+      # the release-22 multi-release shared-memory overlay in one pass.
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # Fail fast if the release tag doesn't match the version in build.gradle.kts,
+      # so a forgotten version bump can't publish the wrong coordinates.
+      - name: Verify tag matches project version
+        run: |
+          PROJECT_VERSION=$(grep -oE 'version = "[^"]+"' build.gradle.kts | head -1 | cut -d'"' -f2)
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "project version: $PROJECT_VERSION"
+          echo "release tag:     $TAG"
+          if [ "$PROJECT_VERSION" != "$TAG" ]; then
+            echo "::error::Release tag '$TAG' does not match build.gradle.kts version '$PROJECT_VERSION'."
+            exit 1
+          fi
+
+      - name: Test (core + FFM shared-memory overlay)
+        run: ./gradlew --no-daemon :vgirpc:test :vgirpc:java22Test
+
+      - name: Publish and release to Maven Central
+        run: ./gradlew --no-daemon publishToMavenCentral
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}

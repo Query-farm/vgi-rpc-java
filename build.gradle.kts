@@ -1,42 +1,51 @@
 plugins {
     java
+    // Applied (below) only to the published library modules. Targets the
+    // Sonatype Central Portal by default and handles signing + sources/javadoc.
+    id("com.vanniktech.maven.publish") version "0.36.0" apply false
 }
 
 allprojects {
     group = "farm.query"
-    version = "0.1.0-SNAPSHOT"
+    version = "0.8.0"
 
     repositories {
         mavenCentral()
     }
 }
 
+// Library modules published to Maven Central. The conformance/benchmark
+// service definitions and their runnable workers are internal test/bench
+// harnesses and are intentionally NOT published.
+val publishedModules = setOf("vgirpc", "vgirpc-oauth", "vgirpc-s3", "vgirpc-gcs")
+
+// One-line POM descriptions per published artifact.
+val moduleDescriptions = mapOf(
+    "vgirpc" to "Transport-agnostic RPC framework built on Apache Arrow IPC.",
+    "vgirpc-oauth" to "Optional OAuth/JWT (JWKS, PKCE, signed cookies) support for vgi-rpc.",
+    "vgirpc-s3" to "Amazon S3 ExternalStorage backend for vgi-rpc.",
+    "vgirpc-gcs" to "Google Cloud Storage ExternalStorage backend for vgi-rpc.",
+)
+
 subprojects {
     apply(plugin = "java")
-    apply(plugin = "maven-publish")
-
-    afterEvaluate {
-        // Only publish modules that produce a Java component (skip
-        // platform-only or test-only projects that don't define one).
-        if (components.findByName("java") != null) {
-            extensions.configure<PublishingExtension> {
-                publications {
-                    create<MavenPublication>("maven") {
-                        from(components["java"])
-                    }
-                }
-            }
-        }
-    }
 
     extensions.configure<JavaPluginExtension> {
         toolchain {
+            // JDK 25 toolchain so the vgirpc multi-release JAR can build its
+            // java.lang.foreign (shared-memory) overlay. Per-module release
+            // levels below control the actual bytecode target.
             languageVersion.set(JavaLanguageVersion.of(25))
         }
     }
 
+    // Published library modules target a Java 21 baseline so consumers aren't
+    // forced onto JDK 25 (vgirpc overrides individual tasks for its 21/22
+    // multi-release split in its own build file). Internal worker/bench
+    // modules stay on 25.
+    val releaseLevel = if (name in publishedModules) 21 else 25
     tasks.withType<JavaCompile>().configureEach {
-        options.release.set(25)
+        options.release.set(releaseLevel)
         options.compilerArgs.addAll(
             listOf(
                 "-Xlint:all,-serial,-processing",
@@ -54,5 +63,61 @@ subprojects {
             "--add-opens=java.base/java.nio=ALL-UNNAMED",
             "--enable-native-access=ALL-UNNAMED",
         )
+    }
+
+    if (name in publishedModules) {
+        apply(plugin = "com.vanniktech.maven.publish")
+
+        // The codebase predates strict doc-comment hygiene; don't fail the
+        // build (and thus publishing) on doclint warnings.
+        tasks.withType<Javadoc>().configureEach {
+            (options as StandardJavadocDocletOptions).addStringOption("Xdoclint:none", "-quiet")
+        }
+
+        extensions.configure<com.vanniktech.maven.publish.MavenPublishBaseExtension> {
+            // Upload to the Central Portal and auto-release once validation
+            // passes (no manual "publish" click in the Portal UI). Flip to
+            // publishToMavenCentral(false) if you'd rather gate releases by hand.
+            publishToMavenCentral(automaticRelease = true)
+
+            // Sign only when a key is available (CI / local release). Plain
+            // `publishToMavenLocal` and contributor builds without a key still work.
+            if (project.findProperty("signingInMemoryKey") != null) {
+                signAllPublications()
+            }
+
+            coordinates(group.toString(), name, version.toString())
+
+            pom {
+                name.set(this@subprojects.name)
+                description.set(
+                    moduleDescriptions[this@subprojects.name]
+                        ?: "vgi-rpc-java module ${this@subprojects.name}."
+                )
+                url.set("https://github.com/Query-farm/vgi-rpc-java")
+                inceptionYear.set("2026")
+                licenses {
+                    license {
+                        name.set("The Apache License, Version 2.0")
+                        url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                    }
+                }
+                organization {
+                    name.set("Query Farm LLC")
+                    url.set("https://query.farm")
+                }
+                developers {
+                    developer {
+                        name.set("Query Farm LLC")
+                        url.set("https://query.farm")
+                    }
+                }
+                scm {
+                    connection.set("scm:git:https://github.com/Query-farm/vgi-rpc-java.git")
+                    developerConnection.set("scm:git:git@github.com:Query-farm/vgi-rpc-java.git")
+                    url.set("https://github.com/Query-farm/vgi-rpc-java")
+                }
+            }
+        }
     }
 }

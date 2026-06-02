@@ -26,8 +26,10 @@ dependencies {
     implementation("org.eclipse.jetty.ee10:jetty-ee10-servlet:$jettyVersion")
     implementation("org.eclipse.jetty:jetty-client:$jettyVersion")
 
-    // Logging backend (only required for tests/worker; library users may bring their own)
-    runtimeOnly("org.slf4j:slf4j-simple:$slf4jVersion")
+    // Logging backend. This is a *library* — consumers bring their own SLF4J
+    // binding, so slf4j-simple must NOT leak into the published runtime POM.
+    // Tests use it directly; the runnable worker modules declare it themselves.
+    testRuntimeOnly("org.slf4j:slf4j-simple:$slf4jVersion")
 
     testImplementation(platform("org.junit:junit-bom:5.11.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
@@ -91,6 +93,19 @@ val java22TestTask = tasks.register<Test>("java22Test") {
     jvmArgs("--add-opens=java.base/java.nio=ALL-UNNAMED", "--enable-native-access=ALL-UNNAMED")
 }
 tasks.named("check") { dependsOn(java22TestTask) }
+
+// The java-test-fixtures variants (HttpRequestStub etc.) are test-only helpers
+// and must not be published to Maven Central — strip them from the java
+// component so they don't appear in the POM / Gradle module metadata. Done in
+// afterEvaluate because the maven-publish plugin adds the *sources* test-fixtures
+// variant late; this block must run after that to catch all three.
+afterEvaluate {
+    (components["java"] as AdhocComponentWithVariants).let { javaComponent ->
+        listOf("testFixturesApiElements", "testFixturesRuntimeElements", "testFixturesSourcesElements").forEach { cfg ->
+            configurations.findByName(cfg)?.let { javaComponent.withVariantsFromConfiguration(it) { skip() } }
+        }
+    }
+}
 
 // Run the (Java 21) `test` task on a chosen runtime JDK to validate the
 // baseline degrades correctly: `./gradlew :vgirpc:test -PtestJdk=21`. The FFM

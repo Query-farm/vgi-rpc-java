@@ -7,6 +7,8 @@ dependencies {
     implementation(project(":conformance"))
     // Optional — only needed by --auth-jwt / --auth-pkce modes
     implementation(project(":vgirpc-oauth"))
+    // SLF4J backend for this runnable worker (vgirpc no longer ships one).
+    runtimeOnly("org.slf4j:slf4j-simple:2.0.16")
 }
 
 application {
