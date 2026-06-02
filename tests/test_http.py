@@ -5,7 +5,8 @@ import time
 from vgi_rpc.conformance import ConformanceService, Point
 from vgi_rpc.http import http_connect
 
-WORKER = "/Users/rusty/Development/vgi-rpc-java/conformance-worker/build/install/conformance-worker/bin/conformance-worker"
+from pathlib import Path
+WORKER = str(Path(__file__).parent.parent / "conformance-worker/build/install/conformance-worker/bin/conformance-worker")
 
 proc = subprocess.Popen([WORKER, "--http"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 try:

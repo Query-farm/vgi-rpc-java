@@ -98,7 +98,7 @@ Package root: `farm.query.vgirpc`
 ## Testing
 
 - **JUnit 5** for Java-side unit tests (`*Test.java` under `src/test/java`). Arrow memory needs `--add-opens=java.base/java.nio=ALL-UNNAMED` — already wired in the root `build.gradle.kts`.
-- **Conformance** is driven from Python via `test_java_conformance.py` and the other `test_java_*.py` files at the repo root. These spawn the Java worker (built via `./gradlew installDist`) over the transport under test.
+- **Conformance** is driven from Python via `tests/test_java_conformance.py` and the other `tests/test_java_*.py` files. These spawn the Java worker (built via `./gradlew installDist`) over the transport under test. The `./run_tests.sh` / `./inspect.sh` entry points stay at the repo root.
 - The conformance driver expects `conformance-worker` to print `PORT:<port>` on stdout when launched with `--http` (auto-port selection, matches the Python reference).
 
 ## Cross-language wire alignment

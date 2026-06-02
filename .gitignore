@@ -4,7 +4,7 @@ build/
 *.iml
 out/
 bin/
-/test_smoke.py
+/tests/test_smoke.py
 
 # Python bytecode caches from the pytest conformance driver.
 __pycache__/

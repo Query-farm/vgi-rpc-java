@@ -2,7 +2,8 @@
 from vgi_rpc.introspect import introspect
 from vgi_rpc.rpc import SubprocessTransport
 
-WORKER = "/Users/rusty/Development/vgi-rpc-java/conformance-worker/build/install/conformance-worker/bin/conformance-worker"
+from pathlib import Path
+WORKER = str(Path(__file__).parent.parent / "conformance-worker/build/install/conformance-worker/bin/conformance-worker")
 
 transport = SubprocessTransport([WORKER])
 try:

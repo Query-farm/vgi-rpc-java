@@ -19,7 +19,7 @@ from vgi_rpc.rpc import AnnotatedBatch, SubprocessTransport, _RpcProxy, Stream, 
 
 WORKER = os.environ.get(
     "JAVA_BENCHMARK_WORKER",
-    str(Path(__file__).parent / "benchmark-worker/build/install/benchmark-worker/bin/benchmark-worker"),
+    str(Path(__file__).parent.parent / "benchmark-worker/build/install/benchmark-worker/bin/benchmark-worker"),
 )
 
 

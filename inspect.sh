@@ -8,7 +8,8 @@
 #
 # Assumes the Java worker is already built. If not, run ./run_tests.sh first.
 set -u
-export JAVA_HOME=/opt/homebrew/opt/openjdk@21
+# JDK 25 matches the build toolchain (the worker is compiled at release 25).
+export JAVA_HOME=/opt/homebrew/opt/openjdk@25
 cd "$(dirname "$0")"
 
 PY=/Users/rusty/Development/vgi-rpc/.venv/bin/python
@@ -18,6 +19,6 @@ shift || true
 pkill -f conformance-worker 2>/dev/null
 sleep 0.3
 
-"$PY" -m pytest test_java_conformance.py \
+"$PY" -m pytest tests/test_java_conformance.py \
     -p no:cacheprovider --tb=long -q \
     -k "$PATTERN" "$@" 2>&1

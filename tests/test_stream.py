@@ -7,7 +7,8 @@ import pyarrow as pa
 from vgi_rpc.conformance import ConformanceService, ConformanceHeader
 from vgi_rpc.rpc import AnnotatedBatch, RpcError, SubprocessTransport, _RpcProxy
 
-WORKER = "/Users/rusty/Development/vgi-rpc-java/conformance-worker/build/install/conformance-worker/bin/conformance-worker"
+from pathlib import Path
+WORKER = str(Path(__file__).parent.parent / "conformance-worker/build/install/conformance-worker/bin/conformance-worker")
 
 
 def ok(label, got, expected=None):

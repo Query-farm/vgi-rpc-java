@@ -25,7 +25,7 @@ from vgi_rpc.rpc import SubprocessTransport, _RpcProxy, unix_connect
 
 JAVA_WORKER = os.environ.get(
     "JAVA_CONFORMANCE_WORKER",
-    str(Path(__file__).parent / "conformance-worker/build/install/conformance-worker/bin/conformance-worker"),
+    str(Path(__file__).parent.parent / "conformance-worker/build/install/conformance-worker/bin/conformance-worker"),
 )
 
 
