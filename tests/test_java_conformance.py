@@ -245,7 +245,20 @@ def conformance_http_with_zstd_storage_port(conformance_fake_storage: str) -> It
 ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
 
 
-@pytest.fixture(params=["pipe", "subprocess", "http", "http_externalize_always", "unix"])
+# The transport set is filterable via the CONFORMANCE_TRANSPORTS env var
+# (comma-separated) so CI can fan the suite out across parallel jobs by
+# transport group — e.g. "pipe,subprocess,unix" for the launcher lanes vs
+# "http,http_externalize_always" for the HTTP lane. Unset = all (local default).
+_ALL_CONNS = ["pipe", "subprocess", "http", "http_externalize_always", "unix"]
+_CONN_SEL = os.environ.get("CONFORMANCE_TRANSPORTS")
+_CONN_PARAMS = (
+    [c for c in _ALL_CONNS if c in {s.strip() for s in _CONN_SEL.split(",")}]
+    if _CONN_SEL
+    else _ALL_CONNS
+)
+
+
+@pytest.fixture(params=_CONN_PARAMS)
 def conformance_conn(
     request: pytest.FixtureRequest,
     java_transport: SubprocessTransport,

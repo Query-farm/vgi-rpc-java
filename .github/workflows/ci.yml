@@ -53,21 +53,46 @@ jobs:
           -PtestJdk=21 :vgirpc:test
 
   # Python-driven conformance suite: a Python driver (the vgi_rpc reference)
-  # spawns the Java worker over pipe / unix / HTTP and asserts byte-for-byte
-  # wire compatibility. Runs in parallel with the JUnit `test` job.
+  # spawns the Java worker and asserts byte-for-byte wire compatibility. Fanned
+  # out across transport groups so the lanes run in parallel and failures
+  # isolate by mode. The launcher lanes split by runtime JDK because shm has no
+  # disable switch — it is gated purely by ShmFactory.available() (true on JDK
+  # >= 22 via the multi-release overlay, false on 21):
+  #   * launcher @ JDK 21 -> shm unavailable, pure pipe/unix wire
+  #   * launcher @ JDK 25 -> shm side-channel active (+ zero-copy resolve)
+  #   * http     @ JDK 25 -> HTTP transport (shm not involved)
   conformance:
+    name: conformance / ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: launcher (JDK 21, no shm)
+            run_jdk: '21'
+            transports: pipe,subprocess,unix
+            zerocopy: ''
+          - name: launcher + shm (JDK 25)
+            run_jdk: '25'
+            transports: pipe,subprocess,unix
+            zerocopy: '1'
+          - name: http (JDK 25)
+            run_jdk: '25'
+            transports: http,http_externalize_always
+            zerocopy: ''
     steps:
       - uses: actions/checkout@v4
 
-      # JDK 25: the build toolchain, and the runtime the worker needs (it is a
-      # non-published module compiled at release 25; the FFM shm overlay is
-      # active). setup-java sets JAVA_HOME, which the worker launch script uses.
-      - name: Set up JDK 25
+      # Always install both JDKs: 25 is the build toolchain (it compiles
+      # vgirpc's release-22 shared-memory overlay), while the worker is *run* on
+      # matrix.run_jdk. setup-java exports JAVA_HOME_{21,25}_X64 for both.
+      - name: Set up JDKs 25 + 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '25'
+          java-version: |
+            25
+            21
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -94,11 +119,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install "${RUNNER_TEMP}/vgi-rpc-python[http,cli,external,conformance,oauth,mtls]" pytest pytest-timeout
 
-      - name: Build conformance worker
+      - name: Build conformance worker (toolchain JDK 25)
         run: >-
           ./gradlew --no-daemon
-          -Porg.gradle.java.installations.fromEnv=JAVA_HOME_25_X64
+          -Porg.gradle.java.installations.fromEnv=JAVA_HOME_21_X64,JAVA_HOME_25_X64
           :conformance-worker:installDist
 
-      - name: Run conformance suite (pipe + unix + HTTP)
-        run: python -m pytest tests/test_java_conformance.py -p no:cacheprovider -q --timeout=120
+      - name: Run conformance suite (${{ matrix.transports }} on JDK ${{ matrix.run_jdk }})
+        env:
+          CONFORMANCE_TRANSPORTS: ${{ matrix.transports }}
+          VGI_RPC_SHM_ZEROCOPY: ${{ matrix.zerocopy }}
+        run: |
+          # The worker launch script honors JAVA_HOME; point it at the run-JDK.
+          if [ "${{ matrix.run_jdk }}" = "21" ]; then
+            export JAVA_HOME="$JAVA_HOME_21_X64"
+          else
+            export JAVA_HOME="$JAVA_HOME_25_X64"
+          fi
+          echo "worker JAVA_HOME=$JAVA_HOME"
+          python -m pytest tests/test_java_conformance.py -p no:cacheprovider -q --timeout=120

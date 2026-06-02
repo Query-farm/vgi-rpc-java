@@ -39,13 +39,14 @@ subprojects {
         }
     }
 
-    // Published library modules target a Java 21 baseline so consumers aren't
-    // forced onto JDK 25 (vgirpc overrides individual tasks for its 21/22
-    // multi-release split in its own build file). Internal worker/bench
-    // modules stay on 25.
-    val releaseLevel = if (name in publishedModules) 21 else 25
+    // Everything targets a Java 21 baseline (vgirpc overrides individual tasks
+    // for its 21/22 multi-release split in its own build file). Published
+    // modules so consumers aren't forced onto a newer JDK; the worker/bench
+    // modules so the runnable workers also launch on a JDK 21 runtime (where
+    // the FFM shared-memory overlay is absent and the pipe fallback is used).
+    // The toolchain is still JDK 25 — only the bytecode target is 21.
     tasks.withType<JavaCompile>().configureEach {
-        options.release.set(releaseLevel)
+        options.release.set(21)
         options.compilerArgs.addAll(
             listOf(
                 "-Xlint:all,-serial,-processing",
