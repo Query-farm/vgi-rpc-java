@@ -51,3 +51,54 @@ jobs:
           ./gradlew --no-daemon --rerun-tasks
           -Porg.gradle.java.installations.fromEnv=JAVA_HOME_21_X64,JAVA_HOME_25_X64
           -PtestJdk=21 :vgirpc:test
+
+  # Python-driven conformance suite: a Python driver (the vgi_rpc reference)
+  # spawns the Java worker over pipe / unix / HTTP and asserts byte-for-byte
+  # wire compatibility. Runs in parallel with the JUnit `test` job.
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 25: the build toolchain, and the runtime the worker needs (it is a
+      # non-published module compiled at release 25; the FFM shm overlay is
+      # active). setup-java sets JAVA_HOME, which the worker launch script uses.
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # The Java worker tracks the *unreleased* Python reference (0.19.0+ on
+      # main), which is ahead of PyPI's latest — so install vgi_rpc from source
+      # off the default branch rather than `pip install vgi-rpc`.
+      - name: Clone vgi-rpc-python reference
+        run: git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git "$RUNNER_TEMP/vgi-rpc-python"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "${RUNNER_TEMP}/vgi-rpc-python[http,cli,external,conformance,oauth,mtls]" pytest pytest-timeout
+
+      - name: Build conformance worker
+        run: >-
+          ./gradlew --no-daemon
+          -Porg.gradle.java.installations.fromEnv=JAVA_HOME_25_X64
+          :conformance-worker:installDist
+
+      - name: Run conformance suite (pipe + unix + HTTP)
+        run: python -m pytest tests/test_java_conformance.py -p no:cacheprovider -q --timeout=120

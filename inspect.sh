@@ -9,10 +9,22 @@
 # Assumes the Java worker is already built. If not, run ./run_tests.sh first.
 set -u
 # JDK 25 matches the build toolchain (the worker is compiled at release 25).
-export JAVA_HOME=/opt/homebrew/opt/openjdk@25
+# Honor an existing JAVA_HOME; else pick JDK 25 via macOS java_home; else PATH.
+if [[ -z "${JAVA_HOME:-}" ]] && [[ -x /usr/libexec/java_home ]]; then
+    JAVA_HOME=$(/usr/libexec/java_home -v 25 2>/dev/null) && export JAVA_HOME
+fi
 cd "$(dirname "$0")"
 
-PY=/Users/rusty/Development/vgi-rpc/.venv/bin/python
+# Python with vgi_rpc importable. Override with VGI_RPC_PYTHON; else prefer a
+# local reference venv, else system python3.
+PY="${VGI_RPC_PYTHON:-}"
+if [[ -z "$PY" ]]; then
+    if [[ -x "$HOME/Development/vgi-rpc/.venv/bin/python" ]]; then
+        PY="$HOME/Development/vgi-rpc/.venv/bin/python"
+    else
+        PY="python3"
+    fi
+fi
 PATTERN="${1:?usage: inspect.sh <test-pattern> [more pytest args...]}"
 shift || true
 

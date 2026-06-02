@@ -13,11 +13,25 @@ set -u
 # compiled at release 25, so it must run on a >= 25 runtime; the FFM shared-
 # memory overlay is active here. (Java-21 baseline degradation is covered by
 # the JUnit `-PtestJdk=21` lane, not this Python conformance suite.)
-export JAVA_HOME=/opt/homebrew/opt/openjdk@25
+#
+# Honor an existing JAVA_HOME (CI's setup-java sets it); else pick JDK 25 via
+# macOS java_home; else fall back to whatever `java` is on PATH.
+if [[ -z "${JAVA_HOME:-}" ]] && [[ -x /usr/libexec/java_home ]]; then
+    JAVA_HOME=$(/usr/libexec/java_home -v 25 2>/dev/null) && export JAVA_HOME
+fi
 cd "$(dirname "$0")"
 
 OUT=/tmp/pytest_java.txt
-PY=/Users/rusty/Development/vgi-rpc/.venv/bin/python
+# Python with the vgi_rpc reference package importable. Override with
+# VGI_RPC_PYTHON; else prefer a local reference venv, else system python3.
+PY="${VGI_RPC_PYTHON:-}"
+if [[ -z "$PY" ]]; then
+    if [[ -x "$HOME/Development/vgi-rpc/.venv/bin/python" ]]; then
+        PY="$HOME/Development/vgi-rpc/.venv/bin/python"
+    else
+        PY="python3"
+    fi
+fi
 
 BUILD=1
 if [[ "${1:-}" == "--no-build" ]]; then BUILD=0; shift; fi

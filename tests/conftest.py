@@ -1,12 +1,16 @@
-"""Keep pytest cache out of the vgi-rpc-java tree.
+"""Make the vgi_rpc reference package importable for the conformance driver.
 
-Avoids cluttering the repo with .pytest_cache and keeps cross-run state off
-disk so rebuilding is fully deterministic.
+The suite is re-exported from the Python `vgi_rpc` package. Normally that
+package is installed in the interpreter running pytest (CI pip-installs it, or
+locally you run via the reference venv's python), so nothing extra is needed.
+
+As an escape hatch, set VGI_RPC_SITE to a site-packages directory and it will
+be prepended to sys.path — useful when running under an interpreter that
+doesn't have vgi_rpc installed but can borrow it from elsewhere.
 """
 import os
 import sys
 
-# The conformance suite is re-exported from vgi_rpc; make sure it's importable.
-_VENV_SITE = "/Users/rusty/Development/vgi-rpc/.venv/lib/python3.13/site-packages"
-if os.path.isdir(_VENV_SITE) and _VENV_SITE not in sys.path:
-    sys.path.insert(0, _VENV_SITE)
+_site = os.environ.get("VGI_RPC_SITE")
+if _site and os.path.isdir(_site) and _site not in sys.path:
+    sys.path.insert(0, _site)
