@@ -36,6 +36,7 @@ public final class Metadata {
     public static final String PROTOCOL_NAME     = "vgi_rpc.protocol_name";
     public static final String DESCRIBE_VERSION_KEY = "vgi_rpc.describe_version";
     public static final String PROTOCOL_HASH_KEY = "vgi_rpc.protocol_hash";
+    public static final String PROTOCOL_VERSION_KEY = "vgi_rpc.protocol_version";
 
     public static final String TRACEPARENT = "traceparent";
     public static final String TRACESTATE  = "tracestate";

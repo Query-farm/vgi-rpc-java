@@ -65,7 +65,8 @@ public final class Introspect {
     private Introspect() {}
 
     /** Build the describe batch + metadata for an {@link RpcServer}. */
-    public static Built build(String protocolName, Map<String, RpcMethodInfo> methods, String serverId) {
+    public static Built build(String protocolName, Map<String, RpcMethodInfo> methods,
+                              String serverId, String protocolVersion) {
         Map<String, RpcMethodInfo> sorted = new TreeMap<>(methods);
         VectorSchemaRoot root = VectorSchemaRoot.create(DESCRIBE_SCHEMA, Allocators.root());
         root.allocateNew();
@@ -131,6 +132,11 @@ public final class Introspect {
         md.put(Metadata.DESCRIBE_VERSION_KEY, DESCRIBE_VERSION);
         md.put(Metadata.PROTOCOL_HASH_KEY, protocolHash);
         md.put(Metadata.SERVER_ID, serverId);
+        // Optional human-readable version label; mirrors Python introspect, which
+        // appends vgi_rpc.protocol_version after server_id only when declared.
+        if (protocolVersion != null && !protocolVersion.isEmpty()) {
+            md.put(Metadata.PROTOCOL_VERSION_KEY, protocolVersion);
+        }
         return new Built(root, md);
     }
 

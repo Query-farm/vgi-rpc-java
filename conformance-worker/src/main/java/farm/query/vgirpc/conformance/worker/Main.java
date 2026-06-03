@@ -44,6 +44,9 @@ public final class Main {
     public static void main(String[] args) throws Exception {
         ConformanceService impl = new ConformanceServiceImpl();
         RpcServer server = new RpcServer(ConformanceService.class, impl);
+        // Match the Python reference's ConformanceService.protocol_version so the
+        // describe conformance suite sees the same MAJOR.MINOR.PATCH label.
+        server.setProtocolVersion("1.0.0");
 
         byte[] tokenKey = null;
         long tokenTtl = 0;

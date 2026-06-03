@@ -106,7 +106,7 @@ public final class RpcServer {
     /** SHA-256 hex digest of the canonical __describe__ payload. */
     public String protocolHash() {
         if (protocolHash.isEmpty()) {
-            Introspect.Built b = Introspect.build(protocolName(), methods, serverId);
+            Introspect.Built b = Introspect.build(protocolName(), methods, serverId, protocolVersion);
             try {
                 protocolHash = b.customMetadata().getOrDefault(Metadata.PROTOCOL_HASH_KEY, "");
             } finally {
@@ -673,7 +673,7 @@ public final class RpcServer {
     }
 
     private void serveDescribe(RpcTransport transport) throws IOException {
-        Introspect.Built built = Introspect.build(protocolName(), methods, serverId);
+        Introspect.Built built = Introspect.build(protocolName(), methods, serverId, protocolVersion);
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer());
              VectorSchemaRoot root = built.root()) {
             w.writeBatch(root, built.customMetadata());

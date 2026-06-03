@@ -42,6 +42,26 @@ def java_transport() -> Iterator[SubprocessTransport]:
     transport.close()
 
 
+@pytest.fixture(scope="session")
+def conformance_describe() -> Iterator[Any]:
+    """Real ``__describe__`` against the Java worker for TestDescribeConformance.
+
+    The upstream suite requires the host harness to supply the worker's
+    ``ServiceDescription`` (rather than a throwaway in-process Python server), so
+    introspection is validated against the actual Java implementation. Uses its
+    own subprocess transport to stay isolated from the shared ``java_transport``
+    stream state. The describe payload is transport-independent server-side, so a
+    single transport exercises ``Introspect``/``serveDescribe`` fully.
+    """
+    from vgi_rpc.introspect import introspect
+
+    transport = SubprocessTransport([JAVA_WORKER])
+    try:
+        yield introspect(transport)
+    finally:
+        transport.close()
+
+
 def _wait_for_http(port: int, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
