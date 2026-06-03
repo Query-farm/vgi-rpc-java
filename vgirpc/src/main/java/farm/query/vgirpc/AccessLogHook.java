@@ -31,6 +31,10 @@ public final class AccessLogHook implements DispatchHook {
     private final String serverVersion;
     private final Object writeLock = new Object();
 
+    /**
+     * @param out destination for one JSONL record per dispatch (writes are synchronized)
+     * @param serverVersion server-version string included in each record; {@code null} becomes {@code ""}
+     */
     public AccessLogHook(OutputStream out, String serverVersion) {
         this.out = out;
         this.serverVersion = serverVersion == null ? "" : serverVersion;
@@ -45,11 +49,13 @@ public final class AccessLogHook implements DispatchHook {
         return sb.toString();
     }
 
+    /** {@inheritDoc} Returns a nanosecond start timestamp used to compute duration. */
     @Override
     public Object onDispatchStart(DispatchInfo info) {
         return System.nanoTime();
     }
 
+    /** {@inheritDoc} Writes one JSONL access-log record describing the completed dispatch. */
     @Override
     public void onDispatchEnd(Object token, DispatchInfo info, CallStatistics stats, Throwable error) {
         long startNs = token instanceof Long ? (Long) token : System.nanoTime();

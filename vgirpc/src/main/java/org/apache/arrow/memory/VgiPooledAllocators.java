@@ -17,6 +17,13 @@ public final class VgiPooledAllocators {
 
     private VgiPooledAllocators() {}
 
+    /**
+     * Build a {@link RootAllocator} with a custom allocation-manager factory.
+     *
+     * @param maxAllocation the allocator's byte cap
+     * @param factory the allocation-manager factory to install
+     * @return the configured root allocator
+     */
     public static RootAllocator create(long maxAllocation, AllocationManager.Factory factory) {
         return new RootAllocator(BaseAllocator.configBuilder()
                 .maxAllocation(maxAllocation)

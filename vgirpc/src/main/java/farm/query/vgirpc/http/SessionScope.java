@@ -53,6 +53,15 @@ public final class SessionScope {
     private String mintTokenB64;
     private boolean closeSignal;
 
+    /**
+     * @param clientOptedIn whether the request carried {@code VGI-Session-Accept: true}
+     * @param stickyEnabled whether the server has sticky sessions enabled
+     * @param principalKey key binding a session to its principal
+     * @param principal the authenticated principal
+     * @param serverId server id embedded in minted session tokens
+     * @param tokenKey AEAD key for sealing session tokens (kept off the public surface)
+     * @param registry the per-worker session registry
+     */
     public SessionScope(boolean clientOptedIn, boolean stickyEnabled,
                          String principalKey, String principal,
                          String serverId,
@@ -66,8 +75,16 @@ public final class SessionScope {
         this.registry = registry;
     }
 
+    /** @return the {@link SessionScope} bound to the current thread, or {@code null}. */
     public static SessionScope current() { return CURRENT.get(); }
 
+    /**
+     * Bind {@code s} to the current thread, returning a handle that restores the
+     * previous scope when closed (use in try-with-resources).
+     *
+     * @param s the scope to install
+     * @return a closeable that pops the scope
+     */
     public static AutoCloseable push(SessionScope s) {
         SessionScope prev = CURRENT.get();
         CURRENT.set(s);
@@ -77,25 +94,34 @@ public final class SessionScope {
         };
     }
 
+    /** @return the session entry bound to this request, or {@code null}. */
     public SessionRegistry.Entry entry() { return entry; }
+    /** Bind a registry entry and record the dispatch action that produced it. */
     public void bindEntry(SessionRegistry.Entry e, String action) {
         this.entry = e;
         this.sessionId = e != null ? e.sessionId : null;
         this.action = action;
     }
 
-    /** Replace just the action label without rebinding the entry. */
+    /** @return a copy of the bound session id, or {@code null} if none. */
     public byte[] sessionId() { return sessionId == null ? null : sessionId.clone(); }
+    /** @return the hex-encoded bound session id, or {@code null} if none. */
     public String sessionIdHex() {
         return sessionId == null ? null : SessionRegistry.hex(sessionId);
     }
+    /** @return the dispatch action label (open/resume/close/none). */
     public String action() { return action; }
+    /** Replace just the action label without rebinding the entry. */
     public void setAction(String a) { this.action = a; }
 
+    /** @return the base64 session token to emit on the response, or {@code null}. */
     public String mintTokenB64() { return mintTokenB64; }
+    /** Set the base64 session token to emit on the response. */
     public void setMintTokenB64(String b64) { this.mintTokenB64 = b64; }
 
+    /** @return whether the response should signal {@code VGI-Session-Close: true}. */
     public boolean closeSignal() { return closeSignal; }
+    /** Set whether the response should signal session close. */
     public void setCloseSignal(boolean v) { this.closeSignal = v; }
 
     /** Clear the bound session after close so {@code CallContext.session()} returns null. */

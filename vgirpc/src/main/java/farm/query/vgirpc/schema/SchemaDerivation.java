@@ -197,6 +197,15 @@ public final class SchemaDerivation {
         throw new IllegalArgumentException("Cannot derive raw class from: " + t);
     }
 
+    /**
+     * Map a Java {@link Type} to its corresponding Arrow {@link ArrowType}
+     * (the leaf-type rule used when deriving schemas from method signatures and
+     * record components).
+     *
+     * @param type the Java type to map
+     * @return the Arrow type
+     * @throws IllegalArgumentException if the type has no Arrow mapping
+     */
     public static ArrowType inferArrowType(Type type) {
         Class<?> raw = rawClass(type);
 
