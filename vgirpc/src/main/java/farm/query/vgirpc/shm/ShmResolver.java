@@ -32,7 +32,7 @@ import java.util.Map;
  * Detect, resolve and produce shared-memory "pointer batches" — the local
  * analogue of {@link farm.query.vgirpc.external.LocationResolver} /
  * {@link farm.query.vgirpc.external.Externalizer}, but the payload lives in a
- * {@link ShmSegment} rather than at an HTTP URL.
+ * {@link Shm} segment rather than at an HTTP URL.
  *
  * <p>A pointer batch is a zero-row batch (same schema as the real batch) whose
  * custom metadata carries {@code vgi_rpc.shm_offset} + {@code vgi_rpc.shm_length}.

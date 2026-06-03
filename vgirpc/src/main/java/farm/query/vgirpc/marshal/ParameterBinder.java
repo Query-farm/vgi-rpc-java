@@ -29,7 +29,7 @@ public final class ParameterBinder {
     /**
      * Build the positional argument array for {@code method.invoke(impl, args)}.
      *
-     * @param info       reflective method info (only the {@link Method} is used)
+     * @param method     the service {@link Method} whose argument array is being built
      * @param kwargs     decoded request parameters, keyed by parameter name
      * @param ctx        the {@link CallContext} to inject where declared
      * @throws RpcError  if a non-{@link Optional}, non-primitive parameter is missing

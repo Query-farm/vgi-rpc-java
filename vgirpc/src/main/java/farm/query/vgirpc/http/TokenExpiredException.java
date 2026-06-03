@@ -4,7 +4,7 @@
 package farm.query.vgirpc.http;
 
 /**
- * Thrown by {@link StateToken#unpack(byte[], byte[], long)} when the token's
+ * Thrown by {@link StateToken#unpack(byte[], byte[], long, String)} when the token's
  * creation timestamp is older than the configured TTL. Maps to HTTP 400 at the
  * request boundary (matches the Python reference).
  */
