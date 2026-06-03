@@ -38,6 +38,17 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
     private IpcStreamReader outputReader;
     private boolean closed;
 
+    /**
+     * Create a client streaming session. The input/output streams are opened
+     * lazily on the first {@link #tick()}, {@link #exchange(AnnotatedBatch)},
+     * or {@link #close()}.
+     *
+     * @param transport the underlying transport
+     * @param inputSchema schema of input batches; {@code null} becomes {@link RpcStream#EMPTY_SCHEMA}
+     * @param outputSchema schema of output batches; {@code null} becomes {@link RpcStream#EMPTY_SCHEMA}
+     * @param header optional stream header record returned by the server, or {@code null}
+     * @param onLog sink for log batches received on the output stream; may be {@code null}
+     */
     public ClientStreamSession(RpcTransport transport, Schema inputSchema, Schema outputSchema,
                                ArrowSerializableRecord header, Consumer<Message> onLog) {
         this.transport = transport;
@@ -52,7 +63,15 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
     @Override public S state() { throw new UnsupportedOperationException("state() not available on client session"); }
     @Override public ArrowSerializableRecord header() { return header; }
 
-    /** Send a tick (zero-row empty-schema batch) and return the next data batch. */
+    /**
+     * Send a tick (a zero-row batch matching the input schema) and return the
+     * next data batch from the producer. The returned batch's root is owned by
+     * the reader and is reused on the next call — copy any data you must keep.
+     *
+     * @return the next output {@link AnnotatedBatch}
+     * @throws NoSuchElementException when the producer has finished (output stream closed)
+     * @throws RpcError on transport failure or if the server reported an error
+     */
     @Override
     public AnnotatedBatch tick() {
         ensureNotClosed();
@@ -68,7 +87,15 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
         }
     }
 
-    /** Send {@code input} and read the next data batch (exchange streams). */
+    /**
+     * Send an input batch and read the next output data batch (exchange streams).
+     * The returned batch's root is owned by the reader and reused on the next
+     * call — copy any data you must keep.
+     *
+     * @param input the input batch to send for this tick
+     * @return the next output {@link AnnotatedBatch}
+     * @throws RpcError on transport failure or if the server reported an error
+     */
     @Override
     public AnnotatedBatch exchange(AnnotatedBatch input) {
         ensureNotClosed();
@@ -81,6 +108,11 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
         }
     }
 
+    /**
+     * Signal end-of-stream to the server by closing the input stream (writing
+     * EOS), then drain any remaining output so the transport is left clean for
+     * the next call. Idempotent.
+     */
     @Override
     public void close() {
         if (closed) return;
@@ -97,6 +129,11 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
         drainOutput();
     }
 
+    /**
+     * Abort the stream early: write a zero-row batch carrying the
+     * {@code vgi_rpc.cancel} metadata flag, then {@link #close()}. The server
+     * stops producing and the session is closed.
+     */
     @Override
     public void cancel() {
         if (closed) return;

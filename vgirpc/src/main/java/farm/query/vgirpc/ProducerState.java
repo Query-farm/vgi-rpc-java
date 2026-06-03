@@ -13,6 +13,13 @@ package farm.query.vgirpc;
  */
 public abstract class ProducerState extends StreamState {
 
+    /**
+     * Produce output for one tick: emit zero or one data batch via {@code out},
+     * and call {@link OutputCollector#finish()} when the stream is exhausted.
+     *
+     * @param out collector for this tick's output
+     * @param ctx request-scoped call context (auth, metadata, logging)
+     */
     public abstract void produce(OutputCollector out, CallContext ctx);
 
     /**
@@ -25,6 +32,7 @@ public abstract class ProducerState extends StreamState {
         produce(out, ctx);
     }
 
+    /** {@inheritDoc} Routes the tick to {@link #produce(AnnotatedBatch, OutputCollector, CallContext)}. */
     @Override
     public final void process(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
         produce(input, out, ctx);

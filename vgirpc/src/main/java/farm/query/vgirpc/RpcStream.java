@@ -27,24 +27,45 @@ import java.util.NoSuchElementException;
  */
 public abstract class RpcStream<S extends StreamState> implements AutoCloseable {
 
+    /** The empty Arrow schema (zero fields), used for ticks and producer inputs. */
     public static final Schema EMPTY_SCHEMA = new Schema(Collections.emptyList());
 
+    /** Schema of output (server→client) batches. */
     public abstract Schema outputSchema();
+    /** Schema of input (client→server) batches; {@link #EMPTY_SCHEMA} for producer streams. */
     public abstract Schema inputSchema();
+    /** The server-side {@link StreamState}; throws on client sessions. */
     public abstract S state();
+    /** The optional stream header record, or {@code null} if the method declares none. */
     public abstract ArrowSerializableRecord header();
 
+    /** @return {@code true} if this is a producer stream (no input schema). */
     public boolean isProducer() { return inputSchema().getFields().isEmpty(); }
 
     // --- Client-only operations (server-built streams throw) ---------------
 
+    /**
+     * Advance a producer stream one tick and return the next batch.
+     *
+     * @return the next output batch
+     * @throws UnsupportedOperationException on server-built streams
+     */
     public AnnotatedBatch tick() {
         throw new UnsupportedOperationException("tick() only valid on client-side stream sessions");
     }
+    /**
+     * Send an input batch and return the next output batch (exchange streams).
+     *
+     * @param input the input batch to send
+     * @return the next output batch
+     * @throws UnsupportedOperationException on server-built streams
+     */
     public AnnotatedBatch exchange(AnnotatedBatch input) {
         throw new UnsupportedOperationException("exchange() only valid on client-side stream sessions");
     }
+    /** Abort the stream early (client sessions only); no-op by default. */
     public void cancel() {}
+    /** End the stream and release resources; no-op by default. */
     @Override public void close() {}
 
     /** Iterate over data batches (client-side producer streams). */
@@ -74,16 +95,52 @@ public abstract class RpcStream<S extends StreamState> implements AutoCloseable 
 
     // --- Server factories --------------------------------------------------
 
+    /**
+     * Build a producer stream (server pushes output batches per tick, no input).
+     *
+     * @param outputSchema schema of the batches the state will emit
+     * @param state per-stream state whose {@code process} runs once per tick
+     * @param <S> the state type
+     * @return a server-side stream
+     */
     public static <S extends StreamState> RpcStream<S> producer(Schema outputSchema, S state) {
         return new ServerStream<>(outputSchema, EMPTY_SCHEMA, state, null);
     }
+    /**
+     * Build a producer stream that emits a header record before the body.
+     *
+     * @param outputSchema schema of the batches the state will emit
+     * @param state per-stream state whose {@code process} runs once per tick
+     * @param header header record sent on the separate header IPC stream
+     * @param <S> the state type
+     * @return a server-side stream
+     */
     public static <S extends StreamState> RpcStream<S> producer(Schema outputSchema, S state,
                                                                  ArrowSerializableRecord header) {
         return new ServerStream<>(outputSchema, EMPTY_SCHEMA, state, header);
     }
+    /**
+     * Build an exchange stream (client sends an input batch each tick, server replies with one output batch).
+     *
+     * @param inputSchema schema of client input batches
+     * @param outputSchema schema of server output batches
+     * @param state per-stream state whose {@code process} runs once per input
+     * @param <S> the state type
+     * @return a server-side stream
+     */
     public static <S extends StreamState> RpcStream<S> exchange(Schema inputSchema, Schema outputSchema, S state) {
         return new ServerStream<>(outputSchema, inputSchema, state, null);
     }
+    /**
+     * Build an exchange stream that emits a header record before the body.
+     *
+     * @param inputSchema schema of client input batches
+     * @param outputSchema schema of server output batches
+     * @param state per-stream state whose {@code process} runs once per input
+     * @param header header record sent on the separate header IPC stream
+     * @param <S> the state type
+     * @return a server-side stream
+     */
     public static <S extends StreamState> RpcStream<S> exchange(Schema inputSchema, Schema outputSchema, S state,
                                                                  ArrowSerializableRecord header) {
         return new ServerStream<>(outputSchema, inputSchema, state, header);

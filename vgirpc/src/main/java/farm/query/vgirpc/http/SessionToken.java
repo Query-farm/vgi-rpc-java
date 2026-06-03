@@ -62,6 +62,16 @@ public record SessionToken(
         return sb.toString();
     }
 
+    /**
+     * Seal this token into a URL-safe base64 string. The {@code principal} is
+     * bound as AEAD associated data, so a token minted for one principal cannot
+     * be replayed under another.
+     *
+     * @param tokenKey 32-byte ChaCha20-Poly1305 key
+     * @param principal principal bound as associated data
+     * @return the URL-safe base64-encoded sealed token (as bytes)
+     * @throws IllegalArgumentException if the server id exceeds 255 bytes
+     */
     public byte[] pack(byte[] tokenKey, String principal) {
         byte[] serverIdBytes = serverId.getBytes(StandardCharsets.UTF_8);
         if (serverIdBytes.length > 255) {
@@ -81,6 +91,16 @@ public record SessionToken(
         return Base64.getUrlEncoder().withoutPadding().encode(wire);
     }
 
+    /**
+     * Verify and decode a token produced by {@link #pack(byte[], String)}.
+     *
+     * @param b64 the URL-safe base64-encoded sealed token
+     * @param tokenKey the 32-byte ChaCha20-Poly1305 key
+     * @param principal principal that must match the token's associated data
+     * @return the decoded token
+     * @throws IllegalArgumentException if the token is malformed, the version is
+     *         unsupported, or AEAD verification fails (wrong key/principal/tamper)
+     */
     public static SessionToken unpack(byte[] b64, byte[] tokenKey, String principal) {
         byte[] raw;
         try {

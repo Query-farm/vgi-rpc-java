@@ -27,6 +27,15 @@ public final class CallContext {
     private final String protocolName;
     private final String requestId;
 
+    /**
+     * @param auth authenticated principal; {@code null} becomes {@link AuthContext#ANONYMOUS}
+     * @param emitClientLog sink for client-directed log messages
+     * @param transportMetadata transport-level metadata for the request; {@code null} becomes empty
+     * @param serverId the serving server's id
+     * @param methodName the RPC method being dispatched
+     * @param protocolName the service/protocol name
+     * @param requestId per-request id; {@code null} becomes {@code ""}
+     */
     public CallContext(AuthContext auth,
                        Consumer<Message> emitClientLog,
                        Map<String, Object> transportMetadata,
@@ -45,21 +54,41 @@ public final class CallContext {
         this.requestId = requestId != null ? requestId : "";
     }
 
+    /** The authenticated principal ({@link AuthContext#ANONYMOUS} if unauthenticated). */
     public AuthContext auth() { return auth; }
+    /** Transport-level request metadata (unmodifiable, never {@code null}). */
     public Map<String, Object> transportMetadata() { return transportMetadata; }
+    /** The serving server's id. */
     public String serverId() { return serverId; }
+    /** The RPC method name being dispatched. */
     public String methodName() { return methodName; }
+    /** The service/protocol name. */
     public String protocolName() { return protocolName; }
+    /** The per-request id, or {@code ""} if none. */
     public String requestId() { return requestId; }
 
+    /**
+     * Emit a client-directed log batch.
+     *
+     * @param level log level
+     * @param msg log message text
+     */
     public void clientLog(Level level, String msg) {
         emitClientLog.accept(new Message(level, msg, null));
     }
 
+    /**
+     * Emit a client-directed log batch with structured extra fields.
+     *
+     * @param level log level
+     * @param msg log message text
+     * @param extra structured fields serialized into {@code vgi_rpc.log_extra}
+     */
     public void clientLog(Level level, String msg, Map<String, Object> extra) {
         emitClientLog.accept(new Message(level, msg, extra));
     }
 
+    /** Emit a pre-built client-directed log {@link Message}. */
     public void emitClientLog(Message m) { emitClientLog.accept(m); }
 
     // --- Sticky-session API (HTTP-only) ---------------------------------

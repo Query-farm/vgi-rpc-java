@@ -39,6 +39,14 @@ public final class StateSerializer {
 
     private StateSerializer() {}
 
+    /**
+     * Serialize stream state to CBOR. {@link PortableStreamState} instances
+     * encode themselves; all others are reflected field-by-field.
+     *
+     * @param state the stream state to serialize
+     * @return the CBOR (or {@code PortableStreamState.encode()}) bytes
+     * @throws RuntimeException if encoding fails
+     */
     public static byte[] serialize(StreamState state) {
         if (state instanceof PortableStreamState pss) {
             try {
@@ -60,6 +68,16 @@ public final class StateSerializer {
         }
     }
 
+    /**
+     * Reconstruct stream state of type {@code cls} from bytes produced by
+     * {@link #serialize(StreamState)}.
+     *
+     * @param data the serialized bytes
+     * @param cls the concrete state type to instantiate
+     * @param <S> the state type
+     * @return the reconstructed state
+     * @throws RuntimeException if decoding or instantiation fails
+     */
     public static <S extends StreamState> S deserialize(byte[] data, Class<S> cls) {
         if (PortableStreamState.class.isAssignableFrom(cls)) {
             try {
@@ -158,6 +176,8 @@ public final class StateSerializer {
     }
 
     // Convenience: base64 helpers so callers can round-trip bytes in textual metadata.
+    /** Standard base64-encode bytes for embedding in textual metadata. */
     public static String base64Encode(byte[] bytes) { return Base64.getEncoder().encodeToString(bytes); }
+    /** Standard base64-decode a string produced by {@link #base64Encode(byte[])}. */
     public static byte[] base64Decode(String s) { return Base64.getDecoder().decode(s); }
 }

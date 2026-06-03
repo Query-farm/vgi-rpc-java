@@ -37,12 +37,34 @@ public final class RpcConnection implements AutoCloseable {
     private final Consumer<Message> onLog;
     private final farm.query.vgirpc.external.LocationResolver locationResolver;
 
+    /**
+     * Create a connection over the given transport with no log sink and no
+     * external-location resolution.
+     *
+     * @param transport the underlying transport (owned: closed by {@link #close()})
+     */
     public RpcConnection(RpcTransport transport) { this(transport, m -> {}); }
 
+    /**
+     * Create a connection that forwards server-emitted log batches to {@code onLog}.
+     *
+     * @param transport the underlying transport (owned: closed by {@link #close()})
+     * @param onLog sink for {@link Message} log batches received during calls; may be {@code null}
+     */
     public RpcConnection(RpcTransport transport, Consumer<Message> onLog) {
         this(transport, onLog, null);
     }
 
+    /**
+     * Create a connection with log forwarding and transparent external-location
+     * resolution. When {@code externalConfig} is supplied, pointer batches in
+     * unary responses are fetched and decoded in place via a
+     * {@link farm.query.vgirpc.external.LocationResolver}.
+     *
+     * @param transport the underlying transport (owned: closed by {@link #close()})
+     * @param onLog sink for {@link Message} log batches; may be {@code null}
+     * @param externalConfig external-storage configuration, or {@code null} to disable resolution
+     */
     public RpcConnection(RpcTransport transport, Consumer<Message> onLog,
                          farm.query.vgirpc.external.ExternalLocationConfig externalConfig) {
         this.transport = transport;
@@ -52,6 +74,16 @@ public final class RpcConnection implements AutoCloseable {
                 : null;
     }
 
+    /**
+     * Create a typed dynamic proxy that implements {@code serviceInterface}. Each
+     * method call is introspected via {@link ServiceIntrospector}, marshalled to
+     * an Arrow params batch, and dispatched over the transport — unary calls
+     * return the decoded result, streaming methods return a {@link ClientStreamSession}.
+     *
+     * @param serviceInterface the RPC service interface to implement
+     * @param <T> the service type
+     * @return a proxy instance bound to this connection
+     */
     @SuppressWarnings("unchecked")
     public <T> T proxy(Class<T> serviceInterface) {
         Map<String, RpcMethodInfo> methods = ServiceIntrospector.describe(serviceInterface);
@@ -61,6 +93,7 @@ public final class RpcConnection implements AutoCloseable {
                 new ClientHandler(methods));
     }
 
+    /** Close the underlying transport. */
     @Override
     public void close() { transport.close(); }
 

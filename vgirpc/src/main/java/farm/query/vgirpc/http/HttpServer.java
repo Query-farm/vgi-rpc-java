@@ -124,6 +124,13 @@ public final class HttpServer {
         this(rpc, Config.defaults());
     }
 
+    /**
+     * Create a server for {@code rpc} with the given configuration. Call
+     * {@link #start()} to bind and begin accepting requests.
+     *
+     * @param rpc the dispatcher serving the service
+     * @param config server configuration (see {@link Config})
+     */
     public HttpServer(RpcServer rpc, Config config) {
         this.rpc = rpc;
         this.streamHandler = new HttpStreamHandler(rpc, config.tokenKey(),
@@ -273,7 +280,9 @@ public final class HttpServer {
             }
         }
 
+        /** @return a config with all defaults (loopback, ephemeral port, anonymous auth). */
         public static Config defaults() { return builder().build(); }
+        /** @return a new {@link Builder}. */
         public static Builder builder() { return new Builder(); }
 
         public static final class Builder {
@@ -299,17 +308,29 @@ public final class HttpServer {
             private Map<String, String> stickyEchoHeaders = Map.of();
             private boolean exposeTestDrainAdmin;
 
+            /** Listen address (default {@code "127.0.0.1"}). See {@link Config#host()}. */
             public Builder host(String host) { this.host = host; return this; }
+            /** Listen port; {@code 0} for an OS-assigned ephemeral port. */
             public Builder port(int port) { this.port = port; return this; }
+            /** URL prefix such as {@code "/vgi"}; empty for none. */
             public Builder prefix(String prefix) { this.prefix = prefix; return this; }
+            /** 32-byte AEAD key sealing stream-state tokens; {@code null} generates a random per-process key. */
             public Builder tokenKey(byte[] tokenKey) { this.tokenKey = tokenKey; return this; }
+            /** Maximum state-token age in seconds before rejection; {@code 0} disables enforcement. */
             public Builder tokenTtlSeconds(long tokenTtlSeconds) { this.tokenTtlSeconds = tokenTtlSeconds; return this; }
+            /** Per-request authenticator; {@code null} = anonymous. */
             public Builder authenticator(Authenticator authenticator) { this.authenticator = authenticator; return this; }
+            /** Pre-route handlers run in order before dispatch. */
             public Builder preHandlers(List<HttpPreHandler> preHandlers) { this.preHandlers = preHandlers; return this; }
+            /** Request-body size cap in bytes; oversized requests get HTTP 413. */
             public Builder maxRequestBytes(long maxRequestBytes) { this.maxRequestBytes = maxRequestBytes; return this; }
+            /** Response-body size cap in bytes (in-process memory bound). */
             public Builder maxResponseBytes(long maxResponseBytes) { this.maxResponseBytes = maxResponseBytes; return this; }
+            /** Jetty connector idle timeout in milliseconds. */
             public Builder idleTimeoutMs(long idleTimeoutMs) { this.idleTimeoutMs = idleTimeoutMs; return this; }
+            /** {@code zstd} Content-Encoding level, 1 (fastest) to 22 (max); default 3. */
             public Builder zstdLevel(int zstdLevel) { this.zstdLevel = zstdLevel; return this; }
+            /** TLS settings; {@code null} = plaintext (only safe on loopback or behind a TLS proxy). */
             public Builder tls(TlsConfig tls) { this.tls = tls; return this; }
             /** Advertise {@code VGI-Max-Request-Bytes} on every response. */
             public Builder advertiseMaxRequestBytes(boolean v) { this.advertiseMaxRequestBytes = v; return this; }
@@ -336,6 +357,11 @@ public final class HttpServer {
             /** Conformance-only: expose POST/DELETE {@code /__test_drain__} for tests. */
             public Builder exposeTestDrainAdmin(boolean v) { this.exposeTestDrainAdmin = v; return this; }
 
+            /**
+             * Build the immutable config.
+             *
+             * @throws IllegalArgumentException if a numeric bound is out of range (see {@link Config})
+             */
             public Config build() {
                 return new Config(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator,
                         preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls,
@@ -346,15 +372,33 @@ public final class HttpServer {
         }
     }
 
+    /**
+     * Bind the connector and start accepting requests. After this returns,
+     * {@link #port()} reflects the actual bound port.
+     *
+     * @throws Exception if Jetty fails to start (e.g. the port is in use)
+     */
     public void start() throws Exception {
         jetty.start();
         this.port = ((ServerConnector) jetty.getConnectors()[0]).getLocalPort();
     }
 
+    /** @return the bound listen port (resolved after {@link #start()}). */
     public int port() { return port; }
 
+    /**
+     * Gracefully stop the server, waiting up to the configured stop timeout for
+     * in-flight requests.
+     *
+     * @throws Exception if Jetty fails to stop cleanly
+     */
     public void stop() throws Exception { jetty.stop(); }
 
+    /**
+     * Block until the server thread terminates.
+     *
+     * @throws InterruptedException if the calling thread is interrupted while waiting
+     */
     public void join() throws InterruptedException { jetty.join(); }
 
     // --- Servlet ---------------------------------------------------------

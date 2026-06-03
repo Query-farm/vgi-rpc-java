@@ -59,10 +59,24 @@ public final class RpcServer {
     private String protocolVersion = "";
     private String protocolHash = "";
 
+    /**
+     * Create a server with a random 12-char server id and {@code __describe__} enabled.
+     *
+     * @param serviceInterface the service interface introspected for method schemas
+     * @param impl the implementation instance calls are dispatched to
+     */
     public RpcServer(Class<?> serviceInterface, Object impl) {
         this(serviceInterface, impl, UUID.randomUUID().toString().replace("-", "").substring(0, 12), true);
     }
 
+    /**
+     * Create a server with an explicit server id.
+     *
+     * @param serviceInterface the service interface introspected for method schemas
+     * @param impl the implementation instance calls are dispatched to
+     * @param serverId stable identifier echoed in response metadata
+     * @param enableDescribe whether to answer the built-in {@code __describe__} introspection call
+     */
     public RpcServer(Class<?> serviceInterface, Object impl, String serverId, boolean enableDescribe) {
         this.serviceInterface = serviceInterface;
         this.impl = impl;
@@ -86,6 +100,7 @@ public final class RpcServer {
 
     /** Operator-supplied free-form protocol-contract version label (optional). */
     public void setProtocolVersion(String v) { this.protocolVersion = v == null ? "" : v; }
+    /** The operator-supplied protocol-contract version label, or {@code ""} if unset. */
     public String protocolVersion() { return protocolVersion; }
 
     /** SHA-256 hex digest of the canonical __describe__ payload. */
@@ -101,14 +116,24 @@ public final class RpcServer {
         return protocolHash;
     }
 
+    /** The stable server identifier echoed in response metadata. */
     public String serverId() { return serverId; }
+    /** The protocol name advertised in {@code __describe__}; the service interface's simple name. */
     public String protocolName() { return serviceInterface.getSimpleName(); }
+    /** Introspected method table keyed by method name (unmodifiable). */
     public Map<String, RpcMethodInfo> methods() { return Collections.unmodifiableMap(methods); }
 
     /** Underlying service implementation (exposed for the HTTP streaming handler). */
     public Object implementation() { return impl; }
 
-    /** Loop serving requests until the transport closes. */
+    /**
+     * Loop serving requests until the transport closes. A single shared-memory
+     * session is held for the lifetime of the connection. Recoverable per-call
+     * errors are reported back to the client as error streams without tearing
+     * down the loop.
+     *
+     * @param transport the transport whose request/response streams are served
+     */
     public void serve(RpcTransport transport) {
         // One shared-memory session per connection: lazily attaches when the
         // client advertises a segment, and is munmap'd/closed when the loop
@@ -159,7 +184,11 @@ public final class RpcServer {
         }
     }
 
-    /** Handle exactly one RPC call (no shared-memory session — used by the HTTP transport). */
+    /**
+     * Handle exactly one RPC call (no shared-memory session — used by the HTTP transport).
+     *
+     * @param transport the transport whose next request stream is read and answered
+     */
     public void serveOne(RpcTransport transport) {
         serveOne(transport, null);
     }

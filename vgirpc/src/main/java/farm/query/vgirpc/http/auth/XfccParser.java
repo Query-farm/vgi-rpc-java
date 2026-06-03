@@ -27,6 +27,12 @@ public final class XfccParser {
 
     private XfccParser() {}
 
+    /**
+     * Parse an {@code x-forwarded-client-cert} header value into its elements.
+     *
+     * @param headerValue the raw header value; {@code null} yields an empty list
+     * @return the parsed {@link XfccElement}s in order
+     */
     public static List<XfccElement> parse(String headerValue) {
         List<XfccElement> out = new ArrayList<>();
         if (headerValue == null) return out;

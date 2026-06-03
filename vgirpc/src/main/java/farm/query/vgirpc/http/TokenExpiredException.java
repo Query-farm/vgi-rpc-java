@@ -9,5 +9,6 @@ package farm.query.vgirpc.http;
  * request boundary (matches the Python reference).
  */
 public class TokenExpiredException extends IllegalArgumentException {
+    /** @param message diagnostic message */
     public TokenExpiredException(String message) { super(message); }
 }

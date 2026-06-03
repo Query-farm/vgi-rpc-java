@@ -34,6 +34,7 @@ public final class OutputCollector {
      */
     public record Entry(VectorSchemaRoot root, Map<String, String> customMetadata,
                           boolean isData, DictionaryProvider dictionaryProvider) {
+        /** Create an entry with no per-batch dictionary provider. */
         public Entry(VectorSchemaRoot root, Map<String, String> customMetadata, boolean isData) {
             this(root, customMetadata, isData, null);
         }
@@ -46,16 +47,30 @@ public final class OutputCollector {
     private boolean finished;
     private int dataIdx = -1;
 
+    /**
+     * @param outputSchema schema all data and zero-row batches conform to
+     * @param serverId server id stamped onto log batches; may be {@code null}
+     * @param producerMode whether {@link #finish()} is permitted (producer streams)
+     */
     public OutputCollector(Schema outputSchema, String serverId, boolean producerMode) {
         this.outputSchema = outputSchema;
         this.serverId = serverId;
         this.producerMode = producerMode;
     }
 
+    /** The output schema for this stream. */
     public Schema outputSchema() { return outputSchema; }
+    /** Whether {@link #finish()} has been called (producer streams). */
     public boolean finished() { return finished; }
+    /** Buffered entries (log batches plus the single data batch), in emission order; unmodifiable. */
     public List<Entry> entries() { return Collections.unmodifiableList(entries); }
 
+    /**
+     * The single emitted data batch.
+     *
+     * @return the data {@link Entry}
+     * @throws IllegalStateException if no data batch was emitted
+     */
     public Entry dataEntry() {
         if (dataIdx < 0) throw new IllegalStateException("no data batch emitted");
         return entries.get(dataIdx);
@@ -64,6 +79,13 @@ public final class OutputCollector {
     /** Emit the (single) data batch for this call. Ownership of {@code root} transfers to the collector. */
     public void emit(VectorSchemaRoot root) { emit(root, null, null); }
 
+    /**
+     * Emit the single data batch with custom metadata. Ownership of {@code root}
+     * transfers to the collector.
+     *
+     * @param root the data batch
+     * @param customMetadata custom metadata to attach, or {@code null}
+     */
     public void emit(VectorSchemaRoot root, Map<String, String> customMetadata) {
         emit(root, customMetadata, null);
     }
@@ -91,6 +113,7 @@ public final class OutputCollector {
         clientLog(new Message(level, text, null));
     }
 
+    /** Append a zero-row log batch carrying {@code msg}'s level/message/extra metadata. */
     public void clientLog(Message msg) {
         Map<String, String> md = msg.addToMetadata(null);
         if (serverId != null) md.put(Metadata.SERVER_ID, serverId);

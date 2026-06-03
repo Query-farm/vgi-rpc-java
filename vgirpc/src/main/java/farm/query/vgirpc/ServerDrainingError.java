@@ -12,6 +12,7 @@ package farm.query.vgirpc;
 public class ServerDrainingError extends RuntimeException implements HasErrorKind {
     public static final String ERROR_KIND = "server_draining";
 
+    /** @param message diagnostic message */
     public ServerDrainingError(String message) { super(message); }
 
     @Override public String errorKind() { return ERROR_KIND; }
