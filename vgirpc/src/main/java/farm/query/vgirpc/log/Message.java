@@ -11,6 +11,12 @@ import java.io.StringWriter;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+/**
+ * A structured log record carried on the RPC stream: a {@link Level}, a text
+ * message, and optional extra fields. It is serialized as a zero-row batch whose
+ * {@code vgi_rpc.log_*} custom metadata the caller can surface without disturbing
+ * the data stream. Exception tracebacks are truncated to {@link #MAX_TRACEBACK_CHARS}.
+ */
 public final class Message {
 
     public static final int MAX_TRACEBACK_CHARS = 16_000;

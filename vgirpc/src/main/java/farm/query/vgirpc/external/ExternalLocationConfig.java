@@ -84,6 +84,11 @@ public final class ExternalLocationConfig {
 
     public static Builder builder() { return new Builder(); }
 
+    /**
+     * Fluent builder for {@link ExternalLocationConfig}. Defaults externalize
+     * batches over 1&nbsp;MiB and cap fetches at 512&nbsp;MiB; set a
+     * {@link ExternalStorage} backend and override the thresholds as needed.
+     */
     public static final class Builder {
         private ExternalStorage storage;
         private long thresholdBytes = 1L << 20;      // 1 MiB

@@ -276,6 +276,11 @@ public final class HttpServer {
         public static Config defaults() { return builder().build(); }
         public static Builder builder() { return new Builder(); }
 
+        /**
+         * Fluent builder for {@link Config}. Defaults bind to {@code 127.0.0.1}
+         * on an automatically chosen port with no path prefix; override as needed
+         * and call {@link #build()}.
+         */
         public static final class Builder {
             private String host = "127.0.0.1";
             private int port = 0;

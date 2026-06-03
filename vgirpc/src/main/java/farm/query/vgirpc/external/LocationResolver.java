@@ -88,5 +88,10 @@ public final class LocationResolver {
         return dst;
     }
 
+    /**
+     * The outcome of resolving an external-location pointer batch: the fetched,
+     * materialised {@link VectorSchemaRoot} and the custom metadata that should
+     * accompany it downstream.
+     */
     public record Resolved(VectorSchemaRoot root, Map<String, String> customMetadata) {}
 }

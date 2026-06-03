@@ -280,6 +280,12 @@ public final class Introspect {
 
     // --- Result records ---------------------------------------------------
 
+    /**
+     * The introspected description of a single method, as returned by
+     * {@code __describe__}: its name, {@link MethodType}, whether it returns a
+     * value, the params/result/header Arrow schemas, and (for streams) whether it
+     * is an exchange.
+     */
     public record MethodDescription(
             String name,
             MethodType methodType,
@@ -291,6 +297,12 @@ public final class Introspect {
             Boolean isExchange
     ) {}
 
+    /**
+     * The introspected description of a whole service, as returned by
+     * {@code __describe__}: the protocol name, wire/describe versions, the
+     * protocol hash (byte-identical to the Python reference), the server id, and
+     * the per-method {@link MethodDescription}s keyed by method name.
+     */
     public record ServiceDescription(
             String protocolName,
             String requestVersion,

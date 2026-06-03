@@ -17,6 +17,12 @@ import java.util.Map;
  */
 public final class AuthScope {
 
+    /**
+     * The bundle published into the thread-local scope for the duration of a
+     * request: the resolved {@link AuthContext} and the request's transport
+     * metadata. Null components are normalised to {@link AuthContext#ANONYMOUS}
+     * and an empty map.
+     */
     public record Scope(AuthContext auth, Map<String, Object> transportMetadata) {
         public Scope {
             auth = auth != null ? auth : AuthContext.ANONYMOUS;
