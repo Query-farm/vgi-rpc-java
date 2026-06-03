@@ -10,5 +10,8 @@ dependencies {
 
     testImplementation(platform("org.junit:junit-bom:5.11.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
+    // Gradle 9 no longer auto-provisions the launcher; declare it explicitly
+    // (the core vgirpc module does the same) or the test JVM fails to start.
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation(testFixtures(project(":vgirpc")))
 }
