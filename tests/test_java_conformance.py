@@ -21,12 +21,18 @@ import pytest
 from vgi_rpc.conformance import ConformanceService
 from vgi_rpc.http import http_connect
 from vgi_rpc.log import Message
-from vgi_rpc.rpc import SubprocessTransport, _RpcProxy, unix_connect
+from vgi_rpc.rpc import ShmPipeTransport, SubprocessTransport, _RpcProxy, unix_connect
+from vgi_rpc.shm import ShmSegment
 
 JAVA_WORKER = os.environ.get(
     "JAVA_CONFORMANCE_WORKER",
     str(Path(__file__).parent.parent / "conformance-worker/build/install/conformance-worker/bin/conformance-worker"),
 )
+
+# Size of the per-connection POSIX shm segment for the "subprocess_shm"
+# transport. Large enough that conformance batches ride the side-channel;
+# anything that overflows falls back to inline transfer (never an error).
+SHM_SEGMENT_BYTES = 128 * 1024 * 1024
 
 
 @pytest.fixture(scope="session")
@@ -249,7 +255,7 @@ ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
 # (comma-separated) so CI can fan the suite out across parallel jobs by
 # transport group — e.g. "pipe,subprocess,unix" for the launcher lanes vs
 # "http,http_externalize_always" for the HTTP lane. Unset = all (local default).
-_ALL_CONNS = ["pipe", "subprocess", "http", "http_externalize_always", "unix"]
+_ALL_CONNS = ["pipe", "subprocess", "subprocess_shm", "http", "http_externalize_always", "unix"]
 _CONN_SEL = os.environ.get("CONFORMANCE_TRANSPORTS")
 _CONN_PARAMS = (
     [c for c in _ALL_CONNS if c in {s.strip() for s in _CONN_SEL.split(",")}]
@@ -283,6 +289,23 @@ def conformance_conn(
             def _shared_subproc() -> Iterator[_RpcProxy]:
                 yield _RpcProxy(ConformanceService, java_transport, on_log)
             return _shared_subproc()
+        elif request.param == "subprocess_shm":
+            # Co-located subprocess worker with the POSIX shared-memory
+            # side-channel active: the client owns a segment and advertises it,
+            # so batches transfer through shm (bidirectionally) instead of the
+            # pipe. The worker attaches on JDK >= 22; on a runtime without shm
+            # it transparently falls back to inline transfer.
+            @contextlib.contextmanager
+            def _shm_conn() -> Iterator[_RpcProxy]:
+                segment = ShmSegment.create(SHM_SEGMENT_BYTES)
+                transport = ShmPipeTransport(SubprocessTransport([JAVA_WORKER]), segment)
+                try:
+                    yield _RpcProxy(ConformanceService, transport, on_log)
+                finally:
+                    transport.close()       # closes the pipe; not the segment
+                    segment.close()
+                    segment.unlink()
+            return _shm_conn()
         elif request.param == "http":
             return http_connect(
                 ConformanceService,
