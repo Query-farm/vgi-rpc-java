@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc;
 
+import farm.query.vgirpc.shm.Shm;
 import farm.query.vgirpc.shm.ShmFactory;
 
 import java.util.LinkedHashMap;
@@ -37,11 +38,13 @@ public final class TransportOptions {
     /**
      * This worker's transport capabilities. SHM is offered only when the FFM
      * implementation is actually loadable on this runtime — true on JDK&nbsp;&ge;&nbsp;22
-     * (the {@code java22} multi-release overlay), false on Java&nbsp;21 / non-POSIX.
+     * (the {@code java22} multi-release overlay), false on Java&nbsp;21 / non-POSIX —
+     * and not turned off via the {@code VGI_RPC_SHM_DISABLE} kill-switch.
      */
     public static Map<String, String> workerCapabilities() {
         Map<String, String> caps = new LinkedHashMap<>();
-        caps.put(CAP_SHM, Boolean.toString(ShmFactory.available()));
+        boolean shm = ShmFactory.available() && !Shm.disabledByEnv();
+        caps.put(CAP_SHM, Boolean.toString(shm));
         return caps;
     }
 

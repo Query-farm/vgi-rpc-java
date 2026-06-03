@@ -37,6 +37,10 @@ public final class ShmSession implements AutoCloseable {
      */
     public void attachIfAdvertised(Map<String, String> meta) {
         if (segment != null || failed || meta == null) return;
+        // Honor the kill-switch even if a peer advertises a segment anyway: a
+        // disabled worker never attaches, so inbound resolve / outbound writes
+        // stay dormant and the connection uses inline transfer.
+        if (Shm.disabledByEnv()) { failed = true; return; }
         String name = meta.get(Metadata.SHM_SEGMENT_NAME);
         String size = meta.get(Metadata.SHM_SEGMENT_SIZE);
         if (name == null || size == null) return;       // not advertised on this request

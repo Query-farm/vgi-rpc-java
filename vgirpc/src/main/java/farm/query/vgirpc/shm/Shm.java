@@ -26,6 +26,18 @@ public abstract class Shm implements AutoCloseable {
     /** Fixed header size; the allocator hands out offsets at or beyond this. */
     public static final int HEADER_SIZE = 65_536;
 
+    /**
+     * Operator kill-switch: {@code VGI_RPC_SHM_DISABLE=1} forces the shared-memory
+     * side-channel off regardless of runtime support. The worker then advertises
+     * {@code vgi_rpc.transport.shm=false} and falls back to inline (pipe)
+     * transfer, exactly as on a Java&nbsp;21 runtime. Useful where POSIX shm is
+     * unavailable or restricted (small/absent {@code /dev/shm}, sandboxes) and
+     * for exercising the no-shm path on a JDK&nbsp;&ge;&nbsp;22 runtime.
+     */
+    public static boolean disabledByEnv() {
+        return "1".equals(System.getenv("VGI_RPC_SHM_DISABLE"));
+    }
+
     // Worker-side usage counters for this connection. "inline-eligible" = a data
     // batch that *should* have used shm (non-empty, non-dict) but didn't — the
     // signal that something leaked to the pipe.
