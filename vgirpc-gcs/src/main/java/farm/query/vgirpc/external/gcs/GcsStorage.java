@@ -35,6 +35,12 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
     private final Duration signDuration;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
+    /**
+     * Start building a {@code GcsStorage} that uploads into the given bucket.
+     *
+     * @param bucket destination GCS bucket name
+     * @return a fresh {@link Builder}
+     */
     public static Builder builder(String bucket) { return new Builder(bucket); }
 
     private GcsStorage(Builder b) {
@@ -50,6 +56,17 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
         this.signDuration = b.signDuration;
     }
 
+    /**
+     * Create a blob at {@code <keyPrefix><uuid>.arrow} with content type
+     * {@code application/vnd.apache.arrow.stream}, then return a V4 signed GET
+     * URL valid for the configured {@link Builder#signDuration duration}.
+     *
+     * @param body full Arrow IPC stream bytes
+     * @param contentEncoding stored as the blob's {@code Content-Encoding}
+     *        (e.g. {@code "zstd"}); ignored when {@code null}
+     * @return a short-lived signed GET URL the peer can fetch
+     * @throws IllegalStateException if the signer returns a URL that cannot be parsed as a {@link URI}
+     */
     @Override
     public URI upload(byte[] body, String contentEncoding) {
         String key = keyPrefix + UUID.randomUUID() + ".arrow";
@@ -69,6 +86,11 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
         }
     }
 
+    /**
+     * Close the underlying {@link Storage} client, but only when it was created
+     * internally — a caller-supplied client (via {@link Builder#storage}) is left
+     * open. Idempotent.
+     */
     @Override
     public void close() {
         if (closed.compareAndSet(false, true) && ownsStorage) {
@@ -76,6 +98,7 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
         }
     }
 
+    /** Fluent builder for {@link GcsStorage}. */
     public static final class Builder {
         private final String bucket;
         private String keyPrefix = "vgi-rpc/";
@@ -84,11 +107,18 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
 
         Builder(String bucket) { this.bucket = bucket; }
 
+        /** Key prefix for uploaded blobs; a trailing slash is added if missing (default {@code "vgi-rpc/"}). */
         public Builder keyPrefix(String keyPrefix) { this.keyPrefix = keyPrefix; return this; }
+        /** Validity window of the signed GET URLs (default one hour). */
         public Builder signDuration(Duration signDuration) { this.signDuration = signDuration; return this; }
-        /** Supply a pre-configured GCS client (e.g. for custom project/credentials). */
+        /**
+         * Supply a pre-configured GCS client (e.g. for custom project/credentials).
+         * A client provided here is not closed by {@link GcsStorage#close()}; when
+         * omitted, Application Default Credentials are used and the client is owned.
+         */
         public Builder storage(Storage storage) { this.storage = storage; return this; }
 
+        /** Build the configured {@link GcsStorage}. */
         public GcsStorage build() { return new GcsStorage(this); }
     }
 }

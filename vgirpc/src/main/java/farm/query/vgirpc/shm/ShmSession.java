@@ -59,6 +59,11 @@ public final class ShmSession implements AutoCloseable {
         }
     }
 
+    /**
+     * Detach from the segment (munmap + close fd, never unlink — the client owns
+     * the segment). Optionally emits a utilization summary when shm stats are
+     * enabled. Idempotent.
+     */
     @Override
     public void close() {
         if (segment != null) {

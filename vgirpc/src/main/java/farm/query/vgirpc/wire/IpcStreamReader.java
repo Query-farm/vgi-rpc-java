@@ -41,6 +41,12 @@ public final class IpcStreamReader implements AutoCloseable {
     private boolean eos = false;
     private boolean schemaInitialized = false;
 
+    /**
+     * Read an Arrow IPC stream from an {@link InputStream}.
+     *
+     * @param raw the source byte stream
+     * @param allocator allocator for the decoded vectors
+     */
     public IpcStreamReader(InputStream raw, BufferAllocator allocator) {
         this(Channels.newChannel(raw), allocator);
     }
@@ -99,6 +105,12 @@ public final class IpcStreamReader implements AutoCloseable {
         }
     }
 
+    /**
+     * Release reader buffers without closing the underlying channel (it is the
+     * per-connection socket, reused across calls).
+     *
+     * @throws IOException on close failure
+     */
     @Override
     public void close() throws IOException {
         // closeReadSource=false: the underlying channel is the per-connection

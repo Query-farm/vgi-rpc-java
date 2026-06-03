@@ -29,6 +29,10 @@ public final class ExternalFetcher {
     private final ExternalLocationConfig config;
     private final HttpClient client;
 
+    /**
+     * @param config configuration controlling timeouts, retries, size caps,
+     *        URL validation, and range parallelism
+     */
     public ExternalFetcher(ExternalLocationConfig config) {
         this.config = config;
         this.client = HttpClient.newBuilder()

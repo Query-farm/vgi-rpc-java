@@ -57,6 +57,11 @@ public final class IpcStreamWriter implements AutoCloseable {
     private boolean schemaEmittedDirect;
     private boolean closed;
 
+    /**
+     * Write an Arrow IPC stream to an {@link OutputStream}.
+     *
+     * @param raw the destination byte stream
+     */
     public IpcStreamWriter(OutputStream raw) {
         this.rawChannel = Channels.newChannel(raw);
         this.out = new WriteChannel(rawChannel);
@@ -85,6 +90,13 @@ public final class IpcStreamWriter implements AutoCloseable {
         declaredSchema = schema;
     }
 
+    /**
+     * Write a record batch with custom metadata and no dictionary provider.
+     *
+     * @param root the batch to write
+     * @param customMetadata Arrow IPC custom metadata for this batch, or {@code null}
+     * @throws IOException on write failure
+     */
     public void writeBatch(VectorSchemaRoot root, Map<String, String> customMetadata) throws IOException {
         writeBatch(root, customMetadata, null);
     }
@@ -129,6 +141,13 @@ public final class IpcStreamWriter implements AutoCloseable {
         ArrowStreamWriter.writeEndOfStream(out, IpcOption.DEFAULT);
     }
 
+    /**
+     * Emit end-of-stream (and a deferred schema if no batch was written) and
+     * release writer-internal buffers. The underlying channel is left open so
+     * the next call can reuse the same connection. Idempotent.
+     *
+     * @throws IOException on write failure
+     */
     @Override
     public void close() throws IOException {
         if (closed) return;

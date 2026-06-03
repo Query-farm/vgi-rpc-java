@@ -13,7 +13,12 @@ package farm.query.vgirpc;
 public class SessionLostError extends RuntimeException implements HasErrorKind {
     public static final String ERROR_KIND = "session_lost";
 
+    /** @param message diagnostic message */
     public SessionLostError(String message) { super(message); }
+    /**
+     * @param message diagnostic message
+     * @param cause the underlying cause
+     */
     public SessionLostError(String message, Throwable cause) { super(message, cause); }
 
     @Override public String errorKind() { return ERROR_KIND; }

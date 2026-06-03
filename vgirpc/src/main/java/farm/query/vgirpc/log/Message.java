@@ -12,13 +12,15 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * A structured log record carried on the RPC stream: a {@link Level}, a text
+ * A structured log/error record carried on the RPC stream: a {@link Level}, a text
  * message, and optional extra fields. It is serialized as a zero-row batch whose
- * {@code vgi_rpc.log_*} custom metadata the caller can surface without disturbing
- * the data stream. Exception tracebacks are truncated to {@link #MAX_TRACEBACK_CHARS}.
+ * custom metadata ({@code vgi_rpc.log_level} / {@code vgi_rpc.log_message} /
+ * {@code vgi_rpc.log_extra}) the caller can surface without disturbing the data
+ * stream. Exception tracebacks are truncated to {@link #MAX_TRACEBACK_CHARS}.
  */
 public final class Message {
 
+    /** Maximum traceback length retained by {@link #fromException(Throwable)} before truncation. */
     public static final int MAX_TRACEBACK_CHARS = 16_000;
 
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -27,29 +29,53 @@ public final class Message {
     private final String message;
     private final Map<String, Object> extra;
 
+    /**
+     * @param level severity
+     * @param message human-readable message text
+     * @param extra structured fields serialized to {@code vgi_rpc.log_extra}, or {@code null}
+     */
     public Message(Level level, String message, Map<String, Object> extra) {
         this.level = level;
         this.message = message;
         this.extra = extra;
     }
 
+    /**
+     * @param level severity
+     * @param message human-readable message text
+     */
     public Message(Level level, String message) {
         this(level, message, null);
     }
 
+    /** @return the severity level. */
     public Level level() { return level; }
+    /** @return the message text. */
     public String message() { return message; }
+    /** @return the structured extra fields, or {@code null}. */
     public Map<String, Object> extra() { return extra; }
 
+    /** Build an {@link Level#EXCEPTION}-level message with structured extras. */
     public static Message exception(String msg, Map<String, Object> extra) {
         return new Message(Level.EXCEPTION, msg, extra);
     }
+    /** Build an {@link Level#ERROR}-level message. */
     public static Message error(String msg) { return new Message(Level.ERROR, msg, null); }
+    /** Build a {@link Level#WARN}-level message. */
     public static Message warn(String msg) { return new Message(Level.WARN, msg, null); }
+    /** Build an {@link Level#INFO}-level message. */
     public static Message info(String msg) { return new Message(Level.INFO, msg, null); }
+    /** Build a {@link Level#DEBUG}-level message. */
     public static Message debug(String msg) { return new Message(Level.DEBUG, msg, null); }
+    /** Build a {@link Level#TRACE}-level message. */
     public static Message trace(String msg) { return new Message(Level.TRACE, msg, null); }
 
+    /**
+     * Write this message's level/message/extra onto a metadata map.
+     *
+     * @param base existing metadata to copy and extend, or {@code null} for a fresh map
+     * @return a new map containing {@code base} plus the log metadata keys
+     */
     public Map<String, String> addToMetadata(Map<String, String> base) {
         Map<String, String> result = base != null ? new LinkedHashMap<>(base) : new LinkedHashMap<>();
         result.put(Metadata.LOG_LEVEL, level.name());
@@ -64,6 +90,14 @@ public final class Message {
         return result;
     }
 
+    /**
+     * Build an {@link Level#EXCEPTION} message from a thrown exception: captures
+     * the (truncated) stack trace and a Python-compatible {@code exception_type}
+     * into the extras so cross-language clients can match by type name.
+     *
+     * @param t the exception
+     * @return the corresponding error message
+     */
     public static Message fromException(Throwable t) {
         StringWriter sw = new StringWriter();
         try (PrintWriter pw = new PrintWriter(sw)) {

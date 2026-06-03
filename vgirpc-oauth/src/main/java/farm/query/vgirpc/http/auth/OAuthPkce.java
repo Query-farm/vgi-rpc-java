@@ -65,6 +65,11 @@ public final class OAuthPkce {
     private final HttpClient http;
     private final String domain;
 
+    /**
+     * Start building an {@code OAuthPkce} flow helper.
+     *
+     * @return a fresh {@link Builder}
+     */
     public static Builder builder() { return new Builder(); }
 
     private OAuthPkce(Builder b) {
@@ -276,17 +281,32 @@ public final class OAuthPkce {
         private JwtAuthenticator idTokenValidator;
         private String domain = "oauth-pkce";
 
+        /** OAuth client id registered with the authorization server. Required. */
         public Builder clientId(String v) { this.clientId = v; return this; }
+        /** Absolute redirect URI registered with the authorization server (the {@code callbackPath} URL). Required. */
         public Builder redirectUri(String v) { this.redirectUri = v; return this; }
+        /** Local path the {@link #preHandler()} intercepts for the OAuth callback (default {@code "/_oauth/callback"}). */
         public Builder callbackPath(String v) { this.callbackPath = v; return this; }
+        /** Requested OAuth scope (default {@code "openid"}). */
         public Builder scope(String v) { this.scope = v; return this; }
+        /** HMAC key for signing the short-lived PKCE session cookie. The bytes are copied. Required. */
         public Builder sessionKey(byte[] v) { this.sessionKey = v.clone(); return this; }
+        /** HMAC key for signing the authenticated user cookie. The bytes are copied. Required. */
         public Builder authKey(byte[] v) { this.authKey = v.clone(); return this; }
+        /** Lifetime of the auth cookie in seconds when the id token carries no {@code exp} (default one hour). */
         public Builder authTtlSeconds(long v) { this.authTtlSeconds = v; return this; }
+        /** Authorization-server endpoints (authorize/token). Required. */
         public Builder oidcMetadata(OidcMetadata v) { this.oidc = v; return this; }
+        /** Validator that verifies the returned {@code id_token} (JWKS + signature + issuer/audience). Required. */
         public Builder idTokenValidator(JwtAuthenticator v) { this.idTokenValidator = v; return this; }
+        /** Auth domain label recorded on the resulting {@link AuthContext} (default {@code "oauth-pkce"}). */
         public Builder domain(String v) { this.domain = v; return this; }
 
+        /**
+         * Build the flow helper.
+         *
+         * @throws NullPointerException if any required field is unset
+         */
         public OAuthPkce build() { return new OAuthPkce(this); }
     }
 }

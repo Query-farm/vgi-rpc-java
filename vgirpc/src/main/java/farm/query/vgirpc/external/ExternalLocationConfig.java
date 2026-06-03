@@ -50,20 +50,34 @@ public final class ExternalLocationConfig {
         this.compression = b.compression;
     }
 
+    /** @return the upload backend, or {@code null} if externalisation is fetch-only. */
     public ExternalStorage storage() { return storage; }
+    /** @return batch size (bytes) at or above which a batch is externalised. */
     public long thresholdBytes() { return thresholdBytes; }
+    /** @return hard cap (bytes) on a fetched body; oversized fetches are rejected. */
     public long maxFetchBytes() { return maxFetchBytes; }
+    /** @return number of fetch retries before giving up. */
     public int maxRetries() { return maxRetries; }
+    /** @return delay between fetch retries. */
     public Duration retryDelay() { return retryDelay; }
+    /** @return per-request HTTP timeout. */
     public Duration httpTimeout() { return httpTimeout; }
+    /** @return validator applied to each fetch URL before the request is made. */
     public Consumer<URI> urlValidator() { return urlValidator; }
+    /** @return maximum parallel range requests for a single body ({@code 1} = single request). */
     public int maxRangeParallelism() { return maxRangeParallelism; }
+    /** @return upload compression spec, or {@code null} to upload raw. */
     public Compression compression() { return compression; }
 
     /** Upload-side compression spec. {@code algorithm} is currently always
      * {@code "zstd"}; {@code level} maps to libzstd compression levels (1–22). */
     public record Compression(String algorithm, int level) {
+        /** @return zstd compression at the default level (3). */
         public static Compression zstd() { return new Compression("zstd", 3); }
+        /**
+         * @param level libzstd level 1–22
+         * @return zstd compression at the given level
+         */
         public static Compression zstd(int level) { return new Compression("zstd", level); }
     }
 
@@ -82,6 +96,7 @@ public final class ExternalLocationConfig {
         return uri -> { /* no-op */ };
     }
 
+    /** @return a new {@link Builder} with default thresholds and HTTPS-only validation. */
     public static Builder builder() { return new Builder(); }
 
     /**
@@ -100,16 +115,26 @@ public final class ExternalLocationConfig {
         private int maxRangeParallelism = 1; // simple path by default; set >1 to enable ranges
         private Compression compression; // null = upload raw
 
+        /** Upload backend used to externalise large outbound batches. */
         public Builder storage(ExternalStorage s) { this.storage = s; return this; }
+        /** Size (bytes) at or above which a batch is externalised (default 1 MiB). */
         public Builder thresholdBytes(long v) { this.thresholdBytes = v; return this; }
+        /** Hard cap (bytes) on a fetched body (default 512 MiB). */
         public Builder maxFetchBytes(long v) { this.maxFetchBytes = v; return this; }
+        /** Number of fetch retries before failing (default 2). */
         public Builder maxRetries(int n) { this.maxRetries = n; return this; }
+        /** Delay between fetch retries (default 500&nbsp;ms). */
         public Builder retryDelay(Duration d) { this.retryDelay = d; return this; }
+        /** Per-request HTTP timeout (default 30&nbsp;s). */
         public Builder httpTimeout(Duration d) { this.httpTimeout = d; return this; }
+        /** Validator run against each fetch URL (default {@link #httpsOnlyValidator()}). */
         public Builder urlValidator(Consumer<URI> v) { this.urlValidator = v; return this; }
+        /** Maximum parallel range requests per body; {@code >1} enables ranged fetch (default 1). */
         public Builder maxRangeParallelism(int n) { this.maxRangeParallelism = n; return this; }
+        /** Upload compression spec; {@code null} uploads raw (default). */
         public Builder compression(Compression c) { this.compression = c; return this; }
 
+        /** @return the immutable {@link ExternalLocationConfig}. */
         public ExternalLocationConfig build() { return new ExternalLocationConfig(this); }
     }
 }

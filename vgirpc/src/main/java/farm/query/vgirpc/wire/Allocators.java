@@ -26,6 +26,7 @@ public final class Allocators {
 
     private Allocators() {}
 
+    /** @return the shared process-wide root {@link BufferAllocator}. */
     public static BufferAllocator root() { return ROOT; }
 
     private static BufferAllocator buildRoot() {

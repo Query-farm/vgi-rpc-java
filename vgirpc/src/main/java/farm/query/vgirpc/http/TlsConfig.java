@@ -30,6 +30,13 @@ public record TlsConfig(
         Objects.requireNonNull(keystorePassword, "keystorePassword");
     }
 
+    /**
+     * Convenience constructor with no separate key-manager password (Jetty
+     * reuses the keystore password for the private key).
+     *
+     * @param keystorePath path to a JKS / PKCS#12 keystore
+     * @param keystorePassword password for the keystore
+     */
     public TlsConfig(Path keystorePath, String keystorePassword) {
         this(keystorePath, keystorePassword, null);
     }

@@ -47,10 +47,15 @@ public final class SessionRegistry {
             this.lock = lock;
         }
 
+        /** @return a copy of the 12-byte session id. */
         public byte[] sessionId() { return sessionId.clone(); }
+        /** @return the user-owned session state object. */
         public Object state() { return state; }
+        /** @return the session's absolute expiry as Unix seconds. */
         public long expiresAtSeconds() { return expiresAtSeconds; }
+        /** @return the key binding this session to its principal. */
         public String principalKey() { return principalKey; }
+        /** @return the per-session lock serializing concurrent calls for the same session. */
         public ReentrantLock lock() { return lock; }
 
         /** Invoke {@link AutoCloseable#close()} exactly once across all
@@ -68,6 +73,10 @@ public final class SessionRegistry {
     private final SecureRandom rng = new SecureRandom();
     private volatile Thread reaper;
 
+    /**
+     * @param defaultTtlSeconds default lifetime for new sessions, in seconds
+     * @throws IllegalArgumentException if {@code defaultTtlSeconds <= 0}
+     */
     public SessionRegistry(long defaultTtlSeconds) {
         if (defaultTtlSeconds <= 0) {
             throw new IllegalArgumentException("defaultTtlSeconds must be > 0");
@@ -75,9 +84,12 @@ public final class SessionRegistry {
         this.defaultTtlSeconds = defaultTtlSeconds;
     }
 
+    /** @return the default session TTL in seconds. */
     public long defaultTtlSeconds() { return defaultTtlSeconds; }
 
+    /** @return whether the registry is draining (new opens rejected, existing sessions kept). */
     public boolean isDraining() { return draining.get(); }
+    /** Enter or leave drain mode. */
     public void setDraining(boolean v) { draining.set(v); }
 
     /** Lazily start the reaper thread on first request. Hot path: a volatile
@@ -182,6 +194,7 @@ public final class SessionRegistry {
         if (reaper != null) reaper.interrupt();
     }
 
+    /** Lowercase-hex encode bytes (used for session-id display in logs). */
     public static String hex(byte[] b) {
         StringBuilder sb = new StringBuilder(b.length * 2);
         for (byte x : b) sb.append(String.format("%02x", x));

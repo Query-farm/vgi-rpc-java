@@ -77,6 +77,7 @@ public abstract class Shm implements AutoCloseable {
      *  {@code ReadChannel}. */
     public abstract ReadableByteChannel readChannelAt(long offset, long length);
 
+    /** Unmap the segment and release its resources. */
     @Override
     public abstract void close();
 }

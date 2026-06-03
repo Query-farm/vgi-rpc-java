@@ -29,11 +29,15 @@ public final class LocationResolver {
     private final ExternalLocationConfig config;
     private final ExternalFetcher fetcher;
 
+    /**
+     * @param config configuration backing the underlying {@link ExternalFetcher}
+     */
     public LocationResolver(ExternalLocationConfig config) {
         this.config = config;
         this.fetcher = new ExternalFetcher(config);
     }
 
+    /** @return the configuration this resolver was built with. */
     public ExternalLocationConfig config() { return config; }
 
     /** True iff the metadata describes an external-location pointer. */

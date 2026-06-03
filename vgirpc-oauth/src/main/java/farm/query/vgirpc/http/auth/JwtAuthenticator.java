@@ -47,6 +47,11 @@ public final class JwtAuthenticator implements Authenticator {
     private final String principalClaim;
     private final String domain;
 
+    /**
+     * Start building a {@code JwtAuthenticator}.
+     *
+     * @return a fresh {@link Builder}
+     */
     public static Builder builder() { return new Builder(); }
 
     private JwtAuthenticator(Builder b) {
@@ -93,7 +98,16 @@ public final class JwtAuthenticator implements Authenticator {
         }
     }
 
-    /** Validate a bare JWT string (no HTTP request wrapping). Throws on any verification failure. */
+    /**
+     * Validate a bare JWT string (no HTTP request wrapping). Runs JWKS key
+     * selection, signature verification, and the issuer/audience/required-claim
+     * checks, then maps the configured principal claim into the returned context.
+     *
+     * @param token the raw compact JWT
+     * @return an authenticated {@link AuthContext} carrying all token claims
+     * @throws MissingCredentials if {@code token} is null or empty
+     * @throws InvalidCredentials if signature, issuer, audience, or a required claim fails
+     */
     public AuthContext validateBearer(String token) throws AuthException {
         if (token == null || token.isEmpty()) {
             throw new MissingCredentials("Missing bearer token", CHALLENGE);
@@ -109,6 +123,15 @@ public final class JwtAuthenticator implements Authenticator {
         }
     }
 
+    /**
+     * Extract the {@code Bearer} token from the {@code Authorization} header and
+     * validate it via {@link #validateBearer(String)}.
+     *
+     * @param request the inbound HTTP request
+     * @return an authenticated {@link AuthContext}
+     * @throws MissingCredentials if the {@code Authorization: Bearer} header is absent or malformed
+     * @throws InvalidCredentials if the token fails validation
+     */
     @Override
     public AuthContext authenticate(HttpServletRequest request) throws AuthException {
         String header = request.getHeader(HttpHeaders.AUTHORIZATION);
@@ -154,21 +177,39 @@ public final class JwtAuthenticator implements Authenticator {
         private Set<JWSAlgorithm> allowedAlgorithms = Collections.emptySet();
         private Set<String> requiredClaims = Collections.emptySet();
 
+        /** Accept tokens from this issuer ({@code iss}); may be called more than once. At least one is required. */
         public Builder issuer(String iss) { issuers.add(iss); return this; }
+        /** Accept tokens for this audience ({@code aud}); may be called more than once. At least one is required. */
         public Builder audience(String aud) { audiences.add(aud); return this; }
+        /** Set the JWKS endpoint explicitly. When unset, it is discovered from the first issuer's OIDC metadata. */
         public Builder jwksUri(URL uri) { this.jwksUri = uri; return this; }
+        /**
+         * Set the JWKS endpoint from a string URL.
+         *
+         * @throws IllegalArgumentException if {@code uri} is not a valid URL
+         */
         public Builder jwksUri(String uri) {
             try { this.jwksUri = URI.create(uri).toURL(); return this; }
             catch (Exception e) { throw new IllegalArgumentException("bad jwksUri: " + uri, e); }
         }
+        /** JWT claim mapped to {@link AuthContext#principal()} (default {@code "sub"}). */
         public Builder principalClaim(String c) { this.principalClaim = c; return this; }
+        /** Auth domain label recorded on the resulting {@link AuthContext} (default {@code "jwt"}). */
         public Builder domain(String d) { this.domain = d; return this; }
+        /** JWKS cache lifetime in seconds (default 300); a refresh-ahead window is derived from it. */
         public Builder cacheTtlSeconds(long seconds) { this.cacheTtlSeconds = seconds; return this; }
+        /** Restrict accepted JWS signature algorithms; when empty, the common RSA/EC/PS family is allowed. */
         public Builder allowedAlgorithms(Set<JWSAlgorithm> algs) { this.allowedAlgorithms = Set.copyOf(algs); return this; }
+        /** Require an additional claim to be present (beyond the always-required {@code iss}/{@code aud}/{@code exp}). */
         public Builder requireClaim(String name) {
             Set<String> n = new HashSet<>(requiredClaims); n.add(name); this.requiredClaims = n; return this;
         }
 
+        /**
+         * Build the authenticator.
+         *
+         * @throws IllegalStateException if no issuer or no audience was configured
+         */
         public JwtAuthenticator build() {
             if (issuers.isEmpty()) throw new IllegalStateException("issuer required");
             if (audiences.isEmpty()) throw new IllegalStateException("audience required");

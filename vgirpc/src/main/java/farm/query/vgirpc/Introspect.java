@@ -234,6 +234,14 @@ public final class Introspect {
         } catch (Exception e) { throw new RpcError("TransportError", "introspect read failed: " + e.getMessage(), ""); }
     }
 
+    /**
+     * Decode a {@code __describe__} response batch (the slim 8-column
+     * {@link #DESCRIBE_SCHEMA}) plus its metadata into a {@link ServiceDescription}.
+     *
+     * @param root the describe response batch
+     * @param meta the batch's custom metadata (protocol name/version, hash, server id)
+     * @return the parsed service description
+     */
     public static ServiceDescription parse(VectorSchemaRoot root, Map<String, String> meta) {
         String protocolName = meta.getOrDefault(Metadata.PROTOCOL_NAME, "");
         String requestVersion = meta.getOrDefault(Metadata.REQUEST_VERSION_KEY, "");

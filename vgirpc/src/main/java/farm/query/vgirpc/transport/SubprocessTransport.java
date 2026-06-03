@@ -14,6 +14,13 @@ public final class SubprocessTransport implements RpcTransport {
 
     private final Process process;
 
+    /**
+     * Spawn the worker process and connect to its stdio. The subprocess's stderr
+     * is inherited by this JVM.
+     *
+     * @param command the command line to launch (program plus arguments)
+     * @throws RuntimeException if the process cannot be started
+     */
     public SubprocessTransport(List<String> command) {
         try {
             ProcessBuilder pb = new ProcessBuilder(command);
@@ -27,6 +34,10 @@ public final class SubprocessTransport implements RpcTransport {
     @Override public InputStream reader() { return process.getInputStream(); }
     @Override public OutputStream writer() { return process.getOutputStream(); }
 
+    /**
+     * Close the subprocess's stdin and wait up to two seconds for it to exit,
+     * then force-destroy it.
+     */
     @Override
     public void close() {
         try { process.getOutputStream().close(); } catch (Exception ignore) {}

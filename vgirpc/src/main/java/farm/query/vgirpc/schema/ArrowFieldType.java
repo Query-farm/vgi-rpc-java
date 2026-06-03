@@ -40,5 +40,6 @@ public enum ArrowFieldType {
 
     private final ArrowType arrowType;
     ArrowFieldType(ArrowType t) { this.arrowType = t; }
+    /** @return the underlying Arrow {@link ArrowType} for this field type. */
     public ArrowType arrowType() { return arrowType; }
 }

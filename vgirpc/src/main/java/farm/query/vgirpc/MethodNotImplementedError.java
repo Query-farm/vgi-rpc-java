@@ -12,6 +12,7 @@ package farm.query.vgirpc;
 public class MethodNotImplementedError extends RuntimeException implements HasErrorKind {
     public static final String ERROR_KIND = "method_not_implemented";
 
+    /** @param message diagnostic message naming the unimplemented method */
     public MethodNotImplementedError(String message) { super(message); }
 
     @Override public String errorKind() { return ERROR_KIND; }

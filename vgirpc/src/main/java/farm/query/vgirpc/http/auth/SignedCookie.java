@@ -66,12 +66,18 @@ public final class SignedCookie {
         private final byte[] payload;
         private final long createdAt;
 
+        /**
+         * @param payload the wrapped bytes
+         * @param createdAt creation time as Unix seconds
+         */
         public TimestampedPayload(byte[] payload, long createdAt) {
             this.payload = payload;
             this.createdAt = createdAt;
         }
 
+        /** @return the wrapped payload bytes. */
         public byte[] payload() { return payload; }
+        /** @return the creation timestamp as Unix seconds. */
         public long createdAt() { return createdAt; }
 
         /** Pack {@code payload} with a current timestamp for {@link SignedCookie#sign}. */

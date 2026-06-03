@@ -30,6 +30,11 @@ public final class BearerAuthenticator implements Authenticator {
 
     private final Function<String, AuthContext> validator;
 
+    /**
+     * @param validator maps a presented token to an {@link AuthContext}; should
+     *        throw {@link IllegalArgumentException}/{@link SecurityException} (or
+     *        return an unauthenticated context) to reject the token
+     */
     public BearerAuthenticator(Function<String, AuthContext> validator) {
         this.validator = Objects.requireNonNull(validator, "validator");
     }
@@ -44,6 +49,15 @@ public final class BearerAuthenticator implements Authenticator {
         });
     }
 
+    /**
+     * Read a token from {@code Authorization: Bearer} (or {@code X-API-Key}) and
+     * validate it via the configured function.
+     *
+     * @param request the inbound request
+     * @return the authenticated context
+     * @throws MissingCredentials if no token header is present
+     * @throws InvalidCredentials if the token is rejected or maps to an unauthenticated context
+     */
     @Override
     public AuthContext authenticate(HttpServletRequest request) throws AuthException {
         String header = request.getHeader(HttpHeaders.AUTHORIZATION);

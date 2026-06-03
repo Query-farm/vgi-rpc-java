@@ -14,6 +14,7 @@ public final class StdioTransport implements RpcTransport {
     private final InputStream in;
     private final OutputStream out;
 
+    /** Wrap {@link System#in}/{@link System#out} in 64&nbsp;KiB buffered streams. */
     public StdioTransport() {
         this.in = new BufferedInputStream(System.in, 1 << 16);
         this.out = new BufferedOutputStream(System.out, 1 << 16);
@@ -22,6 +23,7 @@ public final class StdioTransport implements RpcTransport {
     @Override public InputStream reader() { return in; }
     @Override public OutputStream writer() { return out; }
 
+    /** Flush stdout; the underlying streams are left open. */
     @Override
     public void close() {
         try { out.flush(); } catch (Exception ignore) {}

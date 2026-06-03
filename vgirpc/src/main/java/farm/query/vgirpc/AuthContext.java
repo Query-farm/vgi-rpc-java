@@ -20,6 +20,11 @@ public record AuthContext(
         claims = claims != null ? Map.copyOf(claims) : Collections.emptyMap();
     }
 
+    /**
+     * Assert that the caller is authenticated.
+     *
+     * @throws SecurityException if {@link #authenticated()} is {@code false}
+     */
     public void requireAuthenticated() {
         if (!authenticated) throw new SecurityException("Authentication required");
     }

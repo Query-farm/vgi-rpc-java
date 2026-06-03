@@ -30,6 +30,12 @@ public final class UnixSocketTransport implements RpcTransport {
     private final InputStream in;
     private final OutputStream out;
 
+    /**
+     * Wrap an accepted socket channel in buffered IO streams.
+     *
+     * @param channel the connected Unix-domain socket channel
+     * @throws IOException if the channel streams cannot be opened
+     */
     public UnixSocketTransport(SocketChannel channel) throws IOException {
         this.in = new BufferedInputStream(Channels.newInputStream(channel), 1 << 16);
         this.out = new BufferedOutputStream(Channels.newOutputStream(channel), 1 << 16);
@@ -37,6 +43,7 @@ public final class UnixSocketTransport implements RpcTransport {
 
     @Override public InputStream reader() { return in; }
     @Override public OutputStream writer() { return out; }
+    /** Flush and close both stream directions (closing the underlying channel). */
     @Override public void close() {
         try { out.flush(); } catch (Exception ignore) {}
         try { out.close(); } catch (Exception ignore) {}

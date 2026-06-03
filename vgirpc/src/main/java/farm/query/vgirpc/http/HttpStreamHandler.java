@@ -60,6 +60,12 @@ public final class HttpStreamHandler {
     /** method name → concrete {@link StreamState} class, learned from the first init call. */
     private final Map<String, Class<? extends StreamState>> stateTypes = new ConcurrentHashMap<>();
 
+    /**
+     * Create a handler with a random per-process token key, no token TTL, and an
+     * unbounded response size.
+     *
+     * @param rpc the dispatcher whose streaming methods are served
+     */
     public HttpStreamHandler(RpcServer rpc) { this(rpc, null, 0, Long.MAX_VALUE); }
 
     /**

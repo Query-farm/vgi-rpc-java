@@ -15,6 +15,13 @@ public final class EnumDictionaryRegistry {
 
     private EnumDictionaryRegistry() {}
 
+    /**
+     * Return the stable Arrow dictionary id for an enum class, allocating a new
+     * one on first request.
+     *
+     * @param cls the enum class
+     * @return the dictionary id (stable for the lifetime of the JVM)
+     */
     public static long idFor(Class<? extends Enum<?>> cls) {
         return IDS.computeIfAbsent(cls, c -> NEXT.getAndIncrement());
     }

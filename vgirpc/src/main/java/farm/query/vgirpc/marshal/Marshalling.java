@@ -711,6 +711,15 @@ public final class Marshalling {
         throw new IllegalStateException("not a float vector: " + v.getClass());
     }
 
+    /**
+     * Read a single scalar value out of a vector, boxed to the natural Java
+     * type, resolving dictionary-encoded values to their decoded form.
+     *
+     * @param v the source vector
+     * @param row the row index
+     * @param f the field (used to detect dictionary encoding)
+     * @return the boxed value, or {@code null} if the cell is null
+     */
     public static Object readScalar(FieldVector v, int row, Field f) {
         if (v.isNull(row)) return null;
         org.apache.arrow.vector.types.pojo.DictionaryEncoding de = f.getDictionary();

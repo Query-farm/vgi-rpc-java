@@ -26,6 +26,14 @@ public final class ServiceIntrospector {
 
     private ServiceIntrospector() {}
 
+    /**
+     * Introspect a service interface into a method table (results are cached
+     * per interface).
+     *
+     * @param serviceInterface the service interface to describe
+     * @return method name → {@link RpcMethodInfo}, in declaration order
+     * @throws IllegalArgumentException if {@code serviceInterface} is not an interface
+     */
     public static Map<String, RpcMethodInfo> describe(Class<?> serviceInterface) {
         return CACHE.computeIfAbsent(serviceInterface, ServiceIntrospector::buildMethods);
     }
