@@ -29,6 +29,15 @@ val moduleDescriptions = mapOf(
 
 subprojects {
     apply(plugin = "java")
+    // Coverage. Applied everywhere so the JUnit lane is instrumented for free
+    // (`./gradlew test jacocoTestReport`). The high-value lane — the
+    // conformance worker subprocess — is wired separately in vgirpc's build
+    // via a JacocoReport task fed by per-process .exec files (see run_tests.sh
+    // --coverage). Pin the tool so both lanes agree on one JaCoCo version.
+    apply(plugin = "jacoco")
+    extensions.configure<JacocoPluginExtension> {
+        toolVersion = "0.8.13"
+    }
 
     extensions.configure<JavaPluginExtension> {
         toolchain {

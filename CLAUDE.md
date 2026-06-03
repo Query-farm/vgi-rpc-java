@@ -34,6 +34,14 @@ When the Python and Java implementations disagree, **Python is the reference**. 
 
 # Inspect a single failing conformance test
 ./inspect.sh <test_id>
+
+# Conformance suite under JaCoCo (one .exec per spawned worker, merged report)
+./run_tests.sh --coverage              # → vgirpc/build/reports/jacoco/jacocoConformanceReport/
+
+# Combined coverage: JUnit lane + conformance lane (the honest "adequacy" number)
+./gradlew :vgirpc:test :vgirpc:java22Test      # JUnit + FFM exec data
+./run_tests.sh --coverage                      # conformance exec data
+./gradlew :vgirpc:jacocoMergedReport           # → .../jacocoMergedReport/
 ```
 
 `run_tests.sh` requires `JAVA_HOME=/opt/homebrew/opt/openjdk@21` (set inside the script) and the Python venv at `~/Development/vgi-rpc/.venv`. Full pytest output is written to `/tmp/pytest_java.txt`.

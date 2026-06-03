@@ -117,3 +117,92 @@ afterEvaluate {
         })
     }
 }
+
+// --- Coverage: the conformance-worker subprocess lane ---
+//
+// The library's real exercise is the Python conformance suite, which spawns the
+// worker as a separate JVM over every transport. To measure what that suite
+// covers we attach the JaCoCo agent to each worker process (see run_tests.sh
+// --coverage) and merge the resulting per-process .exec files into one report
+// against this module's bytecode (the 21 baseline + the java22 FFM overlay,
+// since the worker runs on JDK 25 and loads FfmShm).
+val jacocoAgentRuntime by configurations.creating
+dependencies {
+    // The `runtime` classifier IS the standalone agent jar usable with
+    // -javaagent (vs. the default artifact, which embeds it as a resource).
+    jacocoAgentRuntime("org.jacoco:org.jacoco.agent:0.8.13:runtime")
+}
+
+// Stage the agent jar at a stable path so the worker wrapper can reference it.
+tasks.register<Copy>("extractJacocoAgent") {
+    description = "Stage the JaCoCo runtime agent jar for the conformance worker subprocess."
+    group = "verification"
+    from(jacocoAgentRuntime)
+    into(layout.buildDirectory.dir("jacoco-agent"))
+    rename { "jacocoagent.jar" }
+}
+
+// Directory the worker wrapper writes per-process .exec files into. Overridable
+// so CI can point it at a shared location across sharded transport jobs.
+val conformanceExecDir = (findProperty("conformanceExecDir") as String?)
+    ?.let { file(it) }
+    ?: layout.buildDirectory.dir("jacoco-conformance").get().asFile
+
+tasks.register<org.gradle.testing.jacoco.tasks.JacocoReport>("jacocoConformanceReport") {
+    description = "Coverage report for the Python conformance suite (worker subprocess lane)."
+    group = "verification"
+    // The worker runs on JDK >= 25, so the multi-release JAR loads the java22
+    // overlay (FfmShm + the real ShmFactory) from META-INF/versions/22 — never
+    // the baseline stub. Report against main's classes EXCEPT the shadowed
+    // ShmFactory, plus the java22 overlay. (Feeding both source sets whole would
+    // hand JaCoCo two classes with the VM name ShmFactory and fail the report.)
+    classDirectories.setFrom(
+        sourceSets["main"].output.classesDirs.asFileTree.matching {
+            exclude("**/shm/ShmFactory.class", "**/shm/ShmFactory\$*.class")
+        },
+        java22.output.classesDirs,
+    )
+    sourceDirectories.setFrom(sourceSets["main"].java.srcDirs, java22.java.srcDirs)
+    executionData(fileTree(conformanceExecDir) { include("*.exec") })
+    reports {
+        html.required.set(true)
+        xml.required.set(true)
+        csv.required.set(false)
+    }
+    doFirst {
+        val execs = fileTree(conformanceExecDir) { include("*.exec") }.files
+        if (execs.isEmpty()) {
+            throw GradleException(
+                "No .exec files in $conformanceExecDir — run `./run_tests.sh --coverage` first."
+            )
+        }
+        logger.lifecycle("Merging ${execs.size} worker .exec file(s) from $conformanceExecDir")
+    }
+}
+
+// Overall library coverage = JUnit lane (test + the FFM java22Test) merged with
+// the conformance subprocess lane. This is the honest "is coverage adequate"
+// number: the conformance suite deliberately skips auth/JWT (covered by JUnit
+// and the dedicated test_java_auth_*.py suites), so neither lane alone tells the
+// whole story. Run `./gradlew :vgirpc:test :vgirpc:java22Test` and
+// `./run_tests.sh --coverage` first to populate every .exec source.
+tasks.register<org.gradle.testing.jacoco.tasks.JacocoReport>("jacocoMergedReport") {
+    description = "Combined coverage: JUnit lane + conformance subprocess lane."
+    group = "verification"
+    classDirectories.setFrom(
+        sourceSets["main"].output.classesDirs.asFileTree.matching {
+            exclude("**/shm/ShmFactory.class", "**/shm/ShmFactory\$*.class")
+        },
+        java22.output.classesDirs,
+    )
+    sourceDirectories.setFrom(sourceSets["main"].java.srcDirs, java22.java.srcDirs)
+    executionData(
+        fileTree(layout.buildDirectory.dir("jacoco")) { include("*.exec") },
+        fileTree(conformanceExecDir) { include("*.exec") },
+    )
+    reports {
+        html.required.set(true)
+        xml.required.set(true)
+        csv.required.set(false)
+    }
+}
