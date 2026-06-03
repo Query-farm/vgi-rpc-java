@@ -100,7 +100,9 @@ import farm.query.vgirpc.RpcConnection;
 import farm.query.vgirpc.transport.SubprocessTransport;
 import java.util.List;
 
-var transport = new SubprocessTransport(List.of("java", "-cp", "worker.jar", "CalculatorWorker"));
+var transport = new SubprocessTransport(List.of(
+        "java", "--add-opens=java.base/java.nio=ALL-UNNAMED",
+        "-cp", "worker.jar", "CalculatorWorker"));
 try (RpcConnection conn = new RpcConnection(transport)) {
     Calculator calc = conn.proxy(Calculator.class);
     double sum    = calc.add(2.0, 3.0);   // 5.0
@@ -108,7 +110,9 @@ try (RpcConnection conn = new RpcConnection(transport)) {
 }
 ```
 
-> Compile services with `-parameters` (this project already does): the framework binds call arguments by parameter name, matching the Python reference's keyword-argument wire semantics.
+> **Two things to get right:**
+> - **Run with `--add-opens=java.base/java.nio=ALL-UNNAMED`** on every JVM that touches the library (both the worker and the client above) — Apache Arrow accesses `java.nio` internals and throws on startup without it. Notice it's passed both to the client JVM and, in the `SubprocessTransport` command, to the spawned worker.
+> - **Compile services with `-parameters`** — the framework binds call arguments by parameter name (matching the Python reference's keyword-argument wire semantics).
 
 ## Modules
 
