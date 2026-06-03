@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/vgi-logo.png" alt="Vector Gateway Interface logo" width="320">
+</p>
+
 <h1 align="center">vgi-rpc-java</h1>
 
 <p align="center">
