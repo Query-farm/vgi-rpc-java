@@ -78,10 +78,11 @@ subprojects {
     if (name in publishedModules) {
         apply(plugin = "com.vanniktech.maven.publish")
 
-        // The codebase predates strict doc-comment hygiene; don't fail the
-        // build (and thus publishing) on doclint warnings.
+        // Catch real doc problems (broken HTML, dangling @link, malformed tags)
+        // but don't demand @param/@return boilerplate on every accessor —
+        // the codebase predates strict doc-comment hygiene.
         tasks.withType<Javadoc>().configureEach {
-            (options as StandardJavadocDocletOptions).addStringOption("Xdoclint:none", "-quiet")
+            (options as StandardJavadocDocletOptions).addStringOption("Xdoclint:all,-missing", "-quiet")
         }
 
         extensions.configure<com.vanniktech.maven.publish.MavenPublishBaseExtension> {
