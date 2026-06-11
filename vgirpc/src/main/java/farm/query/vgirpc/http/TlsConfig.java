@@ -25,6 +25,7 @@ public record TlsConfig(
         String keystorePassword,
         String keyManagerPassword) {
 
+    /** Validates that {@code keystorePath} and {@code keystorePassword} are non-null. */
     public TlsConfig {
         Objects.requireNonNull(keystorePath, "keystorePath");
         Objects.requireNonNull(keystorePassword, "keystorePassword");

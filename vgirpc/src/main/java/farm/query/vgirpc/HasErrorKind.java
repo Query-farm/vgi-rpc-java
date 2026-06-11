@@ -10,5 +10,14 @@ package farm.query.vgirpc;
  * message text.
  */
 public interface HasErrorKind {
+    /**
+     * Stable, machine-readable error category for this exception. The
+     * server emits it under the {@code vgi_rpc.error_kind} metadata key on
+     * the error batch; the client hoists it back into the reconstructed
+     * {@link RpcError#errorKind()} so callers can branch on it.
+     *
+     * @return the stable error category (e.g. {@code "session_lost"}), or
+     *         {@code null} when no category applies
+     */
     String errorKind();
 }

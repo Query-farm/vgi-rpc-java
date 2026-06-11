@@ -24,22 +24,45 @@ import java.util.NoSuchElementException;
  * subclass. Client callers use {@link #tick()} (producer), {@link #exchange(AnnotatedBatch)}
  * (exchange), {@link #batches()} for iteration, and {@link #close()} /
  * {@link #cancel()} to end the stream.</p>
+ *
+ * @param <S> the {@link StreamState} subtype driving the server side of the stream
  */
 public abstract class RpcStream<S extends StreamState> implements AutoCloseable {
 
     /** The empty Arrow schema (zero fields), used for ticks and producer inputs. */
     public static final Schema EMPTY_SCHEMA = new Schema(Collections.emptyList());
 
-    /** Schema of output (server→client) batches. */
+    /**
+     * Schema of output (server→client) batches.
+     *
+     * @return the Arrow schema every data batch on the output stream conforms to
+     */
     public abstract Schema outputSchema();
-    /** Schema of input (client→server) batches; {@link #EMPTY_SCHEMA} for producer streams. */
+    /**
+     * Schema of input (client→server) batches.
+     *
+     * @return the input schema, or {@link #EMPTY_SCHEMA} for producer streams
+     */
     public abstract Schema inputSchema();
-    /** The server-side {@link StreamState}; throws on client sessions. */
+    /**
+     * The server-side {@link StreamState}; throws on client sessions.
+     *
+     * @return the state whose {@code process()} the framework calls per tick
+     */
     public abstract S state();
-    /** The optional stream header record, or {@code null} if the method declares none. */
+    /**
+     * The optional stream header record.
+     *
+     * @return the header sent before the body, or {@code null} if the method declares none
+     */
     public abstract ArrowSerializableRecord header();
 
-    /** @return {@code true} if this is a producer stream (no input schema). */
+    /**
+     * Whether this stream is a producer (server pushes data, client only ticks)
+     * as opposed to an exchange, determined by an empty input schema.
+     *
+     * @return {@code true} if this is a producer stream (no input schema)
+     */
     public boolean isProducer() { return inputSchema().getFields().isEmpty(); }
 
     // --- Client-only operations (server-built streams throw) ---------------
@@ -68,7 +91,12 @@ public abstract class RpcStream<S extends StreamState> implements AutoCloseable 
     /** End the stream and release resources; no-op by default. */
     @Override public void close() {}
 
-    /** Iterate over data batches (client-side producer streams). */
+    /**
+     * Iterate over data batches (client-side producer streams). Each iteration
+     * step issues a {@link #tick()}; iteration ends when the producer finishes.
+     *
+     * @return a single-use {@link Iterable} that ticks the stream lazily
+     */
     public Iterable<AnnotatedBatch> batches() {
         return () -> new Iterator<AnnotatedBatch>() {
             AnnotatedBatch pending;

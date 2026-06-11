@@ -67,15 +67,22 @@ import java.util.Map;
  */
 public final class HttpServer {
 
+    /** MIME type of every request and response body: a single Arrow IPC stream. */
     public static final String ARROW_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 
-    /** Capability response headers (mirrors {@code vgi_rpc/http/_common.py}). */
+    /** Capability response header (mirrors {@code vgi_rpc/http/_common.py}): the request-body size cap in bytes. */
     public static final String MAX_REQUEST_BYTES_HEADER = "VGI-Max-Request-Bytes";
+    /** Capability response header: {@code "true"} when the {@code __upload_url__} endpoint is wired up. */
     public static final String UPLOAD_URL_HEADER = "VGI-Upload-URL-Support";
+    /** Capability response header: advisory per-object upload size cap in bytes. */
     public static final String MAX_UPLOAD_BYTES_HEADER = "VGI-Max-Upload-Bytes";
+    /** Capability response header: operator-configured cap on inline response bodies, in bytes. */
     public static final String MAX_RESPONSE_BYTES_HEADER = "VGI-Max-Response-Bytes";
+    /** Capability response header: operator-configured cap on externalized response payloads, in bytes. */
     public static final String MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER = "VGI-Max-Externalized-Response-Bytes";
+    /** Capability response header: {@code "true"}/{@code "false"} — whether the {@link RpcServer} has an external-location config and can externalise oversized payloads. */
     public static final String EXTERNALIZATION_ENABLED_HEADER = "VGI-Externalization-Enabled";
+    /** Response header set to {@code "true"} when a 200 response body carries an Arrow error batch. */
     public static final String RPC_ERROR_HEADER = "X-VGI-RPC-Error";
 
     /** The synthetic method name used by the {@code __upload_url__} endpoint. */
@@ -119,7 +126,11 @@ public final class HttpServer {
     private final SessionRegistry sessionRegistry;
     private int port;
 
-    /** Defaults: loopback bind, ephemeral port, no prefix, anonymous auth, 1-hour TTL, 16 MiB request/response cap. */
+    /**
+     * Defaults: loopback bind, ephemeral port, no prefix, anonymous auth, 1-hour TTL, 16 MiB request/response cap.
+     *
+     * @param rpc the dispatcher serving the service
+     */
     public HttpServer(RpcServer rpc) {
         this(rpc, Config.defaults());
     }
@@ -232,6 +243,44 @@ public final class HttpServer {
      *                         Content-Encoding (1=fastest, 22=max). Default 3.
      * @param tls              TLS settings; {@code null} = plaintext (only safe
      *                         on loopback or behind a TLS-terminating proxy).
+     * @param advertiseMaxRequestBytes when {@code true}, every response carries
+     *                         {@code VGI-Max-Request-Bytes} so capability-aware
+     *                         clients can externalize oversized requests up front.
+     *                         Default {@code false}.
+     * @param uploadUrlProvider when non-null, wires the {@code __upload_url__/init}
+     *                         endpoint (presigned upload/download URL minting) and
+     *                         advertises {@code VGI-Upload-URL-Support: true}.
+     *                         {@code null} disables the endpoint.
+     * @param maxUploadBytes   advisory per-object upload cap advertised via
+     *                         {@code VGI-Max-Upload-Bytes} when an upload-URL
+     *                         provider is set; {@code null} omits the header.
+     *                         Not enforced server-side.
+     * @param advertisedMaxResponseBytes operator-facing cap on inline response
+     *                         bodies, advertised via {@code VGI-Max-Response-Bytes}
+     *                         and enforced post-flush for unary and stream-exchange
+     *                         responses (Arrow EXCEPTION batch, HTTP 200 +
+     *                         {@code X-VGI-RPC-Error}). {@code 0} = unbounded.
+     *                         Distinct from {@code maxResponseBytes}, the in-process
+     *                         memory bound.
+     * @param advertisedMaxExternalizedResponseBytes cap advertised via
+     *                         {@code VGI-Max-Externalized-Response-Bytes};
+     *                         advertisement-only today (the Java HTTP transport
+     *                         does not yet externalise stream output).
+     *                         {@code 0} = unbounded/omitted.
+     * @param stickyEnabled    enable opt-in HTTP sticky sessions: clients sending
+     *                         {@code VGI-Session-Accept: true} get an HMAC-signed
+     *                         session token bound to their principal, and calls
+     *                         on the same session serialize on a per-session lock.
+     *                         Default {@code false}.
+     * @param stickyDefaultTtlSeconds idle TTL for sticky-session registry entries,
+     *                         in seconds; must be {@code > 0} when sticky sessions
+     *                         are enabled. Default 300.
+     * @param stickyEchoHeaders header-name → value map set verbatim on responses
+     *                         that mint a sticky-session token (the names are also
+     *                         advertised via the sticky-echo capability header).
+     * @param exposeTestDrainAdmin conformance-only: expose the unauthenticated
+     *                         {@code POST/DELETE /__test_drain__} admin endpoint
+     *                         that toggles drain mode. Never enable in production.
      */
     public record Config(
             String host,
@@ -265,6 +314,10 @@ public final class HttpServer {
         /** Mid-range zstd level: solid ratio, modest CPU. */
         public static final int DEFAULT_ZSTD_LEVEL = 3;
 
+        /**
+         * Normalizes nullable fields (host, prefix, key copy, immutable
+         * collection copies) and validates numeric bounds.
+         */
         public Config {
             host = host != null ? host : "127.0.0.1";
             prefix = prefix != null ? prefix : "";
@@ -280,9 +333,17 @@ public final class HttpServer {
             }
         }
 
-        /** @return a config with all defaults (loopback, ephemeral port, anonymous auth). */
+        /**
+         * Default configuration.
+         *
+         * @return a config with all defaults (loopback, ephemeral port, anonymous auth)
+         */
         public static Config defaults() { return builder().build(); }
-        /** @return a new {@link Builder}. */
+        /**
+         * Start building a configuration.
+         *
+         * @return a new {@link Builder} initialized with the defaults
+         */
         public static Builder builder() { return new Builder(); }
 
         /**
@@ -313,58 +374,169 @@ public final class HttpServer {
             private Map<String, String> stickyEchoHeaders = Map.of();
             private boolean exposeTestDrainAdmin;
 
-            /** Listen address (default {@code "127.0.0.1"}). See {@link Config#host()}. */
+            /**
+             * Listen address (default {@code "127.0.0.1"}). See {@link Config#host()}.
+             *
+             * @param host the bind address; non-loopback values should be fronted by TLS
+             * @return this builder
+             */
             public Builder host(String host) { this.host = host; return this; }
-            /** Listen port; {@code 0} for an OS-assigned ephemeral port. */
+            /**
+             * Listen port; {@code 0} for an OS-assigned ephemeral port.
+             *
+             * @param port the port to bind (default {@code 0})
+             * @return this builder
+             */
             public Builder port(int port) { this.port = port; return this; }
-            /** URL prefix such as {@code "/vgi"}; empty for none. */
+            /**
+             * URL prefix such as {@code "/vgi"}; empty for none.
+             *
+             * @param prefix the path prefix all endpoints are mounted under (default empty)
+             * @return this builder
+             */
             public Builder prefix(String prefix) { this.prefix = prefix; return this; }
-            /** 32-byte AEAD key sealing stream-state tokens; {@code null} generates a random per-process key. */
+            /**
+             * 32-byte AEAD key sealing stream-state tokens; {@code null} generates a random per-process key.
+             *
+             * @param tokenKey the master key (defensively copied); set a fixed key
+             *        when tokens must survive restarts or load-balance across workers
+             * @return this builder
+             */
             public Builder tokenKey(byte[] tokenKey) { this.tokenKey = tokenKey; return this; }
-            /** Maximum state-token age in seconds before rejection; {@code 0} disables enforcement. */
+            /**
+             * Maximum state-token age in seconds before rejection; {@code 0} disables enforcement.
+             *
+             * @param tokenTtlSeconds the TTL (default {@value Config#DEFAULT_TOKEN_TTL_SECONDS})
+             * @return this builder
+             */
             public Builder tokenTtlSeconds(long tokenTtlSeconds) { this.tokenTtlSeconds = tokenTtlSeconds; return this; }
-            /** Per-request authenticator; {@code null} = anonymous. */
+            /**
+             * Per-request authenticator; {@code null} = anonymous.
+             *
+             * @param authenticator credential check applied to every request (default {@link Authenticator#ANONYMOUS})
+             * @return this builder
+             */
             public Builder authenticator(Authenticator authenticator) { this.authenticator = authenticator; return this; }
-            /** Pre-route handlers run in order before dispatch. */
+            /**
+             * Pre-route handlers run in order before dispatch.
+             *
+             * @param preHandlers the handlers; the first to return {@code true} short-circuits dispatch (default none)
+             * @return this builder
+             */
             public Builder preHandlers(List<HttpPreHandler> preHandlers) { this.preHandlers = preHandlers; return this; }
-            /** Request-body size cap in bytes; oversized requests get HTTP 413. */
+            /**
+             * Request-body size cap in bytes; oversized requests get HTTP 413.
+             *
+             * @param maxRequestBytes the cap (default {@value Config#DEFAULT_MAX_BYTES} bytes)
+             * @return this builder
+             */
             public Builder maxRequestBytes(long maxRequestBytes) { this.maxRequestBytes = maxRequestBytes; return this; }
-            /** Response-body size cap in bytes (in-process memory bound). */
+            /**
+             * Response-body size cap in bytes (in-process memory bound).
+             *
+             * @param maxResponseBytes the cap (default {@value Config#DEFAULT_MAX_BYTES} bytes)
+             * @return this builder
+             */
             public Builder maxResponseBytes(long maxResponseBytes) { this.maxResponseBytes = maxResponseBytes; return this; }
-            /** Jetty connector idle timeout in milliseconds. */
+            /**
+             * Jetty connector idle timeout in milliseconds.
+             *
+             * @param idleTimeoutMs the timeout (default {@value Config#DEFAULT_IDLE_TIMEOUT_MS} ms)
+             * @return this builder
+             */
             public Builder idleTimeoutMs(long idleTimeoutMs) { this.idleTimeoutMs = idleTimeoutMs; return this; }
-            /** {@code zstd} Content-Encoding level, 1 (fastest) to 22 (max); default 3. */
+            /**
+             * {@code zstd} Content-Encoding level, 1 (fastest) to 22 (max); default 3.
+             *
+             * @param zstdLevel the compression level used for {@code zstd}-encoded responses
+             * @return this builder
+             */
             public Builder zstdLevel(int zstdLevel) { this.zstdLevel = zstdLevel; return this; }
-            /** TLS settings; {@code null} = plaintext (only safe on loopback or behind a TLS proxy). */
+            /**
+             * TLS settings; {@code null} = plaintext (only safe on loopback or behind a TLS proxy).
+             *
+             * @param tls keystore settings for Jetty's HTTPS connector (default {@code null})
+             * @return this builder
+             */
             public Builder tls(TlsConfig tls) { this.tls = tls; return this; }
-            /** Advertise {@code VGI-Max-Request-Bytes} on every response. */
+            /**
+             * Advertise {@code VGI-Max-Request-Bytes} on every response.
+             *
+             * @param v {@code true} to emit the header so clients can externalize
+             *        oversized requests up front (default {@code false})
+             * @return this builder
+             */
             public Builder advertiseMaxRequestBytes(boolean v) { this.advertiseMaxRequestBytes = v; return this; }
-            /** Wire the {@code __upload_url__/init} endpoint and advertise {@code VGI-Upload-URL-Support: true}. */
+            /**
+             * Wire the {@code __upload_url__/init} endpoint and advertise {@code VGI-Upload-URL-Support: true}.
+             *
+             * @param p mints presigned upload/download URL pairs; {@code null} disables the endpoint (default)
+             * @return this builder
+             */
             public Builder uploadUrlProvider(UploadUrlProvider p) { this.uploadUrlProvider = p; return this; }
-            /** Advertised via {@code VGI-Max-Upload-Bytes}; informational only. */
+            /**
+             * Advertised via {@code VGI-Max-Upload-Bytes}; informational only.
+             *
+             * @param v the advisory per-object upload cap in bytes; {@code null} omits the header (default)
+             * @return this builder
+             */
             public Builder maxUploadBytes(Long v) { this.maxUploadBytes = v; return this; }
-            /** Advertised via {@code VGI-Max-Response-Bytes} and enforced
-             *  post-flush as a hard cap for unary and stream-exchange.
-             *  Pass {@code 0} to disable. */
+            /**
+             * Advertised via {@code VGI-Max-Response-Bytes} and enforced
+             * post-flush as a hard cap for unary and stream-exchange.
+             * Pass {@code 0} to disable.
+             *
+             * @param v the cap in bytes; {@code 0} = unbounded (default)
+             * @return this builder
+             */
             public Builder advertisedMaxResponseBytes(long v) { this.advertisedMaxResponseBytes = v; return this; }
-            /** Advertised via {@code VGI-Max-Externalized-Response-Bytes}.  Java's
-             *  HTTP transport does not yet externalise stream output, so the
-             *  cap is advertisement-only today. */
+            /**
+             * Advertised via {@code VGI-Max-Externalized-Response-Bytes}.  Java's
+             * HTTP transport does not yet externalise stream output, so the
+             * cap is advertisement-only today.
+             *
+             * @param v the cap in bytes; {@code 0} omits the header (default)
+             * @return this builder
+             */
             public Builder advertisedMaxExternalizedResponseBytes(long v) {
                 this.advertisedMaxExternalizedResponseBytes = v; return this;
             }
-            /** Enable opt-in HTTP sticky sessions. */
+            /**
+             * Enable opt-in HTTP sticky sessions.
+             *
+             * @param v {@code true} to honor {@code VGI-Session-Accept} opt-ins and
+             *        mint HMAC-signed session tokens (default {@code false})
+             * @return this builder
+             */
             public Builder stickyEnabled(boolean v) { this.stickyEnabled = v; return this; }
-            /** Default TTL for new sticky sessions, in seconds. */
+            /**
+             * Default TTL for new sticky sessions, in seconds.
+             *
+             * @param v idle seconds before a session registry entry expires
+             *        (default 300; must be {@code > 0} when sticky is enabled)
+             * @return this builder
+             */
             public Builder stickyDefaultTtlSeconds(long v) { this.stickyDefaultTtlSeconds = v; return this; }
-            /** Header-name → value map echoed back to clients on session opens. */
+            /**
+             * Header-name → value map echoed back to clients on session opens.
+             *
+             * @param m headers set verbatim on responses that mint a session token (default empty)
+             * @return this builder
+             */
             public Builder stickyEchoHeaders(Map<String, String> m) { this.stickyEchoHeaders = m; return this; }
-            /** Conformance-only: expose POST/DELETE {@code /__test_drain__} for tests. */
+            /**
+             * Conformance-only: expose POST/DELETE {@code /__test_drain__} for tests.
+             *
+             * @param v {@code true} to expose the unauthenticated drain-toggle
+             *        endpoint; never enable in production (default {@code false})
+             * @return this builder
+             */
             public Builder exposeTestDrainAdmin(boolean v) { this.exposeTestDrainAdmin = v; return this; }
 
             /**
              * Build the immutable config.
              *
+             * @return the validated {@link Config}
              * @throws IllegalArgumentException if a numeric bound is out of range (see {@link Config})
              */
             public Config build() {
@@ -388,7 +560,11 @@ public final class HttpServer {
         this.port = ((ServerConnector) jetty.getConnectors()[0]).getLocalPort();
     }
 
-    /** @return the bound listen port (resolved after {@link #start()}). */
+    /**
+     * The actual listen port, useful when the config requested port {@code 0}.
+     *
+     * @return the bound listen port (resolved after {@link #start()}; {@code 0} before)
+     */
     public int port() { return port; }
 
     /**

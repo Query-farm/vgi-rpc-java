@@ -50,38 +50,58 @@ public final class ExternalLocationConfig {
         this.compression = b.compression;
     }
 
-    /** @return the upload backend, or {@code null} if externalisation is fetch-only. */
+    /** Storage backend used to upload outbound batches that reach the size threshold.
+     * @return the upload backend, or {@code null} if externalisation is fetch-only. */
     public ExternalStorage storage() { return storage; }
-    /** @return batch size (bytes) at or above which a batch is externalised. */
+    /** Externalisation cut-over point: outbound batches whose serialised IPC size
+     * reaches this value are uploaded and replaced with a pointer batch.
+     * @return batch size (bytes) at or above which a batch is externalised. */
     public long thresholdBytes() { return thresholdBytes; }
-    /** @return hard cap (bytes) on a fetched body; oversized fetches are rejected. */
+    /** Safety cap protecting the fetcher against runaway downloads.
+     * @return hard cap (bytes) on a fetched body; oversized fetches are rejected. */
     public long maxFetchBytes() { return maxFetchBytes; }
-    /** @return number of fetch retries before giving up. */
+    /** Retry budget for transient fetch errors, not counting the initial attempt.
+     * @return number of fetch retries before giving up. */
     public int maxRetries() { return maxRetries; }
-    /** @return delay between fetch retries. */
+    /** Pause inserted between successive fetch attempts.
+     * @return delay between fetch retries. */
     public Duration retryDelay() { return retryDelay; }
-    /** @return per-request HTTP timeout. */
+    /** Timeout applied to each individual HTTP request issued by the fetcher.
+     * @return per-request HTTP timeout. */
     public Duration httpTimeout() { return httpTimeout; }
-    /** @return validator applied to each fetch URL before the request is made. */
+    /** Security hook run before every fetch; it throws {@link IllegalArgumentException}
+     * to reject a URL.
+     * @return validator applied to each fetch URL before the request is made. */
     public Consumer<URI> urlValidator() { return urlValidator; }
-    /** @return maximum parallel range requests for a single body ({@code 1} = single request). */
+    /** Degree of HTTP range-request parallelism when downloading a single body.
+     * @return maximum parallel range requests for a single body ({@code 1} = single request). */
     public int maxRangeParallelism() { return maxRangeParallelism; }
-    /** @return upload compression spec, or {@code null} to upload raw. */
+    /** Compression applied to externalised bodies before upload.
+     * @return upload compression spec, or {@code null} to upload raw. */
     public Compression compression() { return compression; }
 
     /** Upload-side compression spec. {@code algorithm} is currently always
-     * {@code "zstd"}; {@code level} maps to libzstd compression levels (1–22). */
+     * {@code "zstd"}; {@code level} maps to libzstd compression levels (1–22).
+     *
+     * @param algorithm compression algorithm identifier; only {@code "zstd"} is recognised
+     * @param level libzstd compression level (1–22)
+     */
     public record Compression(String algorithm, int level) {
-        /** @return zstd compression at the default level (3). */
+        /** Convenience factory for zstd at libzstd's default level.
+         * @return zstd compression at the default level (3). */
         public static Compression zstd() { return new Compression("zstd", 3); }
         /**
+         * Convenience factory for zstd at an explicit level.
+         *
          * @param level libzstd level 1–22
          * @return zstd compression at the given level
          */
         public static Compression zstd(int level) { return new Compression("zstd", level); }
     }
 
-    /** HTTPS-only URL validator; throws {@link IllegalArgumentException} otherwise. */
+    /** HTTPS-only URL validator; throws {@link IllegalArgumentException} otherwise.
+     * This is the default {@code urlValidator}.
+     * @return a validator that rejects every URI whose scheme is not {@code https}. */
     public static Consumer<URI> httpsOnlyValidator() {
         return uri -> {
             String scheme = uri.getScheme();
@@ -91,12 +111,14 @@ public final class ExternalLocationConfig {
         };
     }
 
-    /** Accepts anything — suitable for tests and trusted-network use. */
+    /** Accepts anything — suitable for tests and trusted-network use.
+     * @return a validator that never rejects a URI. */
     public static Consumer<URI> permissiveValidator() {
         return uri -> { /* no-op */ };
     }
 
-    /** @return a new {@link Builder} with default thresholds and HTTPS-only validation. */
+    /** Entry point for assembling a config.
+     * @return a new {@link Builder} with default thresholds and HTTPS-only validation. */
     public static Builder builder() { return new Builder(); }
 
     /**
@@ -115,26 +137,45 @@ public final class ExternalLocationConfig {
         private int maxRangeParallelism = 1; // simple path by default; set >1 to enable ranges
         private Compression compression; // null = upload raw
 
-        /** Upload backend used to externalise large outbound batches. */
+        /** Upload backend used to externalise large outbound batches.
+         * @param s the storage backend; {@code null} (the default) disables externalisation
+         * @return this builder */
         public Builder storage(ExternalStorage s) { this.storage = s; return this; }
-        /** Size (bytes) at or above which a batch is externalised (default 1 MiB). */
+        /** Size (bytes) at or above which a batch is externalised (default 1 MiB).
+         * @param v the externalisation threshold in bytes
+         * @return this builder */
         public Builder thresholdBytes(long v) { this.thresholdBytes = v; return this; }
-        /** Hard cap (bytes) on a fetched body (default 512 MiB). */
+        /** Hard cap (bytes) on a fetched body (default 512 MiB).
+         * @param v the maximum fetch size in bytes
+         * @return this builder */
         public Builder maxFetchBytes(long v) { this.maxFetchBytes = v; return this; }
-        /** Number of fetch retries before failing (default 2). */
+        /** Number of fetch retries before failing (default 2).
+         * @param n retry count, not including the initial attempt
+         * @return this builder */
         public Builder maxRetries(int n) { this.maxRetries = n; return this; }
-        /** Delay between fetch retries (default 500&nbsp;ms). */
+        /** Delay between fetch retries (default 500&nbsp;ms).
+         * @param d the inter-retry delay
+         * @return this builder */
         public Builder retryDelay(Duration d) { this.retryDelay = d; return this; }
-        /** Per-request HTTP timeout (default 30&nbsp;s). */
+        /** Per-request HTTP timeout (default 30&nbsp;s).
+         * @param d the timeout applied to each HTTP request
+         * @return this builder */
         public Builder httpTimeout(Duration d) { this.httpTimeout = d; return this; }
-        /** Validator run against each fetch URL (default {@link #httpsOnlyValidator()}). */
+        /** Validator run against each fetch URL (default {@link #httpsOnlyValidator()}).
+         * @param v the validator; throw {@link IllegalArgumentException} to reject a URL
+         * @return this builder */
         public Builder urlValidator(Consumer<URI> v) { this.urlValidator = v; return this; }
-        /** Maximum parallel range requests per body; {@code >1} enables ranged fetch (default 1). */
+        /** Maximum parallel range requests per body; {@code >1} enables ranged fetch (default 1).
+         * @param n the parallelism degree
+         * @return this builder */
         public Builder maxRangeParallelism(int n) { this.maxRangeParallelism = n; return this; }
-        /** Upload compression spec; {@code null} uploads raw (default). */
+        /** Upload compression spec; {@code null} uploads raw (default).
+         * @param c the compression spec, e.g. {@link Compression#zstd()}
+         * @return this builder */
         public Builder compression(Compression c) { this.compression = c; return this; }
 
-        /** @return the immutable {@link ExternalLocationConfig}. */
+        /** Freezes the current settings.
+         * @return the immutable {@link ExternalLocationConfig}. */
         public ExternalLocationConfig build() { return new ExternalLocationConfig(this); }
     }
 }

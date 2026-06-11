@@ -31,10 +31,21 @@ public final class OutputCollector {
      * {@code root}; {@code null} when the batch has no dict-encoded columns,
      * in which case callers fall back to a stream-level provider (e.g. the
      * input-reader's dicts on the TIO/echo path).
+     *
+     * @param root the batch vectors (owned by the collector once buffered)
+     * @param customMetadata Arrow IPC custom metadata written with the batch, or {@code null}
+     * @param isData {@code true} for the single data batch, {@code false} for log/zero-row batches
+     * @param dictionaryProvider per-batch dictionaries for dict-encoded fields, or {@code null}
      */
     public record Entry(VectorSchemaRoot root, Map<String, String> customMetadata,
                           boolean isData, DictionaryProvider dictionaryProvider) {
-        /** Create an entry with no per-batch dictionary provider. */
+        /**
+         * Create an entry with no per-batch dictionary provider.
+         *
+         * @param root the batch vectors
+         * @param customMetadata Arrow IPC custom metadata written with the batch, or {@code null}
+         * @param isData {@code true} for the single data batch, {@code false} for log/zero-row batches
+         */
         public Entry(VectorSchemaRoot root, Map<String, String> customMetadata, boolean isData) {
             this(root, customMetadata, isData, null);
         }
@@ -48,6 +59,9 @@ public final class OutputCollector {
     private int dataIdx = -1;
 
     /**
+     * Create a collector for one stream tick. The framework constructs one per
+     * {@code process()} call and drains the buffered entries to the wire afterwards.
+     *
      * @param outputSchema schema all data and zero-row batches conform to
      * @param serverId server id stamped onto log batches; may be {@code null}
      * @param producerMode whether {@link #finish()} is permitted (producer streams)
@@ -58,11 +72,23 @@ public final class OutputCollector {
         this.producerMode = producerMode;
     }
 
-    /** The output schema for this stream. */
+    /**
+     * The output schema for this stream.
+     *
+     * @return the schema all emitted and zero-row batches must conform to
+     */
     public Schema outputSchema() { return outputSchema; }
-    /** Whether {@link #finish()} has been called (producer streams). */
+    /**
+     * Whether {@link #finish()} has been called (producer streams).
+     *
+     * @return {@code true} once the producer has signalled end-of-stream
+     */
     public boolean finished() { return finished; }
-    /** Buffered entries (log batches plus the single data batch), in emission order; unmodifiable. */
+    /**
+     * Buffered entries (log batches plus the single data batch), in emission order.
+     *
+     * @return an unmodifiable view of the entries collected so far
+     */
     public List<Entry> entries() { return Collections.unmodifiableList(entries); }
 
     /**
@@ -76,7 +102,12 @@ public final class OutputCollector {
         return entries.get(dataIdx);
     }
 
-    /** Emit the (single) data batch for this call. Ownership of {@code root} transfers to the collector. */
+    /**
+     * Emit the (single) data batch for this call. Ownership of {@code root}
+     * transfers to the collector.
+     *
+     * @param root the data batch to send to the client this tick
+     */
     public void emit(VectorSchemaRoot root) { emit(root, null, null); }
 
     /**
@@ -98,6 +129,12 @@ public final class OutputCollector {
      * referenced by the schema; the framework hands it to
      * {@link farm.query.vgirpc.wire.IpcStreamWriter#writeBatch(VectorSchemaRoot, Map, DictionaryProvider)}
      * so the dict batches go out on the wire alongside the data.
+     *
+     * @param root the data batch; ownership transfers to the collector
+     * @param customMetadata custom metadata to attach, or {@code null}
+     * @param dictionaryProvider dictionaries for {@code root}'s dict-encoded
+     *     fields, or {@code null} when there are none
+     * @throws IllegalStateException if a data batch was already emitted this tick
      */
     public void emit(VectorSchemaRoot root, Map<String, String> customMetadata,
                        DictionaryProvider dictionaryProvider) {
@@ -108,12 +145,21 @@ public final class OutputCollector {
         entries.add(new Entry(root, customMetadata, true, dictionaryProvider));
     }
 
-    /** Append a zero-row client-directed log batch. */
+    /**
+     * Append a zero-row client-directed log batch.
+     *
+     * @param level log level
+     * @param text log message text
+     */
     public void clientLog(Level level, String text) {
         clientLog(new Message(level, text, null));
     }
 
-    /** Append a zero-row log batch carrying {@code msg}'s level/message/extra metadata. */
+    /**
+     * Append a zero-row log batch carrying {@code msg}'s level/message/extra metadata.
+     *
+     * @param msg the pre-built log message to serialize into batch metadata
+     */
     public void clientLog(Message msg) {
         Map<String, String> md = msg.addToMetadata(null);
         if (serverId != null) md.put(Metadata.SERVER_ID, serverId);

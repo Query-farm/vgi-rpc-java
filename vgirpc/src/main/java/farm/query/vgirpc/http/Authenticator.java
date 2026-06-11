@@ -23,6 +23,14 @@ import java.util.List;
 @FunctionalInterface
 public interface Authenticator {
 
+    /**
+     * Authenticate the request.
+     *
+     * @param request the inbound servlet request to extract credentials from
+     * @return the resulting context; may be {@link AuthContext#ANONYMOUS} (or any
+     *         unauthenticated context) to indicate "no credentials, but not an error"
+     * @throws AuthException if credentials are missing or invalid (mapped to HTTP 401)
+     */
     AuthContext authenticate(HttpServletRequest request) throws AuthException;
 
     /** Always returns the anonymous context; the default when none is configured. */
@@ -32,6 +40,12 @@ public interface Authenticator {
      * Compose authenticators, returning the first one that yields an
      * authenticated context. Unauthenticated (anonymous) results fall through
      * to the next chain member. Mirrors Python's {@code chain_authenticate}.
+     *
+     * @param authenticators chain members, tried in order
+     * @return a composite authenticator that returns the first authenticated
+     *         context, rethrows the last {@link AuthException} if every member
+     *         failed, or returns {@link AuthContext#ANONYMOUS} if all members
+     *         declined without error
      */
     static Authenticator chain(Authenticator... authenticators) {
         List<Authenticator> list = Arrays.asList(authenticators);

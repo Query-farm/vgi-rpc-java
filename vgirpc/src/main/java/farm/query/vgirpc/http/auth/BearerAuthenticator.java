@@ -31,6 +31,8 @@ public final class BearerAuthenticator implements Authenticator {
     private final Function<String, AuthContext> validator;
 
     /**
+     * Create an authenticator backed by a custom validation function.
+     *
      * @param validator maps a presented token to an {@link AuthContext}; should
      *        throw {@link IllegalArgumentException}/{@link SecurityException} (or
      *        return an unauthenticated context) to reject the token
@@ -39,7 +41,13 @@ public final class BearerAuthenticator implements Authenticator {
         this.validator = Objects.requireNonNull(validator, "validator");
     }
 
-    /** Convenience: validate against a static token-to-context map. */
+    /**
+     * Convenience: validate against a static token-to-context map.
+     *
+     * @param tokens token → context map; tokens absent from the map are rejected
+     *        with {@link InvalidCredentials}
+     * @return an authenticator that looks presented tokens up in {@code tokens}
+     */
     public static BearerAuthenticator fromMap(Map<String, AuthContext> tokens) {
         Objects.requireNonNull(tokens, "tokens");
         return new BearerAuthenticator(token -> {

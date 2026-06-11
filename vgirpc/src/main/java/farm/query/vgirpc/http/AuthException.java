@@ -14,13 +14,24 @@ package farm.query.vgirpc.http;
 public abstract sealed class AuthException extends Exception
         permits MissingCredentials, InvalidCredentials {
 
+    /** Optional challenge value for the {@code WWW-Authenticate} response header. */
     private final String wwwAuthenticate;
 
+    /**
+     * Create an authentication failure.
+     *
+     * @param message diagnostic message returned to the client
+     * @param wwwAuthenticate value for the {@code WWW-Authenticate} challenge header, or {@code null} for none
+     */
     protected AuthException(String message, String wwwAuthenticate) {
         super(message);
         this.wwwAuthenticate = wwwAuthenticate;
     }
 
-    /** The value to place on the {@code WWW-Authenticate} response header, or {@code null}. */
+    /**
+     * The value to place on the {@code WWW-Authenticate} response header, or {@code null}.
+     *
+     * @return the challenge string supplied at construction, or {@code null} if none
+     */
     public final String wwwAuthenticate() { return wwwAuthenticate; }
 }

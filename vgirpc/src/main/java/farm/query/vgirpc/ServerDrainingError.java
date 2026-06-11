@@ -10,9 +10,11 @@ package farm.query.vgirpc;
  * error_kind on the wire.
  */
 public class ServerDrainingError extends RuntimeException implements HasErrorKind {
+    /** Stable error category emitted via the {@code vgi_rpc.error_kind} metadata key. */
     public static final String ERROR_KIND = "server_draining";
 
-    /** @param message diagnostic message */
+    /** Creates the error with a diagnostic message.
+     *  @param message diagnostic message */
     public ServerDrainingError(String message) { super(message); }
 
     @Override public String errorKind() { return ERROR_KIND; }

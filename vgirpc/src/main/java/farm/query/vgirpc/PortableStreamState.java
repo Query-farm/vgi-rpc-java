@@ -20,9 +20,17 @@ package farm.query.vgirpc;
  */
 public interface PortableStreamState {
 
-    /** Serialise this state to a self-contained byte array. */
+    /**
+     * Serialise this state to a self-contained byte array.
+     *
+     * @return bytes from which {@link #decode(byte[])} can fully restore the state
+     */
     byte[] encode();
 
-    /** Restore state from bytes produced by {@link #encode()}. Mutates {@code this}. */
+    /**
+     * Restore state from bytes produced by {@link #encode()}. Mutates {@code this}.
+     *
+     * @param data the encoded state, exactly as returned by {@link #encode()}
+     */
     void decode(byte[] data);
 }

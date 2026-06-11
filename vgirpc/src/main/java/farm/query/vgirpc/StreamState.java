@@ -15,9 +15,18 @@ public abstract class StreamState {
      * For producer streams the input is a zero-row tick batch and may be ignored;
      * call {@link OutputCollector#finish()} to end the stream. For exchange streams
      * the input carries real data and exactly one output batch must be emitted.
+     *
+     * @param input the tick or input batch for this call; owned by the framework
+     *     and only valid for the duration of the call
+     * @param out fresh per-tick collector for the data batch and any client logs
+     * @param ctx request-scoped call context (auth, metadata, logging)
      */
     public abstract void process(AnnotatedBatch input, OutputCollector out, CallContext ctx);
 
-    /** Hook invoked when the client cancels the stream. Default no-op. */
+    /**
+     * Hook invoked when the client cancels the stream. Default no-op.
+     *
+     * @param ctx request-scoped call context for the cancelled stream
+     */
     public void onCancel(CallContext ctx) {}
 }

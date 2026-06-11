@@ -59,6 +59,11 @@ public final class UnixSocketTransport implements RpcTransport {
      *
      * <p>Equivalent to {@link #serveForever(Path, RpcServer, long)} with
      * {@code idleTimeoutMs = 0} — server runs until the process is killed.
+     *
+     * @param socketPath filesystem path for the Unix-domain socket; any stale
+     *        file at this path is deleted before binding
+     * @param server the dispatcher invoked for every accepted connection
+     * @throws IOException if the socket cannot be bound or the accept loop fails
      */
     public static void serveForever(Path socketPath, RpcServer server) throws IOException {
         serveForever(socketPath, server, 0L);
@@ -73,6 +78,14 @@ public final class UnixSocketTransport implements RpcTransport {
      * loop catches the resulting {@link ClosedChannelException} (the
      * superclass of {@code AsynchronousCloseException}) and returns cleanly
      * so the JVM can exit.
+     *
+     * @param socketPath filesystem path for the Unix-domain socket; any stale
+     *        file at this path is deleted before binding
+     * @param server the dispatcher invoked for every accepted connection
+     * @param idleTimeoutMs idle period (milliseconds, with no active
+     *        connections) after which the server shuts itself down;
+     *        {@code <= 0} runs forever
+     * @throws IOException if the socket cannot be bound or the accept loop fails
      */
     public static void serveForever(Path socketPath, RpcServer server, long idleTimeoutMs)
             throws IOException {

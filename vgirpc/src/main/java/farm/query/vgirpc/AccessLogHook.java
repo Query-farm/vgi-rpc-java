@@ -32,6 +32,9 @@ public final class AccessLogHook implements DispatchHook {
     private final Object writeLock = new Object();
 
     /**
+     * Creates a hook that appends one JSONL record per dispatch to {@code out}.
+     * The stream is not closed by this class; the caller retains ownership.
+     *
      * @param out destination for one JSONL record per dispatch (writes are synchronized)
      * @param serverVersion server-version string included in each record; {@code null} becomes {@code ""}
      */
@@ -40,7 +43,10 @@ public final class AccessLogHook implements DispatchHook {
         this.serverVersion = serverVersion == null ? "" : serverVersion;
     }
 
-    /** Mint a 32-char lowercase hex stream identifier. */
+    /** Mint a 32-char lowercase hex stream identifier. The dispatcher assigns
+     *  one per streaming call so every record of a stream's lifecycle can be
+     *  correlated in the access log.
+     *  @return a freshly generated 32-character lowercase hex string */
     public static String randomStreamId() {
         byte[] b = new byte[16];
         new SecureRandom().nextBytes(b);

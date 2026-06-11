@@ -43,9 +43,19 @@ public final class AnnotatedBatch implements AutoCloseable {
         this.releaseFn = releaseFn;
     }
 
-    /** The batch's vectors. */
+    /**
+     * The batch's vectors.
+     *
+     * @return the wrapped {@link VectorSchemaRoot}; remains owned by this
+     *     batch and is released by {@link #close()}
+     */
     public VectorSchemaRoot root() { return root; }
-    /** The batch's Arrow IPC custom metadata (never {@code null}). */
+    /**
+     * The batch's Arrow IPC custom metadata.
+     *
+     * @return the {@code vgi_rpc.*} metadata from the batch envelope; never
+     *     {@code null}, possibly empty
+     */
     public Map<String, String> customMetadata() { return customMetadata; }
 
     /** Run the release function (if any) and close the root. Idempotent. */

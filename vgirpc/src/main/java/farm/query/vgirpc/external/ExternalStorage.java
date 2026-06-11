@@ -22,6 +22,8 @@ public interface ExternalStorage {
      * @param body full IPC stream bytes
      * @param contentEncoding {@code "zstd"} or {@code null}
      * @return URI the peer should GET to retrieve the bytes
+     * @throws Exception if the upload fails; the error propagates out of the
+     *         externaliser and surfaces as an RPC error on the calling side
      */
     URI upload(byte[] body, String contentEncoding) throws Exception;
 }

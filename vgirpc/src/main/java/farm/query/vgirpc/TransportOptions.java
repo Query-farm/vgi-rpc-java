@@ -25,6 +25,7 @@ import java.util.Map;
  */
 public final class TransportOptions {
 
+    /** Reserved method name under which the capability handshake is dispatched. */
     public static final String METHOD_NAME = "__transport_options__";
 
     /** Metadata-key namespace for transport capabilities (request and response). */
@@ -40,6 +41,9 @@ public final class TransportOptions {
      * implementation is actually loadable on this runtime — true on JDK&nbsp;&ge;&nbsp;22
      * (the {@code java22} multi-release overlay), false on Java&nbsp;21 / non-POSIX —
      * and not turned off via the {@code VGI_RPC_SHM_DISABLE} kill-switch.
+     *
+     * @return mutable map of full {@code vgi_rpc.transport.*} keys to string
+     *         values, ready to be merged into response metadata
      */
     public static Map<String, String> workerCapabilities() {
         Map<String, String> caps = new LinkedHashMap<>();
@@ -48,7 +52,10 @@ public final class TransportOptions {
         return caps;
     }
 
-    /** Extract the {@code vgi_rpc.transport.*} capabilities from a metadata map. */
+    /** Extract the {@code vgi_rpc.transport.*} capabilities from a metadata map.
+     * @param meta a request or response custom-metadata map; may be {@code null}
+     * @return capability names (with the {@link #CAP_PREFIX} stripped) mapped to
+     *         their string values; empty if none are present. */
     public static Map<String, String> parse(Map<String, String> meta) {
         Map<String, String> caps = new LinkedHashMap<>();
         if (meta != null) {

@@ -25,14 +25,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * shm→buffer copy) and large output data buffers (immediately overwritten by
  * the function). Both are pure waste.</p>
  *
- * <p>This factory, for allocations {@code >= MIN_POOLED}:
+ * <p>This factory, for allocations {@code >= MIN_POOLED}:</p>
  * <ul>
  *   <li>allocates via {@link MemoryUtil#allocateMemory} (Unsafe) — <b>not</b>
  *       zeroed;</li>
  *   <li>on free, returns the block to a size-keyed free list instead of the OS,
  *       so the next same-size batch reuses it — no syscall, no re-zero.</li>
  * </ul>
- * Smaller buffers delegate to {@link NettyAllocationManager} unchanged, so
+ * <p>Smaller buffers delegate to {@link NettyAllocationManager} unchanged, so
  * validity/offset buffers (which may rely on zeroed memory) keep their default
  * behaviour. Bounded by a retained-bytes cap; blocks beyond it are freed.</p>
  *

@@ -9,6 +9,7 @@ package farm.query.vgirpc;
  * than risk misinterpreting an incompatible wire layout.
  */
 public class VersionError extends RuntimeException {
-    /** @param message diagnostic message */
+    /** Creates the error with a diagnostic message.
+     *  @param message diagnostic message describing the version mismatch */
     public VersionError(String message) { super(message); }
 }

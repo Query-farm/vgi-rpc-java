@@ -10,9 +10,11 @@ package farm.query.vgirpc;
  * cleanly across older / partial server implementations.
  */
 public class MethodNotImplementedError extends RuntimeException implements HasErrorKind {
+    /** Stable error category emitted via the {@code vgi_rpc.error_kind} metadata key. */
     public static final String ERROR_KIND = "method_not_implemented";
 
-    /** @param message diagnostic message naming the unimplemented method */
+    /** Creates the error with a diagnostic message.
+     *  @param message diagnostic message naming the unimplemented method */
     public MethodNotImplementedError(String message) { super(message); }
 
     @Override public String errorKind() { return ERROR_KIND; }

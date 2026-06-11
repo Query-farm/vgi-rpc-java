@@ -27,6 +27,11 @@ public abstract class ProducerState extends StreamState {
      * Default delegates to {@link #produce(OutputCollector, CallContext)} so
      * existing producers keep working without change. Producers that consume
      * dynamic filter updates (e.g. Top-N tightening) override this method.
+     *
+     * @param input the zero-row tick batch; its custom metadata may carry
+     *     per-tick framework messages
+     * @param out collector for this tick's output
+     * @param ctx request-scoped call context (auth, metadata, logging)
      */
     public void produce(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
         produce(out, ctx);

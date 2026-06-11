@@ -17,6 +17,10 @@ public enum MethodType {
 
     private final String wireValue;
     MethodType(String wireValue) { this.wireValue = wireValue; }
-    /** @return the wire string for this method type ({@code "unary"} / {@code "stream"}). */
+    /**
+     * The token identifying this method type in {@code __describe__} responses.
+     *
+     * @return the wire string for this method type ({@code "unary"} / {@code "stream"})
+     */
     public String wireValue() { return wireValue; }
 }

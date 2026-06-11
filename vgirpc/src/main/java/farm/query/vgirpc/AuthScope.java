@@ -22,8 +22,12 @@ public final class AuthScope {
      * request: the resolved {@link AuthContext} and the request's transport
      * metadata. Null components are normalised to {@link AuthContext#ANONYMOUS}
      * and an empty map.
+     *
+     * @param auth the authenticated principal for the current request
+     * @param transportMetadata per-request transport metadata (e.g. {@code remote_addr})
      */
     public record Scope(AuthContext auth, Map<String, Object> transportMetadata) {
+        /** Normalises {@code null} components to anonymous auth and an empty, unmodifiable map. */
         public Scope {
             auth = auth != null ? auth : AuthContext.ANONYMOUS;
             transportMetadata = transportMetadata != null
@@ -37,14 +41,27 @@ public final class AuthScope {
 
     private AuthScope() {}
 
-    /** Push a new scope for the current thread; the returned {@link AutoCloseable} restores on close. */
+    /**
+     * Push a new scope for the current thread; the returned {@link AutoCloseable}
+     * restores the previous scope on close (use in try-with-resources around
+     * the dispatch).
+     *
+     * @param auth authenticated principal; {@code null} becomes {@link AuthContext#ANONYMOUS}
+     * @param transportMetadata per-request transport metadata; {@code null} becomes empty
+     * @return a handle that restores the previously active scope when closed
+     */
     public static AutoCloseable push(AuthContext auth, Map<String, Object> transportMetadata) {
         Scope previous = CURRENT.get();
         CURRENT.set(new Scope(auth, transportMetadata));
         return () -> CURRENT.set(previous);
     }
 
-    /** Return the current scope (never null). */
+    /**
+     * Return the current scope (never null).
+     *
+     * @return the scope installed by the innermost active {@link #push}, or the
+     *     anonymous default when no transport has pushed one
+     */
     public static Scope current() {
         return CURRENT.get();
     }

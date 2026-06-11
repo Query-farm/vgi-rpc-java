@@ -11,11 +11,16 @@ package farm.query.vgirpc;
  * pattern-match without parsing message strings.
  */
 public class SessionLostError extends RuntimeException implements HasErrorKind {
+    /** Stable error category emitted via the {@code vgi_rpc.error_kind} metadata key. */
     public static final String ERROR_KIND = "session_lost";
 
-    /** @param message diagnostic message */
+    /** Creates the error with a diagnostic message.
+     *  @param message diagnostic message */
     public SessionLostError(String message) { super(message); }
     /**
+     * Creates the error wrapping the failure that invalidated the session
+     * (e.g. a token-verification exception).
+     *
      * @param message diagnostic message
      * @param cause the underlying cause
      */

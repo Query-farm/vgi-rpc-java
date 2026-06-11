@@ -11,6 +11,10 @@ package farm.query.vgirpc.http;
  * callers at it.
  */
 public final class PayloadTooLargeException extends RuntimeException {
-    /** @param message diagnostic message (typically points callers at the external-location protocol) */
+    /**
+     * Create an exception describing which cap was exceeded.
+     *
+     * @param message diagnostic message (typically points callers at the external-location protocol)
+     */
     public PayloadTooLargeException(String message) { super(message); }
 }

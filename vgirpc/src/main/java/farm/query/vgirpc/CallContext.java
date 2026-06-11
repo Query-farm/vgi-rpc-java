@@ -28,6 +28,10 @@ public final class CallContext {
     private final String requestId;
 
     /**
+     * Create a per-request context. Constructed by the framework at dispatch
+     * time; service implementations never build one themselves — they receive
+     * it by declaring a {@code CallContext} parameter on the implementation method.
+     *
      * @param auth authenticated principal; {@code null} becomes {@link AuthContext#ANONYMOUS}
      * @param emitClientLog sink for client-directed log messages
      * @param transportMetadata transport-level metadata for the request; {@code null} becomes empty
@@ -54,17 +58,41 @@ public final class CallContext {
         this.requestId = requestId != null ? requestId : "";
     }
 
-    /** The authenticated principal ({@link AuthContext#ANONYMOUS} if unauthenticated). */
+    /**
+     * The authenticated principal for this request.
+     *
+     * @return the caller's {@link AuthContext}; {@link AuthContext#ANONYMOUS} if unauthenticated
+     */
     public AuthContext auth() { return auth; }
-    /** Transport-level request metadata (unmodifiable, never {@code null}). */
+    /**
+     * Transport-level request metadata (e.g. {@code remote_addr} on HTTP).
+     *
+     * @return an unmodifiable, never-{@code null} map of transport metadata
+     */
     public Map<String, Object> transportMetadata() { return transportMetadata; }
-    /** The serving server's id. */
+    /**
+     * The serving server's id, as stamped on response batches.
+     *
+     * @return the server identifier
+     */
     public String serverId() { return serverId; }
-    /** The RPC method name being dispatched. */
+    /**
+     * The RPC method name being dispatched.
+     *
+     * @return the name of the method this context was created for
+     */
     public String methodName() { return methodName; }
-    /** The service/protocol name. */
+    /**
+     * The service/protocol name (the service interface's simple name).
+     *
+     * @return the protocol name advertised in {@code __describe__}
+     */
     public String protocolName() { return protocolName; }
-    /** The per-request id, or {@code ""} if none. */
+    /**
+     * The per-request id assigned by the transport.
+     *
+     * @return the request id, or {@code ""} when the transport assigns none
+     */
     public String requestId() { return requestId; }
 
     /**
@@ -88,7 +116,11 @@ public final class CallContext {
         emitClientLog.accept(new Message(level, msg, extra));
     }
 
-    /** Emit a pre-built client-directed log {@link Message}. */
+    /**
+     * Emit a pre-built client-directed log {@link Message}.
+     *
+     * @param m the message to serialize as a zero-row log batch on the response stream
+     */
     public void emitClientLog(Message m) { emitClientLog.accept(m); }
 
     // --- Sticky-session API (HTTP-only) ---------------------------------
@@ -137,8 +169,11 @@ public final class CallContext {
     }
 
     /**
-     * The state bound to this request's sticky session, or {@code null}
-     * when no session is active.
+     * The state bound to this request's sticky session.
+     *
+     * @return the user-owned state object registered via
+     *     {@link #openSession(Object, Long)}, or {@code null} when no session
+     *     is active (including on non-HTTP transports)
      */
     public Object session() {
         SessionScope s = SessionScope.current();
@@ -147,7 +182,12 @@ public final class CallContext {
         return e == null ? null : e.state();
     }
 
-    /** Hex-encoded 12-byte session id, or {@code null} when no session is bound. */
+    /**
+     * The current sticky-session id.
+     *
+     * @return the hex-encoded 12-byte session id, or {@code null} when no
+     *     session is bound to this request
+     */
     public String sessionId() {
         SessionScope s = SessionScope.current();
         return s == null ? null : s.sessionIdHex();

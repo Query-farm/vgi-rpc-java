@@ -25,6 +25,10 @@ import java.util.function.Consumer;
 /**
  * Client-side streaming session. Lazily opens the input and output IPC
  * streams on first use. Not thread-safe.
+ *
+ * @param <S> the server-side {@link StreamState} type declared by the service
+ *     interface; purely a compile-time marker here — {@link #state()} always
+ *     throws on the client
  */
 public final class ClientStreamSession<S extends StreamState> extends RpcStream<S> {
 

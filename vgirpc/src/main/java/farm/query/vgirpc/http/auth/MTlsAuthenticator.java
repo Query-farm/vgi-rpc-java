@@ -48,7 +48,17 @@ public final class MTlsAuthenticator {
 
     private MTlsAuthenticator() {}
 
-    /** XFCC flavour: no PEM parsing, principal from {@code Subject=CN=...} or {@code URI=}. */
+    /**
+     * XFCC flavour: no PEM parsing, principal from {@code Subject=CN=...} or {@code URI=}.
+     *
+     * <p>Uses the first element of the {@code x-forwarded-client-cert} header
+     * (the certificate presented to the outermost proxy) and copies its
+     * {@code hash} / {@code subject} / {@code uri} / {@code dns} / {@code by}
+     * fields into the context claims.</p>
+     *
+     * @param domain the {@link AuthContext} domain label; {@code null} defaults to {@code "mtls"}
+     * @return an authenticator deriving identity from the XFCC header
+     */
     public static Authenticator xfcc(String domain) {
         String dom = domain != null ? domain : "mtls";
         return request -> {
@@ -73,7 +83,17 @@ public final class MTlsAuthenticator {
         };
     }
 
-    /** PEM fingerprint lookup. Fingerprints must be lowercase hex without colons. */
+    /**
+     * PEM fingerprint lookup. Fingerprints must be lowercase hex without colons.
+     *
+     * @param fingerprints fingerprint → context map; certificates whose digest
+     *        is absent from the map are rejected with {@link InvalidCredentials}
+     * @param header name of the proxy header carrying the URL-encoded PEM
+     *        certificate; {@code null} defaults to {@code X-SSL-Client-Cert}
+     * @param algorithm {@link MessageDigest} algorithm used to fingerprint the
+     *        DER-encoded certificate; {@code null} defaults to {@code SHA-256}
+     * @return an authenticator that resolves the client certificate's digest in {@code fingerprints}
+     */
     public static Authenticator byFingerprint(Map<String, AuthContext> fingerprints,
                                                String header, String algorithm) {
         Objects.requireNonNull(fingerprints, "fingerprints");
@@ -97,7 +117,18 @@ public final class MTlsAuthenticator {
         };
     }
 
-    /** PEM subject CN with optional allow-list. */
+    /**
+     * PEM subject CN with optional allow-list. The principal is the
+     * certificate's subject CN; {@code subject_dn}, {@code serial}, and
+     * {@code not_valid_after} ride along as claims.
+     *
+     * @param header name of the proxy header carrying the URL-encoded PEM
+     *        certificate; {@code null} defaults to {@code X-SSL-Client-Cert}
+     * @param allowedSubjects CNs to accept; {@code null} accepts any CN,
+     *        otherwise out-of-list CNs are rejected with {@link InvalidCredentials}
+     * @param domain the {@link AuthContext} domain label; {@code null} defaults to {@code "mtls"}
+     * @return an authenticator deriving identity from the certificate subject CN
+     */
     public static Authenticator bySubjectCn(String header, Set<String> allowedSubjects, String domain) {
         String hdr = header != null ? header : HttpHeaders.X_SSL_CLIENT_CERT;
         String dom = domain != null ? domain : "mtls";
