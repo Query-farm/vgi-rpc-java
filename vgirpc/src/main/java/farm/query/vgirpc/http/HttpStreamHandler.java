@@ -6,6 +6,7 @@ package farm.query.vgirpc.http;
 import farm.query.vgirpc.AnnotatedBatch;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.CallContext;
+import farm.query.vgirpc.MethodType;
 import farm.query.vgirpc.OutputCollector;
 import farm.query.vgirpc.RpcMethodInfo;
 import farm.query.vgirpc.RpcServer;
@@ -33,6 +34,10 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.nio.channels.Channels;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
@@ -48,8 +53,9 @@ import java.util.function.Consumer;
  * Stateless HTTP streaming dispatch: each init / exchange request is a standalone
  * HTTP call that round-trips a signed state token in Arrow custom metadata.
  *
- * <p>Producer streams emit all batches within the init response (no token);
- * exchange streams emit a zero-row batch carrying a continuation token.</p>
+ * <p>Producer streams emit one {@code process()} turn per response, followed by a
+ * zero-row continuation-token batch while unfinished; exchange streams piggy-back
+ * the refreshed token on each data batch.</p>
  */
 public final class HttpStreamHandler {
 
@@ -57,7 +63,15 @@ public final class HttpStreamHandler {
     private final byte[] tokenKey;
     private final long tokenTtlSeconds;
     private final long maxResponseBytes;
-    /** method name → concrete {@link StreamState} class, learned from the first init call. */
+    /**
+     * method name → concrete {@link StreamState} class. Seeded at construction by
+     * introspecting the implementation's generic return types (the Java mirror of
+     * Python's {@code _resolve_state_types}), so a continuation-only {@code /exchange}
+     * — e.g. a relay resuming from a held token — works on a process that never
+     * served the stream's {@code /init}. Implementations that keep a wildcard
+     * return ({@code RpcStream<? extends ProducerState>}) are learned from their
+     * first init call instead, and cannot be resumed on a fresh process.
+     */
     private final Map<String, Class<? extends StreamState>> stateTypes = new ConcurrentHashMap<>();
 
     /**
@@ -94,6 +108,39 @@ public final class HttpStreamHandler {
         }
         this.tokenTtlSeconds = tokenTtlSeconds;
         this.maxResponseBytes = maxResponseBytes;
+        seedStateTypes();
+    }
+
+    /**
+     * Resolve each stream method's concrete state class from the implementation's
+     * declared generic return type ({@code RpcStream<Counter> produce_n(long)}).
+     * Wildcards, type variables, and abstract state types are skipped — those
+     * methods fall back to init-time learning.
+     */
+    private void seedStateTypes() {
+        Class<?> implClass = rpc.implementation().getClass();
+        for (RpcMethodInfo info : rpc.methods().values()) {
+            if (info.methodType() != MethodType.STREAM) continue;
+            Method implMethod;
+            try {
+                implMethod = implClass.getMethod(
+                        info.reflectMethod().getName(), info.reflectMethod().getParameterTypes());
+            } catch (NoSuchMethodException e) {
+                continue;
+            }
+            Class<? extends StreamState> cls = concreteStateArg(implMethod.getGenericReturnType());
+            if (cls != null) stateTypes.put(info.name(), cls);
+        }
+    }
+
+    /** The concrete {@link StreamState} type argument of an {@code RpcStream<X>} return, or null. */
+    private static Class<? extends StreamState> concreteStateArg(Type returnType) {
+        if (!(returnType instanceof ParameterizedType pt)) return null;
+        if (!(pt.getRawType() instanceof Class<?> raw) || !RpcStream.class.isAssignableFrom(raw)) return null;
+        Type[] args = pt.getActualTypeArguments();
+        if (args.length != 1 || !(args[0] instanceof Class<?> c)) return null;
+        if (!StreamState.class.isAssignableFrom(c) || Modifier.isAbstract(c.getModifiers())) return null;
+        return c.asSubclass(StreamState.class);
     }
 
     /** Handle {@code POST /{method}/init}. Returns response IPC bytes. */
@@ -184,7 +231,8 @@ public final class HttpStreamHandler {
 
             Class<? extends StreamState> stateCls = stateTypes.get(method);
             if (stateCls == null) {
-                return errorStream(new IllegalStateException("No state class cached for '" + method + "'"));
+                return errorStream(new IllegalStateException(
+                        "Cannot resolve state type for method '" + method + "'"));
             }
             Schema outputSchema = deserializeSchema(token.outputSchema());
             Schema inputSchema = deserializeSchema(token.inputSchema());

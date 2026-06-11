@@ -120,36 +120,36 @@ public final class ConformanceServiceImpl implements ConformanceService {
 
     // --- Producer streams ---------------------------------------------------
 
-    @Override public RpcStream<? extends ProducerState> produce_n(long count) {
+    @Override public RpcStream<StreamStates.Counter> produce_n(long count) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Counter(count));
     }
-    @Override public RpcStream<? extends ProducerState> produce_empty() {
+    @Override public RpcStream<StreamStates.Empty> produce_empty() {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Empty());
     }
-    @Override public RpcStream<? extends ProducerState> produce_single() {
+    @Override public RpcStream<StreamStates.Single> produce_single() {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Single());
     }
-    @Override public RpcStream<? extends ProducerState> produce_large_batches(long rpb, long bc) {
+    @Override public RpcStream<StreamStates.Large> produce_large_batches(long rpb, long bc) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Large(rpb, bc));
     }
-    @Override public RpcStream<? extends ProducerState> produce_with_logs(long count) {
+    @Override public RpcStream<StreamStates.LoggingProducer> produce_with_logs(long count) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.LoggingProducer(count));
     }
-    @Override public RpcStream<? extends ProducerState> produce_error_mid_stream(long n) {
+    @Override public RpcStream<StreamStates.ErrorAfterN> produce_error_mid_stream(long n) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.ErrorAfterN(n));
     }
     @Override public RpcStream<? extends ProducerState> produce_error_on_init() {
         throw new RuntimeException("intentional init error");
     }
-    @Override public RpcStream<? extends ProducerState> produce_oversized_batch(long rows_per_batch) {
+    @Override public RpcStream<StreamStates.OversizedBatch> produce_oversized_batch(long rows_per_batch) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.OversizedBatch(rows_per_batch));
     }
 
-    @Override public RpcStream<? extends ProducerState> produce_with_header(long count) {
+    @Override public RpcStream<StreamStates.Counter> produce_with_header(long count) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Counter(count),
                 new ConformanceHeader(count, "producing " + count + " batches"));
     }
-    @Override public RpcStream<? extends ProducerState> produce_with_header_and_logs(long count, CallContext ctx) {
+    @Override public RpcStream<StreamStates.LoggingProducer> produce_with_header_and_logs(long count, CallContext ctx) {
         ctx.clientLog(Level.INFO, "stream init log");
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.LoggingProducer(count),
                 new ConformanceHeader(count, "producing " + count + " with logs"));
@@ -157,34 +157,34 @@ public final class ConformanceServiceImpl implements ConformanceService {
 
     // --- Exchange streams ---------------------------------------------------
 
-    @Override public RpcStream<? extends ExchangeState> exchange_scale(double factor) {
+    @Override public RpcStream<StreamStates.Scale> exchange_scale(double factor) {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
                 new StreamStates.Scale(factor));
     }
-    @Override public RpcStream<? extends ExchangeState> exchange_accumulate() {
+    @Override public RpcStream<StreamStates.Accumulate> exchange_accumulate() {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.ACCUM_SCHEMA,
                 new StreamStates.Accumulate());
     }
-    @Override public RpcStream<? extends ExchangeState> exchange_with_logs() {
+    @Override public RpcStream<StreamStates.LoggingExchange> exchange_with_logs() {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
                 new StreamStates.LoggingExchange());
     }
-    @Override public RpcStream<? extends ExchangeState> exchange_error_on_nth(long failOn) {
+    @Override public RpcStream<StreamStates.FailOnNth> exchange_error_on_nth(long failOn) {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
                 new StreamStates.FailOnNth(failOn));
     }
-    @Override public RpcStream<? extends ExchangeState> exchange_zero_columns() {
+    @Override public RpcStream<StreamStates.ZeroColumns> exchange_zero_columns() {
         return RpcStream.exchange(StreamStates.EMPTY_SCHEMA, StreamStates.EMPTY_SCHEMA,
                 new StreamStates.ZeroColumns());
     }
     @Override public RpcStream<? extends ExchangeState> exchange_error_on_init() {
         throw new RuntimeException("intentional exchange init error");
     }
-    @Override public RpcStream<? extends ExchangeState> exchange_oversized(long rows_per_batch) {
+    @Override public RpcStream<StreamStates.OversizedExchange> exchange_oversized(long rows_per_batch) {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.COUNTER_SCHEMA,
                 new StreamStates.OversizedExchange(rows_per_batch));
     }
-    @Override public RpcStream<? extends ExchangeState> exchange_with_header(double factor) {
+    @Override public RpcStream<StreamStates.Scale> exchange_with_header(double factor) {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
                 new StreamStates.Scale(factor),
                 new ConformanceHeader(0, "scale by " + factor));
@@ -192,10 +192,10 @@ public final class ConformanceServiceImpl implements ConformanceService {
 
     // --- Cancellation -------------------------------------------------------
 
-    @Override public RpcStream<? extends ProducerState> cancellable_producer() {
+    @Override public RpcStream<StreamStates.CancellableProducer> cancellable_producer() {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.CancellableProducer());
     }
-    @Override public RpcStream<? extends ExchangeState> cancellable_exchange() {
+    @Override public RpcStream<StreamStates.CancellableExchange> cancellable_exchange() {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
                 new StreamStates.CancellableExchange());
     }
@@ -208,11 +208,11 @@ public final class ConformanceServiceImpl implements ConformanceService {
 
     // --- Rich-header producers / dynamic schema ----------------------------
 
-    @Override public RpcStream<? extends ProducerState> produce_with_rich_header(long seed, long count) {
+    @Override public RpcStream<StreamStates.Counter> produce_with_rich_header(long seed, long count) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Counter(count),
                 RichHeader.build(seed));
     }
-    @Override public RpcStream<? extends ProducerState> produce_dynamic_schema(long seed, long count,
+    @Override public RpcStream<StreamStates.DynamicProducer> produce_dynamic_schema(long seed, long count,
                                                                               boolean include_strings,
                                                                               boolean include_floats) {
         org.apache.arrow.vector.types.pojo.Schema schema =
@@ -221,11 +221,11 @@ public final class ConformanceServiceImpl implements ConformanceService {
                 new StreamStates.DynamicProducer(count, include_strings, include_floats),
                 RichHeader.build(seed));
     }
-    @Override public RpcStream<? extends ExchangeState> exchange_cast_compatible() {
+    @Override public RpcStream<StreamStates.Scale> exchange_cast_compatible() {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
                 new StreamStates.Scale(1.0));
     }
-    @Override public RpcStream<? extends ExchangeState> exchange_with_rich_header(long seed, double factor) {
+    @Override public RpcStream<StreamStates.Scale> exchange_with_rich_header(long seed, double factor) {
         return RpcStream.exchange(StreamStates.SCALE_SCHEMA, StreamStates.SCALE_SCHEMA,
                 new StreamStates.Scale(factor),
                 RichHeader.build(seed));
@@ -257,12 +257,12 @@ public final class ConformanceServiceImpl implements ConformanceService {
         return finalValue;
     }
 
-    @Override public RpcStream<? extends ProducerState> stream_session_counter(long count) {
+    @Override public RpcStream<StreamStates.SessionCounterProducer> stream_session_counter(long count) {
         return RpcStream.producer(StreamStates.COUNTER_SINGLE_SCHEMA,
                 new StreamStates.SessionCounterProducer(count));
     }
 
-    @Override public RpcStream<? extends ExchangeState> exchange_session_counter() {
+    @Override public RpcStream<StreamStates.SessionCounterExchange> exchange_session_counter() {
         return RpcStream.exchange(StreamStates.SESSION_COUNTER_BY_SCHEMA,
                 StreamStates.COUNTER_SINGLE_SCHEMA,
                 new StreamStates.SessionCounterExchange());

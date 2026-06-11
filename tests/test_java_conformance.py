@@ -353,3 +353,84 @@ def conformance_conn(
 
 # Import the canonical pytest suite from the vgi-rpc package.
 from vgi_rpc.conformance._pytest_suite import *  # noqa: F401,F403,E402
+
+
+@pytest.fixture(scope="session")
+def java_http_shared_key_ports() -> Iterator[tuple[int, int]]:
+    """Two HTTP workers sharing one --token-key, so tokens minted by one
+    decrypt on the other — the load-balanced / relay topology that
+    continuation-only resume exists for."""
+    key = "00" * 32
+    procs: list[subprocess.Popen[bytes]] = []
+    ports: list[int] = []
+    try:
+        for _ in range(2):
+            proc = subprocess.Popen(
+                [JAVA_WORKER, "--http", "--token-key", key],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            procs.append(proc)
+            assert proc.stdout is not None
+            line = proc.stdout.readline().decode().strip()
+            assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+            port = int(line.split(":", 1)[1])
+            _wait_for_http(port)
+            ports.append(port)
+        yield (ports[0], ports[1])
+    finally:
+        for proc in procs:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+class TestContinuationOnlyResume:
+    """Java worker mirror of the 0.20.0 ``_HttpProxy.resume_stream`` contract.
+
+    A producer continuation token minted by worker A must resume on worker B
+    (same token key) with no ``/init`` round-trip on B: the server recovers
+    state, schemas, and the state class from the signed token plus
+    construction-time introspection alone.
+    """
+
+    def test_resume_stream_on_fresh_worker(
+        self, java_http_shared_key_ports: tuple[int, int]
+    ) -> None:
+        port_a, port_b = java_http_shared_key_ports
+        with (
+            http_connect(ConformanceService, f"http://127.0.0.1:{port_a}") as proxy_a,
+            http_connect(ConformanceService, f"http://127.0.0.1:{port_b}") as proxy_b,
+        ):
+            session = proxy_a.produce_n(count=4)
+            first, token = session.next_with_token()
+            assert first is not None and token is not None
+            assert first.batch.column("index").to_pylist() == [0]
+
+            resumed = proxy_b.resume_stream("produce_n", token)
+            rest = [ab.batch.column("index").to_pylist() for ab in resumed]
+            assert rest == [[1], [2], [3]]
+
+    def test_next_with_token_walks_whole_stream(
+        self, java_http_shared_key_ports: tuple[int, int]
+    ) -> None:
+        """Every per-batch token is a valid resume point on the other worker."""
+        port_a, port_b = java_http_shared_key_ports
+        with (
+            http_connect(ConformanceService, f"http://127.0.0.1:{port_a}") as proxy_a,
+            http_connect(ConformanceService, f"http://127.0.0.1:{port_b}") as proxy_b,
+        ):
+            session = proxy_a.produce_n(count=3)
+            tokens: list[bytes] = []
+            values: list[int] = []
+            while True:
+                ab, token = session.next_with_token()
+                if ab is None:
+                    break
+                values.append(ab.batch.column("value")[0].as_py())
+                if token is not None:
+                    tokens.append(token)
+            assert values == [0, 10, 20]
+
+            # Resume from the first token: replays everything after batch 0.
+            resumed = proxy_b.resume_stream("produce_n", tokens[0])
+            assert [ab.batch.column("value")[0].as_py() for ab in resumed] == [10, 20]
