@@ -1,0 +1,40 @@
+/* Copyright 2026 Query Farm LLC - https://query.farm
+ *
+ * Query.Farm brand overrides for the JDK standard doclet, layered on top of
+ * the default stylesheet via --add-stylesheet and shared by every published
+ * module's javadoc. The palette comes from the VGI logo: deep teal shield,
+ * barn red, cream banner, gold star.
+ */
+:root {
+    --navbar-background-color: #2a5b68;
+    --navbar-text-color: #f6eed8;
+    --subnav-background-color: #e9e2cd;
+    --selected-background-color: #b5432e;
+    --selected-text-color: #f6eed8;
+    --selected-link-color: #f6eed8;
+    --title-color: #2a5b68;
+    --link-color: #226577;
+    --link-color-active: #b5432e;
+    --section-background-color: #faf6ea;
+    --odd-row-color: #f7f2e3;
+    --snippet-background-color: #f3eddb;
+    --snippet-highlight-color: #e9b85c;
+    --border-color: #e2d9c2;
+}
+
+.qf-logo {
+    height: 96px;
+    vertical-align: middle;
+    margin-right: 18px;
+}
+
+/* The -header link lands in the navbar's "about" slot. */
+.about-language a {
+    color: var(--navbar-text-color);
+    font-weight: 700;
+    text-decoration: none;
+}
+
+.about-language a:hover {
+    text-decoration: underline;
+}

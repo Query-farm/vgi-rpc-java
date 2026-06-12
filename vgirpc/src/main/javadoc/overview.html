@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>vgirpc API overview</title>
+</head>
+<body>
+<p>Transport-agnostic RPC framework built on
+<a href="https://arrow.apache.org/">Apache Arrow</a> IPC serialization — the
+Java port of <a href="https://github.com/Query-farm/vgi-rpc-python">vgi-rpc</a>,
+wire-compatible with the Python, Go, and C++ peers. Define RPC interfaces as
+ordinary Java interfaces: the framework derives Arrow schemas from your method
+signatures and record component types, and hands you a typed client proxy with
+automatic serialization. No <code>.proto</code> files, no codegen.</p>
+
+<p>Serve an implementation with {@link farm.query.vgirpc.RpcServer} over
+stdio, AF_UNIX, or HTTP; connect with {@link farm.query.vgirpc.RpcConnection}.
+See the <a href="https://github.com/Query-farm/vgi-rpc-java">project
+README</a> for a runnable example.</p>
+</body>
+</html>

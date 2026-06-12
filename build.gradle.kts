@@ -82,7 +82,33 @@ subprojects {
         // but don't demand @param/@return boilerplate on every accessor —
         // the codebase predates strict doc-comment hygiene.
         tasks.withType<Javadoc>().configureEach {
-            (options as StandardJavadocDocletOptions).addStringOption("Xdoclint:all,-missing", "-quiet")
+            val logo = rootProject.layout.projectDirectory.file("assets/vgi-logo.png").asFile
+            val brandCss = rootProject.layout.projectDirectory.file("assets/javadoc/query-farm.css").asFile
+            val overviewHtml = file("src/main/javadoc/overview.html")
+            inputs.file(logo)
+            inputs.file(brandCss)
+            with(options as StandardJavadocDocletOptions) {
+                addStringOption("Xdoclint:all,-missing", "-quiet")
+                windowTitle = "${project.name} $version — Query.Farm Arrow RPC for Java"
+                docTitle = "<img src='vgi-logo.png' alt='Vector Gateway Interface' class='qf-logo'>" +
+                    "${project.name} $version API"
+                header = "<a href='https://query.farm' target='_top'>🚜 Query.Farm</a>"
+                bottom = "Copyright © 2026 <a href='https://query.farm'>Query Farm LLC</a> · " +
+                    "<a href='https://github.com/Query-farm/vgi-rpc-java'>github.com/Query-farm/vgi-rpc-java</a> · " +
+                    "Apache License 2.0"
+                // Modules without an overview page (the storage/auth add-ons)
+                // just get the default summary table.
+                if (overviewHtml.isFile) {
+                    inputs.file(overviewHtml)
+                    overview = overviewHtml.path
+                }
+                addStringOption("-add-stylesheet", brandCss.path)
+            }
+            // The doctitle's logo isn't a doclet-managed resource; drop it into
+            // the output root so the javadoc jar stays self-contained.
+            doLast {
+                logo.copyTo(destinationDir!!.resolve("vgi-logo.png"), overwrite = true)
+            }
         }
 
         extensions.configure<com.vanniktech.maven.publish.MavenPublishBaseExtension> {
