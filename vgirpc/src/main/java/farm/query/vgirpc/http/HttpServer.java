@@ -1240,6 +1240,10 @@ public final class HttpServer {
                 writePayloadTooLarge(resp, e);
                 return;
             } catch (Exception e) {
+                // The error is reported to the client as an Arrow error stream
+                // below; set VGI_STREAM_DEBUG to also log it server-side (the
+                // stream-state serialization path is otherwise hard to diagnose).
+                if (System.getenv("VGI_STREAM_DEBUG") != null) e.printStackTrace();
                 // Serialise an error stream so the client can read it uniformly.
                 ByteArrayOutputStream errOut = new ByteArrayOutputStream();
                 Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, e, rpc.serverId());
