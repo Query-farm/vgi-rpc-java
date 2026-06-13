@@ -15,6 +15,8 @@ dependencies {
 
     implementation("com.fasterxml.jackson.core:jackson-databind:$jacksonVersion")
     implementation("com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:$jacksonVersion")
+    // java.time support for producer-state fields that hold timestamps as LocalDateTime.
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:$jacksonVersion")
     implementation("com.github.luben:zstd-jni:1.5.6-8")
 
     // OAuth JWT / JWKS support lives in the optional `vgirpc-oauth` module so

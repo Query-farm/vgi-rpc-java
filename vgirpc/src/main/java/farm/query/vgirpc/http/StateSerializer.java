@@ -73,7 +73,10 @@ public final class StateSerializer {
         return new CBORMapper()
                 .setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.NONE)
                 .setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.ANY)
-                .registerModule(arrow);
+                .registerModule(arrow)
+                // java.time types (e.g. a LocalDateTime in a state field) aren't
+                // Jackson beans by default.
+                .registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
     }
 
     private StateSerializer() {}
