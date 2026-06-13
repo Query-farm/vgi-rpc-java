@@ -3,10 +3,23 @@
 
 package farm.query.vgirpc.http;
 
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.annotation.PropertyAccessor;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonDeserializer;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.JsonSerializer;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.dataformat.cbor.databind.CBORMapper;
+import org.apache.arrow.vector.types.pojo.Schema;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import farm.query.vgirpc.PortableStreamState;
 import farm.query.vgirpc.StreamState;
 
@@ -35,7 +48,33 @@ import java.util.List;
  */
 public final class StateSerializer {
 
-    private static final ObjectMapper CBOR = new CBORMapper();
+    // Serialise by FIELD, not getters: nested state POJOs (e.g. BatchState)
+    // expose record-style accessors (total()/index(), not getTotal()) and
+    // private fields, so getter-based bean serialisation finds no properties
+    // and throws. Field visibility matches the top-level reflection below and
+    // round-trips any plain-POJO state component through valueToTree/treeToValue.
+    private static final ObjectMapper CBOR = newMapper();
+
+    private static ObjectMapper newMapper() {
+        // Arrow Schema isn't a Jackson bean (no default ctor on Field; the
+        // Field tree is recursive). Round-trip it through Arrow's own IPC
+        // message encoding so state objects can hold a Schema directly.
+        SimpleModule arrow = new SimpleModule();
+        arrow.addSerializer(Schema.class, new JsonSerializer<Schema>() {
+            @Override public void serialize(Schema s, JsonGenerator g, SerializerProvider p) throws IOException {
+                g.writeBinary(s.serializeAsMessage());
+            }
+        });
+        arrow.addDeserializer(Schema.class, new JsonDeserializer<Schema>() {
+            @Override public Schema deserialize(JsonParser p, DeserializationContext c) throws IOException {
+                return Schema.deserializeMessage(ByteBuffer.wrap(p.getBinaryValue()));
+            }
+        });
+        return new CBORMapper()
+                .setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.NONE)
+                .setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.ANY)
+                .registerModule(arrow);
+    }
 
     private StateSerializer() {}
 
