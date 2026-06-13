@@ -18,6 +18,10 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.dataformat.cbor.databind.CBORMapper;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import farm.query.vgirpc.PortableStreamState;
@@ -82,14 +86,30 @@ public final class StateSerializer {
     private StateSerializer() {}
 
     /**
-     * Serialize stream state to CBOR. {@link PortableStreamState} instances
-     * encode themselves; all others are reflected field-by-field.
+     * Serialize stream state for an HTTP continuation token. The concrete state
+     * class name is prefixed so {@link #deserialize} resolves the actual type
+     * even when many state types are multiplexed through one wildcard RPC method
+     * (VGI's {@code init}) — the per-method type hint otherwise collides when a
+     * query drives two such functions at once (e.g. {@code scalar(...) FROM
+     * table(...)}).
      *
      * @param state the stream state to serialize
-     * @return the CBOR (or {@code PortableStreamState.encode()}) bytes
-     * @throws RuntimeException if encoding fails
+     * @return the class-name-prefixed encoding
      */
     public static byte[] serialize(StreamState state) {
+        byte[] inner = serializeBody(state);
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             DataOutputStream dos = new DataOutputStream(baos)) {
+            dos.writeUTF(state.getClass().getName());
+            dos.writeInt(inner.length);
+            dos.write(inner);
+            return baos.toByteArray();
+        } catch (IOException e) {
+            throw new RuntimeException("state serialize wrap failed: " + state.getClass().getName(), e);
+        }
+    }
+
+    private static byte[] serializeBody(StreamState state) {
         if (state instanceof PortableStreamState pss) {
             try {
                 return pss.encode();
@@ -120,10 +140,35 @@ public final class StateSerializer {
      * @return the reconstructed state
      * @throws RuntimeException if decoding or instantiation fails
      */
-    public static <S extends StreamState> S deserialize(byte[] data, Class<S> cls) {
+    @SuppressWarnings("unchecked")
+    public static <S extends StreamState> S deserialize(byte[] data, Class<S> clsHint) {
+        String className;
+        byte[] inner;
+        try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(data))) {
+            className = dis.readUTF();
+            int len = dis.readInt();
+            inner = new byte[len];
+            dis.readFully(inner);
+        } catch (Exception legacy) {
+            // Unprefixed bytes (older format): fall back to the per-method hint.
+            return (S) deserializeBody(data, clsHint);
+        }
+        Class<? extends StreamState> cls = clsHint;
+        try {
+            Class<?> resolved = Class.forName(className);
+            if (StreamState.class.isAssignableFrom(resolved)) {
+                cls = resolved.asSubclass(StreamState.class);
+            }
+        } catch (ClassNotFoundException ignore) {
+            // fall back to the per-method hint
+        }
+        return (S) deserializeBody(inner, cls);
+    }
+
+    private static StreamState deserializeBody(byte[] data, Class<? extends StreamState> cls) {
         if (PortableStreamState.class.isAssignableFrom(cls)) {
             try {
-                S instance = newInstance(cls);
+                StreamState instance = newInstance(cls);
                 ((PortableStreamState) instance).decode(data);
                 return instance;
             } catch (Exception e) {
@@ -132,7 +177,7 @@ public final class StateSerializer {
         }
         try {
             JsonNode root = CBOR.readTree(data);
-            S instance = newInstance(cls);
+            StreamState instance = newInstance(cls);
             for (Field f : declaredFields(cls)) {
                 if (!f.canAccess(instance)) f.setAccessible(true);
                 JsonNode node = root.get(fieldKey(f));
