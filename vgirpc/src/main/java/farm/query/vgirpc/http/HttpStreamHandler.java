@@ -25,10 +25,13 @@ import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.dictionary.Dictionary;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.ReadChannel;
 import org.apache.arrow.vector.ipc.WriteChannel;
 import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.TransferPair;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -45,6 +48,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
@@ -215,6 +219,8 @@ public final class HttpStreamHandler {
             return errorStream(e);
         }
 
+        DictionaryProvider inputDicts = req.inputDicts();
+        try {
         try (VectorSchemaRoot ownedInput = req.inputRoot()) {
             String tokenB64 = req.meta().get(Metadata.STREAM_STATE);
             if (tokenB64 == null) {
@@ -263,15 +269,18 @@ public final class HttpStreamHandler {
                 } catch (Throwable t) {
                     return errorStream(t);
                 }
-                return writeExchangeResponse(collector, state, token, outputSchema, isProducer, principal);
+                return writeExchangeResponse(collector, state, token, outputSchema, isProducer, principal, inputDicts);
             }
+        }
+        } finally {
+            closeDictionaries(inputDicts);
         }
     }
 
     // --- handleExchange sub-steps -----------------------------------------
 
     /** Parsed exchange-request body: metadata (including the state token) plus the (owned) input batch. */
-    private record ExchangeRequest(Map<String, String> meta, VectorSchemaRoot inputRoot) {}
+    private record ExchangeRequest(Map<String, String> meta, VectorSchemaRoot inputRoot, DictionaryProvider inputDicts) {}
 
     private static ExchangeRequest parseExchangeRequest(byte[] body) throws IOException {
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(body), Allocators.root())) {
@@ -279,7 +288,8 @@ public final class HttpStreamHandler {
             if (meta == null) throw new RuntimeException("empty exchange request");
             // Copy the input because the reader is going out of scope.
             VectorSchemaRoot copied = copyRoot(r.root());
-            return new ExchangeRequest(meta, copied);
+            DictionaryProvider inputDicts = copyDictionaries(r.dictionaryProvider());
+            return new ExchangeRequest(meta, copied, inputDicts);
         }
     }
 
@@ -294,7 +304,8 @@ public final class HttpStreamHandler {
     }
 
     private byte[] writeExchangeResponse(OutputCollector collector, StreamState state, StateToken priorToken,
-                                         Schema outputSchema, boolean isProducer, String principal) throws IOException {
+                                         Schema outputSchema, boolean isProducer, String principal,
+                                         DictionaryProvider inputDicts) throws IOException {
         boolean finished = collector.finished();
         String newTokenStr = finished ? null : serializeContinuationToken(state, priorToken, principal);
 
@@ -306,7 +317,7 @@ public final class HttpStreamHandler {
             OutputCollector.Entry data = null;
             for (OutputCollector.Entry e : collector.entries()) {
                 if (e.isData()) { data = e; continue; }
-                w.writeBatch(e.root(), e.customMetadata(), e.dictionaryProvider());
+                w.writeBatch(e.root(), e.customMetadata(), dictOr(e.dictionaryProvider(), inputDicts));
                 e.root().close();
             }
 
@@ -315,12 +326,12 @@ public final class HttpStreamHandler {
                 Map<String, String> md = new LinkedHashMap<>();
                 if (data.customMetadata() != null) md.putAll(data.customMetadata());
                 md.put(Metadata.STREAM_STATE, newTokenStr);
-                w.writeBatch(data.root(), md, data.dictionaryProvider());
+                w.writeBatch(data.root(), md, dictOr(data.dictionaryProvider(), inputDicts));
                 data.root().close();
             } else {
                 // Producer continuation (or no data): emit the data batch as-is, token as a trailing zero-row batch.
                 if (data != null) {
-                    w.writeBatch(data.root(), data.customMetadata(), data.dictionaryProvider());
+                    w.writeBatch(data.root(), data.customMetadata(), dictOr(data.dictionaryProvider(), inputDicts));
                     data.root().close();
                 }
                 if (newTokenStr != null) {
@@ -476,6 +487,33 @@ public final class HttpStreamHandler {
         }
         return new VectorSchemaRoot(src.getSchema().getFields(), moved, rows);
     }
+
+    /** Transfer the dictionaries out of {@code src} into an owned provider that
+     *  survives the source reader's close; null when there are none. */
+    private static DictionaryProvider copyDictionaries(DictionaryProvider src) {
+        if (src == null) return null;
+        Set<Long> ids = src.getDictionaryIds();
+        if (ids.isEmpty()) return null;
+        DictionaryProvider.MapDictionaryProvider out = new DictionaryProvider.MapDictionaryProvider();
+        for (Long id : ids) {
+            Dictionary d = src.lookup(id);
+            TransferPair tp = d.getVector().getTransferPair(Allocators.root());
+            tp.transfer();
+            out.put(new Dictionary((FieldVector) tp.getTo(), d.getEncoding()));
+        }
+        return out;
+    }
+
+    private static void closeDictionaries(DictionaryProvider provider) {
+        if (provider instanceof DictionaryProvider.MapDictionaryProvider m) {
+            for (Long id : m.getDictionaryIds()) {
+                Dictionary d = m.lookup(id);
+                if (d != null && d.getVector() != null) d.getVector().close();
+            }
+        }
+    }
+
+    private static DictionaryProvider dictOr(DictionaryProvider a, DictionaryProvider b) { return a != null ? a : b; }
 
     /** Collects log Messages during init so they can be flushed into the response stream. */
     private final class OutputCollectorSink implements Consumer<Message> {
