@@ -70,6 +70,37 @@ public final class CallContext {
      * @return an unmodifiable, never-{@code null} map of transport metadata
      */
     public Map<String, Object> transportMetadata() { return transportMetadata; }
+
+    /** Transport-metadata key under which the request's parsed cookies live (HTTP only). */
+    public static final String REQUEST_COOKIES_KEY = "vgi_request_cookies";
+    /** Transport-metadata key for the mutable sink the transport drains into {@code Set-Cookie} (HTTP only). */
+    public static final String RESPONSE_COOKIES_KEY = "vgi_response_cookies";
+
+    /**
+     * Cookies presented on the request ({@code Cookie} header), name → value.
+     * Empty for non-HTTP transports, so a fixture can detect "running over HTTP"
+     * by a non-empty map after it has set one on a prior request.
+     *
+     * @return an immutable view of the request cookies; empty when none/not HTTP
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, String> cookies() {
+        Object c = transportMetadata.get(REQUEST_COOKIES_KEY);
+        return c instanceof Map ? Collections.unmodifiableMap((Map<String, String>) c) : Collections.emptyMap();
+    }
+
+    /**
+     * Set a response cookie (HTTP transport emits {@code Set-Cookie: name=value;
+     * Path=/; HttpOnly; SameSite=Strict}). A no-op on transports without cookies.
+     *
+     * @param name  the cookie name
+     * @param value the cookie value
+     */
+    @SuppressWarnings("unchecked")
+    public void setCookie(String name, String value) {
+        Object c = transportMetadata.get(RESPONSE_COOKIES_KEY);
+        if (c instanceof Map) ((Map<String, String>) c).put(name, value);
+    }
     /**
      * The serving server's id, as stamped on response batches.
      *

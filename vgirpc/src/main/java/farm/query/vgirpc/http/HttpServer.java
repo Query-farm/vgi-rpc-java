@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.luben.zstd.Zstd;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
+import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.SessionLostError;
@@ -82,6 +83,8 @@ public final class HttpServer {
     public static final String MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER = "VGI-Max-Externalized-Response-Bytes";
     /** Capability response header: {@code "true"}/{@code "false"} — whether the {@link RpcServer} has an external-location config and can externalise oversized payloads. */
     public static final String EXTERNALIZATION_ENABLED_HEADER = "VGI-Externalization-Enabled";
+    /** Capability response header: comma-separated content-encodings the server accepts/produces (e.g. {@code "zstd, gzip"}). */
+    public static final String SUPPORTED_ENCODINGS_HEADER = "VGI-Supported-Encodings";
     /** Response header set to {@code "true"} when a 200 response body carries an Arrow error batch. */
     public static final String RPC_ERROR_HEADER = "X-VGI-RPC-Error";
 
@@ -124,6 +127,10 @@ public final class HttpServer {
     private final boolean exposeTestDrainAdmin;
     private final byte[] sessionTokenKey;
     private final SessionRegistry sessionRegistry;
+    /** When {@code true} (VGI_HTTP_DISABLE_ZSTD set), zstd is dropped from the
+     *  advertised/accepted codec set and the server uses gzip only. Mirrors the
+     *  vgi-python http fixture's {@code VGI_HTTP_DISABLE_ZSTD} knob. */
+    private final boolean disableZstd;
     private int port;
 
     /**
@@ -161,6 +168,8 @@ public final class HttpServer {
         this.stickyDefaultTtlSeconds = config.stickyDefaultTtlSeconds();
         this.stickyEchoHeaders = config.stickyEchoHeaders();
         this.exposeTestDrainAdmin = config.exposeTestDrainAdmin();
+        String disZstd = System.getenv("VGI_HTTP_DISABLE_ZSTD");
+        this.disableZstd = disZstd != null && !disZstd.isEmpty() && !disZstd.equals("0");
         // Sticky tokens reuse the per-process state-token key when one is
         // configured; otherwise a random 32-byte key is generated on the fly
         // (tokens won't survive worker restarts or load-balance, but the
@@ -691,6 +700,9 @@ public final class HttpServer {
         // expect externalised payloads.
         resp.setHeader(EXTERNALIZATION_ENABLED_HEADER,
                 rpc.externalConfig() != null ? "true" : "false");
+        // Advertise the codec set so a client that defaulted to zstd can switch
+        // to gzip when zstd is disabled (mirrors vgi-python's factory).
+        resp.setHeader(SUPPORTED_ENCODINGS_HEADER, enabledEncodings());
         if (uploadUrlProvider != null) {
             resp.setHeader(UPLOAD_URL_HEADER, "true");
             if (maxUploadBytes != null) {
@@ -813,6 +825,9 @@ public final class HttpServer {
         } catch (PayloadTooLargeException e) {
             writePayloadTooLarge(resp, e);
             return;
+        } catch (UnsupportedContentEncodingException e) {
+            writeUnsupportedEncoding(resp, e);
+            return;
         }
 
         AuthContext auth;
@@ -833,8 +848,9 @@ public final class HttpServer {
         }
 
         BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
+        Map<String, Object> md = buildTransportMetadata(req);
         try {
-            try (AutoCloseable authPop = AuthScope.push(auth, buildTransportMetadata(req));
+            try (AutoCloseable authPop = AuthScope.push(auth, md);
                  AutoCloseable sessPop = SessionScope.push(scope);
                  InMemoryTransport t = new InMemoryTransport(body, out)) {
                 rpc.serveOne(t);
@@ -850,6 +866,7 @@ public final class HttpServer {
             // released it already on the close path.
             releaseSessionLock(scope);
         }
+        emitResponseCookies(resp, md);
         emitSessionResponseHeaders(resp, scope);
         // Operator-facing response cap: post-flush enforcement.  Mirrors the
         // Python reference's strict-fail — overshoot replaces the body with
@@ -1024,7 +1041,29 @@ public final class HttpServer {
         if (remote != null) md.put("remote_addr", remote);
         String ua = req.getHeader(HttpHeaders.USER_AGENT);
         if (ua != null) md.put("user_agent", ua);
+        // Request cookies (CallContext.cookies()) + a mutable sink that
+        // CallContext.setCookie() writes into; emitResponseCookies() drains it
+        // into Set-Cookie headers after dispatch.
+        Map<String, String> reqCookies = new LinkedHashMap<>();
+        jakarta.servlet.http.Cookie[] cookies = req.getCookies();
+        if (cookies != null) {
+            for (jakarta.servlet.http.Cookie c : cookies) reqCookies.put(c.getName(), c.getValue());
+        }
+        md.put(CallContext.REQUEST_COOKIES_KEY, reqCookies);
+        md.put(CallContext.RESPONSE_COOKIES_KEY, new LinkedHashMap<String, String>());
         return md;
+    }
+
+    /** Drain any cookies the handler set via {@link CallContext#setCookie} into
+     *  {@code Set-Cookie} response headers. */
+    @SuppressWarnings("unchecked")
+    private static void emitResponseCookies(HttpServletResponse resp, Map<String, Object> md) {
+        Object sink = md.get(CallContext.RESPONSE_COOKIES_KEY);
+        if (!(sink instanceof Map)) return;
+        for (Map.Entry<String, String> e : ((Map<String, String>) sink).entrySet()) {
+            resp.addHeader("Set-Cookie",
+                    e.getKey() + "=" + e.getValue() + "; Path=/; HttpOnly; SameSite=Strict");
+        }
     }
 
     private static void writeAuthFailure(HttpServletResponse resp, AuthException e) throws IOException {
@@ -1073,9 +1112,13 @@ public final class HttpServer {
 
     private void writeArrowResponse(HttpServletRequest req, HttpServletResponse resp, byte[] body) throws IOException {
         resp.setContentType(ARROW_CONTENT_TYPE);
-        if (acceptsZstd(req)) {
+        String enc = chooseResponseEncoding(req);
+        if (MediaTypes.ZSTD.equals(enc)) {
             resp.setHeader(HttpHeaders.CONTENT_ENCODING, MediaTypes.ZSTD);
             body = Zstd.compress(body, zstdLevel);
+        } else if (MediaTypes.GZIP.equals(enc)) {
+            resp.setHeader(HttpHeaders.CONTENT_ENCODING, MediaTypes.GZIP);
+            body = gzipCompress(body);
         }
         resp.getOutputStream().write(body);
     }
@@ -1085,10 +1128,20 @@ public final class HttpServer {
                 Map.of("error", e.getMessage()));
     }
 
-    private static byte[] maybeDecodeRequestBody(HttpServletRequest req, byte[] body) throws IOException {
+    private static void writeUnsupportedEncoding(HttpServletResponse resp,
+                                                  UnsupportedContentEncodingException e) throws IOException {
+        resp.setHeader(SUPPORTED_ENCODINGS_HEADER, e.supportedEncodings());
+        writeJson(resp, HttpServletResponse.SC_UNSUPPORTED_MEDIA_TYPE, Map.of("error", e.getMessage()));
+    }
+
+    private byte[] maybeDecodeRequestBody(HttpServletRequest req, byte[] body) throws IOException {
         String enc = req.getHeader(HttpHeaders.CONTENT_ENCODING);
-        if (enc == null) return body;
+        if (enc == null || enc.isEmpty()) return body;
         if (enc.equalsIgnoreCase(MediaTypes.ZSTD)) {
+            if (disableZstd) {
+                throw new UnsupportedContentEncodingException(
+                        "Content-Encoding 'zstd' is not enabled on this server", enabledEncodings());
+            }
             long size = Zstd.getFrameContentSize(body);
             if (size <= 0) throw new IOException("zstd frame has unknown size");
             byte[] out = new byte[(int) size];
@@ -1098,7 +1151,54 @@ public final class HttpServer {
             }
             return out;
         }
-        throw new IOException("unsupported Content-Encoding: " + enc);
+        if (enc.equalsIgnoreCase(MediaTypes.GZIP)) {
+            return gzipDecompress(body, maxRequestBytes);
+        }
+        throw new UnsupportedContentEncodingException(
+                "unsupported Content-Encoding: " + enc, enabledEncodings());
+    }
+
+    /** Comma-separated content-encodings this server accepts and produces. */
+    private String enabledEncodings() {
+        return disableZstd ? MediaTypes.GZIP : MediaTypes.ZSTD + ", " + MediaTypes.GZIP;
+    }
+
+    /** Pick the response {@code Content-Encoding} from the client's
+     *  {@code Accept-Encoding}, honouring the enabled codec set (zstd preferred
+     *  unless disabled). {@code null} = send the body uncompressed. */
+    private String chooseResponseEncoding(HttpServletRequest req) {
+        String accept = req.getHeader(HttpHeaders.ACCEPT_ENCODING);
+        if (accept == null) return null;
+        String lower = accept.toLowerCase(Locale.ROOT);
+        if (!disableZstd && lower.contains(MediaTypes.ZSTD)) return MediaTypes.ZSTD;
+        if (lower.contains(MediaTypes.GZIP)) return MediaTypes.GZIP;
+        return null;
+    }
+
+    private static byte[] gzipCompress(byte[] data) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.max(32, data.length / 2));
+        try (java.util.zip.GZIPOutputStream gz = new java.util.zip.GZIPOutputStream(bos)) {
+            gz.write(data);
+        }
+        return bos.toByteArray();
+    }
+
+    private static byte[] gzipDecompress(byte[] data, long maxOutput) throws IOException {
+        try (java.util.zip.GZIPInputStream gz =
+                     new java.util.zip.GZIPInputStream(new ByteArrayInputStream(data));
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] chunk = new byte[8192];
+            long total = 0;
+            int n;
+            while ((n = gz.read(chunk)) > 0) {
+                total += n;
+                if (maxOutput > 0 && total > maxOutput) {
+                    throw new IOException("gzip request body exceeds " + maxOutput + " bytes");
+                }
+                out.write(chunk, 0, n);
+            }
+            return out.toByteArray();
+        }
     }
 
     private void handleStream(HttpServletRequest req, HttpServletResponse resp,
@@ -1108,6 +1208,9 @@ public final class HttpServer {
             body = readBody(req);
         } catch (PayloadTooLargeException e) {
             writePayloadTooLarge(resp, e);
+            return;
+        } catch (UnsupportedContentEncodingException e) {
+            writeUnsupportedEncoding(resp, e);
             return;
         }
 
@@ -1128,8 +1231,9 @@ public final class HttpServer {
         }
 
         byte[] out;
+        Map<String, Object> md = buildTransportMetadata(req);
         try {
-            try (AutoCloseable authPop = AuthScope.push(auth, buildTransportMetadata(req));
+            try (AutoCloseable authPop = AuthScope.push(auth, md);
                  AutoCloseable sessPop = SessionScope.push(scope)) {
                 out = init ? streamHandler.handleInit(method, body) : streamHandler.handleExchange(method, body);
             } catch (PayloadTooLargeException e) {
@@ -1145,6 +1249,7 @@ public final class HttpServer {
         } finally {
             releaseSessionLock(scope);
         }
+        emitResponseCookies(resp, md);
         emitSessionResponseHeaders(resp, scope);
         // Wire-cap enforcement: /exchange strict-fails on overshoot (mirrors
         // Python's TestHttpResponseCap.test_exchange_strict_fail), while /init
@@ -1159,10 +1264,6 @@ public final class HttpServer {
         writeArrowResponse(req, resp, out);
     }
 
-    private static boolean acceptsZstd(HttpServletRequest req) {
-        String accept = req.getHeader(HttpHeaders.ACCEPT_ENCODING);
-        return accept != null && accept.toLowerCase(Locale.ROOT).contains(MediaTypes.ZSTD);
-    }
 
     /** Simple in-memory transport: reads a fixed byte buffer, writes to another buffer. */
     private static final class InMemoryTransport implements RpcTransport {

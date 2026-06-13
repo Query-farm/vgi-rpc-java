@@ -13,4 +13,7 @@ public final class MediaTypes {
 
     /** zstd Content-Encoding token (response body compression negotiation). */
     public static final String ZSTD = "zstd";
+
+    /** gzip Content-Encoding token (fallback when zstd is unavailable/disabled). */
+    public static final String GZIP = "gzip";
 }
