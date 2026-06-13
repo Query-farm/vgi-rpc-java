@@ -131,11 +131,15 @@ public final class StateSerializer {
     }
 
     /**
-     * Reconstruct stream state of type {@code cls} from bytes produced by
+     * Reconstruct stream state from bytes produced by
      * {@link #serialize(StreamState)}.
      *
+     * <p>The concrete type is read from the class-name prefix the serializer
+     * writes; {@code clsHint} is only a fallback for legacy/unprefixed tokens.
+     *
      * @param data the serialized bytes
-     * @param cls the concrete state type to instantiate
+     * @param clsHint the per-method state type to fall back to when the bytes
+     *     carry no resolvable class-name prefix
      * @param <S> the state type
      * @return the reconstructed state
      * @throws RuntimeException if decoding or instantiation fails
