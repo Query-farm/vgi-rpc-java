@@ -107,14 +107,19 @@ afterEvaluate {
     }
 }
 
-// Run the (Java 21) `test` task on a chosen runtime JDK to validate the
-// baseline degrades correctly: `./gradlew :vgirpc:test -PtestJdk=21`. The FFM
-// `java22Test` always runs on the build toolchain (>= 22).
+// Run the test tasks on a chosen runtime JDK rather than the build toolchain.
+//   `./gradlew :vgirpc:test -PtestJdk=21`        — baseline degrades correctly
+//   `./gradlew :vgirpc:java22Test -PtestJdk=22`  — FFM overlay on a *real* 22
+// The `test` task is release-21 bytecode and runs on any JDK >= 21; `java22Test`
+// carries Java 22 bytecode and loads FfmShm, so it can only be retargeted to a
+// runtime >= 22 (a 21 launcher would NoClassDefFound on the overlay).
 (findProperty("testJdk") as String?)?.let { jdk ->
-    tasks.named<Test>("test") {
-        javaLauncher.set(javaToolchains.launcherFor {
-            languageVersion.set(JavaLanguageVersion.of(jdk.toInt()))
-        })
+    val launcher = javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(jdk.toInt()))
+    }
+    tasks.named<Test>("test") { javaLauncher.set(launcher) }
+    if (jdk.toInt() >= 22) {
+        java22TestTask.configure { javaLauncher.set(launcher) }
     }
 }
 

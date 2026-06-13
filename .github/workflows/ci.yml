@@ -11,25 +11,47 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # ./gradlew (the POSIX launcher script) needs bash; windows-latest
+        # defaults to pwsh, but Git Bash ships on the runner. Linux/macOS are
+        # bash already, so this is a no-op there.
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux x64 + macOS arm64 + Windows x64 (all supported targets). macOS is
+        # not redundant: the POSIX shm overlay (FfmShm) has an explicit Darwin
+        # branch — different shm_open(2) open flags than Linux — that the ubuntu
+        # lane never exercises. Windows has no POSIX shm, so its lane proves the
+        # library degrades to the pure-JVM pipe/HTTP path (shm unadvertised); the
+        # FFM-overlay lanes are skipped there (see `if:` guards below).
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
-      # The build toolchain is JDK 25 (it compiles the release-21 baseline AND
-      # the release-22 multi-release shared-memory overlay). The Java 21 test
-      # lane proves the library runs on a real 21 runtime with shm disabled
-      # (FFM unavailable -> pipe transport). Install both; Gradle's toolchain
-      # detection picks them up from the JAVA_HOME_*_X64 env vars setup-java
-      # exports (this repo has no foojay resolver, so it cannot auto-download).
-      # Listing 21 last makes it JAVA_HOME, so the Gradle launcher itself runs
-      # on 21 while the 25 toolchain is used for compilation.
-      - name: Set up JDKs 25 + 21
+      # Install three runtimes and hand Gradle their exact paths. The build
+      # toolchain is JDK 25 (it compiles the release-21 baseline AND the
+      # release-22 multi-release shared-memory overlay); the 22 and 21 installs
+      # back the runtime-retargeting test lanes below. Passing
+      # `installations.paths` (vs. the JAVA_HOME_*_<arch> env vars) keeps this
+      # architecture-independent — those env vars are _X64 on the Linux runner
+      # but _ARM64 on the macOS runner. Listing 21 last makes it JAVA_HOME, so
+      # the Gradle launcher itself runs on 21 while the 25 toolchain compiles.
+      - name: Set up JDK 25
+        id: jdk25
         uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: |
-            25
-            21
+        with: { distribution: temurin, java-version: '25' }
+      - name: Set up JDK 22
+        id: jdk22
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '22' }
+      - name: Set up JDK 21
+        id: jdk21
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -40,16 +62,36 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: gradle-${{ runner.os }}-
 
-      - name: Test on JDK 25 (core + FFM shared-memory overlay)
+      - name: Toolchain paths
+        id: jdks
+        run: echo "paths=${{ steps.jdk25.outputs.path }},${{ steps.jdk22.outputs.path }},${{ steps.jdk21.outputs.path }}" >> "$GITHUB_OUTPUT"
+
+      - name: Test on JDK 25 (core)
         run: >-
           ./gradlew --no-daemon
-          -Porg.gradle.java.installations.fromEnv=JAVA_HOME_21_X64,JAVA_HOME_25_X64
-          :vgirpc:test :vgirpc:java22Test
+          -Porg.gradle.java.installations.paths=${{ steps.jdks.outputs.paths }}
+          :vgirpc:test
+
+      # FFM shared-memory overlay: POSIX-only, so skip on Windows (no shm_open —
+      # ShmFactory.available() is false there and the worker uses the pipe path).
+      - name: Test on JDK 25 (FFM shared-memory overlay)
+        if: runner.os != 'Windows'
+        run: >-
+          ./gradlew --no-daemon
+          -Porg.gradle.java.installations.paths=${{ steps.jdks.outputs.paths }}
+          :vgirpc:java22Test
+
+      - name: Test on JDK 22 (FFM overlay on a real 22 runtime)
+        if: runner.os != 'Windows'
+        run: >-
+          ./gradlew --no-daemon --rerun-tasks
+          -Porg.gradle.java.installations.paths=${{ steps.jdks.outputs.paths }}
+          -PtestJdk=22 :vgirpc:java22Test
 
       - name: Test on JDK 21 (core; shm disabled, pipe fallback)
         run: >-
           ./gradlew --no-daemon --rerun-tasks
-          -Porg.gradle.java.installations.fromEnv=JAVA_HOME_21_X64,JAVA_HOME_25_X64
+          -Porg.gradle.java.installations.paths=${{ steps.jdks.outputs.paths }}
           -PtestJdk=21 :vgirpc:test
 
   # Python-driven conformance suite: a Python driver (the vgi_rpc reference)
