@@ -9,11 +9,18 @@ import farm.query.vgirpc.VersionError;
 import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.log.Message;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.dictionary.Dictionary;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
+import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -76,8 +83,51 @@ public final class Wire {
         try (VectorSchemaRoot zero = VectorSchemaRoot.create(schema, Allocators.root())) {
             zero.allocateNew();
             zero.setRowCount(0);
-            w.writeBatch(zero, customMetadata);
+            // A dict-encoded (ENUM) field needs *some* dictionary registered for
+            // Arrow to render even the schema message of this zero-row batch
+            // (DictionaryUtility.toMessageFormat). Data batches carry their own
+            // provider; these zero-row token/continuation batches don't, so
+            // supply empty dictionaries.
+            List<FieldVector> owned = new ArrayList<>();
+            DictionaryProvider provider = emptyDictionaries(schema, owned);
+            try {
+                if (provider != null) w.writeBatch(zero, customMetadata, provider);
+                else w.writeBatch(zero, customMetadata);
+            } finally {
+                for (FieldVector v : owned) v.close();
+            }
         }
+    }
+
+    /** Build empty dictionaries for every dict-encoded field in {@code schema}
+     *  (recursively), or {@code null} when there are none. Created vectors are
+     *  added to {@code owned} for the caller to close after the write. */
+    private static DictionaryProvider emptyDictionaries(Schema schema, List<FieldVector> owned) {
+        DictionaryProvider.MapDictionaryProvider provider = new DictionaryProvider.MapDictionaryProvider();
+        boolean any = collectEmptyDictionaries(schema.getFields(), provider, owned);
+        return any ? provider : null;
+    }
+
+    private static boolean collectEmptyDictionaries(List<Field> fields,
+            DictionaryProvider.MapDictionaryProvider provider, List<FieldVector> owned) {
+        boolean any = false;
+        for (Field f : fields) {
+            DictionaryEncoding enc = f.getDictionary();
+            if (enc != null && provider.lookup(enc.getId()) == null) {
+                Field valueField = new Field(f.getName(),
+                        new FieldType(f.isNullable(), f.getType(), null, f.getMetadata()), f.getChildren());
+                FieldVector vec = valueField.createVector(Allocators.root());
+                vec.allocateNew();
+                vec.setValueCount(0);
+                owned.add(vec);
+                provider.put(new Dictionary(vec, enc));
+                any = true;
+            }
+            if (!f.getChildren().isEmpty()) {
+                any |= collectEmptyDictionaries(f.getChildren(), provider, owned);
+            }
+        }
+        return any;
     }
 
     /** Build the metadata for an error/log batch. */
