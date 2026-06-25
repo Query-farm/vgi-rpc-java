@@ -1,7 +1,7 @@
 """Run the reference pytest conformance suite against the Java worker.
 
 Mirrors test_go_conformance.py from vgi-rpc-go, parametrising by transport
-(pipe / subprocess / http / unix) so the entire wire surface is exercised.
+(pipe / subprocess / http / unix / tcp) so the entire wire surface is exercised.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import pytest
 from vgi_rpc.conformance import ConformanceService
 from vgi_rpc.http import http_connect
 from vgi_rpc.log import Message
-from vgi_rpc.rpc import ShmPipeTransport, SubprocessTransport, _RpcProxy, unix_connect
+from vgi_rpc.rpc import ShmPipeTransport, SubprocessTransport, _RpcProxy, tcp_connect, unix_connect
 from vgi_rpc.shm import ShmSegment
 
 JAVA_WORKER = os.environ.get(
@@ -120,6 +120,40 @@ def java_unix_path() -> Iterator[str]:
         assert line == f"UNIX:{path}", f"Expected UNIX:{path}, got: {line!r}"
         _wait_for_unix(path)
         yield path
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def _wait_for_tcp(host: str, port: int, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            sock = socket.create_connection((host, port), timeout=1.0)
+            sock.close()
+            return
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.1)
+    raise TimeoutError(f"TCP {host}:{port} did not start within {timeout}s")
+
+
+@pytest.fixture(scope="session")
+def java_tcp_addr() -> Iterator[tuple[str, int]]:
+    # port 0 ⇒ the worker asks the OS for a free loopback port and reports it
+    # back on the TCP:<host>:<port> discovery line.
+    proc = subprocess.Popen(
+        [JAVA_WORKER, "--tcp", "127.0.0.1:0"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("TCP:"), f"Expected TCP:<host>:<port>, got: {line!r}"
+        host, _, port_part = line[len("TCP:") :].rpartition(":")
+        port = int(port_part)
+        _wait_for_tcp(host, port)
+        yield (host, port)
     finally:
         proc.terminate()
         proc.wait(timeout=5)
@@ -275,7 +309,7 @@ ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
 # (comma-separated) so CI can fan the suite out across parallel jobs by
 # transport group — e.g. "pipe,subprocess,unix" for the launcher lanes vs
 # "http,http_externalize_always" for the HTTP lane. Unset = all (local default).
-_ALL_CONNS = ["pipe", "subprocess", "subprocess_shm", "http", "http_externalize_always", "unix"]
+_ALL_CONNS = ["pipe", "subprocess", "subprocess_shm", "http", "http_externalize_always", "unix", "tcp"]
 _CONN_SEL = os.environ.get("CONFORMANCE_TRANSPORTS")
 _CONN_PARAMS = (
     [c for c in _ALL_CONNS if c in {s.strip() for s in _CONN_SEL.split(",")}]
@@ -290,6 +324,7 @@ def conformance_conn(
     java_transport: SubprocessTransport,
     java_http_port: int,
     java_unix_path: str,
+    java_tcp_addr: tuple[str, int],
 ) -> ConnFactory:
     def factory(
         on_log: Callable[[Message], None] | None = None,
@@ -346,6 +381,9 @@ def conformance_conn(
             )
         elif request.param == "unix":
             return unix_connect(ConformanceService, java_unix_path, on_log=on_log)
+        elif request.param == "tcp":
+            tcp_host, tcp_port = java_tcp_addr
+            return tcp_connect(ConformanceService, tcp_host, tcp_port, on_log=on_log)
         raise ValueError(request.param)
 
     return factory

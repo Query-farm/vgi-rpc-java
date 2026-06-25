@@ -24,7 +24,7 @@ This is a port of the Python reference implementation, [`vgi-rpc`](https://githu
 - **Interface-based services** — define a service as a typed Java interface; the client proxy preserves that interface for full IDE autocompletion.
 - **Apache Arrow IPC wire format** — columnar serialization for structured data.
 - **Two method types** — unary calls and streaming (producer and exchange patterns).
-- **Transport-agnostic** — stdio pipe, subprocess, Unix domain socket, shared memory, or HTTP.
+- **Transport-agnostic** — stdio pipe, subprocess, Unix domain socket, raw TCP socket (trusted networks — no auth/TLS), shared memory, or HTTP.
 - **Automatic schema inference** — Java types and `record` components map to Arrow types; `@ArrowField` refines them.
 - **Pluggable authentication** — `AuthContext` + authenticators for HTTP (bearer, mTLS/XFCC; JWT/OAuth in the optional `vgirpc-oauth` module).
 - **Runtime introspection** — opt-in `__describe__` RPC for dynamic service discovery, with a protocol hash that matches the Python reference byte-for-byte.

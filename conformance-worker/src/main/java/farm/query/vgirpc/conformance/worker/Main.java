@@ -19,6 +19,7 @@ import farm.query.vgirpc.http.auth.MTlsAuthenticator;
 import farm.query.vgirpc.http.auth.OAuthPkce;
 import farm.query.vgirpc.http.auth.OidcMetadata;
 import farm.query.vgirpc.transport.StdioTransport;
+import farm.query.vgirpc.transport.TcpSocketTransport;
 import farm.query.vgirpc.transport.UnixSocketTransport;
 
 import java.io.FileOutputStream;
@@ -52,6 +53,9 @@ public final class Main {
         long tokenTtl = 0;
         String mode = null;
         String unixPath = null;
+        // Raw-TCP target: host defaults to loopback; port 0 ⇒ OS auto-selects.
+        String tcpHost = "127.0.0.1";
+        int tcpPort = 0;
         Authenticator authenticator = null;
         List<HttpPreHandler> preHandlers = new ArrayList<>();
         String fakeStorageUrl = null;
@@ -75,6 +79,23 @@ public final class Main {
             switch (a) {
                 case "--http" -> mode = "http";
                 case "--unix" -> { mode = "unix"; unixPath = c.requireValue(a); }
+                case "--tcp" -> {
+                    mode = "tcp";
+                    // Accept [HOST:]PORT; a bare PORT keeps the loopback default host.
+                    String rawSpec = c.requireValue(a);
+                    String portSpec = rawSpec;
+                    int colon = rawSpec.lastIndexOf(':');
+                    if (colon >= 0) {
+                        tcpHost = rawSpec.substring(0, colon);
+                        portSpec = rawSpec.substring(colon + 1);
+                    }
+                    try {
+                        tcpPort = Integer.parseInt(portSpec);
+                    } catch (NumberFormatException nfe) {
+                        System.err.println("--tcp expects [HOST:]PORT, got: " + rawSpec);
+                        System.exit(2);
+                    }
+                }
                 case "--token-key" -> tokenKey = HexFormat.of().parseHex(c.requireValue(a));
                 case "--token-ttl" -> tokenTtl = Long.parseLong(c.requireValue(a));
                 case "--auth-bearer" -> authenticator = buildBearer(c.requireValue(a));
@@ -137,6 +158,7 @@ public final class Main {
                     maxResponseBytes, maxExternalizedResponseBytes,
                     stickyEnabled, stickyTtl);
             case "unix" -> serveUnix(server, Path.of(unixPath));
+            case "tcp" -> serveTcp(server, tcpHost, tcpPort);
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
         }
     }
@@ -282,5 +304,18 @@ public final class Main {
 
     private static void serveUnix(RpcServer server, Path path) throws Exception {
         UnixSocketTransport.serveForever(path, server);
+    }
+
+    /**
+     * Serve raw Arrow-IPC framing over a bare TCP socket (no auth/TLS — trusted
+     * networks only). Mirrors {@link #serveUnix}: prints the discovery line —
+     * {@code TCP:<host>:<port>} — on stdout once bound (after which no more
+     * stdout), with the actual OS-selected port resolved when {@code port == 0}.
+     */
+    private static void serveTcp(RpcServer server, String host, int port) throws Exception {
+        TcpSocketTransport.serveForever(host, port, server, 0L, (boundHost, boundPort) -> {
+            System.out.println("TCP:" + boundHost + ":" + boundPort);
+            System.out.flush();
+        });
     }
 }

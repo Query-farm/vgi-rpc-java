@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 ## Project overview
 
-**vgi-rpc-java** is a Java 21 port of **vgi-rpc** (the Python reference lives at `~/Development/vgi-rpc`). vgi-rpc is a transport-agnostic RPC framework built on Apache Arrow IPC: services are defined as Java interfaces, Arrow schemas are derived from method signatures / record component types, and calls flow over pipe, unix-socket, or HTTP transports as sequential Arrow IPC streams.
+**vgi-rpc-java** is a Java 21 port of **vgi-rpc** (the Python reference lives at `~/Development/vgi-rpc`). vgi-rpc is a transport-agnostic RPC framework built on Apache Arrow IPC: services are defined as Java interfaces, Arrow schemas are derived from method signatures / record component types, and calls flow over pipe, unix-socket, raw TCP, or HTTP transports as sequential Arrow IPC streams.
 
 When the Python and Java implementations disagree, **Python is the reference**. Wire format, metadata keys, error semantics, and stream-state token layout must match byte-for-byte so the two can interoperate (the conformance suite runs a Python driver against the Java worker).
 
@@ -55,7 +55,7 @@ Before pushing: `./gradlew build` must pass, and `./run_tests.sh` must pass for 
 - **`vgirpc-s3`** — S3 `ExternalStorage` backend.
 - **`vgirpc-gcs`** — Google Cloud Storage `ExternalStorage` backend.
 - **`conformance`** — the conformance service definition (`ConformanceService`, `AllTypes`, `Point`, `BoundingBox`, `RichHeader`, etc.) shared between the Java worker and the Python driver.
-- **`conformance-worker`** — runnable entry point (`Main`) that serves `ConformanceService` over pipe / unix / HTTP based on CLI args. Packaged via `installDist`.
+- **`conformance-worker`** — runnable entry point (`Main`) that serves `ConformanceService` over pipe / unix / tcp / HTTP based on CLI args (`--unix <path>`, `--tcp [HOST:]PORT`, `--http`). Packaged via `installDist`.
 - **`benchmark`** + **`benchmark-worker`** — equivalent pair for the benchmark service.
 
 ## Core modules inside `vgirpc`
@@ -74,7 +74,7 @@ Package root: `farm.query.vgirpc`
 ### Subpackages
 
 - **`wire/`** — `IpcStreamReader`, `IpcStreamWriter`, `Metadata` (all `vgi_rpc.*` metadata key constants), `Allocators` (shared `BufferAllocator` root), `Wire` (higher-level helpers: `requestMetadata`, `validateRequestVersion`, `requireMethodName`, `writeErrorStream`, `writeZeroBatch`, `errorMetadata`, `classify`, `errorFromMetadata`, `messageFromMetadata`), `MapToList` (Arrow map↔list-of-struct coercion).
-- **`transport/`** — `RpcTransport` interface, `StdioTransport`, `SubprocessTransport`, `UnixSocketTransport`.
+- **`transport/`** — `RpcTransport` interface, `StdioTransport`, `SubprocessTransport`, `UnixSocketTransport`, `TcpSocketTransport` (raw Arrow-IPC framing over a bare TCP socket — the network analog of `UnixSocketTransport`; no auth/TLS, loopback-default, trusted networks only).
 - **`http/`** — Jetty-based HTTP transport. `HttpServer`, `HttpPreHandler`, `HttpStreamHandler` (stateless streaming: state travels in a signed `StateToken` in custom metadata), `StateSerializer`, `StateToken`, `Authenticator`, `AuthException`, `TokenExpiredException`.
 - **`http/auth/`** — shared authenticator implementations (bearer, mTLS/XFCC). JWT/OAuth lives in the `vgirpc-oauth` module to keep core deps lean.
 - **`marshal/`** — `Marshalling` (row↔VectorSchemaRoot, type casting, parameter adaptation), `RecordCodec` (Java record ↔ row map).
