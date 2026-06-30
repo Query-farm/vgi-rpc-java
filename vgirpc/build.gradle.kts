@@ -93,6 +93,11 @@ val java22TestTask = tasks.register<Test>("java22Test") {
     classpath = java22Test.runtimeClasspath
     useJUnitPlatform()
     jvmArgs("--add-opens=java.base/java.nio=ALL-UNNAMED", "--enable-native-access=ALL-UNNAMED")
+    // ShmResolverTest exercises the shm write/resolve mechanics with small
+    // batches; neutralize the size gate (default 64KB POSIX) so those batches
+    // still route through shm. The gate itself is validated by the end-to-end
+    // crossover benchmark, not here.
+    environment("VGI_RPC_SHM_MIN_BATCH_BYTES", "0")
 }
 tasks.named("check") { dependsOn(java22TestTask) }
 
