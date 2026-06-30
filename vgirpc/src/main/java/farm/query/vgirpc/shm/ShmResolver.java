@@ -54,8 +54,8 @@ public final class ShmResolver {
     // Smallest batch (bytes) worth shipping through shm; below this the pipe wins,
     // because shm's fixed per-batch cost (slot allocation + pointer round trip +
     // the peer's resolve/free) outweighs the copy it saves. The crossover is
-    // platform-specific: POSIX shm_open/mmap is cheap (~64KB) while Windows'
-    // page-file mapping plus the fast overlapped-pipe read push it to ~1.5MB.
+    // platform-specific: POSIX shm_open/mmap overtakes the pipe around 64-256KB,
+    // while Windows' page-file mapping plus the fast overlapped-pipe read push it to ~0.5-1MB.
     // Overridable with VGI_RPC_SHM_MIN_BATCH_BYTES. Mirrors the same gate in the
     // C++ engine and the Python/Go/Rust SDK output paths.
     private static final long SHM_MIN_BATCH_BYTES = resolveShmMinBatchBytes();
@@ -70,7 +70,7 @@ public final class ShmResolver {
             }
         }
         boolean windows = System.getProperty("os.name", "").toLowerCase().contains("win");
-        return windows ? 1024L * 1024L : 64L * 1024L;
+        return windows ? 1024L * 1024L : 128L * 1024L;
     }
     // Zero-copy inbound decode: wrap the segment region as a foreign ArrowBuf
     // instead of allocating+zeroing+copying. **Opt-in (VGI_RPC_SHM_ZEROCOPY=1),
