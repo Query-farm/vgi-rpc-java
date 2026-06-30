@@ -26,36 +26,60 @@ public final class ShmSession implements AutoCloseable {
     private static final boolean STATS = DEBUG || System.getenv("VGI_RPC_SHM_STATS") != null;
 
     private Shm segment;
-    private boolean failed;
+    private String segmentName;     // name of the currently-attached segment, if any
+    private boolean unavailable;    // shm is impossible on this runtime — permanent
 
     /** The attached segment, or {@code null} if shm is not in use on this connection. */
     public Shm segment() { return segment; }
 
     /**
-     * Attach to the advertised segment if a request carries the segment
-     * name/size and we haven't already attached (or permanently failed).
+     * Attach to the advertised segment when a request carries the segment
+     * name/size. A pooled worker process serves successive client connections
+     * over one {@code serve} loop, and the engine creates a fresh segment (new
+     * name) per connection — so when the advertised name <em>changes</em> we must
+     * detach the old mapping and re-attach the new one. Reusing the previous
+     * attachment would read a stale (already-unlinked) segment. Mirrors the Go
+     * worker's {@code shmConnState.ensure}.
      */
     public void attachIfAdvertised(Map<String, String> meta) {
-        if (segment != null || failed || meta == null) return;
+        if (unavailable || meta == null) return;
         // Honor the kill-switch even if a peer advertises a segment anyway: a
         // disabled worker never attaches, so inbound resolve / outbound writes
         // stay dormant and the connection uses inline transfer.
-        if (Shm.disabledByEnv()) { failed = true; return; }
+        if (Shm.disabledByEnv()) { unavailable = true; detach(); return; }
         String name = meta.get(Metadata.SHM_SEGMENT_NAME);
         String size = meta.get(Metadata.SHM_SEGMENT_SIZE);
-        if (name == null || size == null) return;       // not advertised on this request
+        if (name == null || size == null) return;          // not advertised on this request
+        if (segment != null && name.equals(segmentName)) return;  // already attached to this one
+        // A new or changed segment was advertised — drop the old mapping and (re)attach.
+        detach();
         try {
             // null on Java 21 / non-POSIX / native-access-denied: shm unavailable,
             // stay disabled and use inline transfer. A real attach failure on a
             // capable JVM throws and is caught below.
-            segment = ShmFactory.attach(name, Long.parseLong(size));
-            if (segment == null) failed = true;
+            Shm attached = ShmFactory.attach(name, Long.parseLong(size));
+            if (attached == null) {
+                unavailable = true;   // runtime can't map shm at all; stop trying
+                return;
+            }
+            segment = attached;
+            segmentName = name;
         } catch (Exception e) {
-            failed = true;                               // don't retry a doomed name
+            // Per-segment failure: fall back to inline for now, but a later
+            // (different) advertised segment may still attach — don't latch.
             if (DEBUG) {
                 System.err.println("[vgi-shm] attach failed for " + name + ": " + e
                         + " — using inline transfer");
             }
+        }
+    }
+
+    /** Detach the current segment (munmap + close fd, never unlink), if any. */
+    private void detach() {
+        if (segment != null) {
+            segment.close();
+            segment = null;
+            segmentName = null;
         }
     }
 
@@ -85,8 +109,7 @@ public final class ShmSession implements AutoCloseable {
                     pct((long) (busy * 1000), (long) ((busy + idle) * 1000)),
                     pct((long) (idle * 1000), (long) ((busy + idle) * 1000)));
             }
-            segment.close();
-            segment = null;
+            detach();
         }
     }
 
