@@ -24,7 +24,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -50,6 +52,13 @@ public final class OAuthPkce {
 
     private static final String SESSION_COOKIE = "_vgi_oauth_session";
     private static final String AUTH_COOKIE = "_vgi_auth";
+    /** JS-readable display-identity cookie for the shared VGI landing page.
+     *  Derived from the OIDC id_token at the callback (display-only; the signed
+     *  auth cookie remains the security boundary). Mirrors vgi-rpc-python's
+     *  {@code _vgi_identity} in {@code _oauth_pkce.py}. */
+    private static final String IDENTITY_COOKIE = "_vgi_identity";
+    private static final List<String> IDENTITY_CLAIMS =
+            List.of("sub", "email", "preferred_username", "name", "picture");
     private static final long SESSION_TTL_SECONDS = 600;       // 10 min — authorization round-trip
     private static final long DEFAULT_AUTH_TTL_SECONDS = 3600; // 1 hour default if id_token has no exp
 
@@ -86,16 +95,81 @@ public final class OAuthPkce {
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
     }
 
-    /** Mount on {@code HttpServer}'s preHandler list to route {@code callbackPath} requests. */
+    /** Mount on {@code HttpServer}'s preHandler list to route {@code callbackPath}
+     *  and the sibling {@code /_oauth/login} and {@code /_oauth/logout} paths (the
+     *  shared landing page links to these). */
     public HttpPreHandler preHandler() {
+        // The shared landing page's identity pill links to {prefix}/_oauth/login
+        // and {prefix}/_oauth/logout, siblings of the callback path.
+        int marker = callbackPath.lastIndexOf("/_oauth/");
+        String oauthBase = marker >= 0 ? callbackPath.substring(0, marker) : "";
+        String loginPath = oauthBase + "/_oauth/login";
+        String logoutPath = oauthBase + "/_oauth/logout";
+        String home = oauthBase.isEmpty() ? "/" : oauthBase;
         return (req, resp) -> {
             String path = req.getRequestURI();
-            if (path != null && path.equals(callbackPath)) {
+            if (path == null) return false;
+            if (path.equals(callbackPath)) {
                 handleCallback(req, resp);
+                return true;
+            }
+            if (path.equals(loginPath)) {
+                String url = beginAuthorization(resp, home);
+                resp.setStatus(HttpServletResponse.SC_FOUND);
+                resp.setHeader("Location", url);
+                return true;
+            }
+            if (path.equals(logoutPath)) {
+                clearCookie(resp, AUTH_COOKIE);
+                clearCookie(resp, IDENTITY_COOKIE);
+                clearCookie(resp, SESSION_COOKIE);
+                resp.setStatus(HttpServletResponse.SC_FOUND);
+                resp.setHeader("Location", home);
                 return true;
             }
             return false;
         };
+    }
+
+    private static void clearCookie(HttpServletResponse resp, String name) {
+        Cookie c = new Cookie(name, "");
+        c.setPath("/");
+        c.setMaxAge(0);
+        resp.addCookie(c);
+    }
+
+    /** base64url(JSON) of the display-identity claims from an id_token, or
+     *  {@code null} when the token can't be decoded or carries no such claims. */
+    private static String identityCookieValue(String idToken) {
+        Map<String, Object> claims = decodeJwtPayload(idToken);
+        if (claims == null) return null;
+        Map<String, Object> ident = new LinkedHashMap<>();
+        for (String k : IDENTITY_CLAIMS) {
+            Object v = claims.get(k);
+            if (v != null) ident.put(k, v);
+        }
+        if (ident.isEmpty()) return null;
+        try {
+            byte[] raw = JSON.writeValueAsBytes(ident);
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(raw);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Best-effort decode of a JWT payload (no signature verification — the
+     *  id_token was already validated by {@link JwtAuthenticator}). */
+    private static Map<String, Object> decodeJwtPayload(String token) {
+        try {
+            String[] parts = token.split("\\.");
+            if (parts.length < 2) return null;
+            String seg = parts[1];
+            int pad = (4 - seg.length() % 4) % 4;
+            byte[] payload = Base64.getUrlDecoder().decode(seg + "=".repeat(pad));
+            return JSON.readValue(payload, STRING_OBJECT_MAP);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** Authenticator that reads the auth cookie set by the callback handler. */
@@ -238,6 +312,17 @@ public final class OAuthPkce {
             c.setPath("/");
             c.setMaxAge((int) authTtlSeconds);
             resp.addCookie(c);
+            // Display-identity cookie (JS-readable) for the shared landing page,
+            // derived from the OIDC id_token so the page shows email/name even
+            // when the bearer carries no profile claims.
+            String identity = identityCookieValue(idToken);
+            if (identity != null) {
+                Cookie ic = new Cookie(IDENTITY_COOKIE, identity);
+                ic.setHttpOnly(false);
+                ic.setPath("/");
+                ic.setMaxAge((int) authTtlSeconds);
+                resp.addCookie(ic);
+            }
             // Clear the session cookie.
             Cookie sc = new Cookie(SESSION_COOKIE, "");
             sc.setPath("/");

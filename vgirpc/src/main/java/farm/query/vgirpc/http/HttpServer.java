@@ -45,6 +45,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -103,9 +104,21 @@ public final class HttpServer {
                     FieldType.nullable(new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")),
                     null)));
 
+    /** Shared static landing page, loaded once from the classpath (may be {@code null} if absent). */
+    private static final byte[] LANDING_HTML = loadLandingHtml();
+
+    private static byte[] loadLandingHtml() {
+        try (InputStream in = HttpServer.class.getResourceAsStream("landing.html")) {
+            return in == null ? null : in.readAllBytes();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     private final RpcServer rpc;
     private final HttpStreamHandler streamHandler;
     private final Authenticator authenticator;
+    private final DescribeProvider describeProvider;
     private final List<HttpPreHandler> preHandlers;
     private final Server jetty;
     private final String prefix;
@@ -154,6 +167,7 @@ public final class HttpServer {
         this.streamHandler = new HttpStreamHandler(rpc, config.tokenKey(),
                 config.tokenTtlSeconds(), config.maxResponseBytes());
         this.authenticator = config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
+        this.describeProvider = config.describeProvider();
         this.preHandlers = config.preHandlers();
         this.prefix = config.prefix();
         this.maxRequestBytes = config.maxRequestBytes();
@@ -290,6 +304,11 @@ public final class HttpServer {
      * @param exposeTestDrainAdmin conformance-only: expose the unauthenticated
      *                         {@code POST/DELETE /__test_drain__} admin endpoint
      *                         that toggles drain mode. Never enable in production.
+     * @param describeProvider producer for the standardized landing surface's JSON
+     *                         ({@code describe.json} + lazy column endpoints);
+     *                         {@code null} disables those routes (the shared
+     *                         {@code landing.html} and JSON health status are
+     *                         still served).
      */
     public record Config(
             String host,
@@ -312,7 +331,8 @@ public final class HttpServer {
             boolean stickyEnabled,
             long stickyDefaultTtlSeconds,
             Map<String, String> stickyEchoHeaders,
-            boolean exposeTestDrainAdmin) {
+            boolean exposeTestDrainAdmin,
+            DescribeProvider describeProvider) {
 
         /** 1 hour. */
         public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
@@ -382,6 +402,7 @@ public final class HttpServer {
             private long stickyDefaultTtlSeconds = 300;
             private Map<String, String> stickyEchoHeaders = Map.of();
             private boolean exposeTestDrainAdmin;
+            private DescribeProvider describeProvider;
 
             /**
              * Listen address (default {@code "127.0.0.1"}). See {@link Config#host()}.
@@ -543,6 +564,16 @@ public final class HttpServer {
             public Builder exposeTestDrainAdmin(boolean v) { this.exposeTestDrainAdmin = v; return this; }
 
             /**
+             * Producer for the standardized landing surface's JSON contract
+             * ({@code describe.json} + lazy column endpoints).
+             *
+             * @param p the describe provider; {@code null} disables the describe
+             *          routes (default)
+             * @return this builder
+             */
+            public Builder describeProvider(DescribeProvider p) { this.describeProvider = p; return this; }
+
+            /**
              * Build the immutable config.
              *
              * @return the validated {@link Config}
@@ -553,8 +584,26 @@ public final class HttpServer {
                         preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls,
                         advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
                         advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
-                        stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin);
+                        stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
+                        describeProvider);
             }
+        }
+
+        /**
+         * Return a copy of this config with {@code describeProvider} set. Used by
+         * worker libraries that receive a fully-built config and layer the
+         * landing surface on top.
+         *
+         * @param p the describe provider to attach
+         * @return a copy of this config with the provider set
+         */
+        public Config withDescribeProvider(DescribeProvider p) {
+            return new Config(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator,
+                    preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls,
+                    advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
+                    advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
+                    stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
+                    p);
         }
     }
 
@@ -619,14 +668,60 @@ public final class HttpServer {
         protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
             if (runPreHandlers(req, resp)) return;
             String p = pathInfo(req);
-            if ("health".equals(p) || "".equals(p) || "/".equals(p)) {
-                writeJson(resp, HttpServletResponse.SC_OK, Map.of(
-                        "status", "ok",
-                        "server_id", rpc.serverId(),
-                        "protocol", rpc.protocolName()));
+            if ("".equals(p) || "/".equals(p)) {
+                // Root: content-negotiate. Browsers (Accept: text/html) get the
+                // shared static landing page; health checks / ?format=json get
+                // the JSON status.
+                if (wantsHtml(req) && LANDING_HTML != null) {
+                    resp.setStatus(HttpServletResponse.SC_OK);
+                    resp.setContentType("text/html; charset=utf-8");
+                    resp.getOutputStream().write(LANDING_HTML);
+                    return;
+                }
+                writeStatusJson(resp);
+                return;
+            }
+            if ("health".equals(p)) {
+                writeStatusJson(resp);
+                return;
+            }
+            if (describeProvider != null && serveDescribe(p, resp)) {
                 return;
             }
             resp.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
+        }
+
+        /** Serve {@code describe.json} and {@code describe/{c}/{s}/{t}.json}; returns
+         *  {@code true} when the path matched (response already written). */
+        private boolean serveDescribe(String p, HttpServletResponse resp) throws IOException {
+            if ("describe.json".equals(p)) {
+                writeRawJson(resp, HttpServletResponse.SC_OK,
+                        describeProvider.describeJson(rpc.serverId(), oauthActive()));
+                return true;
+            }
+            if (p.startsWith("describe/") && p.endsWith(".json")) {
+                String rest = p.substring("describe/".length(), p.length() - ".json".length());
+                String[] parts = rest.split("/");
+                if (parts.length == 3) {
+                    String cols = describeProvider.columnsJson(
+                            urlDecode(parts[0]), urlDecode(parts[1]), urlDecode(parts[2]));
+                    if (cols == null) {
+                        writeJson(resp, HttpServletResponse.SC_NOT_FOUND,
+                                Map.of("error", "object not found"));
+                    } else {
+                        writeRawJson(resp, HttpServletResponse.SC_OK, cols);
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void writeStatusJson(HttpServletResponse resp) throws IOException {
+            writeJson(resp, HttpServletResponse.SC_OK, Map.of(
+                    "status", "ok",
+                    "server_id", rpc.serverId(),
+                    "protocol", rpc.protocolName()));
         }
 
         @Override
@@ -1078,6 +1173,31 @@ public final class HttpServer {
         resp.setStatus(status);
         resp.setContentType(MediaTypes.APPLICATION_JSON);
         resp.getOutputStream().write(JSON.writeValueAsBytes(body));
+    }
+
+    /** Write a pre-serialized JSON string as the response body. */
+    private static void writeRawJson(HttpServletResponse resp, int status, String json) throws IOException {
+        resp.setStatus(status);
+        resp.setContentType(MediaTypes.APPLICATION_JSON);
+        resp.getOutputStream().write(json.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** True when the request prefers HTML: not {@code ?format=json}, and the
+     *  {@code Accept} header advertises {@code text/html} (browsers). */
+    private static boolean wantsHtml(HttpServletRequest req) {
+        if ("json".equals(req.getParameter("format"))) return false;
+        String accept = req.getHeader("Accept");
+        return accept != null && accept.contains("text/html");
+    }
+
+    private static String urlDecode(String s) {
+        return URLDecoder.decode(s, StandardCharsets.UTF_8);
+    }
+
+    /** Whether an interactive authenticator (e.g. OAuth/PKCE) is active. Surfaced
+     *  as the {@code oauth} flag of {@code describe.json}. */
+    private boolean oauthActive() {
+        return authenticator != Authenticator.ANONYMOUS;
     }
 
     private byte[] readBody(HttpServletRequest req) throws IOException {
