@@ -6,8 +6,10 @@ package farm.query.vgirpc.wire;
 import farm.query.vgirpc.HasErrorKind;
 import farm.query.vgirpc.RpcError;
 import farm.query.vgirpc.VersionError;
+import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.log.Message;
+import farm.query.vgirpc.marshal.Marshalling;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -18,6 +20,8 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
@@ -190,5 +194,289 @@ public final class Wire {
             } catch (Exception ignore) {}
         }
         return new Message(lvl, text, extra);
+    }
+
+    // ------------------------------------------------------------------
+    // Intermediary framing helpers
+    //
+    // vgirpc has two first-class roles: client ({@link RpcConnection}) and
+    // server ({@link farm.query.vgirpc.RpcServer}). A third role — an
+    // *intermediary* (proxy, router, gateway, test harness) — needs to read a
+    // request off the wire, rewrite it, re-frame it for forwarding, and
+    // synthesize in-band error responses without standing up either. These are
+    // the stable public surface for that role. Mirrors vgi-rpc's `vgi_rpc.wire`.
+    // ------------------------------------------------------------------
+
+    /**
+     * A request parsed off the wire.
+     *
+     * @param method the dispatched RPC method name
+     * @param kwargs the parameter values, keyed by field name
+     * @param protocolVersion the application protocol version stamped on the
+     *     request, or {@code null} when it carried none (structurally exempt
+     *     from the backend's dispatch-boundary version check)
+     */
+    public record Request(String method, Map<String, Object> kwargs, String protocolVersion) {}
+
+    /**
+     * A unary response unwrapped to its envelope schema and raw result bytes.
+     *
+     * @param envelopeSchema the response envelope schema (a single {@code result} field)
+     * @param result the serialized response object
+     */
+    public record UnaryResult(Schema envelopeSchema, byte[] result) {}
+
+    /**
+     * Parse a request IPC body into its method name and keyword arguments.
+     *
+     * @param data the complete request IPC stream bytes
+     * @return the parsed request
+     * @throws IOException if the body is not a readable IPC stream
+     * @throws RpcError if the request carries no method name
+     * @throws VersionError if the request version is missing or unsupported
+     */
+    public static Request readRequest(byte[] data) throws IOException {
+        return readRequest(data, null);
+    }
+
+    /**
+     * Parse a request IPC body, optionally resolving an externalized
+     * ({@code vgi_rpc.location}) pointer request by fetching the referenced bytes.
+     *
+     * @param data the complete request IPC stream bytes
+     * @param resolver resolves pointer requests; {@code null} disables resolution,
+     *     so a pointer request parses to its zero-row (empty-kwargs) form — callers
+     *     that require resolution should treat that as a fail-closed denial
+     * @return the parsed request
+     * @throws IOException if the body is not a readable IPC stream
+     * @throws RpcError if the request carries no method name
+     * @throws VersionError if the request version is missing or unsupported
+     */
+    public static Request readRequest(byte[] data, LocationResolver resolver) throws IOException {
+        try (IpcStreamReader reader = new IpcStreamReader(
+                new ByteArrayInputStream(data), Allocators.root())) {
+            Map<String, String> meta = reader.readNextBatch();
+            if (meta == null) throw new RpcError("ProtocolError", "Empty request stream.", "");
+            validateRequestVersion(meta);
+            String method = requireMethodName(meta);
+
+            VectorSchemaRoot root = reader.root();
+            Map<String, Object> kwargs;
+            if (resolver != null && LocationResolver.isPointer(root.getRowCount(), meta)) {
+                LocationResolver.Resolved resolved;
+                try {
+                    resolved = resolver.resolve(meta);
+                } catch (Exception e) {
+                    throw new IOException("failed to resolve externalized request", e);
+                }
+                try (VectorSchemaRoot resolvedRoot = resolved.root()) {
+                    kwargs = resolvedRoot.getRowCount() == 0
+                            ? new LinkedHashMap<>()
+                            : Marshalling.decodeRow(resolvedRoot, null, resolvedRoot.getSchema());
+                }
+            } else if (root.getRowCount() == 0) {
+                kwargs = new LinkedHashMap<>();
+            } else {
+                kwargs = Marshalling.decodeRow(root, reader.dictionaryProvider(), reader.wireSchema());
+            }
+            return new Request(method, kwargs, meta.get(Metadata.PROTOCOL_VERSION_KEY));
+        }
+    }
+
+    /**
+     * Frame a request as a complete IPC stream body for forwarding.
+     *
+     * @param method the RPC method name (e.g. {@code "bind"})
+     * @param paramsSchema the method's parameter schema
+     * @param kwargs the parameter values, keyed by field name
+     * @param protocolVersion the application protocol version to stamp, so a
+     *     versioned backend's dispatch-boundary check still sees the originating
+     *     client's version; {@code null} omits the key
+     * @return the framed request IPC stream bytes
+     * @throws IOException on a write failure
+     */
+    public static byte[] writeRequest(String method, Schema paramsSchema,
+                                        Map<String, Object> kwargs, String protocolVersion)
+            throws IOException {
+        Map<String, String> meta = requestMetadata(method);
+        if (protocolVersion != null) meta.put(Metadata.PROTOCOL_VERSION_KEY, protocolVersion);
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        try (IpcStreamWriter w = new IpcStreamWriter(buf)) {
+            w.writeSchema(paramsSchema);
+            if (paramsSchema.getFields().isEmpty()) {
+                try (VectorSchemaRoot zero = VectorSchemaRoot.create(paramsSchema, Allocators.root())) {
+                    zero.allocateNew();
+                    zero.setRowCount(1);
+                    w.writeBatch(zero, meta);
+                }
+            } else {
+                try (VectorSchemaRoot root = Marshalling.encodeRow(paramsSchema, kwargs, Allocators.root())) {
+                    w.writeBatch(root, meta);
+                }
+            }
+        }
+        return buf.toByteArray();
+    }
+
+    /**
+     * Build a complete IPC stream carrying a single error batch — the wire shape
+     * an intermediary returns to deny or abort a call in-band. The client decodes
+     * it back into a raised exception.
+     *
+     * @param t the exception to encode; its type and message reach the client
+     * @param schema the stream schema, or {@code null} for an empty schema
+     * @param serverId optional server id to stamp on the error batch
+     * @return the error IPC stream bytes
+     * @throws IOException on a write failure
+     */
+    public static byte[] buildErrorStream(Throwable t, Schema schema, String serverId) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        writeErrorStream(buf, schema != null ? schema : new Schema(List.of()), t, serverId);
+        return buf.toByteArray();
+    }
+
+    /**
+     * Return the stream-state continuation token carried in a request or response body.
+     *
+     * <p>The token (key {@link Metadata#STREAM_STATE}) rides in a record batch's
+     * {@code custom_metadata}, not a header — stream continuations recover their
+     * state from it, so an intermediary that routes or correlates a stream by it
+     * must read the batch metadata. Two body shapes are handled by one walk: an
+     * exchange <em>request</em> is a single IPC stream whose first batch carries
+     * the token, while a producer init/exchange <em>response</em> may be several
+     * concatenated IPC streams (a header stream followed by the producer's data
+     * stream), so the token can be in a later stream.
+     *
+     * <p>Returns the <em>first</em> token found. For a response that rotates the
+     * token across several data batches the <em>last</em> one is the continuation
+     * the peer will send next; single-token responses (the common case) make them
+     * identical.
+     *
+     * @param data the (decompressed) request or response IPC body bytes
+     * @return the state token, or {@code null} when absent or unparseable
+     */
+    public static String findStateToken(byte[] data) {
+        return findBatchMetadata(data, Metadata.STREAM_STATE, /*walkConcatenated=*/true);
+    }
+
+    /**
+     * Return the application protocol version stamped on a request body.
+     *
+     * <p>An intermediary that rewrites a request must recover and re-stamp this
+     * (see {@link #writeRequest}) so the backend's dispatch-boundary version check
+     * still sees the originating client's version.
+     *
+     * @param data the (decompressed) request IPC body bytes
+     * @return the protocol-version string, or {@code null} when absent or unparseable
+     */
+    public static String findProtocolVersion(byte[] data) {
+        return findBatchMetadata(data, Metadata.PROTOCOL_VERSION_KEY, /*walkConcatenated=*/false);
+    }
+
+    /** Scan batch custom_metadata for {@code key}, optionally across concatenated IPC streams. */
+    private static String findBatchMetadata(byte[] data, String key, boolean walkConcatenated) {
+        int offset = 0;
+        do {
+            CountingInputStream in = new CountingInputStream(new ByteArrayInputStream(data, offset,
+                    data.length - offset));
+            try (IpcStreamReader reader = new IpcStreamReader(in, Allocators.root())) {
+                Map<String, String> meta;
+                while ((meta = reader.readNextBatch()) != null) {
+                    String value = meta.get(key);
+                    if (value != null && !value.isEmpty()) return value;
+                }
+            } catch (Exception e) {
+                return null;
+            }
+            if (!walkConcatenated || in.count() == 0) return null;
+            offset += in.count();
+        } while (offset < data.length);
+        return null;
+    }
+
+    /** Tracks how many bytes an {@link IpcStreamReader} consumed, so a
+     *  concatenated-stream walk can advance to the next stream. */
+    private static final class CountingInputStream extends java.io.FilterInputStream {
+        private int count;
+
+        CountingInputStream(java.io.InputStream in) { super(in); }
+
+        int count() { return count; }
+
+        @Override public int read() throws IOException {
+            int b = super.read();
+            if (b >= 0) count++;
+            return b;
+        }
+
+        @Override public int read(byte[] b, int off, int len) throws IOException {
+            int n = super.read(b, off, len);
+            if (n > 0) count += n;
+            return n;
+        }
+
+        @Override public long skip(long n) throws IOException {
+            long s = super.skip(n);
+            count += (int) s;
+            return s;
+        }
+    }
+
+    /**
+     * Unwrap a unary-RPC response to its envelope schema and raw result bytes.
+     *
+     * <p>A unary response is an IPC stream of zero or more leading zero-row log
+     * batches (carrying {@link Metadata#LOG_LEVEL}) followed by one data batch
+     * whose {@code result} column holds the serialized response object. This
+     * returns the envelope schema plus the <em>raw</em> result bytes — no typed
+     * decode — for an intermediary that inspects or rewrites the response and
+     * re-wraps it via {@link #writeUnaryResult}.
+     *
+     * <p>Lenient: returns {@code null} for an error, empty, or
+     * non-{@code result} stream, so the caller can forward it unchanged.
+     *
+     * @param data the (resolved, decompressed) response IPC body bytes
+     * @return the envelope schema and result bytes, or {@code null}
+     */
+    public static UnaryResult readUnaryResult(byte[] data) {
+        try (IpcStreamReader reader = new IpcStreamReader(
+                new ByteArrayInputStream(data), Allocators.root())) {
+            Map<String, String> meta;
+            while ((meta = reader.readNextBatch()) != null) {
+                VectorSchemaRoot root = reader.root();
+                if (root.getRowCount() > 0) {
+                    if (root.getSchema().findField("result") == null) return null;
+                    Object value = Marshalling.decodeRow(root).get("result");
+                    return value instanceof byte[] bytes
+                            ? new UnaryResult(root.getSchema(), bytes) : null;
+                }
+                if (!meta.containsKey(Metadata.LOG_LEVEL)) return null;
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Build a unary-RPC response IPC stream wrapping {@code result} — the inverse
+     * of {@link #readUnaryResult}.
+     *
+     * @param envelopeSchema the response envelope schema (a single {@code result} field)
+     * @param result the serialized response object
+     * @return the response IPC stream bytes
+     * @throws IOException on a write failure
+     */
+    public static byte[] writeUnaryResult(Schema envelopeSchema, byte[] result) throws IOException {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put(envelopeSchema.getFields().get(0).getName(), result);
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        try (IpcStreamWriter w = new IpcStreamWriter(buf)) {
+            w.writeSchema(envelopeSchema);
+            try (VectorSchemaRoot root = Marshalling.encodeRow(envelopeSchema, row, Allocators.root())) {
+                w.writeBatch(root, null);
+            }
+        }
+        return buf.toByteArray();
     }
 }

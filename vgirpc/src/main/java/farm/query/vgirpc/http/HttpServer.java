@@ -89,20 +89,30 @@ public final class HttpServer {
     /** Response header set to {@code "true"} when a 200 response body carries an Arrow error batch. */
     public static final String RPC_ERROR_HEADER = "X-VGI-RPC-Error";
 
-    /** The synthetic method name used by the {@code __upload_url__} endpoint. */
-    private static final String UPLOAD_URL_METHOD = "__upload_url__";
+    /**
+     * The synthetic method name used by the {@code __upload_url__} endpoint.
+     * Public so an intermediary that terminates or serves the upload-URL flow
+     * need not copy the constant.
+     */
+    public static final String UPLOAD_URL_METHOD = "__upload_url__";
     /** Cap on the {@code count} parameter to one {@code __upload_url__/init} call. */
-    private static final int MAX_UPLOAD_URL_COUNT = 100;
+    public static final int MAX_UPLOAD_URL_COUNT = 100;
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
+    /** Schema for the {@code __upload_url__} request batch. */
+    public static final Schema UPLOAD_URL_PARAMS_SCHEMA = new Schema(List.of(
+            new Field("count", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+
     /** Schema for the upload-URL response batch. */
-    private static final Schema UPLOAD_URL_SCHEMA = new Schema(List.of(
+    public static final Schema UPLOAD_URL_RESPONSE_SCHEMA = new Schema(List.of(
             new Field("upload_url", FieldType.nullable(new ArrowType.Utf8()), null),
             new Field("download_url", FieldType.nullable(new ArrowType.Utf8()), null),
             new Field("expires_at",
                     FieldType.nullable(new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")),
                     null)));
+
+    private static final Schema UPLOAD_URL_SCHEMA = UPLOAD_URL_RESPONSE_SCHEMA;
 
     /** Shared static landing page, loaded once from the classpath (may be {@code null} if absent). */
     private static final byte[] LANDING_HTML = loadLandingHtml();
