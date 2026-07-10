@@ -153,6 +153,12 @@ public final class HttpStreamHandler {
         if (info == null) return errorStream(new IllegalArgumentException("Unknown method: " + method));
 
         Map<String, Object> kwargs;
+        // The init request's batch metadata carries per-call signals the producer's
+        // first tick must see (e.g. vgi.cache.if_none_match for conditional
+        // revalidation). The subprocess transport delivers them as the tick's input
+        // batch metadata; http must do the same or a producer that reads them
+        // silently behaves as if they were absent.
+        Map<String, String> requestMeta;
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(requestBody), Allocators.root())) {
             Map<String, String> meta = r.readNextBatch();
             if (meta == null) return errorStream(new RuntimeException("empty request"));
@@ -162,6 +168,7 @@ public final class HttpStreamHandler {
                 return errorStream(new ClassCastException(
                         "Method name mismatch: URL has '" + method + "' but metadata has '" + urlMethod + "'"));
             }
+            requestMeta = Map.copyOf(meta);
             VectorSchemaRoot root = r.root();
             kwargs = root.getRowCount() == 0
                     ? new LinkedHashMap<>()
@@ -200,7 +207,7 @@ public final class HttpStreamHandler {
             writeHeaderIpcStream(out, streamResult.header(), sink);
         }
         if (streamResult.isProducer()) {
-            writeProducerRun(out, streamResult, ctx, sink);
+            writeProducerRun(out, streamResult, ctx, sink, requestMeta);
         } else {
             writeExchangeInitToken(out, streamResult, sink);
         }
@@ -364,7 +371,8 @@ public final class HttpStreamHandler {
     // --- Init helpers -----------------------------------------------------
 
     private void writeProducerRun(ByteArrayOutputStream out, RpcStream<?> streamResult,
-                                   CallContext ctx, OutputCollectorSink sink) throws IOException {
+                                   CallContext ctx, OutputCollectorSink sink,
+                                   Map<String, String> requestMeta) throws IOException {
         Schema outputSchema = streamResult.outputSchema();
         Schema inputSchema = streamResult.inputSchema();
         StreamState state = streamResult.state();
@@ -374,10 +382,9 @@ public final class HttpStreamHandler {
 
             OutputCollector coll = new OutputCollector(outputSchema, rpc.serverId(), true);
             boolean error = false;
-            try {
-                state.process(new AnnotatedBatch(
-                        VectorSchemaRoot.create(RpcStream.EMPTY_SCHEMA, Allocators.root()), Map.of()),
-                        coll, ctx);
+            try (VectorSchemaRoot tickInput =
+                         VectorSchemaRoot.create(RpcStream.EMPTY_SCHEMA, Allocators.root())) {
+                state.process(new AnnotatedBatch(tickInput, requestMeta), coll, ctx);
             } catch (Throwable t) {
                 error = true;
                 Wire.writeZeroBatch(w, outputSchema, Wire.errorMetadata(t, rpc.serverId()));
