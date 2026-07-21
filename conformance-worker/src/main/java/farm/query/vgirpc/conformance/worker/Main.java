@@ -73,6 +73,13 @@ public final class Main {
         // worker; --no-sticky disables them.
         boolean stickyEnabled = true;
         long stickyTtl = 300;
+        // Response compression is on by default (zstd, gzip). --no-compression
+        // boots the server with an EMPTY producible set, which is a server
+        // configuration no client request can induce: it emits a
+        // present-but-empty VGI-Supported-Encodings and never compresses.
+        // Unrelated to --compression, which selects the codec for
+        // external-location payload uploads.
+        boolean responseCompression = true;
         ArgCursor c = new ArgCursor(args);
         while (c.hasNext()) {
             String a = c.next();
@@ -119,6 +126,7 @@ public final class Main {
                 case "--max-response-bytes" -> maxResponseBytes = Long.parseLong(c.requireValue(a));
                 case "--max-externalized-response-bytes" ->
                         maxExternalizedResponseBytes = Long.parseLong(c.requireValue(a));
+                case "--no-compression" -> responseCompression = false;
                 case "--no-sticky" -> stickyEnabled = false;
                 case "--sticky-ttl" -> stickyTtl = Long.parseLong(c.requireValue(a));
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
@@ -156,7 +164,7 @@ public final class Main {
             case "http" -> serveHttp(server, tokenKey, tokenTtl, authenticator, preHandlers, fakeStorage,
                     maxRequestBytes >= 0 ? maxRequestBytes : externalizeThreshold,
                     maxResponseBytes, maxExternalizedResponseBytes,
-                    stickyEnabled, stickyTtl);
+                    stickyEnabled, stickyTtl, responseCompression);
             case "unix" -> serveUnix(server, Path.of(unixPath));
             case "tcp" -> serveTcp(server, tcpHost, tcpPort);
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
@@ -262,12 +270,17 @@ public final class Main {
                                    long maxResponseBytes,
                                    long maxExternalizedResponseBytes,
                                    boolean stickyEnabled,
-                                   long stickyTtl) throws Exception {
+                                   long stickyTtl,
+                                   boolean responseCompression) throws Exception {
         HttpServer.Config.Builder cb = HttpServer.Config.builder()
                 .tokenKey(tokenKey)
                 .tokenTtlSeconds(tokenTtl)
                 .authenticator(authenticator)
                 .preHandlers(preHandlers);
+        // Empty producible set ⇒ present-but-empty VGI-Supported-Encodings and
+        // no compression, whatever the client asks for. null would mean "unset"
+        // and fall back to the default set, so the empty list is load-bearing.
+        if (!responseCompression) cb.supportedEncodings(List.of());
         if (maxResponseBytes > 0) cb.advertisedMaxResponseBytes(maxResponseBytes);
         if (maxExternalizedResponseBytes > 0)
             cb.advertisedMaxExternalizedResponseBytes(maxExternalizedResponseBytes);

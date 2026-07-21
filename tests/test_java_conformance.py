@@ -186,6 +186,35 @@ def conformance_http_auth_port() -> Iterator[int]:
 
 
 @pytest.fixture(scope="session")
+def conformance_http_no_compression_port() -> Iterator[int]:
+    """Spawn an HTTP worker with response compression disabled.
+
+    Backs the shared ``test_empty_advertisement_means_never_compressed``
+    case.  It needs its own worker because the state under test is a
+    *server configuration* -- "I can produce no codecs" -- which no client
+    request can induce.  ``identity`` covers the client-side ability to
+    demand an uncompressed body; only a server booted this way emits the
+    present-but-empty ``VGI-Supported-Encodings`` that distinguishes
+    "speaks no compression" from an absent header on a legacy server.
+    """
+    proc = subprocess.Popen(
+        [JAVA_WORKER, "--http", "--no-compression"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
 def conformance_http_strict_cap_port() -> Iterator[int]:
     """Spawn an HTTP worker with strict response caps (1 MiB) for cap-overshoot tests."""
     proc = subprocess.Popen(
