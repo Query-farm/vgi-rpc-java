@@ -48,6 +48,7 @@ import java.io.OutputStream;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -84,7 +85,17 @@ public final class HttpServer {
     public static final String MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER = "VGI-Max-Externalized-Response-Bytes";
     /** Capability response header: {@code "true"}/{@code "false"} — whether the {@link RpcServer} has an external-location config and can externalise oversized payloads. */
     public static final String EXTERNALIZATION_ENABLED_HEADER = "VGI-Externalization-Enabled";
-    /** Capability response header: comma-separated content-encodings the server accepts/produces (e.g. {@code "zstd, gzip"}). */
+    /**
+     * Capability response header: the ordered intersection of the codecs this
+     * server can decode on requests and produce on responses — right now,
+     * runtime-available and enabled by configuration — e.g. {@code "zstd, gzip"}.
+     * Order is the server's own preference and is informational; the client's
+     * stated order decides which codec a given response actually uses.
+     * {@code identity} is omitted: always available, no information.
+     *
+     * <p>Present-but-empty means "I speak no compression", which is distinct
+     * from an older server that never emits the header at all (assume zstd).
+     */
     public static final String SUPPORTED_ENCODINGS_HEADER = "VGI-Supported-Encodings";
     /** Response header set to {@code "true"} when a 200 response body carries an Arrow error batch. */
     public static final String RPC_ERROR_HEADER = "X-VGI-RPC-Error";
@@ -150,10 +161,12 @@ public final class HttpServer {
     private final boolean exposeTestDrainAdmin;
     private final byte[] sessionTokenKey;
     private final SessionRegistry sessionRegistry;
-    /** When {@code true} (VGI_HTTP_DISABLE_ZSTD set), zstd is dropped from the
-     *  advertised/accepted codec set and the server uses gzip only. Mirrors the
-     *  vgi-python http fixture's {@code VGI_HTTP_DISABLE_ZSTD} knob. */
-    private final boolean disableZstd;
+    /** Codecs this server may use, in server-preference order — from
+     *  {@link Config#supportedEncodings()}. Drives the negotiation walk, the
+     *  request-body decode gate and the {@link #SUPPORTED_ENCODINGS_HEADER}
+     *  advertisement, so none of the three can disagree. Empty = never
+     *  compress, and accept no compressed request bodies. */
+    private final List<String> supportedEncodings;
     private int port;
 
     /**
@@ -192,8 +205,7 @@ public final class HttpServer {
         this.stickyDefaultTtlSeconds = config.stickyDefaultTtlSeconds();
         this.stickyEchoHeaders = config.stickyEchoHeaders();
         this.exposeTestDrainAdmin = config.exposeTestDrainAdmin();
-        String disZstd = System.getenv("VGI_HTTP_DISABLE_ZSTD");
-        this.disableZstd = disZstd != null && !disZstd.isEmpty() && !disZstd.equals("0");
+        this.supportedEncodings = config.supportedEncodings();
         // Sticky tokens reuse the per-process state-token key when one is
         // configured; otherwise a random 32-byte key is generated on the fly
         // (tokens won't survive worker restarts or load-balance, but the
@@ -273,7 +285,22 @@ public final class HttpServer {
      * @param maxResponseBytes response body cap; same rationale as request cap.
      * @param idleTimeoutMs    Jetty connector idle timeout in milliseconds.
      * @param zstdLevel        compression level for the {@code zstd}
-     *                         Content-Encoding (1=fastest, 22=max). Default 3.
+     *                         Content-Encoding (1=fastest, 22=max). Default
+     *                         {@value #DEFAULT_ZSTD_LEVEL} — measured 4.7x faster
+     *                         than level 3 on an 8.41 MB Arrow payload <em>and</em>
+     *                         smaller on the wire, so it is not a size/speed
+     *                         trade-off.
+     * @param supportedEncodings codecs this server may produce on responses and
+     *                         accept on request bodies, in server-preference
+     *                         order; the value advertised via
+     *                         {@code VGI-Supported-Encodings}. {@code null} takes
+     *                         the default ({@code zstd, gzip}, narrowed by
+     *                         {@code VGI_HTTP_DISABLE_ZSTD}); an <em>empty</em>
+     *                         list means "never compress" — identity only —
+     *                         which is advertised as a present-but-empty header
+     *                         and makes compressed request bodies a 415.
+     *                         {@code identity} is not a member: it is always
+     *                         available and never advertised.
      * @param tls              TLS settings; {@code null} = plaintext (only safe
      *                         on loopback or behind a TLS-terminating proxy).
      * @param advertiseMaxRequestBytes when {@code true}, every response carries
@@ -332,6 +359,7 @@ public final class HttpServer {
             long maxResponseBytes,
             long idleTimeoutMs,
             int zstdLevel,
+            List<String> supportedEncodings,
             TlsConfig tls,
             boolean advertiseMaxRequestBytes,
             UploadUrlProvider uploadUrlProvider,
@@ -350,12 +378,46 @@ public final class HttpServer {
         public static final long DEFAULT_MAX_BYTES = 16L << 20;
         /** 30 seconds. */
         public static final long DEFAULT_IDLE_TIMEOUT_MS = 30_000;
-        /** Mid-range zstd level: solid ratio, modest CPU. */
-        public static final int DEFAULT_ZSTD_LEVEL = 3;
+        /**
+         * Fastest zstd level. Not a "cheap but bulkier" setting: on an 8.41 MB
+         * Arrow payload level 1 measured 4.7x faster than level 3 <em>and</em>
+         * produced a smaller body, so there is nothing to trade away. Arrow IPC
+         * buffers are already dictionary/bit-packed, which is where the higher
+         * levels' extra search normally pays off.
+         */
+        public static final int DEFAULT_ZSTD_LEVEL = 1;
+
+        /**
+         * The default producible codec set: both codecs, server-preference
+         * order (zstd first — it dominates gzip on large Arrow bodies).
+         * See {@link #defaultSupportedEncodings()} for the environment
+         * override applied when the config leaves the set unset.
+         */
+        public static final List<String> DEFAULT_SUPPORTED_ENCODINGS =
+                List.of(MediaTypes.ZSTD, MediaTypes.GZIP);
+
+        /**
+         * The codec set used when none is configured: {@link #DEFAULT_SUPPORTED_ENCODINGS},
+         * or {@code [gzip]} when the {@code VGI_HTTP_DISABLE_ZSTD} environment
+         * variable is set to anything but {@code "0"}.
+         *
+         * <p>That variable is the historical knob for exercising the gzip path
+         * without uninstalling zstd-jni (it mirrors vgi-python's factory). It is
+         * now just a preset over the general mechanism — one narrowing of the
+         * configurable set, not a parallel code path — and an explicit
+         * {@link Builder#supportedEncodings(List)} overrides it.
+         *
+         * @return the effective default producible set
+         */
+        public static List<String> defaultSupportedEncodings() {
+            String disableZstd = System.getenv("VGI_HTTP_DISABLE_ZSTD");
+            boolean disabled = disableZstd != null && !disableZstd.isEmpty() && !disableZstd.equals("0");
+            return disabled ? List.of(MediaTypes.GZIP) : DEFAULT_SUPPORTED_ENCODINGS;
+        }
 
         /**
          * Normalizes nullable fields (host, prefix, key copy, immutable
-         * collection copies) and validates numeric bounds.
+         * collection copies) and validates numeric bounds and codec names.
          */
         public Config {
             host = host != null ? host : "127.0.0.1";
@@ -363,6 +425,9 @@ public final class HttpServer {
             tokenKey = tokenKey != null ? tokenKey.clone() : null;
             preHandlers = preHandlers != null ? List.copyOf(preHandlers) : List.of();
             stickyEchoHeaders = stickyEchoHeaders != null ? Map.copyOf(stickyEchoHeaders) : Map.of();
+            supportedEncodings = supportedEncodings != null
+                    ? normalizeEncodings(supportedEncodings)
+                    : defaultSupportedEncodings();
             if (maxRequestBytes <= 0) throw new IllegalArgumentException("maxRequestBytes must be > 0");
             if (maxResponseBytes <= 0) throw new IllegalArgumentException("maxResponseBytes must be > 0");
             if (idleTimeoutMs < 0) throw new IllegalArgumentException("idleTimeoutMs must be >= 0");
@@ -402,6 +467,9 @@ public final class HttpServer {
             private long maxResponseBytes = DEFAULT_MAX_BYTES;
             private long idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS;
             private int zstdLevel = DEFAULT_ZSTD_LEVEL;
+            /** {@code null} = "unset", resolved to {@link Config#defaultSupportedEncodings()}
+             *  at build time; an empty list is a real value ("never compress"). */
+            private List<String> supportedEncodings;
             private TlsConfig tls;
             private boolean advertiseMaxRequestBytes;
             private UploadUrlProvider uploadUrlProvider;
@@ -486,12 +554,40 @@ public final class HttpServer {
              */
             public Builder idleTimeoutMs(long idleTimeoutMs) { this.idleTimeoutMs = idleTimeoutMs; return this; }
             /**
-             * {@code zstd} Content-Encoding level, 1 (fastest) to 22 (max); default 3.
+             * {@code zstd} Content-Encoding level, 1 (fastest) to 22 (max);
+             * default {@value Config#DEFAULT_ZSTD_LEVEL}.
              *
              * @param zstdLevel the compression level used for {@code zstd}-encoded responses
              * @return this builder
              */
             public Builder zstdLevel(int zstdLevel) { this.zstdLevel = zstdLevel; return this; }
+            /**
+             * The codecs this server may produce on responses and accept on
+             * request bodies, in server-preference order — the whole of its
+             * compression configuration, and exactly what it advertises via
+             * {@code VGI-Supported-Encodings}.
+             *
+             * <p>Pass {@link java.util.List#of()} to turn compression off: the
+             * server then negotiates nothing (every response is identity),
+             * answers a compressed request body with 415, and advertises a
+             * present-but-empty header — which clients read as a positive "this
+             * server speaks no compression", distinct from an absent header
+             * (a legacy server, assume zstd).
+             *
+             * <p>There is deliberately no separate on/off flag: "off" is the
+             * empty set, and narrower sets such as {@code List.of("gzip")} — what
+             * {@code VGI_HTTP_DISABLE_ZSTD} presets — are the same mechanism.
+             *
+             * @param encodings the producible codecs, from {@link MediaTypes#ZSTD}
+             *        and {@link MediaTypes#GZIP}; case-insensitive, duplicates
+             *        collapse, and {@code identity} is rejected (always available,
+             *        never advertised); an unknown token fails in {@link #build()}.
+             *        {@code null} restores the default set.
+             * @return this builder
+             */
+            public Builder supportedEncodings(List<String> encodings) {
+                this.supportedEncodings = encodings; return this;
+            }
             /**
              * TLS settings; {@code null} = plaintext (only safe on loopback or behind a TLS proxy).
              *
@@ -587,11 +683,14 @@ public final class HttpServer {
              * Build the immutable config.
              *
              * @return the validated {@link Config}
-             * @throws IllegalArgumentException if a numeric bound is out of range (see {@link Config})
+             * @throws IllegalArgumentException if a numeric bound is out of range,
+             *         or {@link #supportedEncodings(List)} named an unknown codec
+             *         (see {@link Config})
              */
             public Config build() {
                 return new Config(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator,
-                        preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls,
+                        preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel,
+                        supportedEncodings, tls,
                         advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
                         advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
                         stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
@@ -609,7 +708,8 @@ public final class HttpServer {
          */
         public Config withDescribeProvider(DescribeProvider p) {
             return new Config(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator,
-                    preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, tls,
+                    preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel,
+                    supportedEncodings, tls,
                     advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
                     advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
                     stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
@@ -1242,15 +1342,28 @@ public final class HttpServer {
 
     private void writeArrowResponse(HttpServletRequest req, HttpServletResponse resp, byte[] body) throws IOException {
         resp.setContentType(ARROW_CONTENT_TYPE);
-        String enc = chooseResponseEncoding(req);
-        if (MediaTypes.ZSTD.equals(enc)) {
-            resp.setHeader(HttpHeaders.CONTENT_ENCODING, MediaTypes.ZSTD);
-            body = Zstd.compress(body, zstdLevel);
-        } else if (MediaTypes.GZIP.equals(enc)) {
-            resp.setHeader(HttpHeaders.CONTENT_ENCODING, MediaTypes.GZIP);
-            body = gzipCompress(body);
-        }
-        resp.getOutputStream().write(body);
+        ResponseEncoding choice = chooseResponseEncoding(req, supportedEncodings);
+        resp.getOutputStream().write(encodeArrowBody(resp, choice, body, zstdLevel));
+    }
+
+    /** Compress {@code body} with the negotiated codec (if any) and stamp the
+     *  codec on the response. Returns the bytes to write.
+     *
+     *  <p>A codec negotiated only via {@link HttpHeaders#X_VGI_ACCEPT_ENCODING}
+     *  is announced on {@link HttpHeaders#X_VGI_CONTENT_ENCODING} rather than
+     *  the standard {@code Content-Encoding}: such a client reached for the
+     *  custom header because its fetch/proxy layer mangles or silently
+     *  auto-decodes standard content-coding, so the response must not claim
+     *  one. */
+    static byte[] encodeArrowBody(HttpServletResponse resp, ResponseEncoding choice,
+                                   byte[] body, int zstdLevel) throws IOException {
+        String enc = choice.encoding();
+        if (enc == null) return body;
+        resp.setHeader(choice.usedCustomHeader()
+                        ? HttpHeaders.X_VGI_CONTENT_ENCODING
+                        : HttpHeaders.CONTENT_ENCODING,
+                enc);
+        return MediaTypes.ZSTD.equals(enc) ? Zstd.compress(body, zstdLevel) : gzipCompress(body);
     }
 
     private static void writePayloadTooLarge(HttpServletResponse resp, RuntimeException e) throws IOException {
@@ -1264,14 +1377,31 @@ public final class HttpServer {
         writeJson(resp, HttpServletResponse.SC_UNSUPPORTED_MEDIA_TYPE, Map.of("error", e.getMessage()));
     }
 
+    /**
+     * Decode a compressed request body, if the {@code Content-Encoding} names a
+     * codec this server is configured for.
+     *
+     * <p>Gated by the same {@link #supportedEncodings} list that the negotiation
+     * walk and the advertisement use: a codec the server does not advertise is
+     * one it refuses to decode (HTTP 415, carrying the advertised set so the
+     * client can retry correctly). With an empty set that is every codec — a
+     * server that states it speaks no compression must not quietly accept a
+     * compressed body either.
+     */
     private byte[] maybeDecodeRequestBody(HttpServletRequest req, byte[] body) throws IOException {
         String enc = req.getHeader(HttpHeaders.CONTENT_ENCODING);
         if (enc == null || enc.isEmpty()) return body;
-        if (enc.equalsIgnoreCase(MediaTypes.ZSTD)) {
-            if (disableZstd) {
-                throw new UnsupportedContentEncodingException(
-                        "Content-Encoding 'zstd' is not enabled on this server", enabledEncodings());
-            }
+        String token = enc.trim().toLowerCase(Locale.ROOT);
+        if (token.isEmpty() || MediaTypes.IDENTITY.equals(token)) return body;
+        if (!KNOWN_ENCODINGS.contains(token)) {
+            throw new UnsupportedContentEncodingException(
+                    "unsupported Content-Encoding: " + enc, enabledEncodings());
+        }
+        if (!supportedEncodings.contains(token)) {
+            throw new UnsupportedContentEncodingException(
+                    "Content-Encoding '" + token + "' is not enabled on this server", enabledEncodings());
+        }
+        if (MediaTypes.ZSTD.equals(token)) {
             long size = Zstd.getFrameContentSize(body);
             if (size <= 0) throw new IOException("zstd frame has unknown size");
             byte[] out = new byte[(int) size];
@@ -1281,28 +1411,143 @@ public final class HttpServer {
             }
             return out;
         }
-        if (enc.equalsIgnoreCase(MediaTypes.GZIP)) {
-            return gzipDecompress(body, maxRequestBytes);
-        }
-        throw new UnsupportedContentEncodingException(
-                "unsupported Content-Encoding: " + enc, enabledEncodings());
+        return gzipDecompress(body, maxRequestBytes);
     }
 
-    /** Comma-separated content-encodings this server accepts and produces. */
+    /**
+     * Value of {@link #SUPPORTED_ENCODINGS_HEADER}: the codecs this server both
+     * accepts on requests and produces on responses, in server-preference order,
+     * without {@code identity}. Derived from the same list the negotiation walk
+     * consults, so advertisement and behaviour cannot drift. The empty string is
+     * a legitimate value — "no compression" — and is emitted as a present,
+     * empty header rather than omitted.
+     */
     private String enabledEncodings() {
-        return disableZstd ? MediaTypes.GZIP : MediaTypes.ZSTD + ", " + MediaTypes.GZIP;
+        return String.join(", ", supportedEncodings);
     }
 
-    /** Pick the response {@code Content-Encoding} from the client's
-     *  {@code Accept-Encoding}, honouring the enabled codec set (zstd preferred
-     *  unless disabled). {@code null} = send the body uncompressed. */
-    private String chooseResponseEncoding(HttpServletRequest req) {
-        String accept = req.getHeader(HttpHeaders.ACCEPT_ENCODING);
-        if (accept == null) return null;
-        String lower = accept.toLowerCase(Locale.ROOT);
-        if (!disableZstd && lower.contains(MediaTypes.ZSTD)) return MediaTypes.ZSTD;
-        if (lower.contains(MediaTypes.GZIP)) return MediaTypes.GZIP;
-        return null;
+    /** Compressed codecs this build can encode at all — the domain
+     *  {@link Config#supportedEncodings()} is drawn from. Both encoders are
+     *  unconditionally present (zstd-jni is a hard dependency,
+     *  {@code java.util.zip} is stdlib), so configuration is the only gate and
+     *  any subset — including none — is expressible. */
+    private static final List<String> COMPRESSION_CODECS = List.of(MediaTypes.ZSTD, MediaTypes.GZIP);
+
+    /** Tokens {@link #parseEncodingList} recognises: the compressed codecs plus
+     *  {@code identity}, which every server can always produce. */
+    private static final List<String> KNOWN_ENCODINGS =
+            List.of(MediaTypes.ZSTD, MediaTypes.GZIP, MediaTypes.IDENTITY);
+
+    /**
+     * Validate and canonicalise a configured codec set: trimmed, lowercased,
+     * de-duplicated, order preserved (it is the server's advertised preference).
+     *
+     * <p>The empty list is a legitimate configuration — "this server speaks no
+     * compression" — and is what makes an empty {@link #SUPPORTED_ENCODINGS_HEADER}
+     * reachable. {@code identity} is rejected rather than silently dropped: it is
+     * always available and never advertised, so naming it means the caller
+     * expected it to mean something.
+     *
+     * @param raw the configured codec names
+     * @return the canonical list
+     * @throws IllegalArgumentException if a name is null or not a known codec
+     */
+    static List<String> normalizeEncodings(List<String> raw) {
+        List<String> out = new ArrayList<>(raw.size());
+        for (String name : raw) {
+            if (name == null) throw new IllegalArgumentException("supportedEncodings must not contain null");
+            String token = name.trim().toLowerCase(Locale.ROOT);
+            if (MediaTypes.IDENTITY.equals(token)) {
+                throw new IllegalArgumentException("supportedEncodings must not contain '"
+                        + MediaTypes.IDENTITY + "': it is always available and never advertised;"
+                        + " use an empty list to mean \"never compress\"");
+            }
+            if (!COMPRESSION_CODECS.contains(token)) {
+                throw new IllegalArgumentException("unsupported encoding '" + name
+                        + "'; supported: " + COMPRESSION_CODECS);
+            }
+            if (!out.contains(token)) out.add(token);
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * Outcome of response-codec negotiation.
+     *
+     * @param encoding        the chosen codec, or {@code null} to send the body
+     *                        uncompressed (nothing the client offered is producible here)
+     * @param usedCustomHeader {@code true} when the choice came only from
+     *                        {@link HttpHeaders#X_VGI_ACCEPT_ENCODING}, which
+     *                        moves the announcement to
+     *                        {@link HttpHeaders#X_VGI_CONTENT_ENCODING}
+     */
+    record ResponseEncoding(String encoding, boolean usedCustomHeader) {}
+
+    /**
+     * Parse an {@code Accept-Encoding}-style header into an ordered, de-duplicated
+     * list of codecs this transport knows.
+     *
+     * <p>Split on {@code ,}; trim; lowercase; drop anything after a {@code ;} —
+     * q-values are parsed off and <em>ignored</em>, not honoured; skip unknown
+     * tokens (the caller intersects with what we can produce anyway); keep the
+     * first occurrence of a repeat. The client's order is preserved, because it
+     * is the client's preference that decides. A missing or empty header yields
+     * an empty list.
+     */
+    static List<String> parseEncodingList(String headerValue) {
+        if (headerValue == null || headerValue.isEmpty()) return List.of();
+        List<String> out = new ArrayList<>(KNOWN_ENCODINGS.size());
+        for (String raw : headerValue.split(",")) {
+            String token = raw.trim().toLowerCase(Locale.ROOT);
+            int semi = token.indexOf(';');
+            if (semi >= 0) token = token.substring(0, semi).trim();
+            if (token.isEmpty() || !KNOWN_ENCODINGS.contains(token) || out.contains(token)) continue;
+            out.add(token);
+        }
+        return out;
+    }
+
+    /**
+     * Pick the response codec: the first entry of
+     * {@code X-VGI-Accept-Encoding ++ (Accept-Encoding minus it)} that this
+     * server can actually produce.
+     *
+     * <p>VGI's own preference header wins over the generic {@code Accept-Encoding}.
+     * HTTP clients — e.g. cpp-httplib, which the DuckDB extension uses — inject
+     * their own {@code Accept-Encoding: deflate, gzip, br, zstd}, listing gzip
+     * before zstd; walking that list first picks gzip and silently ignores the
+     * zstd-first order VGI states in {@code X-VGI-Accept-Encoding}. gzip
+     * compression dominates large Arrow responses (432ms vs ~40ms of zstd for
+     * 200MB of bodies — a 4.2x slower round-trip end to end). Conversely a
+     * browser/WASM client can send <em>only</em> the custom header, because
+     * {@code fetch()} may not set {@code Accept-Encoding}.
+     *
+     * <p>Note the ordering this implies: the merged list is walked in the
+     * <em>client's</em> stated order, not a hardcoded server preference.
+     * {@code identity} is producible by definition, so a client that names it
+     * ahead of the compressed codecs gets an uncompressed body — an explicit,
+     * per-request "compression off" switch.
+     *
+     * @param req        the request whose encoding headers are read
+     * @param producible the codecs this server can produce, from
+     *                   {@link Config#supportedEncodings()}; empty means
+     *                   nothing is ever compressed
+     */
+    static ResponseEncoding chooseResponseEncoding(HttpServletRequest req, List<String> producible) {
+        List<String> custom = parseEncodingList(req.getHeader(HttpHeaders.X_VGI_ACCEPT_ENCODING));
+        List<String> standard = parseEncodingList(req.getHeader(HttpHeaders.ACCEPT_ENCODING));
+        List<String> merged = new ArrayList<>(custom);
+        for (String enc : standard) {
+            if (!custom.contains(enc)) merged.add(enc);
+        }
+        for (String enc : merged) {
+            // An identity body is just a body: no codec, and no encoding header
+            // on either name.
+            if (MediaTypes.IDENTITY.equals(enc)) return new ResponseEncoding(null, false);
+            if (!producible.contains(enc)) continue;
+            return new ResponseEncoding(enc, custom.contains(enc) && !standard.contains(enc));
+        }
+        return new ResponseEncoding(null, !custom.isEmpty());
     }
 
     private static byte[] gzipCompress(byte[] data) throws IOException {
