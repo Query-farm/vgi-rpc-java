@@ -12,6 +12,7 @@ import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.SessionLostError;
 import farm.query.vgirpc.external.UploadUrlProvider;
+import farm.query.vgirpc.http.auth.ProxyProof;
 import farm.query.vgirpc.transport.RpcTransport;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
@@ -155,6 +156,10 @@ public final class HttpServer {
      *  in-process memory bound. */
     private final long advertisedMaxResponseBytes;
     private final long advertisedMaxExternalizedResponseBytes;
+    /** Operator-declared: this worker's proxy-proof gate is in REQUIRE mode.
+     *  Advertisement only — the gate is an opaque {@link Authenticator}, so the
+     *  server has no way to read the posture back off it. */
+    private final boolean proxyProofRequired;
     private final boolean stickyEnabled;
     private final long stickyDefaultTtlSeconds;
     private final Map<String, String> stickyEchoHeaders;
@@ -201,6 +206,7 @@ public final class HttpServer {
         this.maxUploadBytes = config.maxUploadBytes();
         this.advertisedMaxResponseBytes = config.advertisedMaxResponseBytes();
         this.advertisedMaxExternalizedResponseBytes = config.advertisedMaxExternalizedResponseBytes();
+        this.proxyProofRequired = config.proxyProofRequired();
         this.stickyEnabled = config.stickyEnabled();
         this.stickyDefaultTtlSeconds = config.stickyDefaultTtlSeconds();
         this.stickyEchoHeaders = config.stickyEchoHeaders();
@@ -327,6 +333,15 @@ public final class HttpServer {
      *                         advertisement-only today (the Java HTTP transport
      *                         does not yet externalise stream output).
      *                         {@code 0} = unbounded/omitted.
+     * @param proxyProofRequired advertise
+     *                         {@code VGI-Proxy-Proof-Required: true} on every
+     *                         response. Set it only in
+     *                         {@link farm.query.vgirpc.http.auth.ProxyProof.Mode#REQUIRE}
+     *                         — {@code off} and {@code allow} never deny, so they
+     *                         must not claim they do. Advertisement only: the gate
+     *                         is an opaque {@link Authenticator}, so the server
+     *                         cannot introspect the posture and the operator states
+     *                         it. Default {@code false}.
      * @param stickyEnabled    enable opt-in HTTP sticky sessions: clients sending
      *                         {@code VGI-Session-Accept: true} get an HMAC-signed
      *                         session token bound to their principal, and calls
@@ -366,6 +381,7 @@ public final class HttpServer {
             Long maxUploadBytes,
             long advertisedMaxResponseBytes,
             long advertisedMaxExternalizedResponseBytes,
+            boolean proxyProofRequired,
             boolean stickyEnabled,
             long stickyDefaultTtlSeconds,
             Map<String, String> stickyEchoHeaders,
@@ -476,6 +492,7 @@ public final class HttpServer {
             private Long maxUploadBytes;
             private long advertisedMaxResponseBytes;
             private long advertisedMaxExternalizedResponseBytes;
+            private boolean proxyProofRequired;
             private boolean stickyEnabled;
             private long stickyDefaultTtlSeconds = 300;
             private Map<String, String> stickyEchoHeaders = Map.of();
@@ -638,6 +655,21 @@ public final class HttpServer {
                 this.advertisedMaxExternalizedResponseBytes = v; return this;
             }
             /**
+             * Advertise {@code VGI-Proxy-Proof-Required: true} on every response.
+             *
+             * <p>Set it only when the installed proxy-proof gate is in
+             * {@link farm.query.vgirpc.http.auth.ProxyProof.Mode#REQUIRE}: the header
+             * is how an operator or proxy confirms a worker actually rejects
+             * unproofed requests, so a worker in {@code allow} (which never denies)
+             * advertising it would be the misconfiguration it is meant to expose.
+             * It enables nothing on its own — the gate arrives as an opaque
+             * {@link Authenticator} the server cannot inspect.
+             *
+             * @param v {@code true} to advertise the header (default {@code false})
+             * @return this builder
+             */
+            public Builder proxyProofRequired(boolean v) { this.proxyProofRequired = v; return this; }
+            /**
              * Enable opt-in HTTP sticky sessions.
              *
              * @param v {@code true} to honor {@code VGI-Session-Accept} opt-ins and
@@ -693,6 +725,7 @@ public final class HttpServer {
                         supportedEncodings, tls,
                         advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
                         advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
+                        proxyProofRequired,
                         stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
                         describeProvider);
             }
@@ -712,6 +745,7 @@ public final class HttpServer {
                     supportedEncodings, tls,
                     advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
                     advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
+                    proxyProofRequired,
                     stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
                     p);
         }
@@ -913,6 +947,12 @@ public final class HttpServer {
             if (maxUploadBytes != null) {
                 resp.setHeader(MAX_UPLOAD_BYTES_HEADER, Long.toString(maxUploadBytes));
             }
+        }
+        // Advertised only in REQUIRE mode: a proxy has no other way to tell an
+        // enforcing worker from one silently ignoring the proof header, which is
+        // the misconfiguration that turns the whole feature into a no-op.
+        if (proxyProofRequired) {
+            resp.setHeader(ProxyProof.PROOF_REQUIRED_HEADER, "true");
         }
         if (stickyEnabled) {
             resp.setHeader(StickyHeaders.STICKY_ENABLED, "true");

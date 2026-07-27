@@ -156,11 +156,19 @@ var config = ProxyProof.Config.of(ProxyProof.Mode.REQUIRE, "worker-a", secrets);
 
 HttpServer.Config.builder()
     .authenticator(ProxyProof.require(config, existingAuthenticator)) // inner may be null
+    .proxyProofRequired(true)                                         // REQUIRE mode only
     .build();
 ```
 
 It composes as an **AND**, not an alternative: do not pass the gate to `Authenticator.chain`,
 whose first-authenticated-wins semantics would let any later credential bypass it.
+
+`proxyProofRequired(true)` advertises `VGI-Proxy-Proof-Required: true` on every response,
+`GET /health` and `OPTIONS` included, so an operator or proxy can confirm the worker really does
+reject unproofed requests — otherwise a misconfiguration turns the whole feature into a silent
+no-op. Set it in `REQUIRE` mode only: `off` and `allow` never deny, so they must not claim to. It
+is a separate knob because the gate arrives as an opaque `Authenticator` the server cannot
+introspect, and it advertises only — enforcement is entirely the gate's.
 
 The key id doubles as the calling proxy's label, so `AuthContext.claims().get("vgi_proxy_proof")`
 records which proxy served each request — derived from the secret that verified, never from the

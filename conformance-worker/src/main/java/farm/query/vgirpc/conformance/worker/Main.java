@@ -189,7 +189,9 @@ public final class Main {
             case "http" -> serveHttp(server, tokenKey, tokenTtl, authenticator, preHandlers, fakeStorage,
                     maxRequestBytes >= 0 ? maxRequestBytes : externalizeThreshold,
                     maxResponseBytes, maxExternalizedResponseBytes,
-                    stickyEnabled, stickyTtl, responseCompression);
+                    stickyEnabled, stickyTtl, responseCompression,
+                    // Only require mode denies, so only require mode advertises.
+                    httpProof && "require".equals(proofMode));
             case "unix" -> serveUnix(server, Path.of(unixPath));
             case "tcp" -> serveTcp(server, tcpHost, tcpPort);
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
@@ -322,12 +324,14 @@ public final class Main {
                                    long maxExternalizedResponseBytes,
                                    boolean stickyEnabled,
                                    long stickyTtl,
-                                   boolean responseCompression) throws Exception {
+                                   boolean responseCompression,
+                                   boolean proxyProofRequired) throws Exception {
         HttpServer.Config.Builder cb = HttpServer.Config.builder()
                 .tokenKey(tokenKey)
                 .tokenTtlSeconds(tokenTtl)
                 .authenticator(authenticator)
-                .preHandlers(preHandlers);
+                .preHandlers(preHandlers)
+                .proxyProofRequired(proxyProofRequired);
         // Empty producible set ⇒ present-but-empty VGI-Supported-Encodings and
         // no compression, whatever the client asks for. null would mean "unset"
         // and fall back to the default set, so the empty list is load-bearing.
