@@ -234,6 +234,63 @@ def conformance_http_strict_cap_port() -> Iterator[int]:
         proc.wait(timeout=5)
 
 
+def _start_http_worker(*extra_args: str) -> Iterator[int]:
+    """Spawn a Java HTTP conformance worker and yield the port it reports."""
+    proc = subprocess.Popen(
+        [JAVA_WORKER, *extra_args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def proof_worker_factory() -> Iterator[Callable[..., Any]]:
+    """Spawn Java workers gated on proxy proof, for the shared TestProxyProof group.
+
+    The shared suite owns the matrix; this only has to know how to start one
+    worker for a given configuration.
+    """
+    from vgi_rpc.conformance.proof_harness import ProofWorker, ProofWorkerConfig
+
+    @contextlib.contextmanager
+    def spawn(config: ProofWorkerConfig) -> Iterator[ProofWorker]:
+        args = [
+            "--http-proof",
+            "--proof-mode",
+            config.mode,
+            "--proof-origin-id",
+            config.origin_id,
+            "--proof-secrets",
+            config.secrets,
+            "--proof-skew",
+            str(config.skew_seconds),
+        ]
+        if not config.replay_cache:
+            args.append("--proof-no-replay-cache")
+        gen = _start_http_worker(*args)
+        port = next(gen)
+        try:
+            # The Java worker mounts every HTTP route at the root, as its
+            # --auth-* modes do; prefix="" makes the shared suite address the
+            # real endpoints rather than a path that does not exist.
+            yield ProofWorker(port=port, prefix="", config=config)
+        finally:
+            with contextlib.suppress(StopIteration):
+                next(gen)
+
+    yield spawn
+
+
 @pytest.fixture(scope="session")
 def conformance_fake_storage() -> Iterator[str]:
     """Run the in-process Python fake-storage HTTP service."""

@@ -142,6 +142,34 @@ try (RpcConnection conn = new RpcConnection(transport)) {
 
 When the Python and Java implementations disagree, **Python is the reference.** Wire format, metadata keys, error semantics, and stream-state token layout match byte-for-byte so the two interoperate. See the Python project's [README](https://github.com/Query-farm/vgi-rpc-python) for the higher-level protocol design.
 
+## Proxy proof
+
+Proxy proof lets a worker refuse any request that did not arrive through a trusted proxy. The
+proxy mints a per-request HMAC-SHA256 over a timestamp, a fresh nonce and the worker's own
+identifier, keyed by a secret shared only with that worker. Unlike a forwarded assertion about
+what happened at a TLS terminator, a proof cannot be produced by someone who merely reaches the
+worker directly — without the secret there is nothing to replay.
+
+```java
+var secrets = ProxyProof.parseSecrets("prod-use1:" + hexSecret);
+var config = ProxyProof.Config.of(ProxyProof.Mode.REQUIRE, "worker-a", secrets);
+
+HttpServer.Config.builder()
+    .authenticator(ProxyProof.require(config, existingAuthenticator)) // inner may be null
+    .build();
+```
+
+It composes as an **AND**, not an alternative: do not pass the gate to `Authenticator.chain`,
+whose first-authenticated-wins semantics would let any later credential bypass it.
+
+The key id doubles as the calling proxy's label, so `AuthContext.claims().get("vgi_proxy_proof")`
+records which proxy served each request — derived from the secret that verified, never from the
+transmitted field. `OPTIONS`, `/.well-known/` and `{prefix}/health` stay reachable without a proof
+in every mode.
+
+Needs no dependency beyond the JDK. The normative cross-language contract is
+`docs/proxy-proof-spec.md` in the vgi-rpc repository.
+
 ## License
 
 [Apache License 2.0](LICENSE) — Copyright 2026 Query Farm LLC · https://query.farm

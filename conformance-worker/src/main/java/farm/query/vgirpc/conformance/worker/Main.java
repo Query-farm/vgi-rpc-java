@@ -18,6 +18,7 @@ import farm.query.vgirpc.http.auth.JwtAuthenticator;
 import farm.query.vgirpc.http.auth.MTlsAuthenticator;
 import farm.query.vgirpc.http.auth.OAuthPkce;
 import farm.query.vgirpc.http.auth.OidcMetadata;
+import farm.query.vgirpc.http.auth.ProxyProof;
 import farm.query.vgirpc.transport.StdioTransport;
 import farm.query.vgirpc.transport.TcpSocketTransport;
 import farm.query.vgirpc.transport.UnixSocketTransport;
@@ -80,6 +81,19 @@ public final class Main {
         // Unrelated to --compression, which selects the codec for
         // external-location payload uploads.
         boolean responseCompression = true;
+        // Proxy proof: HMAC evidence that a request arrived through a trusted
+        // proxy.  Mirrors the reference worker's CLI
+        // (tests/serve_conformance_http_proof.py) so the shared TestProxyProof
+        // group drives every language the same way.  The gate is an AND with
+        // whatever authenticates the caller, so it is installed by wrapping —
+        // never handed to Authenticator.chain, whose first-authenticated-wins
+        // semantics would let a later credential bypass it.
+        boolean httpProof = false;
+        String proofMode = "require";
+        String proofOriginId = "conformance-origin";
+        String proofSecrets = "";
+        int proofSkew = 30;
+        boolean proofReplayCache = true;
         ArgCursor c = new ArgCursor(args);
         while (c.hasNext()) {
             String a = c.next();
@@ -117,6 +131,13 @@ public final class Main {
                     authenticator = pkce.authenticator();
                     preHandlers.add(pkce.preHandler());
                 }
+                // --http-proof implies HTTP, mirroring --http-auth in the Go worker.
+                case "--http-proof" -> { mode = "http"; httpProof = true; }
+                case "--proof-mode" -> proofMode = c.requireValue(a);
+                case "--proof-origin-id" -> proofOriginId = c.requireValue(a);
+                case "--proof-secrets" -> proofSecrets = c.requireValue(a);
+                case "--proof-skew" -> proofSkew = Integer.parseInt(c.requireValue(a));
+                case "--proof-no-replay-cache" -> proofReplayCache = false;
                 case "--fake-storage" -> fakeStorageUrl = c.requireValue(a);
                 case "--externalize-threshold" -> externalizeThreshold = Long.parseLong(c.requireValue(a));
                 case "--max-request-bytes" -> maxRequestBytes = Long.parseLong(c.requireValue(a));
@@ -131,6 +152,10 @@ public final class Main {
                 case "--sticky-ttl" -> stickyTtl = Long.parseLong(c.requireValue(a));
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
+        }
+        if (httpProof) {
+            authenticator = buildProofGate(
+                    proofMode, proofOriginId, proofSecrets, proofSkew, proofReplayCache, authenticator);
         }
         FakeStorage fakeStorage = null;
         if (fakeStorageUrl != null) {
@@ -213,6 +238,32 @@ public final class Main {
                 .sessionKey(sessionKey)
                 .authKey(authKey)
                 .build();
+    }
+
+    /**
+     * Build the proxy-proof gate, wrapping {@code inner} when a credential mode was also selected.
+     *
+     * <p>{@code off} installs nothing at all: the feature is opt-in, and a worker that is not
+     * configured for it must behave exactly as it did before the feature existed — which is what
+     * {@code TestProxyProofOffMode} checks.
+     */
+    private static Authenticator buildProofGate(String mode, String originId, String secrets,
+                                                 int skewSeconds, boolean replayCache,
+                                                 Authenticator inner) {
+        if ("off".equals(mode)) return inner;
+        ProxyProof.Mode m = switch (mode) {
+            case "allow" -> ProxyProof.Mode.ALLOW;
+            case "require" -> ProxyProof.Mode.REQUIRE;
+            default -> null;
+        };
+        if (m == null) {
+            System.err.println("unknown --proof-mode: " + mode);
+            System.exit(2);
+        }
+        ProxyProof.Config cfg = ProxyProof.Config.of(m, originId, ProxyProof.parseSecrets(secrets))
+                .withSkewSeconds(skewSeconds);
+        if (!replayCache) cfg = cfg.withoutReplayCache();
+        return ProxyProof.require(cfg, inner);
     }
 
     private static Authenticator buildJwt(String spec) {
