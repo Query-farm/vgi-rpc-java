@@ -253,6 +253,58 @@ def _start_http_worker(*extra_args: str) -> Iterator[int]:
         proc.wait(timeout=5)
 
 
+# ---------------------------------------------------------------------------
+# Sticky failure-path fixtures (upstream TestSticky; see
+# vgi-rpc docs/sticky-sessions-spec.md §9.1)
+# ---------------------------------------------------------------------------
+
+# Shared AEAD key for the peer pair. Both workers can open each other's
+# session tokens, which is the point: the rejection under test has to come
+# from the server_id comparison, not from a decrypt failure.
+_STICKY_PEER_TOKEN_KEY = "5f" * 32
+
+
+@pytest.fixture(scope="session")
+def conformance_http_sticky_short_ttl_port() -> Iterator[int]:
+    """A sticky worker whose default session TTL is short enough to outwait.
+
+    Backs ``TestSticky::test_expired_session_surfaces_session_lost``; the
+    main worker's 300s default is not something a test can sit out.
+    """
+    yield from _start_http_worker("--http", "--sticky-ttl", "1")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_sticky_peer_ports() -> Iterator[tuple[int, int]]:
+    """Two sticky workers sharing one AEAD key, for the wrong-worker check.
+
+    Backs ``TestSticky::test_token_from_other_worker_rejected``. RpcServer
+    mints a random server_id per process, so the two peers differ without
+    any extra flag — which is what makes the shared key safe to use here.
+    """
+    gen_a = _start_http_worker("--http", "--token-key", _STICKY_PEER_TOKEN_KEY)
+    gen_b = _start_http_worker("--http", "--token-key", _STICKY_PEER_TOKEN_KEY)
+    port_a = next(gen_a)
+    try:
+        port_b = next(gen_b)
+        try:
+            yield port_a, port_b
+        finally:
+            next(gen_b, None)
+    finally:
+        next(gen_a, None)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_sticky_auth_port() -> Iterator[int]:
+    """A sticky worker that authenticates the ``X-Conformance-Principal`` header.
+
+    Backs ``TestSticky::test_cross_principal_replay_rejected``, which needs
+    one worker reachable as two identities.
+    """
+    yield from _start_http_worker("--http", "--sticky-auth")
+
+
 @pytest.fixture(scope="session")
 def proof_worker_factory() -> Iterator[Callable[..., Any]]:
     """Spawn Java workers gated on proxy proof, for the shared TestProxyProof group.

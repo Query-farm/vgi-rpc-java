@@ -150,6 +150,7 @@ public final class Main {
                 case "--no-compression" -> responseCompression = false;
                 case "--no-sticky" -> stickyEnabled = false;
                 case "--sticky-ttl" -> stickyTtl = Long.parseLong(c.requireValue(a));
+                case "--sticky-auth" -> authenticator = principalHeaderAuthenticator();
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
         }
@@ -280,6 +281,29 @@ public final class Main {
             }
         }
         return b.build();
+    }
+
+    /**
+     * Resolve the principal named in {@code X-Conformance-Principal}, or stay anonymous.
+     *
+     * <p>Backs {@code TestSticky::test_cross_principal_replay_rejected}, which needs one
+     * worker reachable as two distinct identities so it can open a session as one and
+     * replay the token as the other. Naming yourself in a header is obviously not
+     * authentication — it is the cheapest thing every port can implement identically,
+     * and the test only needs the two identities to be distinguishable.
+     *
+     * <p>Requests without the header stay anonymous rather than being rejected: the
+     * conformance suite probes {@code GET /health} and the capability endpoint before
+     * it authenticates anything.
+     */
+    private static Authenticator principalHeaderAuthenticator() {
+        return request -> {
+            String principal = request.getHeader("X-Conformance-Principal");
+            if (principal == null || principal.isEmpty()) {
+                return AuthContext.ANONYMOUS;
+            }
+            return new AuthContext("conformance", true, principal, Collections.emptyMap());
+        };
     }
 
     private static Authenticator buildBearer(String spec) {
