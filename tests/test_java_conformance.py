@@ -167,9 +167,9 @@ def conformance_http_port(java_http_port: int) -> int:
 
 @pytest.fixture(scope="session")
 def conformance_http_auth_port() -> Iterator[int]:
-    """Spawn an HTTP worker with bearer auth so every RPC POST returns 401."""
+    """Spawn a reject-all HTTP worker, so every RPC POST returns 401."""
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--http", "--auth-bearer", "secret=alice"],
+        [JAVA_WORKER, "--http-auth"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -183,6 +183,21 @@ def conformance_http_auth_port() -> Iterator[int]:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_auth_reason_port(conformance_http_auth_port: int) -> int:
+    """Port of a worker that honours ``X-Conformance-Auth-Reason``.
+
+    Backs the shared ``TestUnauthorized`` reason-code tests. Membership in
+    the closed set is not enough on its own — a server answering every 401
+    with ``unauthorized`` satisfies that. These tests prove the codes are
+    *discriminated*, which is what makes them worth branching on.
+
+    ``--http-auth`` already reads the header, so this is the same worker
+    under the name the shared suite looks up.
+    """
+    return conformance_http_auth_port
 
 
 @pytest.fixture(scope="session")
@@ -251,6 +266,58 @@ def _start_http_worker(*extra_args: str) -> Iterator[int]:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_cold_call_cache_port() -> Iterator[int]:
+    """Spawn an HTTP worker with the per-process call-state cache disabled.
+
+    Backs the shared ``TestColdCallStateCache`` group, which pins the rule
+    that a client echoes the call token on **every** continuation. With the
+    cache warm a client that never echoes still works, and only breaks once
+    a continuation lands on a process that never saw the stream's ``/init``
+    — a restarted worker, an evicted entry, a load-balanced relay. Booting
+    with the cache off turns that load-dependent bug into a deterministic
+    one: every turn takes the miss path.
+    """
+    yield from _start_http_worker("--http", "--no-call-state-cache")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_introspect_port() -> Iterator[int]:
+    """Spawn an HTTP worker with token introspection enabled.
+
+    Backs the shared ``TestTokenIntrospection`` group. It needs its own worker
+    because the endpoint resolves nothing unless explicitly enabled -- which
+    ``TestTokenIntrospectionOffMode`` asserts against the default one. The
+    worker is configured with the exact introspector / subject / JWS-trap
+    constants the shared suite posts; anything else reads as "did not resolve".
+    """
+    yield from _start_http_worker("--http", "--introspect")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_cors_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Spawn an HTTP worker that grants browser access to one fixed origin.
+
+    Backs the shared ``TestCors`` group. It needs its own worker because CORS
+    is opt-in and the default one must stay header-free -- ``TestCorsOffMode``
+    runs against that one and checks exactly that. The origin is the constant
+    the shared suite preflights with; a mismatch reads as "origin refused".
+
+    Storage mode is deliberate: the derived exposure check can only catch a
+    missing entry for a header the worker actually advertises, so a *plain*
+    worker here would silently skip the conditional half of the capability
+    set -- the size caps and the upload-URL trio -- which are exactly the
+    exposures a port is most likely to miss.
+    """
+    yield from _start_http_worker(
+        "--http",
+        "--fake-storage",
+        conformance_fake_storage,
+        "--cors-origin",
+        "https://conformance.example",
+    )
 
 
 # ---------------------------------------------------------------------------

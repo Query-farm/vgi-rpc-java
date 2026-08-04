@@ -95,39 +95,48 @@ class HttpStreamHandlerResumeTest {
         return out.toByteArray();
     }
 
-    private static byte[] continuationRequest(String method, String token) throws Exception {
+    /**
+     * A conformant client echoes BOTH tokens on every continuation: the
+     * cursor it was just handed and the call token /init minted once. That is
+     * precisely what lets a handler which never saw the /init resume.
+     */
+    private static byte[] continuationRequest(String method, String token, String callToken)
+            throws Exception {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(RpcStream.EMPTY_SCHEMA);
             Map<String, String> md = Wire.requestMetadata(method);
             md.put(Metadata.STREAM_STATE, token);
+            if (callToken != null) md.put(Metadata.CALL_STATE, callToken);
             Wire.writeZeroBatch(w, RpcStream.EMPTY_SCHEMA, md);
         }
         return out.toByteArray();
     }
 
     /** Parse a producer response: data row values + trailing continuation token (null when finished). */
-    private record Turn(List<Long> values, String token, String error) {}
+    private record Turn(List<Long> values, String token, String callToken, String error) {}
 
     private static Turn readTurn(byte[] response) throws Exception {
         List<Long> values = new ArrayList<>();
         String token = null;
+        String callToken = null;
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(response), Allocators.root())) {
             Map<String, String> md;
             while ((md = r.readNextBatch()) != null) {
                 if (md.containsKey(Metadata.LOG_LEVEL) && "EXCEPTION".equals(md.get(Metadata.LOG_LEVEL))) {
-                    return new Turn(values, null, md.get(Metadata.LOG_MESSAGE));
+                    return new Turn(values, null, null, md.get(Metadata.LOG_MESSAGE));
                 }
                 VectorSchemaRoot root = r.root();
                 if (root.getRowCount() == 0) {
                     if (md.containsKey(Metadata.STREAM_STATE)) token = md.get(Metadata.STREAM_STATE);
+                    if (md.containsKey(Metadata.CALL_STATE)) callToken = md.get(Metadata.CALL_STATE);
                     continue;
                 }
                 BigIntVector v = (BigIntVector) root.getVector(0);
                 for (int i = 0; i < root.getRowCount(); i++) values.add(v.get(i));
             }
         }
-        return new Turn(values, token, null);
+        return new Turn(values, token, callToken, null);
     }
 
     @Test
@@ -144,16 +153,16 @@ class HttpStreamHandlerResumeTest {
         RpcServer serverB = new RpcServer(CounterService.class, new CounterServiceImpl());
         HttpStreamHandler handlerB = new HttpStreamHandler(serverB, KEY, 0, Long.MAX_VALUE);
 
-        Turn second = readTurn(handlerB.handleExchange("count_to", continuationRequest("count_to", first.token())));
+        Turn second = readTurn(handlerB.handleExchange("count_to", continuationRequest("count_to", first.token(), first.callToken())));
         assertNull(second.error());
         assertEquals(List.of(1L), second.values());
         assertNotNull(second.token());
 
-        Turn third = readTurn(handlerB.handleExchange("count_to", continuationRequest("count_to", second.token())));
+        Turn third = readTurn(handlerB.handleExchange("count_to", continuationRequest("count_to", second.token(), first.callToken())));
         assertEquals(List.of(2L), third.values());
 
         // The stream finishes on whichever handler holds the final token.
-        Turn last = readTurn(handlerB.handleExchange("count_to", continuationRequest("count_to", third.token())));
+        Turn last = readTurn(handlerB.handleExchange("count_to", continuationRequest("count_to", third.token(), first.callToken())));
         assertNull(last.error());
         assertTrue(last.values().isEmpty());
         assertNull(last.token(), "finished producer must not mint a token");
@@ -169,12 +178,12 @@ class HttpStreamHandlerResumeTest {
         HttpStreamHandler handlerA = new HttpStreamHandler(serverA, KEY, 0, Long.MAX_VALUE);
         Turn first = readTurn(handlerA.handleInit("count_to", initRequest(serverA, "count_to", Map.of("limit", 2L))));
         assertNotNull(first.token());
-        Turn refused = readTurn(handler.handleExchange("count_to", continuationRequest("count_to", first.token())));
+        Turn refused = readTurn(handler.handleExchange("count_to", continuationRequest("count_to", first.token(), first.callToken())));
         assertNotNull(refused.error());
         assertTrue(refused.error().contains("Cannot resolve state type"), refused.error());
 
         // …but the in-process path (init then exchange on the same handler) still works.
-        Turn cont = readTurn(handlerA.handleExchange("count_to", continuationRequest("count_to", first.token())));
+        Turn cont = readTurn(handlerA.handleExchange("count_to", continuationRequest("count_to", first.token(), first.callToken())));
         assertNull(cont.error());
         assertEquals(List.of(1L), cont.values());
     }

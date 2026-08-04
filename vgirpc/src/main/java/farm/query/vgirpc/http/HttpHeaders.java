@@ -14,6 +14,13 @@ public final class HttpHeaders {
 
     public static final String AUTHORIZATION    = "Authorization";
     public static final String WWW_AUTHENTICATE = "WWW-Authenticate";
+    /**
+     * Per-request correlation id, echoed from the caller when supplied and
+     * generated otherwise. It is what ties a failure a client saw to this
+     * server's own log line for the same call, so it rides every response —
+     * including the error paths, which are the ones anybody looks up.
+     */
+    public static final String REQUEST_ID       = "X-Request-ID";
     public static final String API_KEY          = "X-API-Key";
     public static final String USER_AGENT       = "User-Agent";
     public static final String CONTENT_TYPE     = "Content-Type";
@@ -32,6 +39,14 @@ public final class HttpHeaders {
      *  a client's fetch/proxy layer would mangle or auto-decode a standard
      *  {@code Content-Encoding}, so the response must not claim one. */
     public static final String X_VGI_CONTENT_ENCODING = "X-VGI-Content-Encoding";
+
+    /** Carries one {@link AuthReason} on every 401. */
+    public static final String VGI_AUTH_REASON = "VGI-Auth-Reason";
+
+    /** {@code "true"} on 401s from a service whose auth depends on a reverse
+     *  proxy. Omitted otherwise — never {@code "false"}, since a note that
+     *  appears everywhere is one operators learn to skip. */
+    public static final String VGI_AUTH_PROXY_REQUIRED = "VGI-Auth-Proxy-Required";
 
     /** XFCC (Envoy / Istio forwarded client certificate) header. */
     public static final String X_FORWARDED_CLIENT_CERT = "x-forwarded-client-cert";

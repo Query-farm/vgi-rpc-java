@@ -10,9 +10,12 @@ import farm.query.vgirpc.conformance.ConformanceService;
 import farm.query.vgirpc.conformance.ConformanceServiceImpl;
 import farm.query.vgirpc.external.ExternalLocationConfig;
 import farm.query.vgirpc.external.LocationResolver;
+import farm.query.vgirpc.http.AuthFailure;
+import farm.query.vgirpc.http.AuthReason;
 import farm.query.vgirpc.http.Authenticator;
 import farm.query.vgirpc.http.HttpPreHandler;
 import farm.query.vgirpc.http.HttpServer;
+import farm.query.vgirpc.http.TokenIdentity;
 import farm.query.vgirpc.http.auth.BearerAuthenticator;
 import farm.query.vgirpc.http.auth.JwtAuthenticator;
 import farm.query.vgirpc.http.auth.MTlsAuthenticator;
@@ -36,6 +39,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 public final class Main {
 
@@ -65,6 +69,12 @@ public final class Main {
         long maxRequestBytes = -1;
         String compression = "none";
         String accessLogPath = null;
+        // Optional access-log behaviours, mirroring the Python reference's flag
+        // names so one driver can exercise every port the same way.
+        double accessLogSample = 1.0;
+        boolean accessLogAsync = false;
+        int accessLogQueueSize = 10000;
+        boolean accessLogPayloads = true;
         boolean strictMode = false;
         // 0 = unbounded; --strict bumps both to 1 MiB to mirror Python's
         // tests/serve_conformance_http_strict.py.
@@ -94,6 +104,18 @@ public final class Main {
         String proofSecrets = "";
         int proofSkew = 30;
         boolean proofReplayCache = true;
+        // The call-state cache is a pure accelerator; --no-call-state-cache
+        // turns every stream continuation onto the miss path so the shared
+        // TestColdCallStateCache group observes it deterministically.
+        boolean callStateCache = true;
+        // CORS is opt-in, so the default worker must stay header-free — that
+        // "off by default" property is itself a conformance contract
+        // (TestCorsOffMode), and only --cors-origin opts a worker out of it.
+        List<String> corsOrigins = new ArrayList<>();
+        // Token introspection is off unless asked for -- that "absent by default"
+        // property is itself a conformance contract (TestTokenIntrospectionOffMode),
+        // which runs against the plain worker.
+        boolean introspect = false;
         ArgCursor c = new ArgCursor(args);
         while (c.hasNext()) {
             String a = c.next();
@@ -131,7 +153,8 @@ public final class Main {
                     authenticator = pkce.authenticator();
                     preHandlers.add(pkce.preHandler());
                 }
-                // --http-proof implies HTTP, mirroring --http-auth in the Go worker.
+                // Both imply HTTP, mirroring the Go and Rust workers' flags.
+                case "--http-auth" -> { mode = "http"; authenticator = rejectAllAuthenticator(); }
                 case "--http-proof" -> { mode = "http"; httpProof = true; }
                 case "--proof-mode" -> proofMode = c.requireValue(a);
                 case "--proof-origin-id" -> proofOriginId = c.requireValue(a);
@@ -143,6 +166,10 @@ public final class Main {
                 case "--max-request-bytes" -> maxRequestBytes = Long.parseLong(c.requireValue(a));
                 case "--compression" -> compression = c.requireValue(a);
                 case "--access-log" -> accessLogPath = c.requireValue(a);
+                case "--access-log-sample" -> accessLogSample = Double.parseDouble(c.requireValue(a));
+                case "--access-log-async" -> accessLogAsync = true;
+                case "--access-log-queue-size" -> accessLogQueueSize = Integer.parseInt(c.requireValue(a));
+                case "--access-log-no-payloads" -> accessLogPayloads = false;
                 case "--strict" -> strictMode = true;
                 case "--max-response-bytes" -> maxResponseBytes = Long.parseLong(c.requireValue(a));
                 case "--max-externalized-response-bytes" ->
@@ -151,9 +178,18 @@ public final class Main {
                 case "--no-sticky" -> stickyEnabled = false;
                 case "--sticky-ttl" -> stickyTtl = Long.parseLong(c.requireValue(a));
                 case "--sticky-auth" -> authenticator = principalHeaderAuthenticator();
+                case "--no-call-state-cache" -> callStateCache = false;
+                // Implies HTTP, like --http-auth and --http-proof; repeatable.
+                case "--cors-origin" -> { mode = "http"; corsOrigins.add(c.requireValue(a)); }
+                // Implies HTTP, and implies principal-header auth below so the
+                // introspector allowlist has something to check.
+                case "--introspect" -> { mode = "http"; introspect = true; }
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
         }
+        // Applied after the loop so flag order does not matter, and only when no
+        // stronger mode was selected.
+        if (introspect && authenticator == null) authenticator = principalHeaderAuthenticator();
         if (httpProof) {
             authenticator = buildProofGate(
                     proofMode, proofOriginId, proofSecrets, proofSkew, proofReplayCache, authenticator);
@@ -179,7 +215,17 @@ public final class Main {
         }
         if (accessLogPath != null) {
             OutputStream accessLogOut = new FileOutputStream(accessLogPath, true);
-            server.setDispatchHook(new AccessLogHook(accessLogOut, "vgi-rpc-java-conformance"));
+            AccessLogHook hook = AccessLogHook.builder(accessLogOut)
+                    .serverVersion("vgi-rpc-java-conformance")
+                    .sampleRate(accessLogSample)
+                    .logPayloads(accessLogPayloads)
+                    .asyncQueueSize(accessLogAsync ? accessLogQueueSize : 0)
+                    .build();
+            server.setDispatchHook(hook);
+            // An async hook holds records in a queue; without this a normal
+            // shutdown would discard whatever had not reached disk, and the
+            // driver would read a truncated log as a conformance failure.
+            Runtime.getRuntime().addShutdownHook(new Thread(hook::close));
         }
         if (mode == null) { servePipe(server); return; }
         if (strictMode) {
@@ -192,7 +238,8 @@ public final class Main {
                     maxResponseBytes, maxExternalizedResponseBytes,
                     stickyEnabled, stickyTtl, responseCompression,
                     // Only require mode denies, so only require mode advertises.
-                    httpProof && "require".equals(proofMode));
+                    httpProof && "require".equals(proofMode),
+                    callStateCache, corsOrigins, introspect);
             case "unix" -> serveUnix(server, Path.of(unixPath));
             case "tcp" -> serveTcp(server, tcpHost, tcpPort);
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
@@ -306,6 +353,76 @@ public final class Main {
         };
     }
 
+    // Fixed values the shared TestTokenIntrospection group is written against:
+    // it posts the subject credential and asserts the principal, so a port
+    // supplying the conformance_http_introspect_port fixture must configure
+    // exactly these.
+    private static final String CONFORMANCE_INTROSPECTOR = "conformance-introspector";
+    private static final String CONFORMANCE_SUBJECT_TOKEN = "conformance-opaque-subject-token";
+    private static final String CONFORMANCE_SUBJECT_PRINCIPAL = "subject@conformance.example";
+    private static final String CONFORMANCE_SUBJECT_TOKEN_NAME = "conformance-subject";
+    private static final long CONFORMANCE_SUBJECT_TTL = 300;
+    /**
+     * A JWS-shaped credential the resolver <em>would</em> resolve.
+     *
+     * <p>Deliberately resolvable: against an unknown JWS a port with no shape
+     * guard rejects it as unknown and passes the test for the wrong reason. Made
+     * resolvable, the guard is the only thing that can produce a rejection — a
+     * port missing it answers 200 and fails.
+     */
+    private static final String CONFORMANCE_JWS_TRAP_TOKEN =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
+
+    /** Resolve the one fixed subject credential the shared tests post. */
+    private static Optional<TokenIdentity> resolveConformanceToken(String token) {
+        if (CONFORMANCE_SUBJECT_TOKEN.equals(token) || CONFORMANCE_JWS_TRAP_TOKEN.equals(token)) {
+            return Optional.of(new TokenIdentity(
+                    CONFORMANCE_SUBJECT_PRINCIPAL, CONFORMANCE_SUBJECT_TOKEN_NAME, CONFORMANCE_SUBJECT_TTL));
+        }
+        return Optional.empty();
+    }
+
+    /** Conformance-fixture affordance, never part of the protocol. */
+    private static final String CONFORMANCE_REASON_HEADER = "X-Conformance-Auth-Reason";
+
+    /**
+     * The reasons a <em>request</em> may ask to be refused with.
+     *
+     * <p>{@code proxy_required} is deliberately absent: the unauthorized spec derives it from
+     * server configuration, never from the request, so a worker letting a caller summon it would
+     * advertise a proxy dependency that does not exist. {@code unauthorized} is absent because it
+     * is what the <em>absence</em> of a requested reason must produce — making it requestable
+     * would hide whether the fallback path works at all. Anything not in this map, including a
+     * typo, falls through to that fallback, so a test asking for a reason it cannot get fails
+     * rather than quietly passing.
+     */
+    private static final Map<String, AuthReason> REQUESTABLE_REASONS = Map.of(
+            "missing_credential", AuthReason.MISSING_CREDENTIAL,
+            "invalid_credential", AuthReason.INVALID_CREDENTIAL,
+            "expired_credential", AuthReason.EXPIRED_CREDENTIAL,
+            "insufficient_scope", AuthReason.INSUFFICIENT_SCOPE);
+
+    /**
+     * Refuse every RPC call, with the reason the request named if it named one.
+     *
+     * <p>Backs the shared {@code TestHealth} exemption check and {@code TestUnauthorized}. The
+     * latter needs one worker that <em>discriminates</em> between codes: membership in the closed
+     * set is satisfied by a server stamping {@code unauthorized} on every 401, which is exactly
+     * the failure that makes the code not worth branching on.
+     */
+    private static Authenticator rejectAllAuthenticator() {
+        return request -> {
+            String requested = request.getHeader(CONFORMANCE_REASON_HEADER);
+            AuthReason reason = requested == null ? null : REQUESTABLE_REASONS.get(requested);
+            if (reason != null) {
+                // The detail is the code itself so the suite can assert header and body agree
+                // without pinning prose.
+                throw new AuthFailure(reason, reason.code());
+            }
+            throw new AuthFailure("authentication required");
+        };
+    }
+
     private static Authenticator buildBearer(String spec) {
         Map<String, AuthContext> tokens = new LinkedHashMap<>();
         for (Map.Entry<String, String> e : splitKv(spec, "--auth-bearer").entrySet()) {
@@ -349,13 +466,22 @@ public final class Main {
                                    boolean stickyEnabled,
                                    long stickyTtl,
                                    boolean responseCompression,
-                                   boolean proxyProofRequired) throws Exception {
+                                   boolean proxyProofRequired,
+                                   boolean callStateCache,
+                                   List<String> corsOrigins,
+                                   boolean introspect) throws Exception {
         HttpServer.Config.Builder cb = HttpServer.Config.builder()
                 .tokenKey(tokenKey)
                 .tokenTtlSeconds(tokenTtl)
                 .authenticator(authenticator)
                 .preHandlers(preHandlers)
                 .proxyProofRequired(proxyProofRequired);
+        if (!callStateCache) cb.callStateCacheMaxEntries(0);
+        if (!corsOrigins.isEmpty()) cb.corsOrigins(corsOrigins);
+        if (introspect) {
+            cb.tokenIntrospection(Main::resolveConformanceToken, List.of(CONFORMANCE_INTROSPECTOR))
+              .introspectTtlSeconds(CONFORMANCE_SUBJECT_TTL);
+        }
         // Empty producible set ⇒ present-but-empty VGI-Supported-Encodings and
         // no compression, whatever the client asks for. null would mean "unset"
         // and fall back to the default set, so the empty list is load-bearing.

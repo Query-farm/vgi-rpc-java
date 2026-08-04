@@ -18,4 +18,6 @@ public final class InvalidCredentials extends AuthException {
      * @param wwwAuthenticate value for the {@code WWW-Authenticate} challenge header, or {@code null}
      */
     public InvalidCredentials(String message, String wwwAuthenticate) { super(message, wwwAuthenticate); }
+
+    @Override public AuthReason reason() { return AuthReason.INVALID_CREDENTIAL; }
 }

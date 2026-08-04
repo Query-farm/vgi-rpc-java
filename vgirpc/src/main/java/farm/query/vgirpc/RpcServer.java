@@ -23,6 +23,7 @@ import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -219,11 +220,16 @@ public final class RpcServer {
      * <p>Best-effort: returns {@code null} on any failure so observability never fails
      * dispatch.
      */
-    private static byte[] serializeRequestBatch(VectorSchemaRoot root, Map<String, String> meta) {
+    private static byte[] serializeRequestBatch(VectorSchemaRoot root, Map<String, String> meta,
+                                                 DictionaryProvider dictionaries) {
         try {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             try (IpcStreamWriter w = new IpcStreamWriter(baos)) {
-                w.writeBatch(root, meta);
+                // Dictionary-encoded params (enums) need their dictionary batches
+                // in the stream, or the writer refuses and the record loses
+                // request_data entirely — which the access-log schema reads as a
+                // missing required property on every enum-taking method.
+                w.writeBatch(root, meta, dictionaries);
                 w.writeEos();
             }
             return baos.toByteArray();
@@ -358,8 +364,13 @@ public final class RpcServer {
                     dispatchInfo.principal = scope.auth() != null && scope.auth().principal() != null ? scope.auth().principal() : "";
                     dispatchInfo.authDomain = scope.auth() != null && scope.auth().domain() != null ? scope.auth().domain() : "";
                     dispatchInfo.authenticated = scope.auth() != null && scope.auth().authenticated();
+                    dispatchInfo.claims = scope.auth() != null ? scope.auth().claims() : null;
                     dispatchInfo.transportMetadata = scope.transportMetadata();
-                    dispatchInfo.requestData = serializeRequestBatch(paramsRoot, meta);
+                    // Same provider choice the kwargs decode made above: a
+                    // resolved external batch carries its own schema and no
+                    // reader dictionaries.
+                    dispatchInfo.requestData = serializeRequestBatch(paramsRoot, meta,
+                            resolvedParams != null ? null : reader.dictionaryProvider());
                     if ("stream".equals(dispatchInfo.methodType)) {
                         dispatchInfo.streamId = AccessLogHook.randomStreamId();
                     }

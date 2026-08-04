@@ -46,6 +46,8 @@ public final class DispatchInfo {
     public boolean cancelled;
     /** Transport-level request metadata (e.g. HTTP headers) captured by the auth scope; may be null. */
     public Map<String, ?> transportMetadata;
+    /** Raw claims of the authenticated principal; may be null or empty. Redacted by the emitter, not here. */
+    public Map<String, Object> claims;
 
     /** Sticky-session id (hex), or null when no session was bound. */
     public String sessionId;

@@ -18,4 +18,6 @@ public final class MissingCredentials extends AuthException {
      * @param wwwAuthenticate value for the {@code WWW-Authenticate} challenge header, or {@code null}
      */
     public MissingCredentials(String message, String wwwAuthenticate) { super(message, wwwAuthenticate); }
+
+    @Override public AuthReason reason() { return AuthReason.MISSING_CREDENTIAL; }
 }

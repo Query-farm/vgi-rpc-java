@@ -66,6 +66,12 @@ public final class HttpStreamHandler {
     private final RpcServer rpc;
     private final byte[] tokenKey;
     private final long tokenTtlSeconds;
+    /**
+     * Accelerates the fixed half of a stream's state. Purely an accelerator:
+     * a miss reopens the call token the client echoed, so correctness never
+     * depends on a hit. See {@link CallStateCache}.
+     */
+    private final CallStateCache callStates;
     private final long maxResponseBytes;
     /**
      * method name → concrete {@link StreamState} class. Seeded at construction by
@@ -97,6 +103,21 @@ public final class HttpStreamHandler {
      *     producers of large batches must use the external-location protocol.
      */
     public HttpStreamHandler(RpcServer rpc, byte[] tokenKey, long tokenTtlSeconds, long maxResponseBytes) {
+        this(rpc, tokenKey, tokenTtlSeconds, maxResponseBytes, CallStateCache.DEFAULT_MAX_ENTRIES);
+    }
+
+    /**
+     * @param tokenKey       AEAD master key (32 bytes) for stream state
+     *     tokens; when {@code null} a random per-process key is generated.
+     * @param tokenTtlSeconds  maximum token age in seconds; {@code 0} disables
+     *     TTL enforcement.
+     * @param maxResponseBytes per-call response cap.
+     * @param callStateCacheMaxEntries entry ceiling for the call-state cache;
+     *     {@code 0} disables it, forcing every continuation to re-open the
+     *     call token the client echoed.
+     */
+    public HttpStreamHandler(RpcServer rpc, byte[] tokenKey, long tokenTtlSeconds, long maxResponseBytes,
+                              int callStateCacheMaxEntries) {
         if (tokenTtlSeconds < 0) {
             throw new IllegalArgumentException("tokenTtlSeconds must be >= 0, got " + tokenTtlSeconds);
         }
@@ -111,6 +132,7 @@ public final class HttpStreamHandler {
             new SecureRandom().nextBytes(this.tokenKey);
         }
         this.tokenTtlSeconds = tokenTtlSeconds;
+        this.callStates = new CallStateCache(tokenTtlSeconds, callStateCacheMaxEntries);
         this.maxResponseBytes = maxResponseBytes;
         seedStateTypes();
     }
@@ -234,10 +256,20 @@ public final class HttpStreamHandler {
                 return errorStream(new RuntimeException("Missing state token in exchange request"));
             }
             String principal = currentPrincipal();
+            // Open the cursor FIRST: its AEAD tag covers the call id and its
+            // AAD covers the caller, so the id is authenticated before it is
+            // used to resolve anything. See resolveCall for why that ordering
+            // is the whole security argument for the cache.
             StateToken token;
             try {
                 token = StateToken.unpack(tokenB64.getBytes(StandardCharsets.US_ASCII),
                         tokenKey, tokenTtlSeconds, principal);
+            } catch (Exception e) {
+                return errorStream(e);
+            }
+            CallToken call;
+            try {
+                call = resolveCall(token, req.meta().get(Metadata.CALL_STATE), principal);
             } catch (Exception e) {
                 return errorStream(e);
             }
@@ -247,8 +279,8 @@ public final class HttpStreamHandler {
                 return errorStream(new IllegalStateException(
                         "Cannot resolve state type for method '" + method + "'"));
             }
-            Schema outputSchema = deserializeSchema(token.outputSchema());
-            Schema inputSchema = deserializeSchema(token.inputSchema());
+            Schema outputSchema = deserializeSchema(call.outputSchema());
+            Schema inputSchema = deserializeSchema(call.inputSchema());
             boolean isProducer = inputSchema.getFields().isEmpty();
             StreamState state = StateSerializer.deserialize(token.state(), stateCls);
 
@@ -351,9 +383,66 @@ public final class HttpStreamHandler {
 
     private String serializeContinuationToken(StreamState state, StateToken priorToken, String principal) {
         byte[] newStateBytes = StateSerializer.serialize(state);
-        StateToken newToken = new StateToken(newStateBytes, priorToken.outputSchema(), priorToken.inputSchema(),
-                priorToken.streamId(), System.currentTimeMillis() / 1000);
+        StateToken newToken = new StateToken(newStateBytes, priorToken.callId(),
+                System.currentTimeMillis() / 1000);
         return new String(newToken.pack(tokenKey, principal), StandardCharsets.US_ASCII);
+    }
+
+    /**
+     * Resolve a stream's fixed half for an already-authenticated cursor.
+     *
+     * <p>Order matters, and it is the whole security argument for the cache.
+     * The cursor is opened first by the caller; its AEAD tag covers the call
+     * id and its AAD covers the caller's identity. Only then is that
+     * authenticated id used as a cache key. A client cannot name a call id
+     * the server did not mint for it, so a cache hit can never hand back
+     * another principal's call state — and on a hit the presented call token
+     * is not consulted at all, which is exactly the work being avoided.</p>
+     *
+     * <p>On a miss (cold process, evicted entry, or a request load-balanced
+     * to a node that never saw this stream's {@code /init}) the client's call
+     * token is opened and verified, and its embedded call id must match the
+     * one the cursor named.</p>
+     */
+    private CallToken resolveCall(StateToken cursor, String callTokenB64, String principal) {
+        CallToken cached = callStates.get(cursor.callId(), principal);
+        if (cached != null) {
+            return cached;
+        }
+        if (callTokenB64 == null) {
+            throw new IllegalArgumentException("Missing call token in exchange request");
+        }
+        CallToken call = CallToken.unpack(callTokenB64.getBytes(StandardCharsets.US_ASCII),
+                tokenKey, tokenTtlSeconds, principal);
+        if (!java.util.Arrays.equals(call.callId(), cursor.callId())) {
+            // The cursor named a different call. Uniform message: reachable
+            // only by pairing two tokens the same principal legitimately
+            // holds, so it carries nothing worth distinguishing.
+            throw new IllegalArgumentException("Malformed state token");
+        }
+        callStates.put(cursor.callId(), principal, call);
+        return call;
+    }
+
+    /** Mint a stream's call id, call token, and first cursor at {@code /init}. */
+    private Map<String, String> mintInitTokens(StreamState state, Schema outputSchema,
+                                                Schema inputSchema, String principal) {
+        byte[] callId = new byte[Tokens.CALL_ID_LEN];
+        new java.security.SecureRandom().nextBytes(callId);
+        long now = System.currentTimeMillis() / 1000;
+
+        CallToken call = new CallToken(serializeSchema(outputSchema), serializeSchema(inputSchema),
+                newStreamId(), callId, now);
+        // Warm the cache with what we already hold, so this stream's first
+        // continuation does not have to open the token it was just handed.
+        callStates.put(callId, principal, call);
+
+        StateToken cursor = new StateToken(StateSerializer.serialize(state), callId, now);
+        return Map.of(
+                Metadata.STREAM_STATE,
+                new String(cursor.pack(tokenKey, principal), StandardCharsets.US_ASCII),
+                Metadata.CALL_STATE,
+                new String(call.pack(tokenKey, principal), StandardCharsets.US_ASCII));
     }
 
     private CallContext buildCallContext(String method, Consumer<Message> sink) {
@@ -399,13 +488,8 @@ public final class HttpStreamHandler {
                 // If the producer isn't finished, append a zero-row state-token batch so the
                 // client knows to call /exchange to continue. Finished streams just EOS.
                 if (!coll.finished()) {
-                    StateToken token = new StateToken(
-                            StateSerializer.serialize(state),
-                            serializeSchema(outputSchema),
-                            serializeSchema(inputSchema),
-                            newStreamId(), System.currentTimeMillis() / 1000);
-                    Map<String, String> md = Map.of(Metadata.STREAM_STATE,
-                            new String(token.pack(tokenKey, currentPrincipal()), StandardCharsets.US_ASCII));
+                    Map<String, String> md = mintInitTokens(state, outputSchema, inputSchema,
+                            currentPrincipal());
                     Wire.writeZeroBatch(w, outputSchema, md);
                 }
             }
@@ -416,16 +500,11 @@ public final class HttpStreamHandler {
                                          OutputCollectorSink sink) throws IOException {
         Schema outputSchema = streamResult.outputSchema();
         Schema inputSchema = streamResult.inputSchema();
-        StateToken token = new StateToken(
-                StateSerializer.serialize(streamResult.state()),
-                serializeSchema(outputSchema),
-                serializeSchema(inputSchema),
-                newStreamId(), System.currentTimeMillis() / 1000);
+        Map<String, String> md = mintInitTokens(streamResult.state(), outputSchema, inputSchema,
+                currentPrincipal());
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
             sink.bind(w, outputSchema);
-            Map<String, String> md = Map.of(Metadata.STREAM_STATE,
-                    new String(token.pack(tokenKey, currentPrincipal()), StandardCharsets.US_ASCII));
             Wire.writeZeroBatch(w, outputSchema, md);
         }
     }

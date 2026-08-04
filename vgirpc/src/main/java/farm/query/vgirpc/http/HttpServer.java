@@ -5,6 +5,7 @@ package farm.query.vgirpc.http;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.luben.zstd.Zstd;
+import farm.query.vgirpc.AccessLogScope;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.CallContext;
@@ -67,6 +68,8 @@ import java.util.Map;
  *   stream (params). Response body is one Arrow IPC stream (result or error).</li>
  *   <li>{@code POST /vgi/{method}/init} and {@code /exchange} — streaming
  *   endpoints.</li>
+ *   <li>{@code POST /vgi/__introspect_token__} — opaque credential to principal;
+ *   refuses definitively unless {@link TokenIntrospection} is configured.</li>
  * </ul>
  */
 public final class HttpServer {
@@ -160,6 +163,11 @@ public final class HttpServer {
      *  Advertisement only — the gate is an opaque {@link Authenticator}, so the
      *  server has no way to read the posture back off it. */
     private final boolean proxyProofRequired;
+    /** The §5 proxy note, or {@code ""} when this service's auth does not
+     *  depend on a proxy. Computed once from configuration — never from what
+     *  failed on a request — so every 401 this server emits says the same
+     *  thing and none of them is an oracle. */
+    private final String proxyHint;
     private final boolean stickyEnabled;
     private final long stickyDefaultTtlSeconds;
     private final Map<String, String> stickyEchoHeaders;
@@ -172,6 +180,13 @@ public final class HttpServer {
      *  advertisement, so none of the three can disagree. Empty = never
      *  compress, and accept no compressed request bodies. */
     private final List<String> supportedEncodings;
+    /** The token-introspection endpoint, or {@code null} when no resolver was
+     *  configured. Null is the load-bearing state: no worker grows a
+     *  credential-to-identity oracle by upgrading a dependency. */
+    private final TokenIntrospection introspection;
+    /** Browser access policy, or {@code null} when no origin was configured —
+     *  CORS is opt-in, and off means not one {@code Access-Control-*} header. */
+    private final CorsPolicy cors;
     private int port;
 
     /**
@@ -193,7 +208,7 @@ public final class HttpServer {
     public HttpServer(RpcServer rpc, Config config) {
         this.rpc = rpc;
         this.streamHandler = new HttpStreamHandler(rpc, config.tokenKey(),
-                config.tokenTtlSeconds(), config.maxResponseBytes());
+                config.tokenTtlSeconds(), config.maxResponseBytes(), config.callStateCacheMaxEntries());
         this.authenticator = config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
         this.describeProvider = config.describeProvider();
         this.preHandlers = config.preHandlers();
@@ -207,6 +222,14 @@ public final class HttpServer {
         this.advertisedMaxResponseBytes = config.advertisedMaxResponseBytes();
         this.advertisedMaxExternalizedResponseBytes = config.advertisedMaxExternalizedResponseBytes();
         this.proxyProofRequired = config.proxyProofRequired();
+        // The proof gate contributes its header only in require mode: in allow
+        // mode an absent proof never denies, so the note would misdirect.
+        List<String> proxyAuthHeaders = new ArrayList<>();
+        if (config.proxyProofRequired()) proxyAuthHeaders.add(ProxyProof.PROOF_HEADER);
+        for (String h : config.proxyAuthHeaders()) {
+            if (!proxyAuthHeaders.contains(h)) proxyAuthHeaders.add(h);
+        }
+        this.proxyHint = Unauthorized.proxyHint(proxyAuthHeaders);
         this.stickyEnabled = config.stickyEnabled();
         this.stickyDefaultTtlSeconds = config.stickyDefaultTtlSeconds();
         this.stickyEchoHeaders = config.stickyEchoHeaders();
@@ -228,6 +251,14 @@ public final class HttpServer {
             this.sessionTokenKey = null;
             this.sessionRegistry = null;
         }
+        // Built before the CORS policy: corsExposeHeaders() reads this field, and
+        // the advertise/expose pair has to agree.
+        this.introspection = config.introspectResolver() == null ? null
+                : new TokenIntrospection(config.introspectResolver(), config.introspectPrincipals(),
+                        config.introspectTtlSeconds(), config.introspectRateLimitPerSecond());
+        this.cors = config.corsOrigins().isEmpty()
+                ? null
+                : new CorsPolicy(config.corsOrigins(), config.corsMaxAgeSeconds(), corsExposeHeaders());
         this.jetty = new Server();
         // Graceful-shutdown window: Jetty.stop() waits up to this many ms for
         // in-flight requests to finish before forcing closes. 15s is enough
@@ -342,6 +373,22 @@ public final class HttpServer {
      *                         is an opaque {@link Authenticator}, so the server
      *                         cannot introspect the posture and the operator states
      *                         it. Default {@code false}.
+     * @param proxyAuthHeaders proxy-injected headers this service's
+     *                         authentication depends on, for a custom
+     *                         {@link Authenticator} the framework cannot
+     *                         introspect. Their presence is what turns on the
+     *                         §5 proxy note ({@code VGI-Auth-Proxy-Required} +
+     *                         {@code proxy_hint}) on every 401. The built-in
+     *                         proxy-proof gate contributes its own header via
+     *                         {@code proxyProofRequired}, so this is only
+     *                         needed on top of that. Default empty.
+     * @param callStateCacheMaxEntries entry ceiling for the per-process
+     *                         call-state cache — a pure accelerator, since a
+     *                         miss reopens the call token the client echoed.
+     *                         {@code 0} disables it, which is how a client that
+     *                         forgets to echo that token fails deterministically
+     *                         rather than only on a cold node. Default
+     *                         {@value CallStateCache#DEFAULT_MAX_ENTRIES}.
      * @param stickyEnabled    enable opt-in HTTP sticky sessions: clients sending
      *                         {@code VGI-Session-Accept: true} get an HMAC-signed
      *                         session token bound to their principal, and calls
@@ -361,6 +408,37 @@ public final class HttpServer {
      *                         {@code null} disables those routes (the shared
      *                         {@code landing.html} and JSON health status are
      *                         still served).
+     * @param corsOrigins      origins allowed to call this server from a browser;
+     *                         empty (the default) leaves CORS off entirely — no
+     *                         {@code Access-Control-*} header on any response. A
+     *                         single {@code "*"} allows all. See
+     *                         {@link Builder#corsOrigins(List)}.
+     * @param corsMaxAgeSeconds preflight cache lifetime advertised via
+     *                         {@code Access-Control-Max-Age}; {@code 0} omits the
+     *                         header. Default
+     *                         {@value #DEFAULT_CORS_MAX_AGE_SECONDS}s. Ignored
+     *                         when {@code corsOrigins} is empty.
+     * @param introspectResolver enables {@code POST {prefix}/__introspect_token__}.
+     *                         This is the on/off switch: {@code null} (the
+     *                         default) leaves the endpoint refusing definitively
+     *                         and holding no resolver, so no worker grows a
+     *                         credential-to-identity oracle by upgrading a
+     *                         dependency. See {@link TokenIntrospection}.
+     * @param introspectPrincipals principals permitted to introspect. Required
+     *                         whenever {@code introspectResolver} is set, with
+     *                         <em>no permissive default</em>: authentication and
+     *                         introspection are different capabilities, and a
+     *                         deployment where any valid credential may introspect
+     *                         lets any user resolve any other user's credential to
+     *                         its owner.
+     * @param introspectTtlSeconds cache lifetime reported to the asker when a
+     *                         {@link TokenIdentity} names none. Default
+     *                         {@value TokenIntrospection#DEFAULT_TTL_SECONDS}s.
+     * @param introspectRateLimitPerSecond introspection requests allowed per
+     *                         caller per second (default
+     *                         {@value TokenIntrospection#DEFAULT_RATE_LIMIT_PER_SECOND}).
+     *                         Bounds, rather than closes, the oracle an
+     *                         allowlisted-but-compromised caller still has.
      */
     public record Config(
             String host,
@@ -382,14 +460,24 @@ public final class HttpServer {
             long advertisedMaxResponseBytes,
             long advertisedMaxExternalizedResponseBytes,
             boolean proxyProofRequired,
+            List<String> proxyAuthHeaders,
+            int callStateCacheMaxEntries,
             boolean stickyEnabled,
             long stickyDefaultTtlSeconds,
             Map<String, String> stickyEchoHeaders,
             boolean exposeTestDrainAdmin,
-            DescribeProvider describeProvider) {
+            DescribeProvider describeProvider,
+            List<String> corsOrigins,
+            long corsMaxAgeSeconds,
+            TokenResolver introspectResolver,
+            List<String> introspectPrincipals,
+            long introspectTtlSeconds,
+            int introspectRateLimitPerSecond) {
 
         /** 1 hour. */
         public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
+        /** 2 hours — the ceiling Chromium honours for a preflight cache entry. */
+        public static final long DEFAULT_CORS_MAX_AGE_SECONDS = 7200;
         /** 16 MiB applies to both request body and serialized response. */
         public static final long DEFAULT_MAX_BYTES = 16L << 20;
         /** 30 seconds. */
@@ -440,7 +528,10 @@ public final class HttpServer {
             prefix = prefix != null ? prefix : "";
             tokenKey = tokenKey != null ? tokenKey.clone() : null;
             preHandlers = preHandlers != null ? List.copyOf(preHandlers) : List.of();
+            proxyAuthHeaders = proxyAuthHeaders != null ? List.copyOf(proxyAuthHeaders) : List.of();
             stickyEchoHeaders = stickyEchoHeaders != null ? Map.copyOf(stickyEchoHeaders) : Map.of();
+            corsOrigins = corsOrigins != null ? List.copyOf(corsOrigins) : List.of();
+            introspectPrincipals = introspectPrincipals != null ? List.copyOf(introspectPrincipals) : List.of();
             supportedEncodings = supportedEncodings != null
                     ? normalizeEncodings(supportedEncodings)
                     : defaultSupportedEncodings();
@@ -448,8 +539,26 @@ public final class HttpServer {
             if (maxResponseBytes <= 0) throw new IllegalArgumentException("maxResponseBytes must be > 0");
             if (idleTimeoutMs < 0) throw new IllegalArgumentException("idleTimeoutMs must be >= 0");
             if (zstdLevel < 1 || zstdLevel > 22) throw new IllegalArgumentException("zstdLevel must be in [1, 22]");
+            if (callStateCacheMaxEntries < 0) {
+                throw new IllegalArgumentException("callStateCacheMaxEntries must be >= 0");
+            }
             if (stickyEnabled && stickyDefaultTtlSeconds <= 0) {
                 throw new IllegalArgumentException("stickyDefaultTtlSeconds must be > 0 when sticky is enabled");
+            }
+            if (corsMaxAgeSeconds < 0) throw new IllegalArgumentException("corsMaxAgeSeconds must be >= 0");
+            // Validated at construction rather than at the first proxy preflight:
+            // a credential-to-identity oracle is not something to discover is
+            // misconfigured in production.
+            if (introspectResolver != null) {
+                TokenIntrospection.normalizeIntrospectors(introspectPrincipals);
+            } else if (!introspectPrincipals.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "introspectPrincipals was given without introspectResolver; the endpoint stays "
+                                + "disabled, so the allowlist would have no effect. Pass both or neither.");
+            }
+            if (introspectTtlSeconds < 0) throw new IllegalArgumentException("introspectTtlSeconds must be >= 0");
+            if (introspectRateLimitPerSecond < 0) {
+                throw new IllegalArgumentException("introspectRateLimitPerSecond must be >= 0");
             }
         }
 
@@ -493,11 +602,19 @@ public final class HttpServer {
             private long advertisedMaxResponseBytes;
             private long advertisedMaxExternalizedResponseBytes;
             private boolean proxyProofRequired;
+            private List<String> proxyAuthHeaders = List.of();
+            private int callStateCacheMaxEntries = CallStateCache.DEFAULT_MAX_ENTRIES;
             private boolean stickyEnabled;
             private long stickyDefaultTtlSeconds = 300;
             private Map<String, String> stickyEchoHeaders = Map.of();
             private boolean exposeTestDrainAdmin;
             private DescribeProvider describeProvider;
+            private List<String> corsOrigins = List.of();
+            private long corsMaxAgeSeconds = DEFAULT_CORS_MAX_AGE_SECONDS;
+            private TokenResolver introspectResolver;
+            private List<String> introspectPrincipals = List.of();
+            private long introspectTtlSeconds = TokenIntrospection.DEFAULT_TTL_SECONDS;
+            private int introspectRateLimitPerSecond = TokenIntrospection.DEFAULT_RATE_LIMIT_PER_SECOND;
 
             /**
              * Listen address (default {@code "127.0.0.1"}). See {@link Config#host()}.
@@ -670,6 +787,39 @@ public final class HttpServer {
              */
             public Builder proxyProofRequired(boolean v) { this.proxyProofRequired = v; return this; }
             /**
+             * Declare the proxy-injected headers this service's authentication
+             * depends on, for a custom {@link Authenticator} the framework
+             * cannot introspect.
+             *
+             * <p>Declaring any header makes every 401 carry the §5 proxy note.
+             * That is deliberate: the note describes a <em>static</em> property
+             * of the deployment, not what failed on a given request, so it
+             * discloses nothing about which stage rejected an attempt — and it
+             * is still right in the case it exists for, where the proxy is not
+             * forwarding the header and every request 401s.
+             *
+             * <p>The built-in proxy-proof gate contributes {@code VGI-Proxy-Proof}
+             * on its own via {@link #proxyProofRequired(boolean)} (require mode
+             * only — in allow mode an absent proof never denies, so the note
+             * would misdirect), so this is only needed on top of that.
+             *
+             * @param headers header names a trusted proxy must set (default none)
+             * @return this builder
+             */
+            public Builder proxyAuthHeaders(List<String> headers) { this.proxyAuthHeaders = headers; return this; }
+            /**
+             * Entry ceiling for the per-process call-state cache; {@code 0} disables it.
+             *
+             * <p>The cache is an accelerator, never a contract — a miss reopens
+             * the call token the client echoed. Disabling it is how the
+             * stateless-relay path gets exercised on every turn instead of only
+             * on a cold or load-balanced node.
+             *
+             * @param v the ceiling (default {@value CallStateCache#DEFAULT_MAX_ENTRIES}); {@code 0} disables
+             * @return this builder
+             */
+            public Builder callStateCacheMaxEntries(int v) { this.callStateCacheMaxEntries = v; return this; }
+            /**
              * Enable opt-in HTTP sticky sessions.
              *
              * @param v {@code true} to honor {@code VGI-Session-Accept} opt-ins and
@@ -712,6 +862,99 @@ public final class HttpServer {
             public Builder describeProvider(DescribeProvider p) { this.describeProvider = p; return this; }
 
             /**
+             * Origins allowed to call this server from a browser; empty (the
+             * default) leaves CORS off entirely.
+             *
+             * <p>Off means <em>no</em> {@code Access-Control-*} header on any
+             * response, not a permissive default: a server that answers every
+             * origin regardless of configuration is a different — and worse —
+             * bug than one that answers none.
+             *
+             * <p>A single {@code "*"} entry allows all. That is safe here only
+             * because vgi-rpc credentials are header-borne and this server never
+             * sets {@code Access-Control-Allow-Credentials}, so a wildcard grant
+             * carries no ambient authority. Anything else is matched
+             * case-insensitively against the request's {@code Origin}, which is
+             * then echoed back.
+             *
+             * @param origins allowed origins (e.g. {@code ["https://app.example"]})
+             * @return this builder
+             */
+            public Builder corsOrigins(List<String> origins) { this.corsOrigins = origins; return this; }
+            /**
+             * Convenience for the single-origin case. See {@link #corsOrigins(List)}.
+             *
+             * @param origin the one allowed origin, or {@code "*"}
+             * @return this builder
+             */
+            public Builder corsOrigin(String origin) { return corsOrigins(List.of(origin)); }
+            /**
+             * How long a browser may cache a preflight, in seconds; {@code 0}
+             * omits {@code Access-Control-Max-Age} so the browser uses its own
+             * default. Ignored when no origin is configured.
+             *
+             * @param v cache lifetime (default {@value #DEFAULT_CORS_MAX_AGE_SECONDS}s)
+             * @return this builder
+             */
+            public Builder corsMaxAgeSeconds(long v) { this.corsMaxAgeSeconds = v; return this; }
+
+            /**
+             * Enable {@code POST {prefix}/__introspect_token__}, which resolves an
+             * opaque bearer credential to a principal for a reverse proxy that
+             * must know the caller's identity before it can authorize.
+             *
+             * <p>Off unless called. A disabled worker still answers the path
+             * definitively ({@code 404 not_enabled}) while holding no resolver and
+             * looking nothing up — a caller that reads anything else as transient
+             * would otherwise retry forever against a worker that will never
+             * support the feature.
+             *
+             * <p>The resolver takes the credential and nothing else, deliberately:
+             * see {@link TokenResolver} for the four ways replaying it through this
+             * server's own {@link Authenticator} breaks. It never returns claims;
+             * see {@link TokenIdentity}.
+             *
+             * @param resolver resolves the subject credential; {@code null} disables
+             *        the endpoint (the default)
+             * @param principals principals permitted to introspect. Must name at
+             *        least one — there is no permissive default, because
+             *        "any authenticated caller" is exactly the configuration that
+             *        turns this endpoint into an open oracle
+             * @return this builder
+             */
+            public Builder tokenIntrospection(TokenResolver resolver, List<String> principals) {
+                this.introspectResolver = resolver;
+                this.introspectPrincipals = principals != null ? principals : List.of();
+                return this;
+            }
+            /**
+             * Cache lifetime reported to the asker when a {@link TokenIdentity}
+             * names none.
+             *
+             * <p>Treat it as an authorization window: for any path the asker serves
+             * without re-presenting the credential, that is exactly what it is.
+             *
+             * @param v the TTL in seconds (default
+             *        {@value TokenIntrospection#DEFAULT_TTL_SECONDS})
+             * @return this builder
+             */
+            public Builder introspectTtlSeconds(long v) { this.introspectTtlSeconds = v; return this; }
+            /**
+             * Introspection requests allowed per caller per second.
+             *
+             * <p>Bounds, rather than closes, the oracle an allowlisted caller whose
+             * own credential leaked still has — a ceiling on how fast an attacker
+             * converts guesses into answers.
+             *
+             * @param v the per-second ceiling (default
+             *        {@value TokenIntrospection#DEFAULT_RATE_LIMIT_PER_SECOND})
+             * @return this builder
+             */
+            public Builder introspectRateLimitPerSecond(int v) {
+                this.introspectRateLimitPerSecond = v; return this;
+            }
+
+            /**
              * Build the immutable config.
              *
              * @return the validated {@link Config}
@@ -725,9 +968,11 @@ public final class HttpServer {
                         supportedEncodings, tls,
                         advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
                         advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
-                        proxyProofRequired,
+                        proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries,
                         stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
-                        describeProvider);
+                        describeProvider, corsOrigins, corsMaxAgeSeconds,
+                        introspectResolver, introspectPrincipals,
+                        introspectTtlSeconds, introspectRateLimitPerSecond);
             }
         }
 
@@ -745,9 +990,11 @@ public final class HttpServer {
                     supportedEncodings, tls,
                     advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
                     advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
-                    proxyProofRequired,
+                    proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries,
                     stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
-                    p);
+                    p, corsOrigins, corsMaxAgeSeconds,
+                    introspectResolver, introspectPrincipals,
+                    introspectTtlSeconds, introspectRateLimitPerSecond);
         }
     }
 
@@ -787,6 +1034,11 @@ public final class HttpServer {
     // --- Servlet ---------------------------------------------------------
 
     /** Single servlet that dispatches health / unary / stream sub-paths. */
+    /** Mint a 16-char hex correlation id, matching the reference's shape. */
+    private static String newRequestId() {
+        return java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+    }
+
     private final class RouterServlet extends HttpServlet {
 
         @Override
@@ -794,10 +1046,36 @@ public final class HttpServer {
             // Set capability headers on every response (parity with the Python
             // _CapabilitiesMiddleware: announce externalisation contract upfront).
             applyCapabilityHeaders(req, resp);
-            try {
-                super.service(req, resp);
-            } catch (jakarta.servlet.ServletException se) {
-                throw new IOException(se);
+            // Echo the caller's correlation id, or mint one. Set before
+            // dispatch so it survives every exit path — the error responses
+            // are precisely the ones someone later grep's the log for.
+            String requestId = req.getHeader(HttpHeaders.REQUEST_ID);
+            if (requestId == null || requestId.isBlank() || requestId.length() > 128) {
+                requestId = newRequestId();
+            }
+            resp.setHeader(HttpHeaders.REQUEST_ID, requestId);
+            // Before dispatch so the grant rides every answer — a 401 or a 413
+            // a browser cannot read is a network error with no explanation.
+            if (cors != null) cors.apply(req, resp);
+            // Access-log records produced during dispatch are parked here and
+            // emitted on close, once the encoded body has been measured.
+            // response_bytes cannot be read where the record is written:
+            // compression runs after the handler, so a record emitted there
+            // could only ever report the uncompressed size.
+            try (AccessLogScope access = AccessLogScope.open(requestId)) {
+                try {
+                    super.service(req, resp);
+                } catch (AuthUnavailableException e) {
+                    // Caught here rather than at each authenticate() call site so
+                    // every route answers an outage the same way. A 401 would tell
+                    // every caller to re-authenticate against a service that is
+                    // simply down, and invite them to negative-cache the outage.
+                    writeServiceUnavailable(resp, e);
+                } catch (jakarta.servlet.ServletException se) {
+                    throw new IOException(se);
+                } finally {
+                    access.httpStatus(resp.getStatus());
+                }
             }
         }
 
@@ -880,17 +1158,33 @@ public final class HttpServer {
                 handleTestDrain(req, resp, true);
                 return;
             }
+            if (TokenIntrospection.ENDPOINT.equals(rest)) {
+                handleIntrospect(req, resp);
+                return;
+            }
             if (UPLOAD_URL_METHOD.equals(rest) || (UPLOAD_URL_METHOD + "/init").equals(rest)) {
                 handleUploadUrl(req, resp);
                 return;
             }
-            if (rest.endsWith("/init") || rest.endsWith("/exchange")) {
-                boolean init = rest.endsWith("/init");
-                String methodName = rest.substring(0, rest.length() - (init ? "/init".length() : "/exchange".length()));
+            boolean stream = rest.endsWith("/init") || rest.endsWith("/exchange");
+            boolean init = rest.endsWith("/init");
+            String methodName = !stream ? rest
+                    : rest.substring(0, rest.length() - (init ? "/init".length() : "/exchange".length()));
+            // An RPC method name never contains a slash, so a path still holding
+            // one after the /init and /exchange suffixes names no route at all.
+            // Answering 404 rather than dispatching it keeps a mistyped or
+            // wrong-prefix POST a definitive client error — dispatched, a
+            // non-Arrow body dies in the IPC reader and surfaces as a 500, which
+            // a caller reads as "retry later".
+            if (methodName.isEmpty() || methodName.indexOf('/') >= 0) {
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+                return;
+            }
+            if (stream) {
                 handleStream(req, resp, methodName, init);
                 return;
             }
-            handleUnary(req, resp, rest);
+            handleUnary(req, resp, methodName);
         }
 
         @Override
@@ -954,6 +1248,10 @@ public final class HttpServer {
         if (proxyProofRequired) {
             resp.setHeader(ProxyProof.PROOF_REQUIRED_HEADER, "true");
         }
+        // Absent, never "false", when disabled: a proxy preflights on presence.
+        if (introspection != null) {
+            resp.setHeader(TokenIntrospection.ENABLED_HEADER, "true");
+        }
         if (stickyEnabled) {
             resp.setHeader(StickyHeaders.STICKY_ENABLED, "true");
             resp.setHeader(StickyHeaders.STICKY_TTL, Long.toString(stickyDefaultTtlSeconds));
@@ -962,6 +1260,59 @@ public final class HttpServer {
                         String.join(",", stickyEchoHeaders.keySet()));
             }
         }
+    }
+
+    /**
+     * The response headers a browser client may read, built from the same
+     * conditions as {@link #applyCapabilityHeaders}.
+     *
+     * <p>The two must stay in lockstep: an advertised-but-unexposed capability
+     * is invisible to JavaScript and to nothing else, so it survives every test
+     * driven by an HTTP client that ignores CORS. Adding a header there without
+     * adding it here ships a server a browser can read no capability from.
+     */
+    private List<String> corsExposeHeaders() {
+        List<String> expose = new ArrayList<>(List.of(
+                HttpHeaders.WWW_AUTHENTICATE,
+                HttpHeaders.X_VGI_CONTENT_ENCODING,
+                // How a client tells a 200 carrying an error batch from a 200
+                // carrying a result — unreadable, the two are indistinguishable.
+                RPC_ERROR_HEADER,
+                EXTERNALIZATION_ENABLED_HEADER,
+                SUPPORTED_ENCODINGS_HEADER,
+                // Describes a rejection rather than a capability, so it is never
+                // advertised on /health — but a browser that cannot read it is
+                // back to guessing the 401 reason out of the body.
+                HttpHeaders.VGI_AUTH_REASON,
+                // Also never advertised on /health: it rides every response
+                // including the failures, and it is what lets a browser client
+                // quote an id the server's own log can be searched for.
+                HttpHeaders.REQUEST_ID));
+        if (advertiseMaxRequestBytes) expose.add(MAX_REQUEST_BYTES_HEADER);
+        if (advertisedMaxResponseBytes > 0) expose.add(MAX_RESPONSE_BYTES_HEADER);
+        if (advertisedMaxExternalizedResponseBytes > 0) expose.add(MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER);
+        if (uploadUrlProvider != null) {
+            expose.add(UPLOAD_URL_HEADER);
+            if (maxUploadBytes != null) expose.add(MAX_UPLOAD_BYTES_HEADER);
+        }
+        if (proxyProofRequired) expose.add(ProxyProof.PROOF_REQUIRED_HEADER);
+        if (introspection != null) expose.add(TokenIntrospection.ENABLED_HEADER);
+        if (!proxyHint.isEmpty()) expose.add(HttpHeaders.VGI_AUTH_PROXY_REQUIRED);
+        if (stickyEnabled) {
+            expose.add(StickyHeaders.STICKY_ENABLED);
+            expose.add(StickyHeaders.STICKY_TTL);
+            // Not advertisements but per-response state: a browser client inside
+            // a session helper reads the minted token and the close signal here.
+            expose.add(StickyHeaders.SESSION);
+            expose.add(StickyHeaders.SESSION_CLOSE);
+            if (!stickyEchoHeaders.isEmpty()) {
+                expose.add(StickyHeaders.STICKY_ECHO);
+                for (String name : stickyEchoHeaders.keySet()) {
+                    expose.add(StickyHeaders.ECHO_PREFIX + name);
+                }
+            }
+        }
+        return expose;
     }
 
     /**
@@ -1059,7 +1410,9 @@ public final class HttpServer {
             byte[] chunk = new byte[8192];
             int n;
             while ((n = in.read(chunk)) > 0) buf.write(chunk, 0, n);
-            return maybeDecodeRequestBody(req, buf.toByteArray());
+            byte[] body = buf.toByteArray();
+            AccessLogScope.recordRequestBytes(body.length);
+            return maybeDecodeRequestBody(req, body);
         }
     }
 
@@ -1079,7 +1432,7 @@ public final class HttpServer {
         try {
             auth = authenticator.authenticate(req);
         } catch (AuthException e) {
-            writeAuthFailure(resp, e);
+            writeUnauthorized(resp, e);
             return;
         }
 
@@ -1256,6 +1609,47 @@ public final class HttpServer {
         resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
     }
 
+    /**
+     * {@code POST {prefix}/__introspect_token__}: resolve an opaque credential
+     * to a principal, or say definitively that this worker will not.
+     *
+     * <p>An {@link AuthException} from the caller's own authenticator collapses
+     * onto the same 403 a non-allowlisted caller gets. Distinguishing "your
+     * credential is bad" from "your credential is fine but you may not
+     * introspect" would tell an unauthorized caller which of the two it is, and
+     * both are equally final. An {@link AuthUnavailableException} is not caught
+     * here — it is not a rejection, and the servlet boundary renders it as 503.
+     */
+    private void handleIntrospect(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        if (introspection == null) {
+            TokenIntrospection.writeNotEnabled(resp);
+            return;
+        }
+        AuthContext auth;
+        try {
+            auth = authenticator.authenticate(req);
+        } catch (AuthException e) {
+            auth = AuthContext.ANONYMOUS;
+        }
+        introspection.handle(req, resp, auth);
+    }
+
+    /**
+     * Render the transient-failure answer: {@code 503} with {@code Retry-After}.
+     *
+     * <p>The counterpart to {@link #writeUnauthorized}. A 401 says "your
+     * credential is bad" and invites a caller to negative-cache; this says
+     * "I could not find out", which a caller must retry instead.
+     */
+    private static void writeServiceUnavailable(HttpServletResponse resp, AuthUnavailableException e)
+            throws IOException {
+        resp.setHeader("Retry-After", Integer.toString(e.retryAfterSeconds()));
+        resp.setHeader("Cache-Control", "no-store");
+        writeJson(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, Map.of(
+                "error", "service_unavailable",
+                "detail", e.getMessage() != null ? e.getMessage() : ""));
+    }
+
     private static boolean isLoopbackRequest(HttpServletRequest req) {
         String remote = req.getRemoteAddr();
         if (remote == null) return false;
@@ -1311,12 +1705,35 @@ public final class HttpServer {
         }
     }
 
-    private static void writeAuthFailure(HttpServletResponse resp, AuthException e) throws IOException {
+    /**
+     * Render the standardized 401 of {@code docs/unauthorized-spec.md} §4: the
+     * reason header, a no-store cache directive, the proxy note when this
+     * service's auth depends on a proxy, and the JSON envelope.
+     *
+     * <p>§4.2 lets a service always answer JSON — what it must never do is
+     * answer a non-HTML request with HTML — and this port takes that option,
+     * so {@code Accept} does not change the body. The reason header, the part
+     * clients actually parse, is set either way.</p>
+     *
+     * <p>Both {@code VGI-} headers describe a rejection, so they are set here
+     * and nowhere else: they are not capability advertisements and must not
+     * appear on a successful response.</p>
+     */
+    private void writeUnauthorized(HttpServletResponse resp, AuthException e) throws IOException {
         if (e.wwwAuthenticate() != null) {
             resp.setHeader(HttpHeaders.WWW_AUTHENTICATE, e.wwwAuthenticate());
         }
-        String msg = e.getMessage() != null ? e.getMessage() : "Unauthorized";
-        writeJson(resp, HttpServletResponse.SC_UNAUTHORIZED, Map.of("error", msg));
+        AuthReason reason = e.reason();
+        resp.setHeader(HttpHeaders.VGI_AUTH_REASON, reason.code());
+        if (!proxyHint.isEmpty()) {
+            resp.setHeader(HttpHeaders.VGI_AUTH_PROXY_REQUIRED, "true");
+        }
+        // A 401 is per-request and flips to 200 on the next attempt with a
+        // credential, so no shared cache may hold it.
+        resp.setHeader("Cache-Control", "no-store");
+        String detail = e.getMessage() != null ? e.getMessage() : "";
+        writeJson(resp, HttpServletResponse.SC_UNAUTHORIZED,
+                Unauthorized.envelope(reason, detail, proxyHint));
     }
 
     private static void writeJson(HttpServletResponse resp, int status, Map<String, ?> body) throws IOException {
@@ -1363,6 +1780,9 @@ public final class HttpServer {
             copyBounded(in, buf, maxRequestBytes);
             body = buf.toByteArray();
         }
+        // Measured before decompression: this is what the peer actually sent,
+        // and therefore what the link was billed for.
+        AccessLogScope.recordRequestBytes(body.length);
         return maybeDecodeRequestBody(req, body);
     }
 
@@ -1383,7 +1803,12 @@ public final class HttpServer {
     private void writeArrowResponse(HttpServletRequest req, HttpServletResponse resp, byte[] body) throws IOException {
         resp.setContentType(ARROW_CONTENT_TYPE);
         ResponseEncoding choice = chooseResponseEncoding(req, supportedEncodings);
-        resp.getOutputStream().write(encodeArrowBody(resp, choice, body, zstdLevel));
+        byte[] encoded = encodeArrowBody(resp, choice, body, zstdLevel);
+        // Post-compression, so this is the egress figure. The logical Arrow size
+        // the worker produced is a different number by up to three orders of
+        // magnitude, and is reported separately as output_bytes.
+        AccessLogScope.recordResponseBytes(encoded.length);
+        resp.getOutputStream().write(encoded);
     }
 
     /** Compress {@code body} with the negotiated codec (if any) and stamp the
@@ -1633,7 +2058,7 @@ public final class HttpServer {
         try {
             auth = authenticator.authenticate(req);
         } catch (AuthException e) {
-            writeAuthFailure(resp, e);
+            writeUnauthorized(resp, e);
             return;
         }
 
