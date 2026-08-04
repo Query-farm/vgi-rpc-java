@@ -318,6 +318,13 @@ public final class RpcServer {
                     transport.writer().flush();
                     return;
                 }
+                // Snapshot request_data here for the same reason the kwargs are
+                // snapshotted above: draining mutates the reader's root, so a
+                // batch serialized after it carries zero rows. Only worth the
+                // re-encode when a hook will actually consume it.
+                byte[] requestDataSnapshot = dispatchHook == null ? null
+                        : serializeRequestBatch(paramsRoot, meta,
+                                resolvedParams != null ? null : reader.dictionaryProvider());
                 // Drain remaining batches in this request stream so the next call sees a fresh stream
                 try { reader.drain(); } catch (IOException ignore) {}
                 String method;
@@ -366,11 +373,7 @@ public final class RpcServer {
                     dispatchInfo.authenticated = scope.auth() != null && scope.auth().authenticated();
                     dispatchInfo.claims = scope.auth() != null ? scope.auth().claims() : null;
                     dispatchInfo.transportMetadata = scope.transportMetadata();
-                    // Same provider choice the kwargs decode made above: a
-                    // resolved external batch carries its own schema and no
-                    // reader dictionaries.
-                    dispatchInfo.requestData = serializeRequestBatch(paramsRoot, meta,
-                            resolvedParams != null ? null : reader.dictionaryProvider());
+                    dispatchInfo.requestData = requestDataSnapshot;
                     if ("stream".equals(dispatchInfo.methodType)) {
                         dispatchInfo.streamId = AccessLogHook.randomStreamId();
                     }
