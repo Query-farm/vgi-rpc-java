@@ -170,6 +170,14 @@ public final class Main {
                 case "--access-log-async" -> accessLogAsync = true;
                 case "--access-log-queue-size" -> accessLogQueueSize = Integer.parseInt(c.requireValue(a));
                 case "--access-log-no-payloads" -> accessLogPayloads = false;
+                // Accepted and ignored. The other ports gate request_data behind a
+                // DEBUG logger, so the porting guide's canonical verification command
+                // passes --access-log-debug to turn it on; this worker writes the
+                // record directly and logs payloads already, but rejecting an unknown
+                // arg would make that one command line fail on Java alone. Deliberately
+                // not the inverse of --access-log-no-payloads: payloads-by-default is
+                // what let this port catch a request_data bug the others logged past.
+                case "--access-log-debug" -> { }
                 case "--strict" -> strictMode = true;
                 case "--max-response-bytes" -> maxResponseBytes = Long.parseLong(c.requireValue(a));
                 case "--max-externalized-response-bytes" ->
