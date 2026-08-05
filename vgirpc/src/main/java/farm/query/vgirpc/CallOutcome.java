@@ -24,6 +24,13 @@ package farm.query.vgirpc;
  * the response, and {@link AccessLogHook}, whose {@code status} field would
  * otherwise report {@code "ok"} for a call whose whole payload is an exception.
  *
+ * <p>They do not want quite the same question answered, which is why there are
+ * two predicates. The log wants {@link #failed()} — did this call fail, at all,
+ * ever. The header wants {@link #shouldFlagResponse()} — is this response one a
+ * client may read as an error <em>instead of</em> as the reply it asked for.
+ * {@link #suppressResponseFlag()} is how the one path where those diverge says
+ * so.
+ *
  * <p>Scopes nest safely. The HTTP transport opens one per request; the
  * dispatcher opens one per call for transports (pipe, unix, TCP) that have no
  * request boundary of their own. Under HTTP the inner open is inert and the
@@ -38,6 +45,8 @@ public final class CallOutcome implements AutoCloseable {
     /** Whether closing this handle uninstalls the scope, or it is a nested no-op. */
     private final boolean owner;
     private Throwable error;
+    /** Set when the error was appended to a body the client reads as a stream sequence. */
+    private boolean errorAppendedToBody;
 
     private CallOutcome(boolean owner) {
         this.owner = owner;
@@ -85,6 +94,56 @@ public final class CallOutcome implements AutoCloseable {
     /** @return whether this call has written an error into its response */
     public static boolean failed() {
         return currentError() != null;
+    }
+
+    /**
+     * Note that this call's error was <em>appended</em> to a response body
+     * already under construction, rather than replacing it — and that the
+     * response must therefore not be flagged. No-op when no scope is installed.
+     *
+     * <p>Almost every error path discards whatever body it had built and answers
+     * a single, self-contained IPC stream whose only batch is the exception.
+     * A reader can find that batch without knowing anything about the method
+     * that failed, which is what makes {@code X-VGI-RPC-Error} safe to act on:
+     * "read this body as an error" is a complete instruction.
+     *
+     * <p>The producer {@code /init} turn is the exception. Its body is a
+     * <em>sequence</em> of IPC streams — the optional stream header, then the
+     * producer's own stream — and a producer that raises inside {@code produce}
+     * has the exception written into that second stream, in place. The body
+     * still has to be read as a stream, in order, because that is what the
+     * client asked for and what the header before it requires. A client that
+     * takes the flag as licence to switch to its unary error reader stops at
+     * the first stream's end-of-stream, never reaches the EXCEPTION batch, and
+     * reports a generic transport failure with the worker's message thrown
+     * away. Suppressing the flag keeps such a client on the streaming reader,
+     * which finds the batch exactly where the protocol says it is.
+     *
+     * <p>This is also what the Python reference does: its producer loop writes
+     * the error batch and deliberately leaves {@code _current_response_status}
+     * at 200, while init-method raises and cap overshoots — both of which
+     * <em>replace</em> the body — set it.
+     *
+     * <p>Deliberately narrow: it changes only the transport's header. The call
+     * still {@linkplain #failed() failed}, so the access log still reports
+     * {@code status: "error"} and still names the exception.
+     */
+    public static void suppressResponseFlag() {
+        CallOutcome scope = CURRENT.get();
+        if (scope != null) scope.errorAppendedToBody = true;
+    }
+
+    /**
+     * Whether the HTTP transport should stamp {@code X-VGI-RPC-Error} on this
+     * response.
+     *
+     * @return {@code true} when this call failed and its error replaced the
+     *         response body; {@code false} for a success, and for an error
+     *         appended in-band by {@link #suppressResponseFlag()}
+     */
+    public static boolean shouldFlagResponse() {
+        CallOutcome scope = CURRENT.get();
+        return scope != null && scope.error != null && !scope.errorAppendedToBody;
     }
 
     /** Uninstall the scope, if this handle owns it. */

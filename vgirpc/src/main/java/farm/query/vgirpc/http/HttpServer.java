@@ -1856,7 +1856,12 @@ public final class HttpServer {
         // rides the body as an EXCEPTION batch — so without this header a
         // client reads a failure as a result. Setting it unconditionally would
         // be the same outage in the other direction, hence the check.
-        if (CallOutcome.failed()) resp.setHeader(RPC_ERROR_HEADER, "true");
+        //
+        // Not CallOutcome.failed(): a producer /init that raises in-band leaves
+        // the exception inside a multi-stream body that must still be read as a
+        // stream, and flagging it sends clients to a unary error reader that
+        // cannot reach the batch. See CallOutcome.suppressResponseFlag().
+        if (CallOutcome.shouldFlagResponse()) resp.setHeader(RPC_ERROR_HEADER, "true");
         resp.setContentType(ARROW_CONTENT_TYPE);
         ResponseEncoding choice = chooseResponseEncoding(req, supportedEncodings);
         byte[] encoded = encodeArrowBody(resp, choice, body, zstdLevel);

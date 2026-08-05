@@ -626,6 +626,14 @@ public final class HttpStreamHandler {
             } catch (Throwable t) {
                 error = true;
                 Wire.writeZeroBatch(w, outputSchema, Wire.errorMetadata(t, rpc.serverId()));
+                // The exception goes *into* the response, behind the stream
+                // header the client is already committed to reading, instead of
+                // replacing it. That makes this the one error the transport must
+                // not advertise with X-VGI-RPC-Error — a client that believes it
+                // stops reading at the header stream's end-of-stream and never
+                // sees this batch. Matches the reference, whose producer loop
+                // leaves the response status at a plain 200 here.
+                CallOutcome.suppressResponseFlag();
             }
 
             if (!error) {
