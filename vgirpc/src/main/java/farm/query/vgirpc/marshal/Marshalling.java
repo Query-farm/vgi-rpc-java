@@ -762,9 +762,15 @@ public final class Marshalling {
             };
             case Bool -> ((BitVector) v).get(row) == 1;
             case Utf8 -> new String(((VarCharVector) v).get(row), StandardCharsets.UTF_8);
-            case LargeUtf8 -> new String(((LargeVarCharVector) v).get(row), StandardCharsets.UTF_8);
+            case LargeUtf8 -> {
+                requireRepresentableOnJvm(v, row, f, "large_utf8");
+                yield new String(((LargeVarCharVector) v).get(row), StandardCharsets.UTF_8);
+            }
             case Binary -> ((VarBinaryVector) v).get(row);
-            case LargeBinary -> ((LargeVarBinaryVector) v).get(row);
+            case LargeBinary -> {
+                requireRepresentableOnJvm(v, row, f, "large_binary");
+                yield ((LargeVarBinaryVector) v).get(row);
+            }
             case Date -> ((DateDayVector) v).get(row);
             case Time -> ((TimeMicroVector) v).get(row);
             case Timestamp -> ((ArrowType.Timestamp) t).getTimezone() != null
@@ -778,6 +784,37 @@ public final class Marshalling {
             case Struct -> readStruct((StructVector) v, row, f);
             default -> throw new IllegalArgumentException("unsupported Arrow type: " + t);
         };
+    }
+
+    /**
+     * Refuse a 64-bit-offset value that no Java array can hold, before Arrow
+     * truncates its length to an {@code int}.
+     *
+     * <p>{@code large_binary} / {@code large_utf8} carry 64-bit offsets
+     * precisely so a single value may exceed 2 GiB, and every other vgi-rpc
+     * runtime can hold one: Go and Rust length their slices with a 64-bit
+     * {@code int}/{@code usize}. A Java array is indexed by {@code int} and
+     * caps at {@link Integer#MAX_VALUE} elements, so this port cannot — the
+     * ceiling is the JVM's, not the wire's, and the bytes arrive intact
+     * before anything goes wrong with them.
+     *
+     * <p>Left alone, {@code LargeVarBinaryVector.get(row)} computes the value
+     * length as {@code (int)(endOffset - startOffset)}, which wraps negative
+     * past {@code INT_MAX} and surfaces to the caller as
+     * {@code RpcError(NegativeArraySizeException): -2147483647} — a number
+     * that names neither the field nor the real size nor the limit. Read the
+     * offsets ourselves (both are 8 bytes wide here) and say what happened.
+     */
+    private static void requireRepresentableOnJvm(FieldVector v, int row, Field f, String arrowType) {
+        var offsets = v.getOffsetBuffer();
+        long length = offsets.getLong(((long) row + 1) * 8L) - offsets.getLong((long) row * 8L);
+        if (length > Integer.MAX_VALUE) {
+            throw new UnsupportedOperationException(
+                    arrowType + " value in field '" + f.getName() + "' is " + length
+                            + " bytes; the JVM caps an array at " + Integer.MAX_VALUE
+                            + " elements, so this Java worker cannot represent it. The wire"
+                            + " carried it intact — the limit is the runtime's, not the protocol's.");
+        }
     }
 
     private static List<Object> readList(ListVector lv, int row, Field f) {

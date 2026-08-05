@@ -114,6 +114,12 @@ Package root: `farm.query.vgirpc`
 - **Conformance** is driven from Python via `tests/test_java_conformance.py` and the other `tests/test_java_*.py` files. These spawn the Java worker (built via `./gradlew installDist`) over the transport under test. The `./run_tests.sh` / `./inspect.sh` entry points stay at the repo root.
 - The conformance driver expects `conformance-worker` to print `PORT:<port>` on stdout when launched with `--http` (auto-port selection, matches the Python reference).
 
+### Large payloads, and the one conformance test this port cannot pass
+
+The reference's `large_payload` category exists because an unbuffered writer maps `write()` onto one `write(2)`, and above `INT_MAX` on macOS a pipe short-writes exactly `INT_MAX` with no error (the peer then deadlocks) while a socket returns `EINVAL`. `large_payload.echo_binary_4mib` passes here on pipe/unix/tcp/http. **`large_payload.echo_binary_over_int32_max` cannot pass and never will**: it echoes `2**31 + 1` bytes, and a Java array caps at `Integer.MAX_VALUE` elements, so no `byte[]` can hold the value. The bytes do arrive — the worker reads all 2,147,483,649 of them off the wire — and `Marshalling.requireRepresentableOnJvm` then refuses them by name rather than letting Arrow's `long`→`int` length truncation surface as `NegativeArraySizeException: -2147483647`. Exclude it (`vgi-rpc-test --filter '!large_payload.echo_binary_over_int32_max'`) rather than trying to fix it; lifting the ceiling means a non-array Java representation for `large_binary`, which is a protocol-visible API decision, not a bug fix.
+
+The *write* side is fine at every size this port can reach: 2,147,483,640 bytes (`Integer.MAX_VALUE - 7`) round-trips clean over pipe, unix and tcp on macOS. Nothing on that path hands the kernel more than a 64 KiB buffer — see the `IpcStreamWriter(OutputStream)` javadoc for why, and `IpcStreamWriterChunkingTest` for the assertion that keeps it that way.
+
 ## Cross-language wire alignment
 
 This port tracks `vgi-rpc-python` for wire compatibility. Two surfaces matter:

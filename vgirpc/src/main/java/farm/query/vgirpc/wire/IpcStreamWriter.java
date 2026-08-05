@@ -60,6 +60,29 @@ public final class IpcStreamWriter implements AutoCloseable {
     /**
      * Write an Arrow IPC stream to an {@link OutputStream}.
      *
+     * <p><strong>This is what keeps large payloads whole on the pipe and
+     * socket transports, so do not "optimise" the adapter away.</strong> A
+     * single {@code write(2)} / {@code send(2)} is free to accept fewer bytes
+     * than offered, and above {@code INT_MAX} on macOS it always does: a pipe
+     * returns a short count of exactly {@code INT_MAX} with <em>no error</em>
+     * (the tail is dropped and the peer then blocks forever waiting for bytes
+     * the Arrow IPC header promised — a deadlock, not an exception) and a
+     * socket fails outright with {@code EINVAL}. The Python reference has to
+     * loop on the returned count <em>and</em> clamp each call to 1 GiB to
+     * survive both.
+     *
+     * <p>This port needs neither, because nothing ever offers the kernel a
+     * buffer that big. {@link Channels#newChannel(OutputStream)} copies
+     * through a fixed 8 KiB heap array, so an arbitrarily large
+     * {@link java.nio.ByteBuffer} reaches {@code raw} as a run of 8 KiB
+     * writes; every transport then wraps {@code raw} in a 64 KiB
+     * {@link java.io.BufferedOutputStream}, whose direct-write bypass (for
+     * {@code len >= buf.length}) is unreachable at 8 KiB. So the largest
+     * buffer any syscall on this path sees is one 64 KiB flush. Arrow's
+     * {@code WriteChannel.write(ArrowBuf)} already slices a &gt;2 GiB buffer
+     * at {@code INT_MAX} before that, and its {@code write(ByteBuffer)} loops
+     * until drained. Pinned by {@code IpcStreamWriterChunkingTest}.
+     *
      * @param raw the destination byte stream
      */
     public IpcStreamWriter(OutputStream raw) {
@@ -69,7 +92,11 @@ public final class IpcStreamWriter implements AutoCloseable {
 
     /** Write directly to a {@link WritableByteChannel} (e.g. a shared-memory
      *  segment channel), bypassing the {@code Channels.newChannel} adapter's
-     *  heap-{@code byte[]} bounce. */
+     *  heap-{@code byte[]} bounce — and with it the 8 KiB chunking documented
+     *  on {@link #IpcStreamWriter(OutputStream)}. Only for channels that write
+     *  to memory. A pipe or socket channel handed here would receive whole
+     *  multi-gigabyte buffers in one call and hit the short-write / EINVAL
+     *  hazard; use the {@link OutputStream} constructor for those. */
     public IpcStreamWriter(WritableByteChannel channel) {
         this.rawChannel = channel;
         this.out = new WriteChannel(channel);
