@@ -41,6 +41,12 @@ public interface Authenticator {
      * authenticated context. Unauthenticated (anonymous) results fall through
      * to the next chain member. Mirrors Python's {@code chain_authenticate}.
      *
+     * <p>Only {@link AuthException} means "not my credential, try the next".
+     * {@link AuthUnavailableException} propagates: an authority that could not
+     * be reached is not a rejection, and swallowing it here would turn a sidecar
+     * restart into a 401 from the end of the chain — which every caller answers
+     * by re-authenticating at once.
+     *
      * @param authenticators chain members, tried in order
      * @return a composite authenticator that returns the first authenticated
      *         context, rethrows the last {@link AuthException} if every member

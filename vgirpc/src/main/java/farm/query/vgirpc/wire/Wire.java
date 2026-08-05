@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc.wire;
 
+import farm.query.vgirpc.CallOutcome;
 import farm.query.vgirpc.HasErrorKind;
 import farm.query.vgirpc.RpcError;
 import farm.query.vgirpc.VersionError;
@@ -134,8 +135,25 @@ public final class Wire {
         return any;
     }
 
-    /** Build the metadata for an error/log batch. */
+    /**
+     * Build the metadata for an error/log batch.
+     *
+     * <p>Also the single choke point at which a call is marked failed
+     * ({@link CallOutcome}). Every path that puts an exception on the wire —
+     * unary, stream init, stream continuation, transport-level rejection — ends
+     * up here, and every one of them then <em>returns normally</em> with the
+     * error inside a well-formed response. Recording it anywhere else would
+     * mean each new error path having to remember, and the two readers that
+     * depend on the signal (the {@code X-VGI-RPC-Error} response header and the
+     * access log's {@code status} field) silently reporting success when one
+     * forgot.
+     *
+     * @param t the exception being serialized
+     * @param serverId server id to stamp on the batch, or {@code null}
+     * @return the batch's custom metadata
+     */
     public static Map<String, String> errorMetadata(Throwable t, String serverId) {
+        CallOutcome.recordError(t);
         Message msg = Message.fromException(t);
         Map<String, String> md = msg.addToMetadata(null);
         if (serverId != null) md.put(Metadata.SERVER_ID, serverId);

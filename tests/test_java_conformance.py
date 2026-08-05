@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -167,9 +168,9 @@ def conformance_http_port(java_http_port: int) -> int:
 
 @pytest.fixture(scope="session")
 def conformance_http_auth_port() -> Iterator[int]:
-    """Spawn an HTTP worker with bearer auth so every RPC POST returns 401."""
+    """Spawn a reject-all HTTP worker, so every RPC POST returns 401."""
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--http", "--auth-bearer", "secret=alice"],
+        [JAVA_WORKER, "--http-auth"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -183,6 +184,21 @@ def conformance_http_auth_port() -> Iterator[int]:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_auth_reason_port(conformance_http_auth_port: int) -> int:
+    """Port of a worker that honours ``X-Conformance-Auth-Reason``.
+
+    Backs the shared ``TestUnauthorized`` reason-code tests. Membership in
+    the closed set is not enough on its own — a server answering every 401
+    with ``unauthorized`` satisfies that. These tests prove the codes are
+    *discriminated*, which is what makes them worth branching on.
+
+    ``--http-auth`` already reads the header, so this is the same worker
+    under the name the shared suite looks up.
+    """
+    return conformance_http_auth_port
 
 
 @pytest.fixture(scope="session")
@@ -251,6 +267,157 @@ def _start_http_worker(*extra_args: str) -> Iterator[int]:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_cold_call_cache_port() -> Iterator[int]:
+    """Spawn an HTTP worker with the per-process call-state cache disabled.
+
+    Backs the shared ``TestColdCallStateCache`` group, which pins the rule
+    that a client echoes the call token on **every** continuation. With the
+    cache warm a client that never echoes still works, and only breaks once
+    a continuation lands on a process that never saw the stream's ``/init``
+    — a restarted worker, an evicted entry, a load-balanced relay. Booting
+    with the cache off turns that load-dependent bug into a deterministic
+    one: every turn takes the miss path.
+    """
+    yield from _start_http_worker("--http", "--no-call-state-cache")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_access_log(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[int, Path]]:
+    """Spawn an HTTP worker writing a JSONL access log, yielding ``(port, path)``.
+
+    Backs the shared ``TestRequestId`` correlation case, which is the one
+    assertion the ``X-Request-ID`` field exists for: an id that appears on the
+    response but not in the log, or differs between them, looks like a working
+    trail right up to the moment somebody follows it. Checking that needs to
+    read back what the server logged for a request the suite itself made, which
+    no amount of poking at the wire substitutes for.
+
+    Its own worker, because ``--access-log`` appends for the process's whole
+    life and the shared one is used by every other HTTP group.
+    """
+    log_path = tmp_path_factory.mktemp("accesslog") / "conformance.jsonl"
+    gen = _start_http_worker("--http", "--access-log", str(log_path))
+    port = next(gen)
+    try:
+        yield port, log_path
+    finally:
+        next(gen, None)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_capped_access_log(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[int, Path]]:
+    """Spawn an HTTP worker with strict response caps *and* a JSONL access log.
+
+    Backs ``TestHttpResponseCapAccessLog``. Neither existing worker can: the
+    strict-cap one writes no log, and the access-log one has no cap to
+    overshoot, so the one state where the two interact -- a response the server
+    threw away for being oversize -- is reachable from neither. Its own process
+    for the same reason ``conformance_http_access_log`` has one: ``--access-log``
+    appends for the process's whole life.
+    """
+    log_path = tmp_path_factory.mktemp("capaccesslog") / "conformance.jsonl"
+    gen = _start_http_worker("--http", "--strict", "--access-log", str(log_path))
+    port = next(gen)
+    try:
+        yield port, log_path
+    finally:
+        next(gen, None)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_introspect_port() -> Iterator[int]:
+    """Spawn an HTTP worker with token introspection enabled.
+
+    Backs the shared ``TestTokenIntrospection`` group. It needs its own worker
+    because the endpoint resolves nothing unless explicitly enabled -- which
+    ``TestTokenIntrospectionOffMode`` asserts against the default one. The
+    worker is configured with the exact introspector / subject / JWS-trap
+    constants the shared suite posts; anything else reads as "did not resolve".
+    """
+    yield from _start_http_worker("--http", "--introspect")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_cors_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Spawn an HTTP worker that grants browser access to one fixed origin.
+
+    Backs the shared ``TestCors`` group. It needs its own worker because CORS
+    is opt-in and the default one must stay header-free -- ``TestCorsOffMode``
+    runs against that one and checks exactly that. The origin is the constant
+    the shared suite preflights with; a mismatch reads as "origin refused".
+
+    Storage mode is deliberate: the derived exposure check can only catch a
+    missing entry for a header the worker actually advertises, so a *plain*
+    worker here would silently skip the conditional half of the capability
+    set -- the size caps and the upload-URL trio -- which are exactly the
+    exposures a port is most likely to miss.
+    """
+    yield from _start_http_worker(
+        "--http",
+        "--fake-storage",
+        conformance_fake_storage,
+        "--cors-origin",
+        "https://conformance.example",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sticky failure-path fixtures (upstream TestSticky; see
+# vgi-rpc docs/sticky-sessions-spec.md §9.1)
+# ---------------------------------------------------------------------------
+
+# Shared AEAD key for the peer pair. Both workers can open each other's
+# session tokens, which is the point: the rejection under test has to come
+# from the server_id comparison, not from a decrypt failure.
+_STICKY_PEER_TOKEN_KEY = "5f" * 32
+
+
+@pytest.fixture(scope="session")
+def conformance_http_sticky_short_ttl_port() -> Iterator[int]:
+    """A sticky worker whose default session TTL is short enough to outwait.
+
+    Backs ``TestSticky::test_expired_session_surfaces_session_lost``; the
+    main worker's 300s default is not something a test can sit out.
+    """
+    yield from _start_http_worker("--http", "--sticky-ttl", "1")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_sticky_peer_ports() -> Iterator[tuple[int, int]]:
+    """Two sticky workers sharing one AEAD key, for the wrong-worker check.
+
+    Backs ``TestSticky::test_token_from_other_worker_rejected``. RpcServer
+    mints a random server_id per process, so the two peers differ without
+    any extra flag — which is what makes the shared key safe to use here.
+    """
+    gen_a = _start_http_worker("--http", "--token-key", _STICKY_PEER_TOKEN_KEY)
+    gen_b = _start_http_worker("--http", "--token-key", _STICKY_PEER_TOKEN_KEY)
+    port_a = next(gen_a)
+    try:
+        port_b = next(gen_b)
+        try:
+            yield port_a, port_b
+        finally:
+            next(gen_b, None)
+    finally:
+        next(gen_a, None)
+
+
+@pytest.fixture(scope="session")
+def conformance_http_sticky_auth_port() -> Iterator[int]:
+    """A sticky worker that authenticates the ``X-Conformance-Principal`` header.
+
+    Backs ``TestSticky::test_cross_principal_replay_rejected``, which needs
+    one worker reachable as two identities.
+    """
+    yield from _start_http_worker("--http", "--sticky-auth")
 
 
 @pytest.fixture(scope="session")
@@ -558,3 +725,315 @@ class TestContinuationOnlyResume:
             # Resume from the first token: replays everything after batch 0.
             resumed = proxy_b.resume_stream("produce_n", tokens[0])
             assert [ab.batch.column("value")[0].as_py() for ab in resumed] == [10, 20]
+
+
+class TestHttpStreamAccessLog:
+    """Every HTTP turn of a stream call must produce an access-log record.
+
+    ``vgi-rpc-test --access-log`` validates the *launcher* worker's log, where a
+    whole stream call is a single dispatch and therefore a single record. Over
+    HTTP a stream is a chain of independent requests — one ``/init`` and one
+    ``/exchange`` per continuation — and the Java server fired its dispatch hook
+    only on the unary path, so streams produced **no records at all**. The
+    validator passed anyway: it checks the records it is given, and there is
+    nothing wrong with a log that is merely missing the traffic that carries the
+    bytes.
+
+    So this asserts presence and shape, which a schema check structurally
+    cannot: an init record carrying ``request_data``, at least one continuation
+    carrying none, and one ``stream_id`` joining them — plus the reference
+    validator over exactly those records, so shape and conformance are both
+    covered.
+
+    ``docs/access-log-spec.md`` §1 ("Stream calls produce one record per init
+    and one per exchange/produce continuation") and §5.
+    """
+
+    #: A stream's lifecycle id: 32 lowercase hex, per the schema.
+    _STREAM_ID = re.compile(r"^[0-9a-f]{32}$")
+
+    @staticmethod
+    def _await_records(
+        log_path: Path, method: str, minimum: int, timeout: float = 1.5
+    ) -> list[dict[str, Any]]:
+        """Poll the log for at least *minimum* stream records naming *method*.
+
+        The record is written as the response completes, so this waits on the
+        writer rather than racing it — a short wait, because the writer is
+        synchronous and has effectively already run by the time the client sees
+        the last response. It has to be short: the shared suite's module-level
+        ``pytest.mark.timeout(5)`` arrives here through the star-import and
+        outranks any ``--timeout`` on the command line, so a generous poll would
+        turn a missing-record failure into an unreadable timeout.
+
+        Returns whatever it has at the deadline — the assertions, not this
+        helper, decide whether that is enough.
+        """
+        import json
+
+        found: list[dict[str, Any]] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if log_path.exists():
+                found = [
+                    rec
+                    for line in log_path.read_text().splitlines()
+                    if line.strip()
+                    for rec in [json.loads(line)]
+                    if rec.get("logger") == "vgi_rpc.access"
+                    and rec.get("method") == method
+                    and rec.get("method_type") == "stream"
+                ]
+                if len(found) >= minimum:
+                    break
+            time.sleep(0.05)
+        return found
+
+    def _assert_stream_shape(self, records: list[dict[str, Any]], method: str) -> None:
+        """Assert one init + at least one continuation, sharing a stream id."""
+        from vgi_rpc.access_log_conformance import validate_access_logs
+
+        assert records, (
+            f"no access-log records for the {method!r} stream; HTTP stream turns must be "
+            f"logged like unary calls are — a validator over a log that omits them passes "
+            f"on nothing"
+        )
+        stream_ids = {r.get("stream_id") for r in records}
+        assert len(stream_ids) == 1, (
+            f"records for one {method!r} call must share one stream_id, saw {stream_ids}; "
+            f"without that the turns of a stream cannot be joined"
+        )
+        stream_id = stream_ids.pop()
+        assert isinstance(stream_id, str) and self._STREAM_ID.match(stream_id), (
+            f"stream_id must be 32 lowercase hex characters, got {stream_id!r}"
+        )
+
+        inits = [r for r in records if "request_data" in r]
+        conts = [r for r in records if "request_data" not in r]
+        assert len(inits) == 1, (
+            f"exactly one {method!r} record must carry request_data (the /init turn), got "
+            f"{len(inits)} of {len(records)}"
+        )
+        assert conts, (
+            f"no continuation record for {method!r}: /exchange turns are where a stream's "
+            f"bytes actually move, and they were the half that went unlogged"
+        )
+        for rec in records:
+            assert rec.get("http_status") == 200, f"expected http_status 200, got {rec.get('http_status')}"
+            assert rec.get("request_bytes", -1) >= 0, "stream turns must report request_bytes"
+
+        violations = validate_access_logs(records)
+        assert not violations, f"stream records violate the access-log schema: {violations}"
+
+    def test_producer_stream_logs_every_turn(
+        self, conformance_http_access_log: tuple[int, Path]
+    ) -> None:
+        """A producer stream logs its init and each continuation."""
+        port, log_path = conformance_http_access_log
+        with http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy:
+            values = [ab.batch.column("value")[0].as_py() for ab in proxy.produce_n(count=3)]
+        assert values == [0, 10, 20]
+
+        # init + one continuation per remaining batch.
+        records = self._await_records(log_path, "produce_n", 4)
+        self._assert_stream_shape(records, "produce_n")
+        # The init mints the first cursor; the turn that closes the stream mints
+        # none, and its absence is the record saying so.
+        assert any("response_state" in r for r in records), "a turn that mints a cursor must log it"
+        assert any("request_state" in r for r in records), (
+            "a continuation must log the decrypted state the client sent, not the "
+            "AEAD ciphertext a reader cannot open"
+        )
+
+    def test_exchange_stream_logs_every_turn(
+        self, conformance_http_access_log: tuple[int, Path]
+    ) -> None:
+        """A bidirectional exchange stream logs its init and each exchange."""
+        from vgi_rpc.rpc import AnnotatedBatch
+
+        port, log_path = conformance_http_access_log
+        with (
+            http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy,
+            proxy.exchange_accumulate() as session,
+        ):
+            first = session.exchange(AnnotatedBatch.from_pydict({"value": [1.0, 2.0]}))
+            second = session.exchange(AnnotatedBatch.from_pydict({"value": [10.0]}))
+        assert first.batch.column("running_sum")[0].as_py() == pytest.approx(3.0)
+        assert second.batch.column("running_sum")[0].as_py() == pytest.approx(13.0)
+
+        records = self._await_records(log_path, "exchange_accumulate", 3)
+        self._assert_stream_shape(records, "exchange_accumulate")
+
+    def test_failing_stream_turn_is_logged_as_an_error(
+        self, conformance_http_access_log: tuple[int, Path]
+    ) -> None:
+        """A raising turn answers 200, so only the record says it failed.
+
+        The status line cannot: the exception rides the body as an EXCEPTION
+        batch. A record reporting ``ok`` for it would hide the failure from the
+        one place an operator looks for it.
+        """
+        port, log_path = conformance_http_access_log
+        with http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy:
+            with pytest.raises(Exception):
+                list(proxy.produce_error_on_init())
+
+        records = self._await_records(log_path, "produce_error_on_init", 1)
+        assert records, "a stream that raised on init produced no access-log record"
+        rec = records[-1]
+        assert rec["status"] == "error", f"expected status=error, got {rec['status']!r}"
+        assert rec["error_type"], "an error record must name the error type"
+        assert rec["error_message"], "an error record must carry the server-side message"
+
+
+class TestHttpResponseCapAccessLog:
+    """A response-cap overshoot must be logged as the failure it is.
+
+    The overshoot is detected *after* dispatch has returned: the body exists,
+    it is too big, so the server discards it and answers an EXCEPTION batch
+    instead. Every wire-visible signal agrees the call failed --
+    ``X-VGI-RPC-Error: true``, and an ``RpcError`` on the client -- while the
+    access record, whose ``status`` was settled when dispatch ended, said
+    ``ok``. That is worse than a missing record: an operator diffing "errors
+    the clients saw" against "errors the server logged" gets a clean log and
+    concludes the clients are wrong.
+
+    ``docs/access-log-spec.md`` §3 (``status`` is ``"error"`` for any failure)
+    and §4.1 (``error_message`` required and non-empty when it is).
+    """
+
+    @staticmethod
+    def _await_records(
+        log_path: Path, method: str, minimum: int, timeout: float = 2.0
+    ) -> list[dict[str, Any]]:
+        """Poll the log for at least *minimum* records naming *method*.
+
+        Short by design: the shared suite's module-level ``pytest.mark.timeout(5)``
+        arrives here through the star-import, so a generous poll would turn a
+        missing-record failure into an unreadable timeout. Returns whatever it
+        has at the deadline -- the assertions decide whether that is enough.
+        """
+        import json
+
+        found: list[dict[str, Any]] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if log_path.exists():
+                found = [
+                    rec
+                    for line in log_path.read_text().splitlines()
+                    if line.strip()
+                    for rec in [json.loads(line)]
+                    if rec.get("logger") == "vgi_rpc.access" and rec.get("method") == method
+                ]
+                if len(found) >= minimum:
+                    break
+            time.sleep(0.05)
+        return found
+
+    @staticmethod
+    def _assert_cap_error(rec: dict[str, Any], method: str) -> None:
+        """Assert one record reports the cap overshoot the wire reported."""
+        from vgi_rpc.access_log_conformance import validate_access_logs
+
+        assert rec["status"] == "error", (
+            f"{method!r} overshot max_response_bytes -- the client got an RpcError and the "
+            f"response carried X-VGI-RPC-Error -- but the access record says "
+            f"status={rec['status']!r}; the log is the only place that failure is visible "
+            f"after the fact"
+        )
+        assert rec["error_type"], "an error record must name the error type"
+        assert "max_response_bytes" in rec.get("error_message", ""), (
+            f"the record must say which cap was overshot, got "
+            f"error_message={rec.get('error_message')!r}"
+        )
+        assert rec["message"].endswith(" error"), (
+            f"the human-readable summary must agree with the structured status, got "
+            f"{rec['message']!r}"
+        )
+        violations = validate_access_logs([rec])
+        assert not violations, f"cap-overshoot record violates the access-log schema: {violations}"
+
+    def _cap(self, port: int) -> int:
+        """The wire cap this worker advertises."""
+        from vgi_rpc.http import http_capabilities
+
+        caps = http_capabilities(base_url=f"http://127.0.0.1:{port}")
+        assert caps.max_response_bytes is not None, "fixture must advertise a wire cap"
+        return int(caps.max_response_bytes)
+
+    def test_unary_overshoot_is_logged_as_an_error(
+        self, conformance_http_capped_access_log: tuple[int, Path]
+    ) -> None:
+        """A unary response discarded for overshooting the cap logs status=error."""
+        from vgi_rpc.rpc import RpcError
+
+        port, log_path = conformance_http_capped_access_log
+        with (
+            http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy,
+            pytest.raises(RpcError, match=r"max_response_bytes"),
+        ):
+            proxy.oversized_unary(target_bytes=self._cap(port) * 4)
+
+        records = self._await_records(log_path, "oversized_unary", 1)
+        assert records, "the overshooting unary call produced no access-log record at all"
+        self._assert_cap_error(records[-1], "oversized_unary")
+
+    def test_exchange_overshoot_is_logged_as_an_error(
+        self, conformance_http_capped_access_log: tuple[int, Path]
+    ) -> None:
+        """The overshooting stream turn logs error; the init turn that succeeded stays ok.
+
+        Streams only began producing records at all in the commit before this
+        one, so this path has never been exercised for a cap overshoot. Both
+        halves matter: promoting the whole call to ``error`` would blame the
+        ``/init`` turn, which genuinely succeeded.
+        """
+        from vgi_rpc.rpc import AnnotatedBatch, RpcError
+
+        port, log_path = conformance_http_capped_access_log
+        target_rows = max(1024, (self._cap(port) * 4) // 16)
+        with (
+            http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy,
+            pytest.raises(RpcError, match=r"max_response_bytes"),
+            proxy.exchange_oversized(rows_per_batch=target_rows) as session,
+        ):
+            session.exchange(AnnotatedBatch.from_pydict({"value": [1.0]}))
+
+        records = self._await_records(log_path, "exchange_oversized", 2)
+        assert len(records) >= 2, (
+            f"expected an /init record and the overshooting /exchange record, got {len(records)}"
+        )
+        inits = [r for r in records if "request_data" in r]
+        conts = [r for r in records if "request_data" not in r]
+        assert inits and conts, f"expected both an init and a continuation record, got {records}"
+        assert all(r["status"] == "ok" for r in inits), (
+            "the /init turn answered a well-formed response under the cap; marking it failed "
+            "attributes the overshoot to the wrong turn"
+        )
+        self._assert_cap_error(conts[-1], "exchange_oversized")
+
+    def test_producer_soft_cap_is_not_logged_as_an_error(
+        self, conformance_http_capped_access_log: tuple[int, Path]
+    ) -> None:
+        """A producer overshoot is covered by a continuation, so nothing failed.
+
+        The negative control on the other two: the wire cap is *soft* for
+        producer streams -- the framework mints a continuation token instead of
+        failing -- so no error reaches the wire and every record must still say
+        ``ok``. An implementation that re-stated status from the mere presence
+        of a cap overshoot would fail here.
+        """
+        port, log_path = conformance_http_capped_access_log
+        target_rows = max(1024, (self._cap(port) * 2) // 16)
+        with http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy:
+            batches = list(proxy.produce_oversized_batch(rows_per_batch=target_rows))
+        assert sum(b.batch.num_rows for b in batches) == target_rows
+
+        records = self._await_records(log_path, "produce_oversized_batch", 1)
+        assert records, "the producer stream produced no access-log record"
+        for rec in records:
+            assert rec["status"] == "ok", (
+                f"a producer overshoot is absorbed by a continuation token, not an error; "
+                f"got status={rec['status']!r} error_message={rec.get('error_message')!r}"
+            )

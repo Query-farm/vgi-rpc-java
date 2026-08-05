@@ -12,6 +12,14 @@ public final class Metadata {
 
     public static final String RPC_METHOD          = "vgi_rpc.method";
     public static final String STREAM_STATE        = "vgi_rpc.stream_state#b64";
+    /**
+     * A stream's <em>call state</em> — the half fixed for the life of the
+     * call (the resolved schemas, the stream id). Minted once by
+     * {@code /init}, never re-issued, and echoed by the client on every
+     * subsequent request; only {@link #STREAM_STATE}, the cursor, comes back
+     * per turn.
+     */
+    public static final String CALL_STATE         = "vgi_rpc.call_state#b64";
     public static final String CANCEL              = "vgi_rpc.cancel";
     public static final String LOG_LEVEL           = "vgi_rpc.log_level";
     public static final String LOG_MESSAGE         = "vgi_rpc.log_message";

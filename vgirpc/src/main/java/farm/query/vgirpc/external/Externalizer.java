@@ -4,6 +4,7 @@
 package farm.query.vgirpc.external;
 
 import com.github.luben.zstd.Zstd;
+import farm.query.vgirpc.AccessLogScope;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
@@ -71,6 +72,11 @@ public final class Externalizer {
             contentEncoding = "zstd";
         }
 
+        // Counted here rather than at the call sites: this is the one place every
+        // externalised payload passes through, so a new upload path cannot drift
+        // from the total. These bytes never appear in the HTTP body — only the
+        // pointer batch below does — so nothing at the transport can see them.
+        AccessLogScope.countExternalized(uploadBody.length);
         URI url = config.storage().upload(uploadBody, contentEncoding);
 
         // Build a zero-row pointer root with the same schema.

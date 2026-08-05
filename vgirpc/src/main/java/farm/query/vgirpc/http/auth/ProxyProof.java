@@ -5,7 +5,8 @@ package farm.query.vgirpc.http.auth;
 
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.http.Authenticator;
-import farm.query.vgirpc.http.InvalidCredentials;
+import farm.query.vgirpc.http.AuthFailure;
+import farm.query.vgirpc.http.AuthReason;
 import jakarta.servlet.http.HttpServletRequest;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
@@ -381,9 +382,11 @@ public final class ProxyProof {
                 claims = verifyRequest(request, config, cache);
             } catch (ProofFailure failure) {
                 if (required) {
-                    // Uniform message: the caller controls kid, so echoing any detail would reflect
-                    // attacker-supplied text.
-                    throw new InvalidCredentials("proxy proof required");
+                    // Every outcome — absent, malformed, unknown kid, expired, bad MAC, replayed —
+                    // collapses onto one reason and one message. The caller controls kid, so echoing
+                    // any detail would reflect attacker-supplied text, and distinguishing the stages
+                    // would turn the rejection into the oracle §6 of the proof spec forbids.
+                    throw new AuthFailure(AuthReason.PROXY_REQUIRED, "proxy proof required");
                 }
                 Map<String, Object> unverified = new LinkedHashMap<>();
                 unverified.put("verified", "false");

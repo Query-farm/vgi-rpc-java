@@ -23,6 +23,7 @@ import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -113,6 +114,17 @@ public final class RpcServer {
      * @param hook the hook to invoke (e.g. {@link AccessLogHook}); {@code null} removes it
      */
     public void setDispatchHook(DispatchHook hook) { this.dispatchHook = hook; }
+
+    /**
+     * The installed dispatch hook, if any.
+     *
+     * <p>Exposed so transports that dispatch outside {@link #serveOne} — the
+     * HTTP stream handler runs its own init/continuation turns — can fire the
+     * same hook and produce the same access-log records.
+     *
+     * @return the hook, or {@code null} when none is installed
+     */
+    public DispatchHook dispatchHook() { return dispatchHook; }
 
     /**
      * Operator-supplied free-form protocol-contract version label (optional).
@@ -219,11 +231,16 @@ public final class RpcServer {
      * <p>Best-effort: returns {@code null} on any failure so observability never fails
      * dispatch.
      */
-    private static byte[] serializeRequestBatch(VectorSchemaRoot root, Map<String, String> meta) {
+    private static byte[] serializeRequestBatch(VectorSchemaRoot root, Map<String, String> meta,
+                                                 DictionaryProvider dictionaries) {
         try {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             try (IpcStreamWriter w = new IpcStreamWriter(baos)) {
-                w.writeBatch(root, meta);
+                // Dictionary-encoded params (enums) need their dictionary batches
+                // in the stream, or the writer refuses and the record loses
+                // request_data entirely — which the access-log schema reads as a
+                // missing required property on every enum-taking method.
+                w.writeBatch(root, meta, dictionaries);
                 w.writeEos();
             }
             return baos.toByteArray();
@@ -243,7 +260,13 @@ public final class RpcServer {
 
     /** Handle exactly one RPC call, attaching/using the connection's shm session if present. */
     private void serveOne(RpcTransport transport, ShmSession shmSession) {
-        try (IpcStreamReader reader = new IpcStreamReader(transport.reader(), Allocators.root())) {
+        // Opened per call so a pipe/unix/TCP transport — which has no request
+        // boundary of its own — still reports a raised method as status="error"
+        // in the access log. Under HTTP the servlet already installed one
+        // spanning the whole request, and this nests inertly inside it so the
+        // signal outlives dispatch and reaches the response headers.
+        try (CallOutcome outcome = CallOutcome.open();
+             IpcStreamReader reader = new IpcStreamReader(transport.reader(), Allocators.root())) {
             Map<String, String> meta;
             try {
                 meta = reader.readNextBatch();
@@ -312,6 +335,13 @@ public final class RpcServer {
                     transport.writer().flush();
                     return;
                 }
+                // Snapshot request_data here for the same reason the kwargs are
+                // snapshotted above: draining mutates the reader's root, so a
+                // batch serialized after it carries zero rows. Only worth the
+                // re-encode when a hook will actually consume it.
+                byte[] requestDataSnapshot = dispatchHook == null ? null
+                        : serializeRequestBatch(paramsRoot, meta,
+                                resolvedParams != null ? null : reader.dictionaryProvider());
                 // Drain remaining batches in this request stream so the next call sees a fresh stream
                 try { reader.drain(); } catch (IOException ignore) {}
                 String method;
@@ -358,8 +388,9 @@ public final class RpcServer {
                     dispatchInfo.principal = scope.auth() != null && scope.auth().principal() != null ? scope.auth().principal() : "";
                     dispatchInfo.authDomain = scope.auth() != null && scope.auth().domain() != null ? scope.auth().domain() : "";
                     dispatchInfo.authenticated = scope.auth() != null && scope.auth().authenticated();
+                    dispatchInfo.claims = scope.auth() != null ? scope.auth().claims() : null;
                     dispatchInfo.transportMetadata = scope.transportMetadata();
-                    dispatchInfo.requestData = serializeRequestBatch(paramsRoot, meta);
+                    dispatchInfo.requestData = requestDataSnapshot;
                     if ("stream".equals(dispatchInfo.methodType)) {
                         dispatchInfo.streamId = AccessLogHook.randomStreamId();
                     }
