@@ -13,6 +13,7 @@ import farm.query.vgirpc.CallOutcome;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.SessionLostError;
+import farm.query.vgirpc.external.ExternalResponseBudget;
 import farm.query.vgirpc.external.UploadUrlProvider;
 import farm.query.vgirpc.http.auth.ProxyProof;
 import farm.query.vgirpc.transport.RpcTransport;
@@ -1186,11 +1187,19 @@ public final class HttpServer {
                 resp.sendError(HttpServletResponse.SC_NOT_FOUND);
                 return;
             }
-            if (stream) {
-                handleStream(req, resp, methodName, init);
-                return;
+            // The external-channel budget spans the whole dispatch: the upload
+            // choke point inside Externalizer charges against it, and the
+            // handlers below read it back after dispatch. Opened here rather
+            // than in each handler because this is the one place that knows the
+            // method name the refusal has to name.
+            try (ExternalResponseBudget budget =
+                         ExternalResponseBudget.open(advertisedMaxExternalizedResponseBytes, methodName)) {
+                if (stream) {
+                    handleStream(req, resp, methodName, init);
+                } else {
+                    handleUnary(req, resp, methodName);
+                }
             }
-            handleUnary(req, resp, methodName);
         }
 
         @Override
@@ -1472,6 +1481,11 @@ public final class HttpServer {
         }
         emitResponseCookies(resp, md);
         emitSessionResponseHeaders(resp, scope);
+        // External-channel cap first: it governs bytes that never touch the
+        // body, so a response can sit comfortably under max_response_bytes and
+        // still have blown this one — which is precisely the case a tight body
+        // cap would otherwise mask.
+        if (writeExternalizedCapErrorIfViolated(req, resp)) return;
         // Operator-facing response cap: post-flush enforcement.  Mirrors the
         // Python reference's strict-fail — overshoot replaces the body with
         // an Arrow EXCEPTION batch carrying the literal "max_response_bytes"
@@ -1668,16 +1682,45 @@ public final class HttpServer {
      *  body overshoots the operator-facing response cap. */
     private void writeResponseCapError(HttpServletRequest req, HttpServletResponse resp,
                                        String method, long actual, long limit) throws IOException {
-        RuntimeException overshoot = new RuntimeException(
+        writeCapError(req, resp, new RuntimeException(
                 "HTTP body exceeds max_response_bytes (" + actual + " > " + limit
-                        + ") for method '" + method + "'");
+                        + ") for method '" + method + "'"));
+    }
+
+    /**
+     * Answer a cap refusal: discard whatever body was built and send an Arrow
+     * EXCEPTION-batch stream carrying {@code overshoot} instead.
+     *
+     * <p>200 + {@code X-VGI-RPC-Error} so clients that discard 5xx bodies still
+     * parse the IPC error batch. Matches Python's {@code _set_http_status}.
+     */
+    private void writeCapError(HttpServletRequest req, HttpServletResponse resp,
+                               Throwable overshoot) throws IOException {
         ByteArrayOutputStream errOut = new ByteArrayOutputStream();
         Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, overshoot, rpc.serverId());
-        // 200 + X-VGI-RPC-Error so clients that discard 5xx bodies still parse
-        // the IPC error batch.  Matches Python's _set_http_status.
         resp.setStatus(HttpServletResponse.SC_OK);
         resp.setHeader(RPC_ERROR_HEADER, "true");
         writeArrowResponse(req, resp, errOut.toByteArray());
+    }
+
+    /**
+     * Fail the response when this request's external-channel budget was tripped.
+     *
+     * <p>Hard on <em>every</em> method type, producer {@code /init} included —
+     * the deliberate opposite of {@code max_response_bytes}, which producers
+     * escape via a continuation token. A continuation cannot help here: by the
+     * time one could be minted the upload has either happened or been refused,
+     * and carrying the overshoot to the next turn would just spend the egress a
+     * turn later.
+     *
+     * @return {@code true} when the response has been written and the caller must stop
+     */
+    private boolean writeExternalizedCapErrorIfViolated(HttpServletRequest req,
+                                                        HttpServletResponse resp) throws IOException {
+        ExternalResponseBudget budget = ExternalResponseBudget.current();
+        if (budget == null || !budget.violated()) return false;
+        writeCapError(req, resp, budget.violation());
+        return true;
     }
 
     private static Map<String, Object> buildTransportMetadata(HttpServletRequest req) {
@@ -2108,6 +2151,9 @@ public final class HttpServer {
         }
         emitResponseCookies(resp, md);
         emitSessionResponseHeaders(resp, scope);
+        // External-channel cap: hard on producer /init too, unlike the wire cap
+        // below — see writeExternalizedCapErrorIfViolated.
+        if (writeExternalizedCapErrorIfViolated(req, resp)) return;
         // Wire-cap enforcement: /exchange strict-fails on overshoot (mirrors
         // Python's TestHttpResponseCap.test_exchange_strict_fail), while /init
         // is soft-capped — a producer that emits one batch larger than the

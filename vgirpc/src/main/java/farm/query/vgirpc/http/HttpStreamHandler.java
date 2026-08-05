@@ -16,6 +16,9 @@ import farm.query.vgirpc.RpcMethodInfo;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.StreamState;
+import farm.query.vgirpc.external.ExternalLocationConfig;
+import farm.query.vgirpc.external.ExternalizedResponseCapExceededException;
+import farm.query.vgirpc.external.Externalizer;
 import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.marshal.ParameterBinder;
@@ -498,15 +501,19 @@ public final class HttpStreamHandler {
 
             if (!isProducer && data != null && newTokenStr != null) {
                 // Exchange continuation: piggy-back the new token on the data batch's metadata.
+                // Externalising keeps it — Externalizer merges the batch's metadata into the
+                // pointer's, so the cursor rides the pointer batch the client actually reads.
                 Map<String, String> md = new LinkedHashMap<>();
                 if (data.customMetadata() != null) md.putAll(data.customMetadata());
                 md.put(Metadata.STREAM_STATE, newTokenStr);
-                w.writeBatch(data.root(), md, dictOr(data.dictionaryProvider(), inputDicts));
+                writeStreamBatch(w, outputSchema, data.root(), md,
+                        dictOr(data.dictionaryProvider(), inputDicts), true);
                 data.root().close();
             } else {
                 // Producer continuation (or no data): emit the data batch as-is, token as a trailing zero-row batch.
                 if (data != null) {
-                    w.writeBatch(data.root(), data.customMetadata(), dictOr(data.dictionaryProvider(), inputDicts));
+                    writeStreamBatch(w, outputSchema, data.root(), data.customMetadata(),
+                            dictOr(data.dictionaryProvider(), inputDicts), true);
                     data.root().close();
                 }
                 if (newTokenStr != null) {
@@ -624,7 +631,8 @@ public final class HttpStreamHandler {
             if (!error) {
                 // Emit all buffered entries (logs + at most one data batch) in order.
                 for (OutputCollector.Entry e : coll.entries()) {
-                    w.writeBatch(e.root(), e.customMetadata(), e.dictionaryProvider());
+                    writeStreamBatch(w, outputSchema, e.root(), e.customMetadata(),
+                            e.dictionaryProvider(), e.isData());
                     e.root().close();
                 }
                 // If the producer isn't finished, append a zero-row state-token batch so the
@@ -743,6 +751,56 @@ public final class HttpStreamHandler {
     }
 
     private static DictionaryProvider dictOr(DictionaryProvider a, DictionaryProvider b) { return a != null ? a : b; }
+
+    /**
+     * Write one stream output batch, routing data batches through the
+     * external-location channel when one is configured.
+     *
+     * <p>Streams used to skip this entirely: only unary results
+     * ({@code RpcServer.writeResult}) and the pipe-family tick loop
+     * ({@code RpcServer.flushEntries}) externalised, so an HTTP worker that
+     * advertised {@code VGI-Externalization-Enabled} and a threshold applied
+     * neither to the responses where the bytes actually are. Nothing noticed,
+     * because inline delivery is observationally identical to a resolved
+     * pointer — right up to the point an operator caps the external channel and
+     * the cap has nothing to govern.
+     *
+     * <p>Dictionary-encoded batches stay inline. {@link Externalizer} serialises
+     * the payload without a dictionary provider, so an externalised dictionary
+     * batch would upload an undecodable stream; inline is the correct answer
+     * until the uploader can carry dictionaries.
+     *
+     * <p>{@code outputSchema} is handed to the uploader so the standalone
+     * payload declares the schema this stream declared. A collector root often
+     * differs from it in field nullability only, which is invisible inline —
+     * the batch rides a stream whose schema was declared up front — and reads
+     * back as a schema mismatch the moment it becomes its own stream.
+     */
+    private void writeStreamBatch(IpcStreamWriter w, Schema outputSchema, VectorSchemaRoot root,
+                                   Map<String, String> meta, DictionaryProvider dicts,
+                                   boolean isData) throws IOException {
+        ExternalLocationConfig cfg = rpc.externalConfig();
+        if (isData && dicts == null && cfg != null && cfg.storage() != null) {
+            Externalizer.Pointer ptr;
+            try {
+                ptr = Externalizer.maybeExternalize(root, meta, cfg, outputSchema);
+            } catch (ExternalizedResponseCapExceededException cap) {
+                // A refusal, not a failure — see Externalizer's docs.
+                throw cap;
+            } catch (Exception up) {
+                // Upload failed — fall through and write inline rather than
+                // failing the turn; the client still gets valid data.
+                ptr = null;
+            }
+            if (ptr != null) {
+                try (VectorSchemaRoot pointer = ptr.root()) {
+                    w.writeBatch(pointer, ptr.customMetadata());
+                }
+                return;
+            }
+        }
+        w.writeBatch(root, meta, dicts);
+    }
 
     /** Collects log Messages during init so they can be flushed into the response stream. */
     private final class OutputCollectorSink implements Consumer<Message> {

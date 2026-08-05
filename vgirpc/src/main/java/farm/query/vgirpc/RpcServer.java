@@ -726,6 +726,11 @@ public final class RpcServer {
                             }
                             continue;
                         }
+                    } catch (farm.query.vgirpc.external.ExternalizedResponseCapExceededException cap) {
+                        // Not an upload failure — an operator refusal. Falling back to
+                        // inline would answer success for the very response the cap was
+                        // configured to refuse, so it propagates and fails the stream.
+                        throw cap;
                     } catch (Exception up) {
                         // Upload failed — fall through and write the batch inline rather than
                         // failing the stream. The client will still receive valid data.
