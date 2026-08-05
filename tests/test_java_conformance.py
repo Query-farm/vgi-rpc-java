@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -281,6 +282,31 @@ def conformance_http_cold_call_cache_port() -> Iterator[int]:
     one: every turn takes the miss path.
     """
     yield from _start_http_worker("--http", "--no-call-state-cache")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_access_log(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[int, Path]]:
+    """Spawn an HTTP worker writing a JSONL access log, yielding ``(port, path)``.
+
+    Backs the shared ``TestRequestId`` correlation case, which is the one
+    assertion the ``X-Request-ID`` field exists for: an id that appears on the
+    response but not in the log, or differs between them, looks like a working
+    trail right up to the moment somebody follows it. Checking that needs to
+    read back what the server logged for a request the suite itself made, which
+    no amount of poking at the wire substitutes for.
+
+    Its own worker, because ``--access-log`` appends for the process's whole
+    life and the shared one is used by every other HTTP group.
+    """
+    log_path = tmp_path_factory.mktemp("accesslog") / "conformance.jsonl"
+    gen = _start_http_worker("--http", "--access-log", str(log_path))
+    port = next(gen)
+    try:
+        yield port, log_path
+    finally:
+        next(gen, None)
 
 
 @pytest.fixture(scope="session")
@@ -677,3 +703,162 @@ class TestContinuationOnlyResume:
             # Resume from the first token: replays everything after batch 0.
             resumed = proxy_b.resume_stream("produce_n", tokens[0])
             assert [ab.batch.column("value")[0].as_py() for ab in resumed] == [10, 20]
+
+
+class TestHttpStreamAccessLog:
+    """Every HTTP turn of a stream call must produce an access-log record.
+
+    ``vgi-rpc-test --access-log`` validates the *launcher* worker's log, where a
+    whole stream call is a single dispatch and therefore a single record. Over
+    HTTP a stream is a chain of independent requests — one ``/init`` and one
+    ``/exchange`` per continuation — and the Java server fired its dispatch hook
+    only on the unary path, so streams produced **no records at all**. The
+    validator passed anyway: it checks the records it is given, and there is
+    nothing wrong with a log that is merely missing the traffic that carries the
+    bytes.
+
+    So this asserts presence and shape, which a schema check structurally
+    cannot: an init record carrying ``request_data``, at least one continuation
+    carrying none, and one ``stream_id`` joining them — plus the reference
+    validator over exactly those records, so shape and conformance are both
+    covered.
+
+    ``docs/access-log-spec.md`` §1 ("Stream calls produce one record per init
+    and one per exchange/produce continuation") and §5.
+    """
+
+    #: A stream's lifecycle id: 32 lowercase hex, per the schema.
+    _STREAM_ID = re.compile(r"^[0-9a-f]{32}$")
+
+    @staticmethod
+    def _await_records(
+        log_path: Path, method: str, minimum: int, timeout: float = 1.5
+    ) -> list[dict[str, Any]]:
+        """Poll the log for at least *minimum* stream records naming *method*.
+
+        The record is written as the response completes, so this waits on the
+        writer rather than racing it — a short wait, because the writer is
+        synchronous and has effectively already run by the time the client sees
+        the last response. It has to be short: the shared suite's module-level
+        ``pytest.mark.timeout(5)`` arrives here through the star-import and
+        outranks any ``--timeout`` on the command line, so a generous poll would
+        turn a missing-record failure into an unreadable timeout.
+
+        Returns whatever it has at the deadline — the assertions, not this
+        helper, decide whether that is enough.
+        """
+        import json
+
+        found: list[dict[str, Any]] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if log_path.exists():
+                found = [
+                    rec
+                    for line in log_path.read_text().splitlines()
+                    if line.strip()
+                    for rec in [json.loads(line)]
+                    if rec.get("logger") == "vgi_rpc.access"
+                    and rec.get("method") == method
+                    and rec.get("method_type") == "stream"
+                ]
+                if len(found) >= minimum:
+                    break
+            time.sleep(0.05)
+        return found
+
+    def _assert_stream_shape(self, records: list[dict[str, Any]], method: str) -> None:
+        """Assert one init + at least one continuation, sharing a stream id."""
+        from vgi_rpc.access_log_conformance import validate_access_logs
+
+        assert records, (
+            f"no access-log records for the {method!r} stream; HTTP stream turns must be "
+            f"logged like unary calls are — a validator over a log that omits them passes "
+            f"on nothing"
+        )
+        stream_ids = {r.get("stream_id") for r in records}
+        assert len(stream_ids) == 1, (
+            f"records for one {method!r} call must share one stream_id, saw {stream_ids}; "
+            f"without that the turns of a stream cannot be joined"
+        )
+        stream_id = stream_ids.pop()
+        assert isinstance(stream_id, str) and self._STREAM_ID.match(stream_id), (
+            f"stream_id must be 32 lowercase hex characters, got {stream_id!r}"
+        )
+
+        inits = [r for r in records if "request_data" in r]
+        conts = [r for r in records if "request_data" not in r]
+        assert len(inits) == 1, (
+            f"exactly one {method!r} record must carry request_data (the /init turn), got "
+            f"{len(inits)} of {len(records)}"
+        )
+        assert conts, (
+            f"no continuation record for {method!r}: /exchange turns are where a stream's "
+            f"bytes actually move, and they were the half that went unlogged"
+        )
+        for rec in records:
+            assert rec.get("http_status") == 200, f"expected http_status 200, got {rec.get('http_status')}"
+            assert rec.get("request_bytes", -1) >= 0, "stream turns must report request_bytes"
+
+        violations = validate_access_logs(records)
+        assert not violations, f"stream records violate the access-log schema: {violations}"
+
+    def test_producer_stream_logs_every_turn(
+        self, conformance_http_access_log: tuple[int, Path]
+    ) -> None:
+        """A producer stream logs its init and each continuation."""
+        port, log_path = conformance_http_access_log
+        with http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy:
+            values = [ab.batch.column("value")[0].as_py() for ab in proxy.produce_n(count=3)]
+        assert values == [0, 10, 20]
+
+        # init + one continuation per remaining batch.
+        records = self._await_records(log_path, "produce_n", 4)
+        self._assert_stream_shape(records, "produce_n")
+        # The init mints the first cursor; the turn that closes the stream mints
+        # none, and its absence is the record saying so.
+        assert any("response_state" in r for r in records), "a turn that mints a cursor must log it"
+        assert any("request_state" in r for r in records), (
+            "a continuation must log the decrypted state the client sent, not the "
+            "AEAD ciphertext a reader cannot open"
+        )
+
+    def test_exchange_stream_logs_every_turn(
+        self, conformance_http_access_log: tuple[int, Path]
+    ) -> None:
+        """A bidirectional exchange stream logs its init and each exchange."""
+        from vgi_rpc.rpc import AnnotatedBatch
+
+        port, log_path = conformance_http_access_log
+        with (
+            http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy,
+            proxy.exchange_accumulate() as session,
+        ):
+            first = session.exchange(AnnotatedBatch.from_pydict({"value": [1.0, 2.0]}))
+            second = session.exchange(AnnotatedBatch.from_pydict({"value": [10.0]}))
+        assert first.batch.column("running_sum")[0].as_py() == pytest.approx(3.0)
+        assert second.batch.column("running_sum")[0].as_py() == pytest.approx(13.0)
+
+        records = self._await_records(log_path, "exchange_accumulate", 3)
+        self._assert_stream_shape(records, "exchange_accumulate")
+
+    def test_failing_stream_turn_is_logged_as_an_error(
+        self, conformance_http_access_log: tuple[int, Path]
+    ) -> None:
+        """A raising turn answers 200, so only the record says it failed.
+
+        The status line cannot: the exception rides the body as an EXCEPTION
+        batch. A record reporting ``ok`` for it would hide the failure from the
+        one place an operator looks for it.
+        """
+        port, log_path = conformance_http_access_log
+        with http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy:
+            with pytest.raises(Exception):
+                list(proxy.produce_error_on_init())
+
+        records = self._await_records(log_path, "produce_error_on_init", 1)
+        assert records, "a stream that raised on init produced no access-log record"
+        rec = records[-1]
+        assert rec["status"] == "error", f"expected status=error, got {rec['status']!r}"
+        assert rec["error_type"], "an error record must name the error type"
+        assert rec["error_message"], "an error record must carry the server-side message"

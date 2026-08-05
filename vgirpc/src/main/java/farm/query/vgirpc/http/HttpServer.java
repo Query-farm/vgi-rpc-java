@@ -9,6 +9,7 @@ import farm.query.vgirpc.AccessLogScope;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.CallContext;
+import farm.query.vgirpc.CallOutcome;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.SessionLostError;
@@ -1062,7 +1063,12 @@ public final class HttpServer {
             // response_bytes cannot be read where the record is written:
             // compression runs after the handler, so a record emitted there
             // could only ever report the uncompressed size.
-            try (AccessLogScope access = AccessLogScope.open(requestId)) {
+            // Spans the whole request, so an error serialized during dispatch is
+            // still visible when the response headers are written — a failed RPC
+            // answers 200 with the exception in the body, and X-VGI-RPC-Error is
+            // the only thing that says so.
+            try (CallOutcome outcome = CallOutcome.open();
+                 AccessLogScope access = AccessLogScope.open(requestId)) {
                 try {
                     super.service(req, resp);
                 } catch (AuthUnavailableException e) {
@@ -1801,6 +1807,13 @@ public final class HttpServer {
     }
 
     private void writeArrowResponse(HttpServletRequest req, HttpServletResponse resp, byte[] body) throws IOException {
+        // Every Arrow response body leaves through here, which makes this the
+        // one place the error flag can be raised without a new failure path
+        // being able to forget it. A failed call answers 200 — the exception
+        // rides the body as an EXCEPTION batch — so without this header a
+        // client reads a failure as a result. Setting it unconditionally would
+        // be the same outage in the other direction, hence the check.
+        if (CallOutcome.failed()) resp.setHeader(RPC_ERROR_HEADER, "true");
         resp.setContentType(ARROW_CONTENT_TYPE);
         ResponseEncoding choice = chooseResponseEncoding(req, supportedEncodings);
         byte[] encoded = encodeArrowBody(resp, choice, body, zstdLevel);

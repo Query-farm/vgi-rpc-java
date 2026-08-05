@@ -228,17 +228,28 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         long startNs = token instanceof Long ? (Long) token : System.nanoTime();
         double durationMs = Math.round((System.nanoTime() - startNs) / 10_000.0) / 100.0;
 
-        String status = error == null ? "ok" : "error";
+        // A method that raised does not propagate: the dispatcher serializes the
+        // exception into the response and returns normally, so `error` is null
+        // for exactly the calls an operator most wants to find. CallOutcome is
+        // what the error was recorded on as it went onto the wire.
+        Throwable failure = error != null ? error : CallOutcome.currentError();
+
+        String status = failure == null ? "ok" : "error";
         String errorType = "";
         String errorMessage = "";
-        if (error != null) {
-            if (error instanceof RpcError re) {
+        if (failure != null) {
+            if (failure instanceof RpcError re) {
                 errorType = re.errorType();
                 errorMessage = re.getMessage() == null ? "" : re.getMessage();
             } else {
-                errorType = error.getClass().getSimpleName();
-                errorMessage = error.getMessage() == null ? error.toString() : error.getMessage();
+                errorType = failure.getClass().getSimpleName();
+                errorMessage = failure.getMessage() == null ? failure.toString() : failure.getMessage();
             }
+            // The schema requires a non-empty error_message on every error
+            // record, and an exception carrying no message is not a reason to
+            // emit an unreadable one.
+            if (errorMessage.isEmpty()) errorMessage = failure.toString();
+            if (errorType.isEmpty()) errorType = failure.getClass().getSimpleName();
         }
 
         AccessLogScope scope = AccessLogScope.current();
@@ -291,6 +302,15 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
             rec.put("stream_id", info.streamId == null || info.streamId.isEmpty()
                     ? "00000000000000000000000000000000" : info.streamId);
         }
+        // Stream state, decrypted. The token on the wire is an opaque AEAD
+        // ciphertext; a log reader holding the server's token_key is not a
+        // situation to design for, so the plaintext is what gets logged.
+        // Gated with request_data: these are the same kind of payload and a
+        // deployment that opted out of one did not ask for the other.
+        if (logPayloads) {
+            putStateBytes(rec, "request_state", info.requestState);
+            putStateBytes(rec, "response_state", info.responseState);
+        }
         if (info.cancelled) rec.put("cancelled", true);
         if (info.sessionId != null && !info.sessionId.isEmpty()) {
             rec.put("session_id", info.sessionId);
@@ -323,6 +343,13 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         } else {
             write(rec);
         }
+    }
+
+    /** Base64 a decrypted state payload under {@code key}, skipping empties —
+     *  the schema's base64 pattern admits no zero-length string. */
+    private static void putStateBytes(Map<String, Object> rec, String key, byte[] state) {
+        if (state == null || state.length == 0) return;
+        rec.put(key, Base64.getEncoder().encodeToString(state));
     }
 
     /** HTTP fills {@code remote_addr} into the transport metadata, not the dispatch info. */

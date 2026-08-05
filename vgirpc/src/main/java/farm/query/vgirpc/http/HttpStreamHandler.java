@@ -4,8 +4,12 @@
 package farm.query.vgirpc.http;
 
 import farm.query.vgirpc.AnnotatedBatch;
+import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.CallContext;
+import farm.query.vgirpc.CallOutcome;
+import farm.query.vgirpc.DispatchHook;
+import farm.query.vgirpc.DispatchInfo;
 import farm.query.vgirpc.MethodType;
 import farm.query.vgirpc.OutputCollector;
 import farm.query.vgirpc.RpcMethodInfo;
@@ -62,6 +66,8 @@ import java.util.function.Consumer;
  * the refreshed token on each data batch.</p>
  */
 public final class HttpStreamHandler {
+
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(HttpStreamHandler.class);
 
     private final RpcServer rpc;
     private final byte[] tokenKey;
@@ -169,6 +175,85 @@ public final class HttpStreamHandler {
         return c.asSubclass(StreamState.class);
     }
 
+    // --- Access-log telemetry ---------------------------------------------
+
+    /**
+     * One HTTP turn of a stream call, and the access-log record it produces.
+     *
+     * <p>A stream over HTTP is not one dispatch but a chain of them: an
+     * {@code /init} and then an {@code /exchange} per continuation, each its own
+     * request with its own body, status and byte counts. The spec follows the
+     * wire — one record per turn, all sharing the {@code stream_id} minted at
+     * init — rather than pretending the chain is a single call whose duration
+     * spans the client's think time.
+     *
+     * <p>Opened once the turn is a genuine dispatch: a malformed body or an
+     * unresolvable token is refused before a method runs and produces no
+     * record, matching the reference.
+     */
+    private final class StreamTurn implements AutoCloseable {
+        private final DispatchHook hook;
+        private final DispatchInfo info;
+        private final Object token;
+        /** Set when the turn threw. Errors written into the body instead are
+         *  picked up from {@link CallOutcome}, which the writer already records. */
+        private Throwable thrown;
+
+        StreamTurn(DispatchHook hook, DispatchInfo info, Object token) {
+            this.hook = hook;
+            this.info = info;
+            this.token = token;
+        }
+
+        @Override
+        public void close() {
+            Throwable err = thrown != null ? thrown : CallOutcome.currentError();
+            try {
+                hook.onDispatchEnd(token, info, null, err);
+            } catch (Throwable t) {
+                LOG.warn("dispatch hook end error: {}", t.toString());
+            }
+        }
+    }
+
+    /**
+     * Start a turn's telemetry, or return {@code null} when nothing is listening.
+     *
+     * @param method the stream method being dispatched
+     * @param streamId the stream's lifecycle id, shared by every turn
+     */
+    private StreamTurn beginTurn(String method, String streamId) {
+        DispatchHook hook = rpc.dispatchHook();
+        if (hook == null) return null;
+        DispatchInfo info = new DispatchInfo();
+        info.method = method;
+        info.methodType = "stream";
+        info.streamId = streamId;
+        info.serverId = rpc.serverId();
+        info.protocol = rpc.protocolName();
+        info.protocolHash = rpc.protocolHash();
+        info.protocolVersion = rpc.protocolVersion();
+        AuthScope.Scope scope = AuthScope.current();
+        AuthContext auth = scope.auth();
+        info.principal = auth != null && auth.principal() != null ? auth.principal() : "";
+        info.authDomain = auth != null && auth.domain() != null ? auth.domain() : "";
+        info.authenticated = auth != null && auth.authenticated();
+        info.claims = auth != null ? auth.claims() : null;
+        info.transportMetadata = scope.transportMetadata();
+        Object token = null;
+        try {
+            token = hook.onDispatchStart(info);
+        } catch (Throwable t) {
+            LOG.warn("dispatch hook start error: {}", t.toString());
+        }
+        return new StreamTurn(hook, info, token);
+    }
+
+    /** Record a field on a turn that may not exist (no hook installed). */
+    private static void onTurn(StreamTurn turn, Consumer<DispatchInfo> mutation) {
+        if (turn != null) mutation.accept(turn.info);
+    }
+
     /** Handle {@code POST /{method}/init}. Returns response IPC bytes. */
     public byte[] handleInit(String method, byte[] requestBody) throws Exception {
         RpcMethodInfo info = rpc.methods().get(method);
@@ -200,6 +285,30 @@ public final class HttpStreamHandler {
         OutputCollectorSink sink = new OutputCollectorSink();
         CallContext ctx = buildCallContext(method, sink);
 
+        // Minted here rather than inside mintInitTokens so the init record
+        // carries it even when the producer finishes in one turn and no
+        // continuation token is ever issued — and so every later turn's record
+        // can be joined to this one.
+        String streamId = newStreamId();
+        try (StreamTurn turn = beginTurn(method, streamId)) {
+            // The request body is already a self-contained Arrow IPC stream, so
+            // it is logged verbatim: byte-faithful, metadata intact, and free.
+            // Only the pipe transport, which reads from a shared stream with no
+            // discrete body, has to re-frame the batch.
+            onTurn(turn, i -> i.requestData = requestBody);
+            try {
+                return runInit(method, info, kwargs, requestMeta, ctx, sink, streamId, turn);
+            } catch (Throwable t) {
+                if (turn != null) turn.thrown = t;
+                throw t;
+            }
+        }
+    }
+
+    /** The body of {@code /init}, wrapped by {@link #handleInit}'s telemetry. */
+    private byte[] runInit(String method, RpcMethodInfo info, Map<String, Object> kwargs,
+                            Map<String, String> requestMeta, CallContext ctx,
+                            OutputCollectorSink sink, String streamId, StreamTurn turn) throws Exception {
         RpcStream<?> streamResult;
         try {
             Object[] args = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
@@ -229,9 +338,9 @@ public final class HttpStreamHandler {
             writeHeaderIpcStream(out, streamResult.header(), sink);
         }
         if (streamResult.isProducer()) {
-            writeProducerRun(out, streamResult, ctx, sink, requestMeta);
+            writeProducerRun(out, streamResult, ctx, sink, requestMeta, streamId, turn);
         } else {
-            writeExchangeInitToken(out, streamResult, sink);
+            writeExchangeInitToken(out, streamResult, sink, streamId, turn);
         }
         return out.toByteArray();
     }
@@ -274,45 +383,70 @@ public final class HttpStreamHandler {
                 return errorStream(e);
             }
 
-            Class<? extends StreamState> stateCls = stateTypes.get(method);
-            if (stateCls == null) {
-                return errorStream(new IllegalStateException(
-                        "Cannot resolve state type for method '" + method + "'"));
-            }
-            Schema outputSchema = deserializeSchema(call.outputSchema());
-            Schema inputSchema = deserializeSchema(call.inputSchema());
-            boolean isProducer = inputSchema.getFields().isEmpty();
-            StreamState state = StateSerializer.deserialize(token.state(), stateCls);
-
-            CallContext ctx = buildCallContext(method, new OutputCollectorSink());
-
-            if (req.meta().containsKey(Metadata.CANCEL)) {
-                return handleCancel(outputSchema, state, ctx);
-            }
-
-            VectorSchemaRoot castInput = null;
-            if (!isProducer && !ownedInput.getSchema().equals(inputSchema)) {
+            // The turn is a real dispatch only once the cursor has opened and
+            // named a call: everything above refuses the request before any
+            // state is rehydrated, and produces no record — same boundary the
+            // reference draws. The stream id rides in the call token, so every
+            // continuation's record joins the init's without server state.
+            try (StreamTurn turn = beginTurn(method, call.streamId())) {
+                // The plaintext the client's opaque AEAD cursor decrypted to.
+                // Logging the ciphertext would give a reader nothing they could
+                // decode without the server's token key.
+                onTurn(turn, i -> i.requestState = token.state());
                 try {
-                    castInput = Marshalling.castRoot(ownedInput, inputSchema, Allocators.root());
-                } catch (Exception castExc) {
-                    return errorStream(new ClassCastException(castExc.getMessage()));
-                }
-            }
-
-            try (VectorSchemaRoot maybeCast = castInput) {
-                VectorSchemaRoot actualInput = maybeCast != null ? maybeCast : ownedInput;
-                OutputCollector collector = new OutputCollector(outputSchema, rpc.serverId(), isProducer);
-                try {
-                    state.process(new AnnotatedBatch(actualInput, req.meta()), collector, ctx);
-                    if (!collector.finished()) collector.validate();
+                    return runExchange(method, req, ownedInput, token, call, principal, inputDicts, turn);
                 } catch (Throwable t) {
-                    return errorStream(t);
+                    if (turn != null) turn.thrown = t;
+                    throw t;
                 }
-                return writeExchangeResponse(collector, state, token, outputSchema, isProducer, principal, inputDicts);
             }
         }
         } finally {
             closeDictionaries(inputDicts);
+        }
+    }
+
+    /** The body of {@code /exchange}, wrapped by {@link #handleExchange}'s telemetry. */
+    private byte[] runExchange(String method, ExchangeRequest req, VectorSchemaRoot ownedInput,
+                                StateToken token, CallToken call, String principal,
+                                DictionaryProvider inputDicts, StreamTurn turn) throws Exception {
+        Class<? extends StreamState> stateCls = stateTypes.get(method);
+        if (stateCls == null) {
+            return errorStream(new IllegalStateException(
+                    "Cannot resolve state type for method '" + method + "'"));
+        }
+        Schema outputSchema = deserializeSchema(call.outputSchema());
+        Schema inputSchema = deserializeSchema(call.inputSchema());
+        boolean isProducer = inputSchema.getFields().isEmpty();
+        StreamState state = StateSerializer.deserialize(token.state(), stateCls);
+
+        CallContext ctx = buildCallContext(method, new OutputCollectorSink());
+
+        if (req.meta().containsKey(Metadata.CANCEL)) {
+            onTurn(turn, i -> i.cancelled = true);
+            return handleCancel(outputSchema, state, ctx);
+        }
+
+        VectorSchemaRoot castInput = null;
+        if (!isProducer && !ownedInput.getSchema().equals(inputSchema)) {
+            try {
+                castInput = Marshalling.castRoot(ownedInput, inputSchema, Allocators.root());
+            } catch (Exception castExc) {
+                return errorStream(new ClassCastException(castExc.getMessage()));
+            }
+        }
+
+        try (VectorSchemaRoot maybeCast = castInput) {
+            VectorSchemaRoot actualInput = maybeCast != null ? maybeCast : ownedInput;
+            OutputCollector collector = new OutputCollector(outputSchema, rpc.serverId(), isProducer);
+            try {
+                state.process(new AnnotatedBatch(actualInput, req.meta()), collector, ctx);
+                if (!collector.finished()) collector.validate();
+            } catch (Throwable t) {
+                return errorStream(t);
+            }
+            return writeExchangeResponse(collector, state, token, outputSchema, isProducer, principal,
+                    inputDicts, turn);
         }
     }
 
@@ -344,9 +478,11 @@ public final class HttpStreamHandler {
 
     private byte[] writeExchangeResponse(OutputCollector collector, StreamState state, StateToken priorToken,
                                          Schema outputSchema, boolean isProducer, String principal,
-                                         DictionaryProvider inputDicts) throws IOException {
+                                         DictionaryProvider inputDicts, StreamTurn turn) throws IOException {
         boolean finished = collector.finished();
-        String newTokenStr = finished ? null : serializeContinuationToken(state, priorToken, principal);
+        // Absent on the terminal turn: there is no outbound state when the
+        // stream closes, which is exactly what its absence in the record means.
+        String newTokenStr = finished ? null : serializeContinuationToken(state, priorToken, principal, turn);
 
         BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
@@ -381,8 +517,10 @@ public final class HttpStreamHandler {
         return out.toByteArray();
     }
 
-    private String serializeContinuationToken(StreamState state, StateToken priorToken, String principal) {
+    private String serializeContinuationToken(StreamState state, StateToken priorToken, String principal,
+                                               StreamTurn turn) {
         byte[] newStateBytes = StateSerializer.serialize(state);
+        onTurn(turn, i -> i.responseState = newStateBytes);
         StateToken newToken = new StateToken(newStateBytes, priorToken.callId(),
                 System.currentTimeMillis() / 1000);
         return new String(newToken.pack(tokenKey, principal), StandardCharsets.US_ASCII);
@@ -426,18 +564,21 @@ public final class HttpStreamHandler {
 
     /** Mint a stream's call id, call token, and first cursor at {@code /init}. */
     private Map<String, String> mintInitTokens(StreamState state, Schema outputSchema,
-                                                Schema inputSchema, String principal) {
+                                                Schema inputSchema, String principal,
+                                                String streamId, StreamTurn turn) {
         byte[] callId = new byte[Tokens.CALL_ID_LEN];
         new java.security.SecureRandom().nextBytes(callId);
         long now = System.currentTimeMillis() / 1000;
 
         CallToken call = new CallToken(serializeSchema(outputSchema), serializeSchema(inputSchema),
-                newStreamId(), callId, now);
+                streamId, callId, now);
         // Warm the cache with what we already hold, so this stream's first
         // continuation does not have to open the token it was just handed.
         callStates.put(callId, principal, call);
 
-        StateToken cursor = new StateToken(StateSerializer.serialize(state), callId, now);
+        byte[] stateBytes = StateSerializer.serialize(state);
+        onTurn(turn, i -> i.responseState = stateBytes);
+        StateToken cursor = new StateToken(stateBytes, callId, now);
         return Map.of(
                 Metadata.STREAM_STATE,
                 new String(cursor.pack(tokenKey, principal), StandardCharsets.US_ASCII),
@@ -461,7 +602,8 @@ public final class HttpStreamHandler {
 
     private void writeProducerRun(ByteArrayOutputStream out, RpcStream<?> streamResult,
                                    CallContext ctx, OutputCollectorSink sink,
-                                   Map<String, String> requestMeta) throws IOException {
+                                   Map<String, String> requestMeta,
+                                   String streamId, StreamTurn turn) throws IOException {
         Schema outputSchema = streamResult.outputSchema();
         Schema inputSchema = streamResult.inputSchema();
         StreamState state = streamResult.state();
@@ -489,7 +631,7 @@ public final class HttpStreamHandler {
                 // client knows to call /exchange to continue. Finished streams just EOS.
                 if (!coll.finished()) {
                     Map<String, String> md = mintInitTokens(state, outputSchema, inputSchema,
-                            currentPrincipal());
+                            currentPrincipal(), streamId, turn);
                     Wire.writeZeroBatch(w, outputSchema, md);
                 }
             }
@@ -497,11 +639,12 @@ public final class HttpStreamHandler {
     }
 
     private void writeExchangeInitToken(ByteArrayOutputStream out, RpcStream<?> streamResult,
-                                         OutputCollectorSink sink) throws IOException {
+                                         OutputCollectorSink sink,
+                                         String streamId, StreamTurn turn) throws IOException {
         Schema outputSchema = streamResult.outputSchema();
         Schema inputSchema = streamResult.inputSchema();
         Map<String, String> md = mintInitTokens(streamResult.state(), outputSchema, inputSchema,
-                currentPrincipal());
+                currentPrincipal(), streamId, turn);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
             sink.bind(w, outputSchema);

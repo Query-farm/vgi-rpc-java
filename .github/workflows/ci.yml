@@ -186,3 +186,23 @@ jobs:
           --access-log "$RUNNER_TEMP/java-access-log.jsonl"
           --require-request-data
           --timeout 30
+
+      # The step above validates the *launcher* worker's log, where a whole
+      # stream call is one dispatch and therefore one record. Over HTTP a stream
+      # is a chain of independent requests — one /init and one /exchange per
+      # continuation — and this server fired its dispatch hook only on the unary
+      # path, so streams produced no records at all. The validator passed
+      # regardless: it checks the records it is handed, and a log missing the
+      # traffic that carries the bytes has nothing wrong with the records it
+      # kept. Presence and shape are what has to be asserted, so this runs the
+      # group that drives real producer / exchange / failing streams over HTTP
+      # against a worker started with --access-log and reads its log back.
+      #
+      # Named as its own step rather than left to the full pytest run in this
+      # lane so the check is visible in the workflow, and so a regression here
+      # reports as itself rather than as one red line in a suite of a thousand.
+      - name: Verify HTTP stream access-log records
+        if: matrix.name == 'http'
+        run: >-
+          python -m pytest tests/test_java_conformance.py
+          -k TestHttpStreamAccessLog -p no:cacheprovider -q --timeout=120

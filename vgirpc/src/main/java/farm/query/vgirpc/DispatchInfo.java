@@ -42,6 +42,19 @@ public final class DispatchInfo {
     public byte[] requestData;
     /** Stream lifecycle identifier (32-char lowercase hex); empty on unary. */
     public String streamId = "";
+    /**
+     * Decrypted stream state the client sent, on a stream continuation; null on
+     * unary and on stream init. The on-wire token is an opaque AEAD ciphertext —
+     * this is the plaintext, so a log reader can decode it without holding the
+     * server's token key.
+     */
+    public byte[] requestState;
+    /**
+     * Decrypted stream state handed back to the client, on stream init and on
+     * any continuation that mints a fresh cursor. Null on unary and on the
+     * terminal continuation that closes the stream.
+     */
+    public byte[] responseState;
     /** True when the client cancelled the stream before end-of-stream. */
     public boolean cancelled;
     /** Transport-level request metadata (e.g. HTTP headers) captured by the auth scope; may be null. */

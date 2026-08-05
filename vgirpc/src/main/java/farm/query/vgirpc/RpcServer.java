@@ -116,6 +116,17 @@ public final class RpcServer {
     public void setDispatchHook(DispatchHook hook) { this.dispatchHook = hook; }
 
     /**
+     * The installed dispatch hook, if any.
+     *
+     * <p>Exposed so transports that dispatch outside {@link #serveOne} — the
+     * HTTP stream handler runs its own init/continuation turns — can fire the
+     * same hook and produce the same access-log records.
+     *
+     * @return the hook, or {@code null} when none is installed
+     */
+    public DispatchHook dispatchHook() { return dispatchHook; }
+
+    /**
      * Operator-supplied free-form protocol-contract version label (optional).
      *
      * @param v the label advertised as {@code vgi_rpc.protocol_version} in
@@ -249,7 +260,13 @@ public final class RpcServer {
 
     /** Handle exactly one RPC call, attaching/using the connection's shm session if present. */
     private void serveOne(RpcTransport transport, ShmSession shmSession) {
-        try (IpcStreamReader reader = new IpcStreamReader(transport.reader(), Allocators.root())) {
+        // Opened per call so a pipe/unix/TCP transport — which has no request
+        // boundary of its own — still reports a raised method as status="error"
+        // in the access log. Under HTTP the servlet already installed one
+        // spanning the whole request, and this nests inertly inside it so the
+        // signal outlives dispatch and reaches the response headers.
+        try (CallOutcome outcome = CallOutcome.open();
+             IpcStreamReader reader = new IpcStreamReader(transport.reader(), Allocators.root())) {
             Map<String, String> meta;
             try {
                 meta = reader.readNextBatch();
