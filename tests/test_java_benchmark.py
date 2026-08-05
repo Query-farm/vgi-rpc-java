@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Protocol
 
-import httpx
+import httpx2 as httpx  # reference renamed httpx -> httpx2 in vgi-rpc 0.40.0
 
 from vgi_rpc.http import http_connect
 from vgi_rpc.rpc import AnnotatedBatch, SubprocessTransport, _RpcProxy, Stream, StreamState

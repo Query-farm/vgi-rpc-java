@@ -21,7 +21,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-import httpx
+import httpx2 as httpx  # reference renamed httpx -> httpx2 in vgi-rpc 0.40.0
 import pytest
 
 from vgi_rpc.conformance import ConformanceService
