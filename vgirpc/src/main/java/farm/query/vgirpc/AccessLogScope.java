@@ -141,7 +141,15 @@ public final class AccessLogScope implements AutoCloseable {
     public void close() {
         CURRENT.remove();
         if (deferred == null) return;
+        // The outcome is one of the things known only now. A response-cap
+        // overshoot is detected after dispatch has returned: the body is
+        // discarded and replaced with an EXCEPTION batch, so the call whose
+        // record already said "ok" answers a failure. The enclosing CallOutcome
+        // outlives this scope (the transport opens it first and closes it last),
+        // which is why the error is still readable here.
+        Throwable late = CallOutcome.currentError();
         for (Deferred d : deferred) {
+            AccessLogHook.restate(d.record(), late);
             if (responseBytes >= 0) d.record().put("response_bytes", responseBytes);
             // The schema constrains this to a real status code, so a response
             // that never got one is better left unreported than guessed at.

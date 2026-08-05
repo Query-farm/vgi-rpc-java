@@ -310,6 +310,28 @@ def conformance_http_access_log(
 
 
 @pytest.fixture(scope="session")
+def conformance_http_capped_access_log(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[int, Path]]:
+    """Spawn an HTTP worker with strict response caps *and* a JSONL access log.
+
+    Backs ``TestHttpResponseCapAccessLog``. Neither existing worker can: the
+    strict-cap one writes no log, and the access-log one has no cap to
+    overshoot, so the one state where the two interact -- a response the server
+    threw away for being oversize -- is reachable from neither. Its own process
+    for the same reason ``conformance_http_access_log`` has one: ``--access-log``
+    appends for the process's whole life.
+    """
+    log_path = tmp_path_factory.mktemp("capaccesslog") / "conformance.jsonl"
+    gen = _start_http_worker("--http", "--strict", "--access-log", str(log_path))
+    port = next(gen)
+    try:
+        yield port, log_path
+    finally:
+        next(gen, None)
+
+
+@pytest.fixture(scope="session")
 def conformance_http_introspect_port() -> Iterator[int]:
     """Spawn an HTTP worker with token introspection enabled.
 
@@ -862,3 +884,156 @@ class TestHttpStreamAccessLog:
         assert rec["status"] == "error", f"expected status=error, got {rec['status']!r}"
         assert rec["error_type"], "an error record must name the error type"
         assert rec["error_message"], "an error record must carry the server-side message"
+
+
+class TestHttpResponseCapAccessLog:
+    """A response-cap overshoot must be logged as the failure it is.
+
+    The overshoot is detected *after* dispatch has returned: the body exists,
+    it is too big, so the server discards it and answers an EXCEPTION batch
+    instead. Every wire-visible signal agrees the call failed --
+    ``X-VGI-RPC-Error: true``, and an ``RpcError`` on the client -- while the
+    access record, whose ``status`` was settled when dispatch ended, said
+    ``ok``. That is worse than a missing record: an operator diffing "errors
+    the clients saw" against "errors the server logged" gets a clean log and
+    concludes the clients are wrong.
+
+    ``docs/access-log-spec.md`` §3 (``status`` is ``"error"`` for any failure)
+    and §4.1 (``error_message`` required and non-empty when it is).
+    """
+
+    @staticmethod
+    def _await_records(
+        log_path: Path, method: str, minimum: int, timeout: float = 2.0
+    ) -> list[dict[str, Any]]:
+        """Poll the log for at least *minimum* records naming *method*.
+
+        Short by design: the shared suite's module-level ``pytest.mark.timeout(5)``
+        arrives here through the star-import, so a generous poll would turn a
+        missing-record failure into an unreadable timeout. Returns whatever it
+        has at the deadline -- the assertions decide whether that is enough.
+        """
+        import json
+
+        found: list[dict[str, Any]] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if log_path.exists():
+                found = [
+                    rec
+                    for line in log_path.read_text().splitlines()
+                    if line.strip()
+                    for rec in [json.loads(line)]
+                    if rec.get("logger") == "vgi_rpc.access" and rec.get("method") == method
+                ]
+                if len(found) >= minimum:
+                    break
+            time.sleep(0.05)
+        return found
+
+    @staticmethod
+    def _assert_cap_error(rec: dict[str, Any], method: str) -> None:
+        """Assert one record reports the cap overshoot the wire reported."""
+        from vgi_rpc.access_log_conformance import validate_access_logs
+
+        assert rec["status"] == "error", (
+            f"{method!r} overshot max_response_bytes -- the client got an RpcError and the "
+            f"response carried X-VGI-RPC-Error -- but the access record says "
+            f"status={rec['status']!r}; the log is the only place that failure is visible "
+            f"after the fact"
+        )
+        assert rec["error_type"], "an error record must name the error type"
+        assert "max_response_bytes" in rec.get("error_message", ""), (
+            f"the record must say which cap was overshot, got "
+            f"error_message={rec.get('error_message')!r}"
+        )
+        assert rec["message"].endswith(" error"), (
+            f"the human-readable summary must agree with the structured status, got "
+            f"{rec['message']!r}"
+        )
+        violations = validate_access_logs([rec])
+        assert not violations, f"cap-overshoot record violates the access-log schema: {violations}"
+
+    def _cap(self, port: int) -> int:
+        """The wire cap this worker advertises."""
+        from vgi_rpc.http import http_capabilities
+
+        caps = http_capabilities(base_url=f"http://127.0.0.1:{port}")
+        assert caps.max_response_bytes is not None, "fixture must advertise a wire cap"
+        return int(caps.max_response_bytes)
+
+    def test_unary_overshoot_is_logged_as_an_error(
+        self, conformance_http_capped_access_log: tuple[int, Path]
+    ) -> None:
+        """A unary response discarded for overshooting the cap logs status=error."""
+        from vgi_rpc.rpc import RpcError
+
+        port, log_path = conformance_http_capped_access_log
+        with (
+            http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy,
+            pytest.raises(RpcError, match=r"max_response_bytes"),
+        ):
+            proxy.oversized_unary(target_bytes=self._cap(port) * 4)
+
+        records = self._await_records(log_path, "oversized_unary", 1)
+        assert records, "the overshooting unary call produced no access-log record at all"
+        self._assert_cap_error(records[-1], "oversized_unary")
+
+    def test_exchange_overshoot_is_logged_as_an_error(
+        self, conformance_http_capped_access_log: tuple[int, Path]
+    ) -> None:
+        """The overshooting stream turn logs error; the init turn that succeeded stays ok.
+
+        Streams only began producing records at all in the commit before this
+        one, so this path has never been exercised for a cap overshoot. Both
+        halves matter: promoting the whole call to ``error`` would blame the
+        ``/init`` turn, which genuinely succeeded.
+        """
+        from vgi_rpc.rpc import AnnotatedBatch, RpcError
+
+        port, log_path = conformance_http_capped_access_log
+        target_rows = max(1024, (self._cap(port) * 4) // 16)
+        with (
+            http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy,
+            pytest.raises(RpcError, match=r"max_response_bytes"),
+            proxy.exchange_oversized(rows_per_batch=target_rows) as session,
+        ):
+            session.exchange(AnnotatedBatch.from_pydict({"value": [1.0]}))
+
+        records = self._await_records(log_path, "exchange_oversized", 2)
+        assert len(records) >= 2, (
+            f"expected an /init record and the overshooting /exchange record, got {len(records)}"
+        )
+        inits = [r for r in records if "request_data" in r]
+        conts = [r for r in records if "request_data" not in r]
+        assert inits and conts, f"expected both an init and a continuation record, got {records}"
+        assert all(r["status"] == "ok" for r in inits), (
+            "the /init turn answered a well-formed response under the cap; marking it failed "
+            "attributes the overshoot to the wrong turn"
+        )
+        self._assert_cap_error(conts[-1], "exchange_oversized")
+
+    def test_producer_soft_cap_is_not_logged_as_an_error(
+        self, conformance_http_capped_access_log: tuple[int, Path]
+    ) -> None:
+        """A producer overshoot is covered by a continuation, so nothing failed.
+
+        The negative control on the other two: the wire cap is *soft* for
+        producer streams -- the framework mints a continuation token instead of
+        failing -- so no error reaches the wire and every record must still say
+        ``ok``. An implementation that re-stated status from the mere presence
+        of a cap overshoot would fail here.
+        """
+        port, log_path = conformance_http_capped_access_log
+        target_rows = max(1024, (self._cap(port) * 2) // 16)
+        with http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy:
+            batches = list(proxy.produce_oversized_batch(rows_per_batch=target_rows))
+        assert sum(b.batch.num_rows for b in batches) == target_rows
+
+        records = self._await_records(log_path, "produce_oversized_batch", 1)
+        assert records, "the producer stream produced no access-log record"
+        for rec in records:
+            assert rec["status"] == "ok", (
+                f"a producer overshoot is absorbed by a continuation token, not an error; "
+                f"got status={rec['status']!r} error_message={rec.get('error_message')!r}"
+            )

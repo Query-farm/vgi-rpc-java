@@ -235,22 +235,9 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         Throwable failure = error != null ? error : CallOutcome.currentError();
 
         String status = failure == null ? "ok" : "error";
-        String errorType = "";
-        String errorMessage = "";
-        if (failure != null) {
-            if (failure instanceof RpcError re) {
-                errorType = re.errorType();
-                errorMessage = re.getMessage() == null ? "" : re.getMessage();
-            } else {
-                errorType = failure.getClass().getSimpleName();
-                errorMessage = failure.getMessage() == null ? failure.toString() : failure.getMessage();
-            }
-            // The schema requires a non-empty error_message on every error
-            // record, and an exception carrying no message is not a reason to
-            // emit an unreadable one.
-            if (errorMessage.isEmpty()) errorMessage = failure.toString();
-            if (errorType.isEmpty()) errorType = failure.getClass().getSimpleName();
-        }
+        Failure described = Failure.describe(failure);
+        String errorType = described == null ? "" : described.type();
+        String errorMessage = described == null ? "" : described.message();
 
         AccessLogScope scope = AccessLogScope.current();
 
@@ -343,6 +330,68 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         } else {
             write(rec);
         }
+    }
+
+    /** The {@code error_type} / {@code error_message} pair a record reports for one failure. */
+    private record Failure(String type, String message) {
+
+        /**
+         * Describe {@code t}, or {@code null} when there is nothing to describe.
+         *
+         * @param t the exception that reached the wire, or {@code null}
+         */
+        static Failure describe(Throwable t) {
+            if (t == null) return null;
+            String type;
+            String message;
+            if (t instanceof RpcError re) {
+                type = re.errorType();
+                message = re.getMessage() == null ? "" : re.getMessage();
+            } else {
+                type = t.getClass().getSimpleName();
+                message = t.getMessage() == null ? t.toString() : t.getMessage();
+            }
+            // The schema requires a non-empty error_message on every error
+            // record, and an exception carrying no message is not a reason to
+            // emit an unreadable one.
+            if (message.isEmpty()) message = t.toString();
+            if (type.isEmpty()) type = t.getClass().getSimpleName();
+            return new Failure(type, message);
+        }
+    }
+
+    /**
+     * Re-state a parked record's outcome from an error that reached the wire
+     * after the dispatch hook had already run.
+     *
+     * <p>{@link #onDispatchEnd} settles {@code status} at the moment dispatch
+     * returns, but that is not the moment the response is finished: the HTTP
+     * transport enforces {@code max_response_bytes} <em>after</em> the body
+     * exists, and an overshoot throws the body away and replaces it with an
+     * EXCEPTION batch. The call really did fail — {@code X-VGI-RPC-Error: true}
+     * says so on the wire — and a record still reading {@code ok} would deny it
+     * to the one consumer that cannot see the wire.
+     *
+     * <p>Reads the same {@link CallOutcome} the error was recorded on, so this
+     * covers any late-serialized error rather than the response cap alone. Only
+     * ever promotes {@code ok} to {@code error}: a record that already named a
+     * failure named the one that caused it, and the cap overshoot it tripped on
+     * the way out is a consequence, not the cause.
+     *
+     * @param rec the parked record, mutated in place
+     * @param late the error learned after dispatch ended, or {@code null}
+     */
+    static void restate(Map<String, Object> rec, Throwable late) {
+        Failure f = Failure.describe(late);
+        if (f == null || !"ok".equals(rec.get("status"))) return;
+        rec.put("status", "error");
+        rec.put("error_type", f.type());
+        rec.put("error_message", f.message());
+        // Rebuilt from the record's own fields rather than re-plumbed from
+        // DispatchInfo; `message` is the same two values plus the status, and
+        // leaving it saying "ok" is how a human reader gets told the opposite
+        // of what the structured fields say.
+        rec.put("message", rec.get("protocol") + "." + rec.get("method") + " error");
     }
 
     /** Base64 a decrypted state payload under {@code key}, skipping empties —
