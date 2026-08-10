@@ -133,6 +133,13 @@ public final class HttpServer {
 
     /** Shared static landing page, loaded once from the classpath (may be {@code null} if absent). */
     private static final byte[] LANDING_HTML = loadLandingHtml();
+    /** Browser build of the @query-farm/vgi JS client the landing page imports.
+     *  Served by the worker rather than fetched from a CDN: the page is
+     *  same-origin with an authenticated worker and carries its session cookie,
+     *  so third-party script there would run with full access to that origin,
+     *  and a CDN dependency would break air-gapped deployments. Vendored and
+     *  released as a pair with the page. */
+    private static final byte[] CLIENT_BUNDLE = loadResource("vgi-client.js");
 
     private static byte[] loadLandingHtml() {
         try (InputStream in = HttpServer.class.getResourceAsStream("landing.html")) {
@@ -142,10 +149,19 @@ public final class HttpServer {
         }
     }
 
+    /** Load a byte resource from this package, or {@code null} when absent. */
+    private static byte[] loadResource(String name) {
+        try (InputStream in = HttpServer.class.getResourceAsStream(name)) {
+            return in == null ? null : in.readAllBytes();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     private final RpcServer rpc;
     private final HttpStreamHandler streamHandler;
     private final Authenticator authenticator;
-    private final DescribeProvider describeProvider;
+    private final LandingInfo landingInfo;
     private final List<HttpPreHandler> preHandlers;
     private final Server jetty;
     private final String prefix;
@@ -212,7 +228,7 @@ public final class HttpServer {
         this.streamHandler = new HttpStreamHandler(rpc, config.tokenKey(),
                 config.tokenTtlSeconds(), config.maxResponseBytes(), config.callStateCacheMaxEntries());
         this.authenticator = config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
-        this.describeProvider = config.describeProvider();
+        this.landingInfo = config.landingInfo();
         this.preHandlers = config.preHandlers();
         this.prefix = config.prefix();
         this.maxRequestBytes = config.maxRequestBytes();
@@ -405,7 +421,7 @@ public final class HttpServer {
      * @param exposeTestDrainAdmin conformance-only: expose the unauthenticated
      *                         {@code POST/DELETE /__test_drain__} admin endpoint
      *                         that toggles drain mode. Never enable in production.
-     * @param describeProvider producer for the standardized landing surface's JSON
+     * @param landingInfo      worker identity for the standardized landing surface
      *                         ({@code describe.json} + lazy column endpoints);
      *                         {@code null} disables those routes (the shared
      *                         {@code landing.html} and JSON health status are
@@ -468,7 +484,7 @@ public final class HttpServer {
             long stickyDefaultTtlSeconds,
             Map<String, String> stickyEchoHeaders,
             boolean exposeTestDrainAdmin,
-            DescribeProvider describeProvider,
+            LandingInfo landingInfo,
             List<String> corsOrigins,
             long corsMaxAgeSeconds,
             TokenResolver introspectResolver,
@@ -610,7 +626,7 @@ public final class HttpServer {
             private long stickyDefaultTtlSeconds = 300;
             private Map<String, String> stickyEchoHeaders = Map.of();
             private boolean exposeTestDrainAdmin;
-            private DescribeProvider describeProvider;
+            private LandingInfo landingInfo;
             private List<String> corsOrigins = List.of();
             private long corsMaxAgeSeconds = DEFAULT_CORS_MAX_AGE_SECONDS;
             private TokenResolver introspectResolver;
@@ -861,7 +877,13 @@ public final class HttpServer {
              *          routes (default)
              * @return this builder
              */
-            public Builder describeProvider(DescribeProvider p) { this.describeProvider = p; return this; }
+            /** Supply the worker's identity, activating the standardized landing
+             *  surface: the shared page, its JSON status document, and the
+             *  browser client build the page reads the catalog with.
+             *
+             *  @param i the worker identity
+             *  @return this builder */
+            public Builder landingInfo(LandingInfo i) { this.landingInfo = i; return this; }
 
             /**
              * Origins allowed to call this server from a browser; empty (the
@@ -972,21 +994,21 @@ public final class HttpServer {
                         advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
                         proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries,
                         stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
-                        describeProvider, corsOrigins, corsMaxAgeSeconds,
+                        landingInfo, corsOrigins, corsMaxAgeSeconds,
                         introspectResolver, introspectPrincipals,
                         introspectTtlSeconds, introspectRateLimitPerSecond);
             }
         }
 
         /**
-         * Return a copy of this config with {@code describeProvider} set. Used by
+         * Return a copy of this config with {@code landingInfo} set. Used by
          * worker libraries that receive a fully-built config and layer the
          * landing surface on top.
          *
-         * @param p the describe provider to attach
-         * @return a copy of this config with the provider set
+         * @param p the worker identity to attach
+         * @return a copy of this config with the identity set
          */
-        public Config withDescribeProvider(DescribeProvider p) {
+        public Config withLandingInfo(LandingInfo p) {
             return new Config(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator,
                     preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel,
                     supportedEncodings, tls,
@@ -1114,43 +1136,32 @@ public final class HttpServer {
                 writeStatusJson(resp);
                 return;
             }
-            if (describeProvider != null && serveDescribe(p, resp)) {
+            if ("vgi-client.js".equals(p)) {
+                resp.setStatus(HttpServletResponse.SC_OK);
+                resp.setContentType("text/javascript; charset=utf-8");
+                // Immutable for a given worker build: the page and the bundle
+                // are vendored and released together.
+                resp.setHeader("Cache-Control", "public, max-age=3600");
+                resp.getOutputStream().write(CLIENT_BUNDLE);
                 return;
             }
             resp.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
         }
 
-        /** Serve {@code describe.json} and {@code describe/{c}/{s}/{t}.json}; returns
-         *  {@code true} when the path matched (response already written). */
-        private boolean serveDescribe(String p, HttpServletResponse resp) throws IOException {
-            if ("describe.json".equals(p)) {
-                writeRawJson(resp, HttpServletResponse.SC_OK,
-                        describeProvider.describeJson(rpc.serverId(), oauthActive()));
-                return true;
-            }
-            if (p.startsWith("describe/") && p.endsWith(".json")) {
-                String rest = p.substring("describe/".length(), p.length() - ".json".length());
-                String[] parts = rest.split("/");
-                if (parts.length == 3) {
-                    String cols = describeProvider.columnsJson(
-                            urlDecode(parts[0]), urlDecode(parts[1]), urlDecode(parts[2]));
-                    if (cols == null) {
-                        writeJson(resp, HttpServletResponse.SC_NOT_FOUND,
-                                Map.of("error", "object not found"));
-                    } else {
-                        writeRawJson(resp, HttpServletResponse.SC_OK, cols);
-                    }
-                    return true;
-                }
-            }
-            return false;
-        }
-
         private void writeStatusJson(HttpServletResponse resp) throws IOException {
-            writeJson(resp, HttpServletResponse.SC_OK, Map.of(
-                    "status", "ok",
-                    "server_id", rpc.serverId(),
-                    "protocol", rpc.protocolName()));
+            // Worker identity is not catalog data and has no protocol method,
+            // so the landing page reads it from here.
+            java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("status", "ok");
+            body.put("server_id", rpc.serverId());
+            body.put("protocol", rpc.protocolName());
+            body.put("worker", landingInfo == null ? "" : landingInfo.name());
+            body.put("doc", landingInfo == null ? "" : landingInfo.doc());
+            body.put("version", landingInfo == null ? "" : landingInfo.version());
+            body.put("lang", "java");
+            body.put("oauth", oauthActive());
+            body.put("cupola_base", "https://cupola.query-farm.services");
+            writeJson(resp, HttpServletResponse.SC_OK, body);
         }
 
         @Override
