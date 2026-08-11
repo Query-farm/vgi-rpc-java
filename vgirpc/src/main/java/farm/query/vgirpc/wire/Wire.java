@@ -157,7 +157,13 @@ public final class Wire {
         Message msg = Message.fromException(t);
         Map<String, String> md = msg.addToMetadata(null);
         if (serverId != null) md.put(Metadata.SERVER_ID, serverId);
-        if (t instanceof HasErrorKind hk) {
+        // errorKind() is documented to return null when no category applies —
+        // which every server-thrown RpcError built without one does. A null
+        // value reaches the flatbuffer key/value writer as a null string and
+        // throws there, so the error batch is never written and the caller
+        // waits on a response that will not come: the wrong error, reported as
+        // a hang.
+        if (t instanceof HasErrorKind hk && hk.errorKind() != null) {
             md.put(Metadata.ERROR_KIND, hk.errorKind());
         }
         return md;
