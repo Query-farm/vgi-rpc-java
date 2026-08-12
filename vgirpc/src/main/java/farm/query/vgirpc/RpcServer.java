@@ -21,6 +21,7 @@ import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
+import farm.query.vgirpc.wire.OversizedMessageException;
 import farm.query.vgirpc.wire.Wire;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
@@ -270,6 +271,25 @@ public final class RpcServer {
             Map<String, String> meta;
             try {
                 meta = reader.readNextBatch();
+            } catch (OversizedMessageException oversized) {
+                // A body this runtime cannot hold — over INT_MAX, so no heap or
+                // allocator limit rescues it. The reader has already drained the
+                // bytes, so the stream is back on a frame boundary and this is an
+                // error for THIS call only: answer it and let the loop serve the
+                // next one. Falling through to the generic IOException branch
+                // would report end-of-stream and hang up on a live connection,
+                // which is precisely the wedge the conformance suite checks for.
+                LOG.warn("refusing oversized request body: {}", oversized.toString());
+                // The reader drained the body, but the caller's request stream is
+                // schema + batch + EOS: the marker its writer.close() emitted is
+                // still queued. Every other exit from this method drains to it
+                // (below); skipping that here leaves the marker to be read as the
+                // next call's schema, and the connection dies one call later —
+                // looking exactly like the wedge this branch exists to avoid.
+                try { reader.drain(); } catch (IOException ignore) { /* best-effort */ }
+                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, oversized, serverId);
+                transport.writer().flush();
+                return;
             } catch (IOException ioe) {
                 throw new EndOfStream();
             }

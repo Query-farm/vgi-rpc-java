@@ -3,7 +3,6 @@
 
 package farm.query.vgirpc.wire;
 
-import org.apache.arrow.flatbuf.KeyValue;
 import org.apache.arrow.flatbuf.Message;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -12,22 +11,22 @@ import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ReadChannel;
 import org.apache.arrow.vector.ipc.message.MessageChannelReader;
-import org.apache.arrow.vector.ipc.message.MessageResult;
+import org.apache.arrow.vector.ipc.message.VgiMessageReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
-import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
  * Arrow IPC stream reader that surfaces per-batch {@code custom_metadata}
  * (which the stock {@link ArrowStreamReader} does not expose).
  *
- * <p>Implementation: subclass {@link MessageChannelReader} so we capture
- * each {@link Message}'s custom_metadata as it flows through, and subclass
+ * <p>Implementation: {@link VgiMessageReader} captures each message's
+ * custom_metadata as it flows through (and refuses an unholdable body
+ * without desyncing the stream), and we subclass
  * {@link ArrowStreamReader} so the original (wire-format) schema can be
  * recovered before {@code ArrowReader.initialize} converts it to memory
  * format. Everything else — dictionary tracking, dict-batch loading,
@@ -36,7 +35,7 @@ import java.util.Map;
 public final class IpcStreamReader implements AutoCloseable {
 
     private final BufferAllocator allocator;
-    private final CapturingMessageReader messageReader;
+    private final VgiMessageReader messageReader;
     private final StreamReaderImpl inner;
     private boolean eos = false;
     private boolean schemaInitialized = false;
@@ -57,7 +56,7 @@ public final class IpcStreamReader implements AutoCloseable {
     public IpcStreamReader(ReadableByteChannel channel, BufferAllocator allocator) {
         this.allocator = allocator;
         ReadChannel rc = new ReadChannel(channel);
-        this.messageReader = new CapturingMessageReader(rc, allocator);
+        this.messageReader = new VgiMessageReader(rc, allocator);
         this.inner = new StreamReaderImpl(messageReader, allocator);
     }
 
@@ -92,7 +91,7 @@ public final class IpcStreamReader implements AutoCloseable {
             eos = true;
             return null;
         }
-        return messageReader.lastCustomMetadata;
+        return messageReader.lastCustomMetadata();
     }
 
     /** True if more data may be available; otherwise EOS / I/O end has been reached. */
@@ -164,38 +163,4 @@ public final class IpcStreamReader implements AutoCloseable {
         }
     }
 
-    /**
-     * {@link MessageChannelReader} subclass that captures the
-     * {@code custom_metadata} of the most-recently-read Message. Stock
-     * {@link ArrowStreamReader} reads dict and record batches via this
-     * channel; we expose the metadata of the last message read so callers
-     * can pick it up after {@link ArrowStreamReader#loadNextBatch()} returns.
-     */
-    private static final class CapturingMessageReader extends MessageChannelReader {
-        Map<String, String> lastCustomMetadata = Map.of();
-
-        CapturingMessageReader(ReadChannel in, BufferAllocator allocator) {
-            super(in, allocator);
-        }
-
-        @Override
-        public MessageResult readNext() throws IOException {
-            MessageResult r = super.readNext();
-            if (r != null) {
-                Message m = r.getMessage();
-                int n = m.customMetadataLength();
-                if (n == 0) {
-                    lastCustomMetadata = Map.of();
-                } else {
-                    Map<String, String> map = new LinkedHashMap<>(n);
-                    for (int i = 0; i < n; i++) {
-                        KeyValue kv = m.customMetadata(i);
-                        map.put(kv.key(), kv.value());
-                    }
-                    lastCustomMetadata = map;
-                }
-            }
-            return r;
-        }
-    }
 }
