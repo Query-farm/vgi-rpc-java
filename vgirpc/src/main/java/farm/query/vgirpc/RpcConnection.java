@@ -57,9 +57,15 @@ public final class RpcConnection implements AutoCloseable {
 
     /**
      * Create a connection with log forwarding and transparent external-location
-     * resolution. When {@code externalConfig} is supplied, pointer batches in
-     * unary responses are fetched and decoded in place via a
-     * {@link farm.query.vgirpc.external.LocationResolver}.
+     * resolution. When {@code externalConfig} is supplied, pointer batches are
+     * fetched and decoded in place via a
+     * {@link farm.query.vgirpc.external.LocationResolver} — in unary responses
+     * and on streaming output alike.
+     *
+     * <p>Without it, an externalised batch cannot be materialised at all;
+     * rather than surface a zero-row batch as if the server had sent no data,
+     * both paths fail loudly (see
+     * {@code ClientStreamSession.resolvePointerBatch}).</p>
      *
      * @param transport the underlying transport (owned: closed by {@link #close()})
      * @param onLog sink for {@link Message} log batches; may be {@code null}
@@ -145,7 +151,11 @@ public final class RpcConnection implements AutoCloseable {
 
             // Client initially knows nothing about the stream's schemas; the first batch
             // received from the server carries them, and exchange inputs carry their own schema.
-            return new ClientStreamSession<>(transport, RpcStream.EMPTY_SCHEMA, RpcStream.EMPTY_SCHEMA, header, onLog);
+            // The resolver goes with it: a producer stream is where externalisation actually
+            // bites (large scan results), so resolving only unary responses would leave the
+            // main data path handing back empty batches for every externalised one.
+            return new ClientStreamSession<>(transport, RpcStream.EMPTY_SCHEMA, RpcStream.EMPTY_SCHEMA,
+                    header, onLog, locationResolver);
         }
 
         @SuppressWarnings("unchecked")

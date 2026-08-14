@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc;
 
+import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.marshal.RecordCodec;
@@ -37,6 +38,14 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
     private final Schema outputSchema;
     private final ArrowSerializableRecord header;
     private final Consumer<Message> onLog;
+    /**
+     * Resolves external-location pointer batches on the output stream, or
+     * {@code null} when the connection was built without an
+     * {@link farm.query.vgirpc.external.ExternalLocationConfig}. Resolution is
+     * opt-in because it costs a fetch against storage the client must be able
+     * to reach; a stream that never sees a pointer is unaffected either way.
+     */
+    private final LocationResolver locationResolver;
 
     private IpcStreamWriter inputWriter;
     private IpcStreamReader outputReader;
@@ -48,11 +57,22 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
      * no further output bytes are coming.
      */
     private boolean outputExhausted;
+    /**
+     * The root handed out for the most recent <em>resolved</em> pointer batch.
+     * Unlike an inline batch — whose root belongs to {@link IpcStreamReader} and
+     * is recycled on the next read — a resolved root is freshly allocated by
+     * {@link LocationResolver#resolve}, so somebody has to free it. Keeping it
+     * here and closing it on the next read (or at {@link #close()}) makes a
+     * resolved batch obey exactly the same caller contract as an inline one
+     * ("valid until the next call — copy what you must keep"), instead of
+     * making the caller remember which kind of batch it just received.
+     */
+    private VectorSchemaRoot resolvedRoot;
 
     /**
-     * Create a client streaming session. The input/output streams are opened
-     * lazily on the first {@link #tick()}, {@link #exchange(AnnotatedBatch)},
-     * or {@link #close()}.
+     * Create a client streaming session with no external-location resolution.
+     * The input/output streams are opened lazily on the first {@link #tick()},
+     * {@link #exchange(AnnotatedBatch)}, or {@link #close()}.
      *
      * @param transport the underlying transport
      * @param inputSchema schema of input batches; {@code null} becomes {@link RpcStream#EMPTY_SCHEMA}
@@ -62,11 +82,31 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
      */
     public ClientStreamSession(RpcTransport transport, Schema inputSchema, Schema outputSchema,
                                ArrowSerializableRecord header, Consumer<Message> onLog) {
+        this(transport, inputSchema, outputSchema, header, onLog, null);
+    }
+
+    /**
+     * Create a client streaming session that transparently resolves
+     * external-location pointer batches on the output stream.
+     *
+     * @param transport the underlying transport
+     * @param inputSchema schema of input batches; {@code null} becomes {@link RpcStream#EMPTY_SCHEMA}
+     * @param outputSchema schema of output batches; {@code null} becomes {@link RpcStream#EMPTY_SCHEMA}
+     * @param header optional stream header record returned by the server, or {@code null}
+     * @param onLog sink for log batches received on the output stream; may be {@code null}
+     * @param locationResolver resolver for {@code vgi_rpc.location} pointer batches, or
+     *     {@code null} to leave resolution disabled — in which case a pointer batch is
+     *     reported as an error rather than silently dropped
+     */
+    public ClientStreamSession(RpcTransport transport, Schema inputSchema, Schema outputSchema,
+                               ArrowSerializableRecord header, Consumer<Message> onLog,
+                               LocationResolver locationResolver) {
         this.transport = transport;
         this.inputSchema = inputSchema != null ? inputSchema : RpcStream.EMPTY_SCHEMA;
         this.outputSchema = outputSchema != null ? outputSchema : RpcStream.EMPTY_SCHEMA;
         this.header = header;
         this.onLog = onLog != null ? onLog : m -> {};
+        this.locationResolver = locationResolver;
     }
 
     @Override public Schema outputSchema() { return outputSchema; }
@@ -183,6 +223,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
         if (outputReader == null) {
             outputReader = new IpcStreamReader(transport.reader(), Allocators.root());
         }
+        releaseResolvedRoot();
         while (true) {
             Map<String, String> md = outputReader.readNextBatch();
             if (md == null) {
@@ -199,13 +240,74 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             if (kind == Wire.BatchKind.ERROR) {
                 throw Wire.errorFromMetadata(md);
             }
+            // Transparent resolution of external-location pointer batches, the
+            // streaming counterpart of the unary path in RpcConnection.doUnary.
+            //
+            // A server externalises a batch that is too large to send inline by
+            // replacing it with a ZERO-ROW batch carrying vgi_rpc.location (see
+            // RpcServer.flushCollector -> Externalizer). Wire.classify only knows
+            // about log/error metadata, so such a batch classifies as DATA: without
+            // this branch the caller is handed an *empty* batch and the stream
+            // carries on as if nothing happened — silent row loss, on the very
+            // path (large results) where externalisation is used at all.
+            if (LocationResolver.isPointer(root.getRowCount(), md)) {
+                return resolvePointerBatch(md);
+            }
             // Note: the AnnotatedBatch here does NOT own the root — it's reused by the reader.
             // Caller must consume / copy data before the next read.
             return new AnnotatedBatch(root, md);
         }
     }
 
+    /**
+     * Fetch and decode an external-location pointer batch, returning the real
+     * batch in its place.
+     *
+     * <p>An unresolvable pointer is a hard failure, never an empty batch. The
+     * client has been told, explicitly, that rows exist somewhere it cannot
+     * reach; continuing would hand the caller a short result that looks
+     * complete. Losing rows silently is strictly worse than failing the stream,
+     * so both "resolution not configured" and "resolution failed" raise
+     * {@link RpcError} with error type {@code ExternalLocationError} — matching
+     * what {@code doUnary} raises when a fetch fails, so a caller can handle
+     * both call shapes with one catch.
+     *
+     * <p>The metadata carried downstream is the resolver's merged view
+     * ({@link LocationResolver.Resolved#customMetadata()}): the pointer's own
+     * metadata with the {@code vgi_rpc.location*} keys stripped, overlaid with
+     * the metadata the externalised batch was written with. That is the
+     * metadata the batch would have had if it had travelled inline, which is
+     * the whole point of the resolution being transparent.
+     */
+    private AnnotatedBatch resolvePointerBatch(Map<String, String> pointerMeta) {
+        String url = pointerMeta.get(Metadata.LOCATION);
+        if (locationResolver == null) {
+            throw new RpcError("ExternalLocationError",
+                    "stream produced an externalized batch (" + Metadata.LOCATION + "=" + url
+                            + ") but this connection has no ExternalLocationConfig; "
+                            + "construct RpcConnection with one to resolve it", "");
+        }
+        LocationResolver.Resolved resolved;
+        try {
+            resolved = locationResolver.resolve(pointerMeta);
+        } catch (Exception fe) {
+            throw new RpcError("ExternalLocationError",
+                    "failed to resolve " + url + ": " + fe.getMessage(), "");
+        }
+        // Held for release on the next read / close — see the resolvedRoot field.
+        resolvedRoot = resolved.root();
+        return new AnnotatedBatch(resolvedRoot, resolved.customMetadata());
+    }
+
+    /** Free the previous resolved batch's caller-facing root, if any. */
+    private void releaseResolvedRoot() {
+        if (resolvedRoot == null) return;
+        try { resolvedRoot.close(); } catch (Exception ignore) { /* best-effort */ }
+        resolvedRoot = null;
+    }
+
     private void drainOutput() {
+        releaseResolvedRoot();
         // Already at EOS: the stream is spent and the server is waiting on the
         // next request. Reading again would block until the transport dies.
         if (outputExhausted) return;
@@ -221,6 +323,13 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
                 Wire.BatchKind kind = Wire.classify(outputReader.root().getRowCount(), md);
                 if (kind == Wire.BatchKind.LOG) onLog.accept(Wire.messageFromMetadata(md));
                 if (kind == Wire.BatchKind.ERROR) break;
+                // Deliberately NOT resolving pointer batches here. Draining exists
+                // to walk the output stream to its EOS marker so the transport is
+                // clean for the next call; every batch it reads is discarded. A
+                // pointer's payload lives in external storage, not on this stream,
+                // so skipping the fetch drops exactly the same rows the inline
+                // batch beside it is already dropping — while saving a network
+                // round-trip (and egress) per abandoned batch on close()/cancel().
             } catch (Exception e) { break; }
         }
     }
