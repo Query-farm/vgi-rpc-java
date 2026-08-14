@@ -41,6 +41,13 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
     private IpcStreamWriter inputWriter;
     private IpcStreamReader outputReader;
     private boolean closed;
+    /**
+     * Set once the server's output IPC stream has signalled EOS. Reading past
+     * that point blocks forever on a persistent transport (subprocess / pipe /
+     * socket): the server has already moved on to awaiting the next request, so
+     * no further output bytes are coming.
+     */
+    private boolean outputExhausted;
 
     /**
      * Create a client streaming session. The input/output streams are opened
@@ -180,6 +187,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             Map<String, String> md = outputReader.readNextBatch();
             if (md == null) {
                 // Server closed output stream without sending data — producer finished
+                outputExhausted = true;
                 throw new NoSuchElementException();
             }
             VectorSchemaRoot root = outputReader.root();
@@ -198,6 +206,9 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
     }
 
     private void drainOutput() {
+        // Already at EOS: the stream is spent and the server is waiting on the
+        // next request. Reading again would block until the transport dies.
+        if (outputExhausted) return;
         if (outputReader == null) {
             try {
                 outputReader = new IpcStreamReader(transport.reader(), Allocators.root());
@@ -206,7 +217,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
         for (int i = 0; i < 10_000; i++) {
             try {
                 Map<String, String> md = outputReader.readNextBatch();
-                if (md == null) break;
+                if (md == null) { outputExhausted = true; break; }
                 Wire.BatchKind kind = Wire.classify(outputReader.root().getRowCount(), md);
                 if (kind == Wire.BatchKind.LOG) onLog.accept(Wire.messageFromMetadata(md));
                 if (kind == Wire.BatchKind.ERROR) break;

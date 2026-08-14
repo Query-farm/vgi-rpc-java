@@ -168,7 +168,28 @@ public final class RpcConnection implements AutoCloseable {
             }
         }
 
+        /**
+         * The stream's header record type, or {@code null} when it declares none.
+         *
+         * <p>{@code @StreamHeader} is the way a service declares this —
+         * {@code RpcStream<S extends StreamState>} takes a single type parameter,
+         * so the header type cannot ride the generic (see
+         * {@code ServiceIntrospector.extractHeaderType}). The introspector has
+         * already resolved the annotation into {@link RpcMethodInfo#headerType()};
+         * consult that first.
+         *
+         * <p>Reading a second type argument is kept as a fallback for any
+         * hand-built {@link RpcMethodInfo}, but no method declared against
+         * {@code RpcStream} can satisfy it. Preferring it was a latent bug: a
+         * server writes the header stream whenever the annotation is present, so
+         * a client that skipped it read the header batch as the stream's first
+         * data batch.
+         */
         private Class<?> resolveHeaderType(RpcMethodInfo info) {
+            if (info.headerType() != null
+                    && ArrowSerializableRecord.class.isAssignableFrom(info.headerType())) {
+                return info.headerType();
+            }
             if (info.resultType() instanceof java.lang.reflect.ParameterizedType pt
                     && pt.getActualTypeArguments().length >= 2) {
                 java.lang.reflect.Type h = pt.getActualTypeArguments()[1];
