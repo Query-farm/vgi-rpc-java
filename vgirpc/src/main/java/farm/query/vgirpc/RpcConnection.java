@@ -10,20 +10,14 @@ import farm.query.vgirpc.schema.ArrowSerializableRecord;
 import farm.query.vgirpc.transport.RpcTransport;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
-import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Wire;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.IOException;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
-import java.lang.reflect.Parameter;
 import java.lang.reflect.Proxy;
-import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Optional;
 import java.util.function.Consumer;
 
 /**
@@ -123,28 +117,13 @@ public final class RpcConnection implements AutoCloseable {
         }
 
         private Object doStream(RpcMethodInfo info, Method m, Object[] args) throws Exception {
-            Map<String, Object> kwargs = bindArgs(m, args);
             // Send request
-            try (IpcStreamWriter w = new IpcStreamWriter(transport.writer())) {
-                w.writeSchema(info.paramsSchema());
-                Map<String, Object> wireKwargs = convertForWire(kwargs, info);
-                if (info.paramsSchema().getFields().isEmpty()) {
-                    try (VectorSchemaRoot zero = VectorSchemaRoot.create(info.paramsSchema(), Allocators.root())) {
-                        zero.allocateNew();
-                        zero.setRowCount(1);
-                        w.writeBatch(zero, Wire.requestMetadata(info.name()));
-                    }
-                } else {
-                    try (VectorSchemaRoot root = Marshalling.encodeRow(info.paramsSchema(), wireKwargs, Allocators.root())) {
-                        w.writeBatch(root, Wire.requestMetadata(info.name()));
-                    }
-                }
-            }
+            ClientMarshalling.writeRequest(transport.writer(), info, m, args);
             transport.writer().flush();
 
             // Read header IPC stream if declared
             ArrowSerializableRecord header = null;
-            Class<?> headerType = resolveHeaderType(info);
+            Class<?> headerType = ClientMarshalling.resolveHeaderType(info);
             if (headerType != null) {
                 header = readHeaderStream(headerType);
             }
@@ -178,55 +157,9 @@ public final class RpcConnection implements AutoCloseable {
             }
         }
 
-        /**
-         * The stream's header record type, or {@code null} when it declares none.
-         *
-         * <p>{@code @StreamHeader} is the way a service declares this —
-         * {@code RpcStream<S extends StreamState>} takes a single type parameter,
-         * so the header type cannot ride the generic (see
-         * {@code ServiceIntrospector.extractHeaderType}). The introspector has
-         * already resolved the annotation into {@link RpcMethodInfo#headerType()};
-         * consult that first.
-         *
-         * <p>Reading a second type argument is kept as a fallback for any
-         * hand-built {@link RpcMethodInfo}, but no method declared against
-         * {@code RpcStream} can satisfy it. Preferring it was a latent bug: a
-         * server writes the header stream whenever the annotation is present, so
-         * a client that skipped it read the header batch as the stream's first
-         * data batch.
-         */
-        private Class<?> resolveHeaderType(RpcMethodInfo info) {
-            if (info.headerType() != null
-                    && ArrowSerializableRecord.class.isAssignableFrom(info.headerType())) {
-                return info.headerType();
-            }
-            if (info.resultType() instanceof java.lang.reflect.ParameterizedType pt
-                    && pt.getActualTypeArguments().length >= 2) {
-                java.lang.reflect.Type h = pt.getActualTypeArguments()[1];
-                if (h instanceof Class<?> c && ArrowSerializableRecord.class.isAssignableFrom(c)) return c;
-            }
-            return null;
-        }
-
         private Object doUnary(RpcMethodInfo info, Method m, Object[] args) throws Exception {
-            Map<String, Object> kwargs = bindArgs(m, args);
-
             // Send request
-            try (IpcStreamWriter w = new IpcStreamWriter(transport.writer())) {
-                w.writeSchema(info.paramsSchema());
-                Map<String, Object> wireKwargs = convertForWire(kwargs, info);
-                if (info.paramsSchema().getFields().isEmpty()) {
-                    try (VectorSchemaRoot zero = VectorSchemaRoot.create(info.paramsSchema(), Allocators.root())) {
-                        zero.allocateNew();
-                        zero.setRowCount(1);
-                        w.writeBatch(zero, Wire.requestMetadata(info.name()));
-                    }
-                } else {
-                    try (VectorSchemaRoot root = Marshalling.encodeRow(info.paramsSchema(), wireKwargs, Allocators.root())) {
-                        w.writeBatch(root, Wire.requestMetadata(info.name()));
-                    }
-                }
-            }
+            ClientMarshalling.writeRequest(transport.writer(), info, m, args);
             transport.writer().flush();
 
             // Read response
@@ -257,14 +190,14 @@ public final class RpcConnection implements AutoCloseable {
                                             + ": " + fe.getMessage(), "");
                         }
                         try {
-                            Object result = decodeResult(info, resolved.root());
+                            Object result = ClientMarshalling.decodeResult(info, resolved.root());
                             drainQuietly(r);
                             return result;
                         } finally {
                             resolved.root().close();
                         }
                     }
-                    Object result = decodeResult(info, root);
+                    Object result = ClientMarshalling.decodeResult(info, root);
                     drainQuietly(r);
                     return result;
                 }
@@ -292,66 +225,5 @@ public final class RpcConnection implements AutoCloseable {
             }
         }
 
-        private Map<String, Object> bindArgs(Method m, Object[] args) {
-            Map<String, Object> out = new LinkedHashMap<>();
-            Parameter[] params = m.getParameters();
-            for (int i = 0; i < params.length; i++) {
-                // Skip framework-injected CallContext parameters — they aren't on the wire.
-                if (CallContext.class.isAssignableFrom(params[i].getType())) continue;
-                Object v = args != null && i < args.length ? args[i] : null;
-                if (v instanceof Optional<?> o) v = o.orElse(null);
-                out.put(params[i].getName(), v);
-            }
-            return out;
-        }
-
-        @SuppressWarnings({"rawtypes", "unchecked"})
-        private Map<String, Object> convertForWire(Map<String, Object> kwargs, RpcMethodInfo info) {
-            Map<String, Object> out = new LinkedHashMap<>();
-            for (Field f : info.paramsSchema().getFields()) {
-                Object v = kwargs.get(f.getName());
-                if (v instanceof Enum<?> e) v = e.name();
-                else if (v instanceof ArrowSerializableRecord r
-                        && f.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Binary) {
-                    v = RecordCodec.serializeToBytes(r);
-                }
-                out.put(f.getName(), v);
-            }
-            return out;
-        }
-
-        @SuppressWarnings({"rawtypes", "unchecked"})
-        private Object decodeResult(RpcMethodInfo info, VectorSchemaRoot root) {
-            if (!info.hasReturn()) return null;
-            Class<?> returnRaw = rawClass(info.resultType());
-            // A method declared to return Optional<T> must never hand back a raw
-            // null — an absent value is Optional.empty(). (bindArgs unwraps
-            // Optional args to null on the way out; this is the symmetric
-            // re-wrap on the way back.)
-            if (root.getRowCount() == 0) {
-                return returnRaw == Optional.class ? Optional.empty() : null;
-            }
-            Map<String, Object> row = Marshalling.decodeRow(root);
-            Object value = row.get("result");
-            if (value == null) {
-                return returnRaw == Optional.class ? Optional.empty() : null;
-            }
-            if (returnRaw == Optional.class) return Optional.ofNullable(value);
-            if (returnRaw != null && returnRaw.isEnum() && value instanceof String s) {
-                return Enum.valueOf((Class<Enum>) returnRaw.asSubclass(Enum.class), s);
-            }
-            if (returnRaw != null && ArrowSerializableRecord.class.isAssignableFrom(returnRaw)
-                    && value instanceof byte[] bytes) {
-                return RecordCodec.deserializeFromBytes(bytes, (Class<? extends ArrowSerializableRecord>) returnRaw);
-            }
-            if (value instanceof Number) return farm.query.vgirpc.marshal.Numbers.coerce(returnRaw, value);
-            return value;
-        }
-
-        private Class<?> rawClass(java.lang.reflect.Type t) {
-            if (t instanceof Class<?> c) return c;
-            if (t instanceof java.lang.reflect.ParameterizedType pt) return (Class<?>) pt.getRawType();
-            return null;
-        }
     }
 }

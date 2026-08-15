@@ -317,9 +317,9 @@ public final class HttpStreamHandler {
             Object[] args = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
             streamResult = (RpcStream<?>) info.reflectMethod().invoke(rpc.implementation(), args);
         } catch (InvocationTargetException ie) {
-            return errorStream(ie.getCause() != null ? ie.getCause() : ie);
+            return errorStream(ie.getCause() != null ? ie.getCause() : ie, sink);
         } catch (Throwable t) {
-            return errorStream(t);
+            return errorStream(t, sink);
         }
         // Record the concrete state class for this method so /exchange can rehydrate.
         stateTypes.put(method, streamResult.state().getClass());
@@ -423,11 +423,19 @@ public final class HttpStreamHandler {
         boolean isProducer = inputSchema.getFields().isEmpty();
         StreamState state = StateSerializer.deserialize(token.state(), stateCls);
 
-        CallContext ctx = buildCallContext(method, new OutputCollectorSink());
+        // The sink has to be kept — and later bound to this turn's response
+        // writer. A stream over HTTP has no single output stream to bind once
+        // (that is what serveStream does on the pipe transports); each turn
+        // writes its own response, so an unbound sink buffers the turn's log
+        // messages into a list that dies with the request. Dropping every log
+        // after the first turn is worst on exactly the long streams whose
+        // progress logs are the only in-band diagnostic a caller has.
+        OutputCollectorSink sink = new OutputCollectorSink();
+        CallContext ctx = buildCallContext(method, sink);
 
         if (req.meta().containsKey(Metadata.CANCEL)) {
             onTurn(turn, i -> i.cancelled = true);
-            return handleCancel(outputSchema, state, ctx);
+            return handleCancel(outputSchema, state, ctx, sink);
         }
 
         VectorSchemaRoot castInput = null;
@@ -446,10 +454,16 @@ public final class HttpStreamHandler {
                 state.process(new AnnotatedBatch(actualInput, req.meta()), collector, ctx);
                 if (!collector.finished()) collector.validate();
             } catch (Throwable t) {
-                return errorStream(t);
+                // Carries whatever the turn logged before it failed. Those lines
+                // are the reason a caller can tell *where* a long stream broke,
+                // and the pipe transports deliver them (their sink is bound to
+                // the output stream for the whole tick loop) — so an HTTP turn
+                // that answered with a bare error batch was strictly less
+                // diagnosable for the same worker code.
+                return errorStream(t, sink);
             }
             return writeExchangeResponse(collector, state, token, outputSchema, isProducer, principal,
-                    inputDicts, turn);
+                    inputDicts, turn, sink);
         }
     }
 
@@ -469,19 +483,26 @@ public final class HttpStreamHandler {
         }
     }
 
-    private byte[] handleCancel(Schema outputSchema, StreamState state, CallContext ctx) throws IOException {
+    private byte[] handleCancel(Schema outputSchema, StreamState state, CallContext ctx,
+                                 OutputCollectorSink sink) throws IOException {
         // on_cancel is best-effort; the client has already decided it's done.
         try { state.onCancel(ctx); } catch (Exception ignore) { /* reported via onCancel contract */ }
         BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
+            // Anything onCancel logged still belongs to the caller — this
+            // response is the last one it will ever read on this stream.
+            sink.bind(w, outputSchema);
+        } finally {
+            sink.detach();
         }
         return out.toByteArray();
     }
 
     private byte[] writeExchangeResponse(OutputCollector collector, StreamState state, StateToken priorToken,
                                          Schema outputSchema, boolean isProducer, String principal,
-                                         DictionaryProvider inputDicts, StreamTurn turn) throws IOException {
+                                         DictionaryProvider inputDicts, StreamTurn turn,
+                                         OutputCollectorSink sink) throws IOException {
         boolean finished = collector.finished();
         // Absent on the terminal turn: there is no outbound state when the
         // stream closes, which is exactly what its absence in the record means.
@@ -490,6 +511,11 @@ public final class HttpStreamHandler {
         BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
+            // Flushes whatever process() logged through the CallContext. It ran
+            // before this writer existed, so the sink buffered it; binding here
+            // drains that buffer ahead of the data batch, matching the order the
+            // pipe transports put on the wire.
+            sink.bind(w, outputSchema);
 
             // Logs and other non-data entries flow through first; the data entry is held for token-attachment.
             OutputCollector.Entry data = null;
@@ -520,6 +546,8 @@ public final class HttpStreamHandler {
                     Wire.writeZeroBatch(w, outputSchema, Map.of(Metadata.STREAM_STATE, newTokenStr));
                 }
             }
+        } finally {
+            sink.detach();
         }
         return out.toByteArray();
     }
@@ -691,6 +719,25 @@ public final class HttpStreamHandler {
         // the error message itself if a different code path tripped maxResponseBytes earlier.
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         Wire.writeErrorStream(out, RpcStream.EMPTY_SCHEMA, t, rpc.serverId());
+        return out.toByteArray();
+    }
+
+    /**
+     * An error stream that first flushes anything the failed call logged.
+     *
+     * <p>Same shape as {@link #errorStream(Throwable)} — log batches then the
+     * EXCEPTION batch — which is exactly the order a client reads them in, so
+     * the logs reach the log sink and the exception is still what gets raised.
+     */
+    private byte[] errorStream(Throwable t, OutputCollectorSink sink) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (IpcStreamWriter w = new IpcStreamWriter(out)) {
+            w.writeSchema(RpcStream.EMPTY_SCHEMA);
+            sink.bind(w, RpcStream.EMPTY_SCHEMA);
+            Wire.writeZeroBatch(w, RpcStream.EMPTY_SCHEMA, Wire.errorMetadata(t, rpc.serverId()));
+        } finally {
+            sink.detach();
+        }
         return out.toByteArray();
     }
 
