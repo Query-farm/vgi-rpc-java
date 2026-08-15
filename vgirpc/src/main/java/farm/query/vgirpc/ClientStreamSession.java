@@ -48,6 +48,21 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
     private final LocationResolver locationResolver;
 
     private IpcStreamWriter inputWriter;
+    /**
+     * The schema the input IPC stream actually carries, learned from the first
+     * thing written to it.
+     *
+     * <p>It is not always {@link #inputSchema}. {@link IpcStreamWriter} defers
+     * the schema message and, when the first write is a real batch, emits
+     * <em>that batch's</em> schema — and on a client session {@code inputSchema}
+     * is always {@link RpcStream#EMPTY_SCHEMA}, because the proxy has no way to
+     * know an exchange's input schema (see {@code RpcConnection.doStream}); the
+     * caller supplies it one batch at a time. Every zero-row control batch
+     * written afterwards — the {@code vgi_rpc.cancel} token — has to match what
+     * the stream declared, or the peer's {@code VectorLoader} rejects it
+     * ("no more field nodes for field …") and the control signal is lost.
+     */
+    private Schema inputWireSchema;
     private IpcStreamReader outputReader;
     private boolean closed;
     /**
@@ -145,6 +160,8 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
      *
      * @param input the input batch to send for this tick
      * @return the next output {@link AnnotatedBatch}
+     * @throws NoSuchElementException if the server ended the stream instead of
+     *     answering this input batch
      * @throws RpcError on transport failure or if the server reported an error
      */
     @Override
@@ -153,6 +170,16 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
         try {
             writeTickOrBatch(input.root(), input.customMetadata());
             return readNextDataBatch();
+        } catch (NoSuchElementException e) {
+            // Same close-on-end-of-stream contract as tick(). An exchange
+            // normally never sees EOS — the server answers every input batch —
+            // so reaching it means the server has torn the stream down and gone
+            // back to awaiting the next request. Leaving the session open would
+            // let the caller write another input batch into a transport where
+            // nobody is reading stream input, which corrupts every later call on
+            // the connection rather than just failing this one.
+            close();
+            throw e;
         } catch (IOException e) {
             closed = true;
             throw new RpcError("TransportError", "stream exchange failed: " + e.getMessage(), "");
@@ -189,12 +216,11 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
     public void cancel() {
         if (closed) return;
         try {
-            Map<String, String> cancel = Map.of(Metadata.CANCEL, "1");
-            if (inputWriter == null) {
-                inputWriter = new IpcStreamWriter(transport.writer());
-                inputWriter.writeSchema(EMPTY_SCHEMA);
-            }
-            Wire.writeZeroBatch(inputWriter, inputSchema, cancel);
+            // Goes through writeTickOrBatch so the token batch is built from the
+            // schema the input stream actually declared — which, once an
+            // exchange has sent its first real batch, is the caller's schema and
+            // not inputSchema. See the inputWireSchema field.
+            writeTickOrBatch(null, Map.of(Metadata.CANCEL, "1"));
         } catch (Exception ignore) {}
         close();
     }
@@ -211,9 +237,15 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             inputWriter.writeSchema(inputSchema);
         }
         if (batch == null) {
-            // Emit a zero-row tick matching the input schema
-            Wire.writeZeroBatch(inputWriter, inputSchema, meta);
+            // Zero-row tick / control batch. It must match whatever schema the
+            // stream already declared (see inputWireSchema), which is only
+            // inputSchema while nothing has been written yet.
+            if (inputWireSchema == null) inputWireSchema = inputSchema;
+            Wire.writeZeroBatch(inputWriter, inputWireSchema, meta);
         } else {
+            // The writer emits this batch's schema if it is the first one, so
+            // that — not inputSchema — is what the stream carries from here on.
+            if (inputWireSchema == null) inputWireSchema = batch.getSchema();
             inputWriter.writeBatch(batch, meta);
         }
         transport.writer().flush();
@@ -238,7 +270,16 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
                 continue;
             }
             if (kind == Wire.BatchKind.ERROR) {
-                throw Wire.errorFromMetadata(md);
+                // An error batch is terminal: RpcServer stops its tick loop and
+                // writes EOS right behind it. Close before raising so the
+                // trailing EOS is consumed and the session is marked spent —
+                // otherwise a caller that retries after catching the error
+                // writes into a transport that has moved on to awaiting the next
+                // request, and the connection is unusable from then on (the
+                // failure then surfaces on some later, unrelated call).
+                RpcError error = Wire.errorFromMetadata(md);
+                close();
+                throw error;
             }
             // Transparent resolution of external-location pointer batches, the
             // streaming counterpart of the unary path in RpcConnection.doUnary.

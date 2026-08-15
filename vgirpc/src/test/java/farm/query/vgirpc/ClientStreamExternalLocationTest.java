@@ -92,13 +92,39 @@ final class ClientStreamExternalLocationTest {
         }
     }
 
+    /**
+     * Exchange counterpart of {@link BulkProducer}: answers each input batch
+     * with the same rows doubled, big enough to be externalised.
+     */
+    public static final class Doubler extends ExchangeState {
+        public Doubler() {}
+
+        @Override public void exchange(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
+            BigIntVector src = (BigIntVector) input.root().getVector("n");
+            int rows = input.root().getRowCount();
+            VectorSchemaRoot root = VectorSchemaRoot.create(OUT_SCHEMA, Allocators.root());
+            root.allocateNew();
+            BigIntVector v = (BigIntVector) root.getVector(0);
+            for (int i = 0; i < rows; i++) v.setSafe(i, src.get(i) * 2);
+            v.setValueCount(rows);
+            root.setRowCount(rows);
+            out.emit(root, Map.of(BATCH_TAG, "exchanged"));
+        }
+    }
+
     public interface BulkService {
         RpcStream<BulkProducer> bulk(long batches);
+
+        RpcStream<Doubler> doubling();
     }
 
     public static final class Impl implements BulkService {
         @Override public RpcStream<BulkProducer> bulk(long batches) {
             return RpcStream.producer(OUT_SCHEMA, new BulkProducer(batches));
+        }
+
+        @Override public RpcStream<Doubler> doubling() {
+            return RpcStream.exchange(OUT_SCHEMA, OUT_SCHEMA, new Doubler());
         }
     }
 
@@ -171,6 +197,48 @@ final class ClientStreamExternalLocationTest {
                         "vgi_rpc.location must be stripped once resolved");
                 assertTrue(md.getOrDefault(BATCH_TAG, "").startsWith("batch-"),
                         "producer batch metadata must survive externalisation: " + md);
+            }
+        }
+    }
+
+    /**
+     * The same resolution on an <em>exchange</em> stream.
+     *
+     * <p>Both stream shapes read their output through {@code readNextDataBatch},
+     * so resolution ought to be inherited — but "ought to" is what the producer
+     * path also looked like before it was driven from a client, so the exchange
+     * half is pinned rather than assumed. The client fetch is what proves it:
+     * the pointer batch carries zero rows, so an unresolved one would show up
+     * here as an empty answer to a non-empty question.
+     */
+    @Test
+    @Timeout(60)
+    void resolvesExternalizedBatchesOnAnExchangeStream() throws Exception {
+        ExternalLocationConfig cfg = config();
+        try (Harness h = Harness.start(cfg, cfg)) {
+            ClientStreamSession<?> session = (ClientStreamSession<?>) h.client().doubling();
+            try (VectorSchemaRoot input = VectorSchemaRoot.create(OUT_SCHEMA, Allocators.root())) {
+                input.allocateNew();
+                BigIntVector n = (BigIntVector) input.getVector("n");
+                for (int i = 0; i < ROWS; i++) n.setSafe(i, i);
+                n.setValueCount(ROWS);
+                input.setRowCount(ROWS);
+
+                AnnotatedBatch answer = session.exchange(new AnnotatedBatch(input, null));
+                assertEquals(1, objects.size(), "the answer should have been externalized");
+                assertFalse(answer.customMetadata().containsKey(Metadata.LOCATION),
+                        "vgi_rpc.location must be stripped once resolved");
+                assertEquals("exchanged", answer.customMetadata().get(BATCH_TAG),
+                        "worker batch metadata must survive externalisation");
+
+                List<Long> rows = new ArrayList<>();
+                BigIntVector doubled = (BigIntVector) answer.root().getVector("n");
+                for (int i = 0; i < answer.root().getRowCount(); i++) rows.add(doubled.get(i));
+                List<Long> expected = new ArrayList<>();
+                for (long i = 0; i < ROWS; i++) expected.add(i * 2);
+                assertEquals(expected, rows);
+            } finally {
+                session.close();
             }
         }
     }
