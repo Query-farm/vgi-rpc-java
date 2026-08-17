@@ -87,10 +87,15 @@ public final class RpcConnection implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public <T> T proxy(Class<T> serviceInterface) {
         Map<String, RpcMethodInfo> methods = ServiceIntrospector.describe(serviceInterface);
+        // The interface's declared @ProtocolVersion rides every request: a
+        // versioned peer checks the key at its dispatch boundary and rejects a
+        // request that carries none, so omitting it is not leniency — it makes
+        // the client unable to call that peer at all.
+        String version = ServiceIntrospector.protocolVersion(serviceInterface);
         return (T) Proxy.newProxyInstance(
                 serviceInterface.getClassLoader(),
                 new Class<?>[]{serviceInterface},
-                new ClientHandler(methods));
+                new ClientHandler(methods, version));
     }
 
     /** Close the underlying transport. */
@@ -100,8 +105,12 @@ public final class RpcConnection implements AutoCloseable {
     private final class ClientHandler implements InvocationHandler {
 
         private final Map<String, RpcMethodInfo> methods;
+        private final String protocolVersion;
 
-        ClientHandler(Map<String, RpcMethodInfo> methods) { this.methods = methods; }
+        ClientHandler(Map<String, RpcMethodInfo> methods, String protocolVersion) {
+            this.methods = methods;
+            this.protocolVersion = protocolVersion;
+        }
 
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
@@ -118,7 +127,7 @@ public final class RpcConnection implements AutoCloseable {
 
         private Object doStream(RpcMethodInfo info, Method m, Object[] args) throws Exception {
             // Send request
-            ClientMarshalling.writeRequest(transport.writer(), info, m, args);
+            ClientMarshalling.writeRequest(transport.writer(), info, m, args, protocolVersion);
             transport.writer().flush();
 
             // Read header IPC stream if declared
@@ -159,7 +168,7 @@ public final class RpcConnection implements AutoCloseable {
 
         private Object doUnary(RpcMethodInfo info, Method m, Object[] args) throws Exception {
             // Send request
-            ClientMarshalling.writeRequest(transport.writer(), info, m, args);
+            ClientMarshalling.writeRequest(transport.writer(), info, m, args, protocolVersion);
             transport.writer().flush();
 
             // Read response

@@ -59,19 +59,47 @@ public final class ClientMarshalling {
      */
     public static void writeRequest(OutputStream out, RpcMethodInfo info, Method method, Object[] args)
             throws IOException {
+        writeRequest(out, info, method, args, null);
+    }
+
+    /**
+     * As {@link #writeRequest(OutputStream, RpcMethodInfo, Method, Object[])},
+     * additionally stamping the application protocol version on the request
+     * batch as {@code vgi_rpc.protocol_version}.
+     *
+     * <p>A versioned peer checks that key at its dispatch boundary and rejects
+     * a request that omits it, so a client which never sends one is not a
+     * lenient client — it is a client that cannot call such a peer at all. The
+     * version is a property of the service interface (see
+     * {@link farm.query.vgirpc.schema.ProtocolVersion}), so the transports read
+     * it from there rather than making each call site remember.
+     *
+     * @param out destination for the framed request; not closed by this method
+     * @param info the introspected method being called
+     * @param method the reflected interface method, used to name the arguments
+     * @param args the invocation arguments, positionally matching {@code method}
+     * @param protocolVersion the version to stamp; {@code null} or blank omits the key
+     * @throws IOException if {@code out} fails
+     */
+    public static void writeRequest(OutputStream out, RpcMethodInfo info, Method method, Object[] args,
+                                    String protocolVersion) throws IOException {
         Map<String, Object> wireKwargs = convertForWire(bindArgs(method, args), info);
+        Map<String, String> meta = Wire.requestMetadata(info.name());
+        if (protocolVersion != null && !protocolVersion.isBlank()) {
+            meta.put(farm.query.vgirpc.wire.Metadata.PROTOCOL_VERSION_KEY, protocolVersion);
+        }
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(info.paramsSchema());
             if (info.paramsSchema().getFields().isEmpty()) {
                 try (VectorSchemaRoot zero = VectorSchemaRoot.create(info.paramsSchema(), Allocators.root())) {
                     zero.allocateNew();
                     zero.setRowCount(1);
-                    w.writeBatch(zero, Wire.requestMetadata(info.name()));
+                    w.writeBatch(zero, meta);
                 }
             } else {
                 try (VectorSchemaRoot root =
                              Marshalling.encodeRow(info.paramsSchema(), wireKwargs, Allocators.root())) {
-                    w.writeBatch(root, Wire.requestMetadata(info.name()));
+                    w.writeBatch(root, meta);
                 }
             }
         }

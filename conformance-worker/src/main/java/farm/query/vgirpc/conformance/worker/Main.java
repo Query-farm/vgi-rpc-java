@@ -12,6 +12,7 @@ import farm.query.vgirpc.external.ExternalLocationConfig;
 import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.http.AuthFailure;
 import farm.query.vgirpc.http.AuthReason;
+import farm.query.vgirpc.http.AuthUnavailableException;
 import farm.query.vgirpc.http.Authenticator;
 import farm.query.vgirpc.http.HttpPreHandler;
 import farm.query.vgirpc.http.HttpServer;
@@ -380,9 +381,28 @@ public final class Main {
      */
     private static final String CONFORMANCE_JWS_TRAP_TOKEN =
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
+    /**
+     * The credential whose resolution is <em>unknowable</em> rather than unknown.
+     *
+     * <p>The shared suite posts it to check that a backing-store outage surfaces
+     * as a transient 503 and not as this endpoint's own definitive 404 — which a
+     * caller may negative-cache, so a briefly unreachable store would be
+     * remembered as a bad credential for the cache's lifetime.
+     */
+    private static final String CONFORMANCE_UNAVAILABLE_TOKEN = "conformance-unavailable-token";
 
-    /** Resolve the one fixed subject credential the shared tests post. */
+    /**
+     * Resolve the fixed credentials the shared tests post.
+     *
+     * <p>Three answers, deliberately: an identity, {@code Optional.empty()} for
+     * "does not resolve", and {@link AuthUnavailableException} for "I could not
+     * find out". The third is not a flavour of the second — an empty result
+     * becomes the definitive 404 a caller may negative-cache.
+     */
     private static Optional<TokenIdentity> resolveConformanceToken(String token) {
+        if (CONFORMANCE_UNAVAILABLE_TOKEN.equals(token)) {
+            throw new AuthUnavailableException("conformance: mapping store unreachable");
+        }
         if (CONFORMANCE_SUBJECT_TOKEN.equals(token) || CONFORMANCE_JWS_TRAP_TOKEN.equals(token)) {
             return Optional.of(new TokenIdentity(
                     CONFORMANCE_SUBJECT_PRINCIPAL, CONFORMANCE_SUBJECT_TOKEN_NAME, CONFORMANCE_SUBJECT_TTL));

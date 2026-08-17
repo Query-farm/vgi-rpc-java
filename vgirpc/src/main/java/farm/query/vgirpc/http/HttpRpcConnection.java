@@ -95,12 +95,15 @@ public final class HttpRpcConnection implements AutoCloseable {
     private final Map<String, String> headers;
     private final Consumer<Message> onLog;
     private final Duration requestTimeout;
+    /** Caller-supplied override for the service interface's own declared version, or {@code null}. */
+    private final String protocolVersion;
 
     private HttpRpcConnection(Builder b) {
         this.endpoint = b.endpoint;
         this.headers = Map.copyOf(b.headers);
         this.onLog = b.onLog != null ? b.onLog : m -> {};
         this.requestTimeout = b.requestTimeout;
+        this.protocolVersion = b.protocolVersion;
         if (b.httpClient != null) {
             this.http = b.httpClient;
             this.ownsHttpClient = false;
@@ -139,10 +142,17 @@ public final class HttpRpcConnection implements AutoCloseable {
     @SuppressWarnings("unchecked")
     public <T> T proxy(Class<T> serviceInterface) {
         Map<String, RpcMethodInfo> methods = ServiceIntrospector.describe(serviceInterface);
+        // The interface's own @ProtocolVersion unless the builder overrode it:
+        // a versioned worker rejects a request with no vgi_rpc.protocol_version,
+        // so getting this from the contract rather than from the call site is
+        // what makes proxy(X.class) work against one.
+        String version = protocolVersion != null
+                ? protocolVersion
+                : ServiceIntrospector.protocolVersion(serviceInterface);
         return (T) Proxy.newProxyInstance(
                 serviceInterface.getClassLoader(),
                 new Class<?>[]{serviceInterface},
-                new ClientHandler(methods));
+                new ClientHandler(methods, version));
     }
 
     /**
@@ -273,8 +283,12 @@ public final class HttpRpcConnection implements AutoCloseable {
     private final class ClientHandler implements InvocationHandler {
 
         private final Map<String, RpcMethodInfo> methods;
+        private final String protocolVersion;
 
-        ClientHandler(Map<String, RpcMethodInfo> methods) { this.methods = methods; }
+        ClientHandler(Map<String, RpcMethodInfo> methods, String protocolVersion) {
+            this.methods = methods;
+            this.protocolVersion = protocolVersion;
+        }
 
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
@@ -321,7 +335,7 @@ public final class HttpRpcConnection implements AutoCloseable {
 
         private byte[] requestBody(RpcMethodInfo info, Method m, Object[] args) throws IOException {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            ClientMarshalling.writeRequest(buf, info, m, args);
+            ClientMarshalling.writeRequest(buf, info, m, args, protocolVersion);
             return buf.toByteArray();
         }
 
@@ -367,6 +381,7 @@ public final class HttpRpcConnection implements AutoCloseable {
         private Duration requestTimeout = Duration.ofMinutes(5);
         private Duration connectTimeout = Duration.ofSeconds(10);
         private HttpClient httpClient;
+        private String protocolVersion;
 
         private Builder(String endpoint) {
             if (endpoint == null || endpoint.isBlank()) {
@@ -458,6 +473,23 @@ public final class HttpRpcConnection implements AutoCloseable {
          * @param client the client to dispatch through
          * @return this builder
          */
+        /**
+         * Override the application protocol version stamped on every request.
+         *
+         * <p>Normally unnecessary — the version comes from the service
+         * interface's {@link farm.query.vgirpc.schema.ProtocolVersion}, which
+         * is where the wire contract is declared. Set it to speak a different
+         * revision of a protocol than the interface declares, or {@code ""} to
+         * send no version key at all.
+         *
+         * @param version the version to send, or {@code ""} for none
+         * @return this builder
+         */
+        public Builder protocolVersion(String version) {
+            this.protocolVersion = version == null ? "" : version;
+            return this;
+        }
+
         public Builder httpClient(HttpClient client) {
             this.httpClient = client;
             return this;

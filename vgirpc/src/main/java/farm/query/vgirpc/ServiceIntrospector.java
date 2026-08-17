@@ -38,6 +38,19 @@ public final class ServiceIntrospector {
         return CACHE.computeIfAbsent(serviceInterface, ServiceIntrospector::buildMethods);
     }
 
+    /**
+     * The application protocol version a service interface declares via
+     * {@link farm.query.vgirpc.schema.ProtocolVersion}.
+     *
+     * @param serviceInterface the service interface
+     * @return the declared version, or {@code ""} when the interface declares none
+     */
+    public static String protocolVersion(Class<?> serviceInterface) {
+        farm.query.vgirpc.schema.ProtocolVersion v =
+                serviceInterface.getAnnotation(farm.query.vgirpc.schema.ProtocolVersion.class);
+        return v == null || v.value() == null ? "" : v.value();
+    }
+
     private static Map<String, RpcMethodInfo> buildMethods(Class<?> iface) {
         if (!iface.isInterface()) {
             throw new IllegalArgumentException("service must be an interface: " + iface);
