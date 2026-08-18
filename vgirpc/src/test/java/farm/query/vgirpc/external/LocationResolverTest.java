@@ -170,4 +170,23 @@ final class LocationResolverTest {
         pointer.put(Metadata.LOCATION, "http://127.0.0.1:" + port + "/anything");
         assertThrows(IllegalArgumentException.class, () -> resolver.resolve(pointer));
     }
+
+    @Test
+    void max_fetch_cap_remains_the_default_decoded_cap() {
+        ExternalLocationConfig config = ExternalLocationConfig.builder()
+                .maxFetchBytes(1234)
+                .build();
+        assertEquals(1234, config.maxFetchBytes());
+        assertEquals(1234, config.maxDecompressedBytes());
+    }
+
+    @Test
+    void decoded_cap_can_be_configured_independently() {
+        ExternalLocationConfig config = ExternalLocationConfig.builder()
+                .maxDecompressedBytes(8192)
+                .maxFetchBytes(4096)
+                .build();
+        assertEquals(4096, config.maxFetchBytes());
+        assertEquals(8192, config.maxDecompressedBytes());
+    }
 }

@@ -60,9 +60,9 @@ public final class VgiMessageReader extends MessageChannelReader {
             return null; // clean end of stream
         }
         Message message = metadata.getMessage();
-        lastCustomMetadata = captureMetadata(message);
 
         if (!metadata.messageHasBody()) {
+            lastCustomMetadata = captureMetadata(message);
             return new MessageResult(message, null);
         }
 
@@ -76,6 +76,16 @@ public final class VgiMessageReader extends MessageChannelReader {
             // caller can answer with for this call alone.
             drain(bodyLength);
             throw new OversizedMessageException(bodyLength, e);
+        }
+        try {
+            // Decode caller-controlled metadata only after consuming the body.
+            // If a key/value is invalid UTF-8, the caller can now drain the
+            // stream's EOS marker and reuse the persistent connection instead
+            // of being left in the middle of this record-batch frame.
+            lastCustomMetadata = captureMetadata(message);
+        } catch (RuntimeException malformedMetadata) {
+            body.close();
+            throw malformedMetadata;
         }
         return new MessageResult(message, body);
     }

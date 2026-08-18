@@ -301,6 +301,16 @@ public final class RpcServer {
                 Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, oversized, serverId);
                 transport.writer().flush();
                 return;
+            } catch (RuntimeException malformed) {
+                // Arrow Java decodes custom_metadata while loading the record
+                // batch.  Invalid UTF-8 therefore surfaces before a metadata
+                // map exists, but the batch frame itself has already been
+                // consumed. Drain its EOS marker, return a typed error for
+                // this call, and preserve the persistent connection.
+                try { reader.drain(); } catch (Exception ignore) { /* best-effort */ }
+                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, malformed, serverId);
+                transport.writer().flush();
+                return;
             } catch (IOException ioe) {
                 throw new EndOfStream();
             }
@@ -310,6 +320,15 @@ public final class RpcServer {
             if (shmSession != null) shmSession.attachIfAdvertised(meta);
             Shm shm = shmSession != null ? shmSession.segment() : null;
             VectorSchemaRoot paramsRoot = reader.root();
+            Schema requestSchema;
+            try {
+                requestSchema = reader.wireSchema();
+            } catch (IOException schemaExc) {
+                try { reader.drain(); } catch (IOException ignore) { /* best-effort */ }
+                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, schemaExc, serverId);
+                transport.writer().flush();
+                return;
+            }
             // If the outer batch is a shm or external-location pointer, resolve the
             // inner batch and decode kwargs from it. Dispatch metadata still comes
             // from the (merged) outer batch metadata.
@@ -350,6 +369,7 @@ public final class RpcServer {
                     transport.writer().flush();
                     return;
                 }
+                int parameterRows = paramsRoot.getRowCount();
                 // Snapshot the kwargs immediately, before draining mutates the reader's root.
                 // Decode errors must be reported as an error response so the (possibly shared)
                 // transport stays framed correctly for the next call.
@@ -397,6 +417,16 @@ public final class RpcServer {
                     Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
                             new IllegalArgumentException("Unknown method: '" + method + "'. Available: " + methods.keySet()),
                             serverId);
+                    transport.writer().flush();
+                    return;
+                }
+                try {
+                    validateParameterContract(method, requestSchema,
+                            parameterRows, info.paramsSchema());
+                } catch (RuntimeException contractError) {
+                    Schema errorSchema = info.methodType() == MethodType.UNARY
+                            ? info.resultSchema() : RpcStream.EMPTY_SCHEMA;
+                    Wire.writeErrorStream(transport.writer(), errorSchema, contractError, serverId);
                     transport.writer().flush();
                     return;
                 }
@@ -467,6 +497,27 @@ public final class RpcServer {
         } catch (Exception e) {
             LOG.warn("serve error: {}", e.toString());
             e.printStackTrace(System.err);
+        }
+    }
+
+    /** Validate the exact parameter schema/cardinality before handler dispatch. */
+    private static void validateParameterContract(String method, Schema actualSchema,
+                                                  int rows, Schema expectedSchema) {
+        if (!actualSchema.equals(expectedSchema)) {
+            throw new ClassCastException(
+                    "parameter schema mismatch for '" + method + "': expected "
+                            + expectedSchema + ", got " + actualSchema);
+        }
+        // Existing clients use both Arrow encodings of an empty argument
+        // tuple: zero rows, or one row in a zero-column batch.
+        boolean validRows = expectedSchema.getFields().isEmpty()
+                ? rows == 0 || rows == 1
+                : rows == 1;
+        if (!validRows) {
+            throw new IllegalArgumentException(
+                    "parameter batch for '" + method + "' must contain "
+                            + (expectedSchema.getFields().isEmpty() ? "zero or one" : "one")
+                            + " row(s), got " + rows);
         }
     }
 

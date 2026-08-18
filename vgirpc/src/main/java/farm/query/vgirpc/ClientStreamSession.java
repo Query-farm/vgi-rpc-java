@@ -15,6 +15,7 @@ import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.IOException;
@@ -142,7 +143,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
     public AnnotatedBatch tick() {
         ensureNotClosed();
         try {
-            writeTickOrBatch(null, null);
+            writeTickOrBatch(null, null, null);
             return readNextDataBatch();
         } catch (NoSuchElementException e) {
             close();
@@ -168,7 +169,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
     public AnnotatedBatch exchange(AnnotatedBatch input) {
         ensureNotClosed();
         try {
-            writeTickOrBatch(input.root(), input.customMetadata());
+            writeTickOrBatch(input.root(), input.customMetadata(), input.dictionaryProvider());
             return readNextDataBatch();
         } catch (NoSuchElementException e) {
             // Same close-on-end-of-stream contract as tick(). An exchange
@@ -220,7 +221,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             // schema the input stream actually declared — which, once an
             // exchange has sent its first real batch, is the caller's schema and
             // not inputSchema. See the inputWireSchema field.
-            writeTickOrBatch(null, Map.of(Metadata.CANCEL, "1"));
+            writeTickOrBatch(null, Map.of(Metadata.CANCEL, "1"), null);
         } catch (Exception ignore) {}
         close();
     }
@@ -231,7 +232,9 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
         if (closed) throw new RpcError("ProtocolError", "RpcStream has been closed or cancelled", "");
     }
 
-    private void writeTickOrBatch(VectorSchemaRoot batch, Map<String, String> meta) throws IOException {
+    private void writeTickOrBatch(VectorSchemaRoot batch, Map<String, String> meta,
+                                  DictionaryProvider dictionaries)
+            throws IOException {
         if (inputWriter == null) {
             inputWriter = new IpcStreamWriter(transport.writer());
             inputWriter.writeSchema(inputSchema);
@@ -246,7 +249,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             // The writer emits this batch's schema if it is the first one, so
             // that — not inputSchema — is what the stream carries from here on.
             if (inputWireSchema == null) inputWireSchema = batch.getSchema();
-            inputWriter.writeBatch(batch, meta);
+            inputWriter.writeBatch(batch, meta, dictionaries);
         }
         transport.writer().flush();
     }
@@ -296,7 +299,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             }
             // Note: the AnnotatedBatch here does NOT own the root — it's reused by the reader.
             // Caller must consume / copy data before the next read.
-            return new AnnotatedBatch(root, md);
+            return new AnnotatedBatch(root, md, outputReader.dictionaryProvider(), null);
         }
     }
 

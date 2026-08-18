@@ -25,6 +25,8 @@ public final class ExternalLocationConfig {
     private final long thresholdBytes;
     /** Max total bytes the fetcher will download per pointer (safety cap). */
     private final long maxFetchBytes;
+    /** Max bytes after external content decompression. */
+    private final long maxDecompressedBytes;
     /** Retry attempts on transient fetch errors (caller count, not including first). */
     private final int maxRetries;
     /** Delay between retries. */
@@ -42,6 +44,7 @@ public final class ExternalLocationConfig {
         this.storage = b.storage;
         this.thresholdBytes = b.thresholdBytes;
         this.maxFetchBytes = b.maxFetchBytes;
+        this.maxDecompressedBytes = b.maxDecompressedBytes;
         this.maxRetries = b.maxRetries;
         this.retryDelay = b.retryDelay;
         this.httpTimeout = b.httpTimeout;
@@ -60,6 +63,9 @@ public final class ExternalLocationConfig {
     /** Safety cap protecting the fetcher against runaway downloads.
      * @return hard cap (bytes) on a fetched body; oversized fetches are rejected. */
     public long maxFetchBytes() { return maxFetchBytes; }
+    /** Safety cap applied after external content decompression.
+     * @return hard cap (bytes) on the decoded body. */
+    public long maxDecompressedBytes() { return maxDecompressedBytes; }
     /** Retry budget for transient fetch errors, not counting the initial attempt.
      * @return number of fetch retries before giving up. */
     public int maxRetries() { return maxRetries; }
@@ -130,6 +136,8 @@ public final class ExternalLocationConfig {
         private ExternalStorage storage;
         private long thresholdBytes = 1L << 20;      // 1 MiB
         private long maxFetchBytes = 512L * 1024 * 1024; // 512 MiB safety cap
+        private long maxDecompressedBytes = 512L * 1024 * 1024;
+        private boolean maxDecompressedBytesSet;
         private int maxRetries = 2;
         private Duration retryDelay = Duration.ofMillis(500);
         private Duration httpTimeout = Duration.ofSeconds(30);
@@ -148,7 +156,22 @@ public final class ExternalLocationConfig {
         /** Hard cap (bytes) on a fetched body (default 512 MiB).
          * @param v the maximum fetch size in bytes
          * @return this builder */
-        public Builder maxFetchBytes(long v) { this.maxFetchBytes = v; return this; }
+        public Builder maxFetchBytes(long v) {
+            this.maxFetchBytes = v;
+            // Before decoded bytes had a separate setting, maxFetchBytes was
+            // enforced after decompression. Preserve that protection unless
+            // the caller explicitly chooses an independent decoded cap.
+            if (!maxDecompressedBytesSet) this.maxDecompressedBytes = v;
+            return this;
+        }
+        /** Hard cap (bytes) after external content decompression (default 512 MiB).
+         * @param v the maximum decoded body size in bytes
+         * @return this builder */
+        public Builder maxDecompressedBytes(long v) {
+            this.maxDecompressedBytes = v;
+            this.maxDecompressedBytesSet = true;
+            return this;
+        }
         /** Number of fetch retries before failing (default 2).
          * @param n retry count, not including the initial attempt
          * @return this builder */

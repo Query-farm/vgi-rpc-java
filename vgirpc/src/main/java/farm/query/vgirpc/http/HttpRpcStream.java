@@ -324,7 +324,8 @@ public final class HttpRpcStream<S extends StreamState> extends RpcStream<S> {
             if (LocationResolver.isPointer(root.getRowCount(), md)) {
                 HttpRpcConnection.failOnPointerBatch(md);
             }
-            return new AnnotatedBatch(root, carriesToken ? stripTokens(md) : md);
+            return new AnnotatedBatch(root, carriesToken ? stripTokens(md) : md,
+                    currentReader.dictionaryProvider(), null);
         }
     }
 
@@ -408,7 +409,7 @@ public final class HttpRpcStream<S extends StreamState> extends RpcStream<S> {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         try (IpcStreamWriter w = new IpcStreamWriter(buf)) {
             w.writeSchema(input.root().getSchema());
-            w.writeBatch(input.root(), md);
+            w.writeBatch(input.root(), md, input.dictionaryProvider());
         }
         return buf.toByteArray();
     }

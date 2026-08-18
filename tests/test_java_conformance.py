@@ -491,6 +491,38 @@ def conformance_http_with_storage_port(conformance_fake_storage: str) -> Iterato
 
 
 @pytest.fixture(scope="session")
+def conformance_http_external_security_port(conformance_fake_storage: str) -> Iterator[int]:
+    """Spawn Java with per-hop URL policy and independent fetch caps."""
+    proc = subprocess.Popen(
+        [
+            JAVA_WORKER,
+            "--http",
+            "--fake-storage",
+            conformance_fake_storage,
+            "--max-request-bytes",
+            "1048576",
+            "--max-fetch-bytes",
+            "4096",
+            "--max-decompressed-fetch-bytes",
+            "8192",
+            "--reject-localhost-redirects",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
 def conformance_http_externalized_cap_port(conformance_fake_storage: str) -> Iterator[int]:
     """Spawn a Java HTTP worker whose *external-channel* cap is the one that bites.
 

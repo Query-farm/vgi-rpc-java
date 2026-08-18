@@ -66,6 +66,9 @@ public final class Main {
         List<HttpPreHandler> preHandlers = new ArrayList<>();
         String fakeStorageUrl = null;
         long externalizeThreshold = 4096;
+        long maxFetchBytes = -1;
+        long maxDecompressedFetchBytes = -1;
+        boolean rejectLocalhostRedirects = false;
         // -1 sentinel: "unset"; falls back to externalizeThreshold for backward compat.
         long maxRequestBytes = -1;
         String compression = "none";
@@ -164,6 +167,10 @@ public final class Main {
                 case "--proof-no-replay-cache" -> proofReplayCache = false;
                 case "--fake-storage" -> fakeStorageUrl = c.requireValue(a);
                 case "--externalize-threshold" -> externalizeThreshold = Long.parseLong(c.requireValue(a));
+                case "--max-fetch-bytes" -> maxFetchBytes = Long.parseLong(c.requireValue(a));
+                case "--max-decompressed-fetch-bytes" ->
+                        maxDecompressedFetchBytes = Long.parseLong(c.requireValue(a));
+                case "--reject-localhost-redirects" -> rejectLocalhostRedirects = true;
                 case "--max-request-bytes" -> maxRequestBytes = Long.parseLong(c.requireValue(a));
                 case "--compression" -> compression = c.requireValue(a);
                 case "--access-log" -> accessLogPath = c.requireValue(a);
@@ -208,8 +215,21 @@ public final class Main {
             fakeStorage = new FakeStorage(fakeStorageUrl);
             ExternalLocationConfig.Builder cfgB = ExternalLocationConfig.builder()
                     .storage(fakeStorage)
-                    .thresholdBytes(externalizeThreshold)
-                    .urlValidator(ExternalLocationConfig.permissiveValidator());
+                    .thresholdBytes(externalizeThreshold);
+            if (rejectLocalhostRedirects) {
+                cfgB.urlValidator(uri -> {
+                    if (!"http".equalsIgnoreCase(uri.getScheme())
+                            || !"127.0.0.1".equals(uri.getHost())) {
+                        throw new IllegalArgumentException("URL rejected by conformance policy");
+                    }
+                });
+            } else {
+                cfgB.urlValidator(ExternalLocationConfig.permissiveValidator());
+            }
+            if (maxFetchBytes >= 0) cfgB.maxFetchBytes(maxFetchBytes);
+            if (maxDecompressedFetchBytes >= 0) {
+                cfgB.maxDecompressedBytes(maxDecompressedFetchBytes);
+            }
             if ("zstd".equalsIgnoreCase(compression)) {
                 cfgB.compression(ExternalLocationConfig.Compression.zstd());
             } else if (!"none".equalsIgnoreCase(compression)) {

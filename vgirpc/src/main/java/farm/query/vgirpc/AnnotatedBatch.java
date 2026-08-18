@@ -4,6 +4,7 @@
 package farm.query.vgirpc;
 
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
 
 import java.util.Collections;
 import java.util.Map;
@@ -16,6 +17,7 @@ public final class AnnotatedBatch implements AutoCloseable {
 
     private final VectorSchemaRoot root;
     private final Map<String, String> customMetadata;
+    private final DictionaryProvider dictionaryProvider;
     private final Runnable releaseFn;
     private boolean closed;
 
@@ -26,7 +28,7 @@ public final class AnnotatedBatch implements AutoCloseable {
      * @param customMetadata batch custom metadata; {@code null} becomes empty
      */
     public AnnotatedBatch(VectorSchemaRoot root, Map<String, String> customMetadata) {
-        this(root, customMetadata, null);
+        this(root, customMetadata, null, null);
     }
 
     /**
@@ -38,8 +40,24 @@ public final class AnnotatedBatch implements AutoCloseable {
      * @param releaseFn extra cleanup run before {@code root.close()}, or {@code null}
      */
     public AnnotatedBatch(VectorSchemaRoot root, Map<String, String> customMetadata, Runnable releaseFn) {
+        this(root, customMetadata, null, releaseFn);
+    }
+
+    /**
+     * Wrap a batch together with the dictionaries referenced by its schema.
+     * The provider follows the root's lifetime but remains caller-owned; this
+     * wrapper does not close dictionary vectors.
+     *
+     * @param root the batch vectors (closed by {@link #close()})
+     * @param customMetadata batch custom metadata; {@code null} becomes empty
+     * @param dictionaryProvider dictionaries for encoded fields, or {@code null}
+     * @param releaseFn extra cleanup run before {@code root.close()}, or {@code null}
+     */
+    public AnnotatedBatch(VectorSchemaRoot root, Map<String, String> customMetadata,
+                          DictionaryProvider dictionaryProvider, Runnable releaseFn) {
         this.root = root;
         this.customMetadata = customMetadata != null ? customMetadata : Collections.emptyMap();
+        this.dictionaryProvider = dictionaryProvider;
         this.releaseFn = releaseFn;
     }
 
@@ -57,6 +75,13 @@ public final class AnnotatedBatch implements AutoCloseable {
      *     {@code null}, possibly empty
      */
     public Map<String, String> customMetadata() { return customMetadata; }
+    /**
+     * Dictionaries referenced by the root's encoded fields. For a received
+     * stream batch they remain valid only as long as the batch root does.
+     *
+     * @return the dictionary provider, or {@code null} for plain schemas
+     */
+    public DictionaryProvider dictionaryProvider() { return dictionaryProvider; }
 
     /** Run the release function (if any) and close the root. Idempotent. */
     @Override

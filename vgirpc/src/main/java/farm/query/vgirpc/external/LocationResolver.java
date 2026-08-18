@@ -56,7 +56,13 @@ public final class LocationResolver {
         String url = pointerMeta.get(Metadata.LOCATION);
         if (url == null) throw new IllegalArgumentException("pointer batch missing vgi_rpc.location");
         String sha = pointerMeta.get(Metadata.LOCATION_SHA256);
-        byte[] body = fetcher.fetch(URI.create(url), sha);
+        URI location;
+        try {
+            location = URI.create(url);
+        } catch (IllegalArgumentException invalid) {
+            throw new java.io.IOException("invalid external location URL: <redacted-url>");
+        }
+        byte[] body = fetcher.fetch(location, sha);
 
         // Open the fetched stream, advance past any log/error batches, and take
         // the first data batch. We copy it into a caller-owned root because the
