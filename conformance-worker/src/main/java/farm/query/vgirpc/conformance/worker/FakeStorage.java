@@ -28,8 +28,10 @@ import java.util.regex.Pattern;
  */
 final class FakeStorage implements ExternalStorage, UploadUrlProvider {
 
-    /** Minimal extractor for the {@code "object_url": "..."} field. */
+    /** Minimal extractors for the fake storage allocation response. */
     private static final Pattern OBJECT_URL = Pattern.compile("\"object_url\"\\s*:\\s*\"([^\"]+)\"");
+    private static final Pattern UPLOAD_URL = Pattern.compile("\"upload_url\"\\s*:\\s*\"([^\"]+)\"");
+    private static final Pattern DOWNLOAD_URL = Pattern.compile("\"download_url\"\\s*:\\s*\"([^\"]+)\"");
 
     /**
      * Attempts per request against the fake-storage service.
@@ -96,14 +98,12 @@ final class FakeStorage implements ExternalStorage, UploadUrlProvider {
             if (allocResp.statusCode() / 100 != 2) {
                 throw new IOException("fake-storage /alloc failed: " + allocResp.statusCode());
             }
-            Matcher m = OBJECT_URL.matcher(allocResp.body());
-            if (!m.find()) {
-                throw new IOException("fake-storage /alloc missing object_url in: " + allocResp.body());
-            }
-            URI objectUrl = URI.create(m.group(1));
+            String legacyUrl = extractUrl(OBJECT_URL, allocResp.body(), "object_url", null);
+            URI uploadUrl = URI.create(extractUrl(UPLOAD_URL, allocResp.body(), "upload_url", legacyUrl));
+            URI downloadUrl = URI.create(extractUrl(DOWNLOAD_URL, allocResp.body(), "download_url", legacyUrl));
 
             HttpRequest.Builder putBuilder = HttpRequest.newBuilder()
-                    .uri(objectUrl)
+                    .uri(uploadUrl)
                     .header("Content-Type", "application/octet-stream")
                     .PUT(HttpRequest.BodyPublishers.ofByteArray(body));
             if (contentEncoding != null) {
@@ -113,7 +113,7 @@ final class FakeStorage implements ExternalStorage, UploadUrlProvider {
             if (putResp.statusCode() / 100 != 2) {
                 throw new IOException("fake-storage PUT failed: " + putResp.statusCode());
             }
-            return objectUrl;
+            return downloadUrl;
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted during fake-storage upload", ie);
@@ -132,17 +132,22 @@ final class FakeStorage implements ExternalStorage, UploadUrlProvider {
             if (allocResp.statusCode() / 100 != 2) {
                 throw new IOException("fake-storage /alloc failed: " + allocResp.statusCode());
             }
-            Matcher m = OBJECT_URL.matcher(allocResp.body());
-            if (!m.find()) {
-                throw new IOException("fake-storage /alloc missing object_url in: " + allocResp.body());
-            }
-            // Fake storage uses the same path for PUT and GET (HTTP method
-            // disambiguation), mirroring the Python adapter.
-            String url = m.group(1);
-            return new UploadUrl(url, url, Instant.now().plus(Duration.ofHours(1)));
+            String legacyUrl = extractUrl(OBJECT_URL, allocResp.body(), "object_url", null);
+            String uploadUrl = extractUrl(UPLOAD_URL, allocResp.body(), "upload_url", legacyUrl);
+            String downloadUrl = extractUrl(DOWNLOAD_URL, allocResp.body(), "download_url", legacyUrl);
+            return new UploadUrl(uploadUrl, downloadUrl, Instant.now().plus(Duration.ofHours(1)));
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted during fake-storage alloc", ie);
         }
+    }
+
+    /** Extract a JSON URL field, falling back to the legacy dual-method URL. */
+    private static String extractUrl(Pattern pattern, String body, String field, String fallback)
+            throws IOException {
+        Matcher matcher = pattern.matcher(body);
+        if (matcher.find()) return matcher.group(1);
+        if (fallback != null) return fallback;
+        throw new IOException("fake-storage /alloc missing " + field + " in: " + body);
     }
 }

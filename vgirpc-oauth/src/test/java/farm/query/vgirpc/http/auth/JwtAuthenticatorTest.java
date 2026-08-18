@@ -14,6 +14,7 @@ import com.sun.net.httpserver.HttpServer;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.http.AuthException;
 import farm.query.vgirpc.http.HttpRequestStub;
+import farm.query.vgirpc.http.InvalidCredentials;
 import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,7 +24,9 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.interfaces.RSAPrivateKey;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.Date;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -70,14 +73,22 @@ final class JwtAuthenticatorTest {
     }
 
     private String issueToken(String issuer, String audience, String subject, long expSeconds) throws Exception {
-        JWTClaimsSet claims = new JWTClaimsSet.Builder()
+        return issueToken(issuer, audience, Map.of("sub", subject), expSeconds);
+    }
+
+    private String issueToken(
+            String issuer,
+            String audience,
+            Map<String, Object> additionalClaims,
+            long expSeconds) throws Exception {
+        JWTClaimsSet.Builder claimsBuilder = new JWTClaimsSet.Builder()
                 .issuer(issuer)
                 .audience(audience)
-                .subject(subject)
                 .issueTime(new Date())
                 .expirationTime(Date.from(Instant.now().plusSeconds(expSeconds)))
-                .claim("role", "admin")
-                .build();
+                .claim("role", "admin");
+        additionalClaims.forEach(claimsBuilder::claim);
+        JWTClaimsSet claims = claimsBuilder.build();
         SignedJWT jwt = new SignedJWT(
                 new JWSHeader.Builder(JWSAlgorithm.RS256).keyID(signingKey.getKeyID()).build(),
                 claims);
@@ -90,6 +101,15 @@ final class JwtAuthenticatorTest {
                 .issuer(ISSUER)
                 .audience(AUDIENCE)
                 .jwksUri("http://127.0.0.1:" + jwksPort + "/jwks.json")
+                .build();
+    }
+
+    private JwtAuthenticator buildAuthenticator(String principalClaim) {
+        return JwtAuthenticator.builder()
+                .issuer(ISSUER)
+                .audience(AUDIENCE)
+                .jwksUri("http://127.0.0.1:" + jwksPort + "/jwks.json")
+                .principalClaim(principalClaim)
                 .build();
     }
 
@@ -106,6 +126,75 @@ final class JwtAuthenticatorTest {
         assertTrue(ctx.authenticated());
         assertEquals("alice", ctx.principal());
         assertEquals("admin", ctx.claims().get("role"));
+    }
+
+    @Test
+    void custom_principal_claim_authenticates() throws Exception {
+        String token = issueToken(
+                ISSUER, AUDIENCE, Map.of("tenant_id", "tenant-a"), 300);
+
+        AuthContext ctx = buildAuthenticator("tenant_id").authenticate(bearer(token));
+
+        assertTrue(ctx.authenticated());
+        assertEquals("tenant-a", ctx.principal());
+    }
+
+    @Test
+    void missing_default_principal_claim_rejected() throws Exception {
+        String token = issueToken(ISSUER, AUDIENCE, Map.of(), 300);
+
+        InvalidCredentials error = assertThrows(
+                InvalidCredentials.class,
+                () -> buildAuthenticator().authenticate(bearer(token)));
+
+        assertTrue(error.getMessage().contains("principal claim 'sub'"));
+    }
+
+    @Test
+    void missing_custom_principal_claim_rejected() throws Exception {
+        String token = issueToken(ISSUER, AUDIENCE, Map.of("sub", "alice"), 300);
+
+        InvalidCredentials error = assertThrows(
+                InvalidCredentials.class,
+                () -> buildAuthenticator("tenant_id").authenticate(bearer(token)));
+
+        assertTrue(error.getMessage().contains("principal claim 'tenant_id'"));
+    }
+
+    @Test
+    void null_principal_claim_rejected() throws Exception {
+        String token = issueToken(
+                ISSUER, AUDIENCE, Collections.singletonMap("sub", null), 300);
+
+        assertThrows(
+                InvalidCredentials.class,
+                () -> buildAuthenticator().authenticate(bearer(token)));
+    }
+
+    @Test
+    void non_string_principal_claims_rejected() throws Exception {
+        for (Object invalidPrincipal : List.of(
+                42,
+                true,
+                List.of("alice"),
+                Map.of("name", "alice"))) {
+            String token = issueToken(
+                    ISSUER, AUDIENCE, Map.of("sub", invalidPrincipal), 300);
+
+            assertThrows(
+                    InvalidCredentials.class,
+                    () -> buildAuthenticator().authenticate(bearer(token)),
+                    () -> "accepted principal claim " + invalidPrincipal);
+        }
+    }
+
+    @Test
+    void whitespace_only_principal_claim_rejected() throws Exception {
+        String token = issueToken(ISSUER, AUDIENCE, Map.of("sub", " \t\n"), 300);
+
+        assertThrows(
+                InvalidCredentials.class,
+                () -> buildAuthenticator().authenticate(bearer(token)));
     }
 
     @Test

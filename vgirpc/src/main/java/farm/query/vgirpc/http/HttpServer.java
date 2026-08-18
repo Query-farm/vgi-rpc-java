@@ -10,10 +10,12 @@ import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.CallOutcome;
+import farm.query.vgirpc.RpcMethodInfo;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.SessionLostError;
 import farm.query.vgirpc.external.ExternalResponseBudget;
+import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.external.UploadUrlProvider;
 import farm.query.vgirpc.http.auth.ProxyProof;
 import farm.query.vgirpc.transport.RpcTransport;
@@ -1341,17 +1343,6 @@ public final class HttpServer {
         return expose;
     }
 
-    /**
-     * True when the request path should bypass the {@code maxRequestBytes} cap.
-     * Mirrors the Python {@code _MaxRequestBytesMiddleware.exempt_prefixes}:
-     * {@code __upload_url__} and {@code health} payloads are intrinsically tiny.
-     */
-    private boolean isMaxBytesExempt(String pathRest) {
-        return pathRest.equals("health")
-                || pathRest.equals(UPLOAD_URL_METHOD)
-                || pathRest.startsWith(UPLOAD_URL_METHOD + "/");
-    }
-
     private void handleUploadUrl(HttpServletRequest req, HttpServletResponse resp) throws IOException {
         if (uploadUrlProvider == null) {
             resp.sendError(HttpServletResponse.SC_NOT_FOUND);
@@ -1360,8 +1351,13 @@ public final class HttpServer {
         // Read & validate the request batch (carries vgi_rpc.method=__upload_url__ and a count column)
         byte[] body;
         try {
-            // Exempt from maxRequestBytes — _MaxRequestBytesMiddleware skips this prefix.
-            body = readBodyUnbounded(req);
+            body = readBody(req);
+        } catch (PayloadTooLargeException e) {
+            writePayloadTooLarge(resp, e);
+            return;
+        } catch (UnsupportedContentEncodingException e) {
+            writeUnsupportedEncoding(resp, e);
+            return;
         } catch (IOException ioe) {
             resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "could not read request body");
             return;
@@ -1430,18 +1426,6 @@ public final class HttpServer {
         writeArrowResponse(req, resp, out.toByteArray());
     }
 
-    private byte[] readBodyUnbounded(HttpServletRequest req) throws IOException {
-        try (InputStream in = req.getInputStream();
-             ByteArrayOutputStream buf = new ByteArrayOutputStream()) {
-            byte[] chunk = new byte[8192];
-            int n;
-            while ((n = in.read(chunk)) > 0) buf.write(chunk, 0, n);
-            byte[] body = buf.toByteArray();
-            AccessLogScope.recordRequestBytes(body.length);
-            return maybeDecodeRequestBody(req, body);
-        }
-    }
-
     private void handleUnary(HttpServletRequest req, HttpServletResponse resp, String method) throws IOException {
         byte[] body;
         try {
@@ -1453,12 +1437,18 @@ public final class HttpServer {
             writeUnsupportedEncoding(resp, e);
             return;
         }
-
         AuthContext auth;
         try {
             auth = authenticator.authenticate(req);
         } catch (AuthException e) {
             writeUnauthorized(resp, e);
+            return;
+        }
+
+        try {
+            validateDispatchRequest(body, method);
+        } catch (Exception e) {
+            writeBadRequestArrow(req, resp, e);
             return;
         }
 
@@ -1828,12 +1818,6 @@ public final class HttpServer {
     }
 
     private byte[] readBody(HttpServletRequest req) throws IOException {
-        long contentLength = req.getContentLengthLong();
-        if (contentLength > maxRequestBytes) {
-            throw new PayloadTooLargeException("request body Content-Length " + contentLength
-                    + " exceeds maxRequestBytes=" + maxRequestBytes
-                    + "; large batches must use the external-location protocol");
-        }
         byte[] body;
         try (InputStream in = req.getInputStream();
              BoundedByteArrayOutputStream buf = new BoundedByteArrayOutputStream(maxRequestBytes)) {
@@ -1904,8 +1888,67 @@ public final class HttpServer {
     }
 
     private static void writePayloadTooLarge(HttpServletResponse resp, RuntimeException e) throws IOException {
+        // The body may have been refused from Content-Length or at the first
+        // over-limit chunk, leaving unread request bytes on this HTTP/1.1
+        // connection. Do not let a subsequent request inherit that framing.
+        resp.setHeader("Connection", "close");
         writeJson(resp, HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE,
                 Map.of("error", e.getMessage()));
+    }
+
+    /**
+     * Validate the language-neutral request contract before application dispatch.
+     *
+     * <p>HTTP has an explicit bad-request status unavailable to the raw stream
+     * transports, so schema/metadata violations are rejected here rather than
+     * reaching reflective parameter binding and becoming a successful 200 or
+     * an application 500.</p>
+     */
+    private void validateDispatchRequest(byte[] body, String urlMethod) throws IOException {
+        RpcMethodInfo info = rpc.methods().get(urlMethod);
+        if (info == null) throw new IllegalArgumentException("Unknown method: " + urlMethod);
+        try (IpcStreamReader reader = new IpcStreamReader(
+                new ByteArrayInputStream(body), Allocators.root())) {
+            Map<String, String> metadata = reader.readNextBatch();
+            if (metadata == null) throw new IllegalArgumentException("request contained no parameter batch");
+            Wire.validateRequestVersion(metadata);
+            String wireMethod = Wire.requireMethodName(metadata);
+            if (!urlMethod.equals(wireMethod)) {
+                throw new IllegalArgumentException(
+                        "Method name mismatch: URL has '" + urlMethod
+                                + "' but metadata has '" + wireMethod + "'");
+            }
+            Schema actualSchema = reader.wireSchema();
+            if (!actualSchema.equals(info.paramsSchema())) {
+                throw new ClassCastException(
+                        "parameter schema mismatch for '" + urlMethod + "': expected "
+                                + info.paramsSchema() + ", got " + actualSchema);
+            }
+            int rows = reader.root().getRowCount();
+            boolean pointer = LocationResolver.isPointer(rows, metadata);
+            // Both encodings of an empty argument tuple are in use by existing
+            // clients: a schema-only (zero-row) batch and a one-row,
+            // zero-column batch.  Parameter-bearing calls remain exactly one
+            // row; zero-row batches with location metadata are pointers.
+            boolean validRows = info.paramsSchema().getFields().isEmpty()
+                    ? rows == 0 || rows == 1
+                    : rows == 1;
+            if (!pointer && !validRows) {
+                throw new IllegalArgumentException(
+                        "parameter batch for '" + urlMethod + "' must contain "
+                                + (info.paramsSchema().getFields().isEmpty() ? "zero or one" : "one")
+                                + " row(s), got " + rows);
+            }
+        }
+    }
+
+    /** Return an HTTP 400 whose body remains a typed Arrow RPC error. */
+    private void writeBadRequestArrow(HttpServletRequest req, HttpServletResponse resp, Throwable error)
+            throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        Wire.writeErrorStream(out, RpcStream.EMPTY_SCHEMA, error, rpc.serverId());
+        resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+        writeArrowResponse(req, resp, out.toByteArray());
     }
 
     private static void writeUnsupportedEncoding(HttpServletResponse resp,
@@ -2125,13 +2168,21 @@ public final class HttpServer {
             writeUnsupportedEncoding(resp, e);
             return;
         }
-
         AuthContext auth;
         try {
             auth = authenticator.authenticate(req);
         } catch (AuthException e) {
             writeUnauthorized(resp, e);
             return;
+        }
+
+        if (init) {
+            try {
+                validateDispatchRequest(body, method);
+            } catch (Exception e) {
+                writeBadRequestArrow(req, resp, e);
+                return;
+            }
         }
 
         SessionScope scope;

@@ -73,7 +73,10 @@ public final class ExternalFetcher {
                 }
             }
         }
-        throw new IOException("External fetch failed after " + attempts + " attempts: " + url, lastError);
+        String detail = lastError != null && lastError.getMessage() != null
+                ? ": " + lastError.getMessage()
+                : "";
+        throw new IOException("External fetch failed after " + attempts + " attempts: " + url + detail, lastError);
     }
 
     private byte[] fetchOnce(URI url) throws IOException {
@@ -179,7 +182,8 @@ public final class ExternalFetcher {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             String actual = HexFormat.of().formatHex(md.digest(body));
             if (!actual.equalsIgnoreCase(expectedHex)) {
-                throw new IOException("SHA-256 mismatch for " + url + ": expected " + expectedHex + ", got " + actual);
+                throw new IOException("external checksum mismatch for " + url
+                        + ": expected " + expectedHex + ", got " + actual);
             }
         } catch (Exception e) {
             if (e instanceof IOException io) throw io;

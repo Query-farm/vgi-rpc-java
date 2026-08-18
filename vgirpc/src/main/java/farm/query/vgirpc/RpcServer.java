@@ -96,6 +96,17 @@ public final class RpcServer {
     public void setLocationResolver(LocationResolver r) { this.locationResolver = r; }
 
     /**
+     * Return the configured inbound external-location resolver.
+     *
+     * <p>The HTTP stream transport dispatches outside {@link #serveOne} and
+     * therefore must resolve pointer batches explicitly on its init and
+     * exchange routes.</p>
+     *
+     * @return the resolver, or {@code null} when inbound external locations are disabled
+     */
+    public LocationResolver locationResolver() { return locationResolver; }
+
+    /**
      * Configure outgoing-batch externalisation. Uploaded via
      * {@link farm.query.vgirpc.external.ExternalStorage}.
      *

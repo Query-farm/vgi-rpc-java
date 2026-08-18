@@ -19,6 +19,7 @@ import farm.query.vgirpc.StreamState;
 import farm.query.vgirpc.external.ExternalLocationConfig;
 import farm.query.vgirpc.external.ExternalizedResponseCapExceededException;
 import farm.query.vgirpc.external.Externalizer;
+import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.marshal.ParameterBinder;
@@ -269,9 +270,21 @@ public final class HttpStreamHandler {
         // batch metadata; http must do the same or a producer that reads them
         // silently behaves as if they were absent.
         Map<String, String> requestMeta;
+        LocationResolver.Resolved resolved = null;
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(requestBody), Allocators.root())) {
             Map<String, String> meta = r.readNextBatch();
             if (meta == null) return errorStream(new RuntimeException("empty request"));
+            VectorSchemaRoot root = r.root();
+            LocationResolver resolver = rpc.locationResolver();
+            if (resolver != null && LocationResolver.isPointer(root.getRowCount(), meta)) {
+                try {
+                    resolved = resolver.resolve(meta);
+                    root = resolved.root();
+                    meta = resolved.customMetadata();
+                } catch (Exception e) {
+                    return errorStream(e);
+                }
+            }
             Wire.validateRequestVersion(meta);
             String urlMethod = Wire.requireMethodName(meta);
             if (!method.equals(urlMethod)) {
@@ -279,10 +292,13 @@ public final class HttpStreamHandler {
                         "Method name mismatch: URL has '" + method + "' but metadata has '" + urlMethod + "'"));
             }
             requestMeta = Map.copyOf(meta);
-            VectorSchemaRoot root = r.root();
             kwargs = root.getRowCount() == 0
                     ? new LinkedHashMap<>()
-                    : Marshalling.decodeRow(root, r.dictionaryProvider(), r.wireSchema());
+                    : (resolved != null
+                        ? Marshalling.decodeRow(root, null, root.getSchema())
+                        : Marshalling.decodeRow(root, r.dictionaryProvider(), r.wireSchema()));
+        } finally {
+            if (resolved != null) resolved.root().close();
         }
 
         OutputCollectorSink sink = new OutputCollectorSink();
@@ -361,9 +377,23 @@ public final class HttpStreamHandler {
         }
 
         DictionaryProvider inputDicts = req.inputDicts();
+        LocationResolver.Resolved resolved = null;
         try {
         try (VectorSchemaRoot ownedInput = req.inputRoot()) {
-            String tokenB64 = req.meta().get(Metadata.STREAM_STATE);
+            VectorSchemaRoot actualInput = ownedInput;
+            Map<String, String> requestMeta = req.meta();
+            LocationResolver resolver = rpc.locationResolver();
+            if (resolver != null && LocationResolver.isPointer(ownedInput.getRowCount(), requestMeta)) {
+                try {
+                    resolved = resolver.resolve(requestMeta);
+                    actualInput = resolved.root();
+                    requestMeta = resolved.customMetadata();
+                } catch (Exception e) {
+                    return errorStream(e);
+                }
+            }
+            ExchangeRequest effectiveRequest = new ExchangeRequest(requestMeta, actualInput, inputDicts);
+            String tokenB64 = requestMeta.get(Metadata.STREAM_STATE);
             if (tokenB64 == null) {
                 return errorStream(new RuntimeException("Missing state token in exchange request"));
             }
@@ -397,7 +427,7 @@ public final class HttpStreamHandler {
                 // decode without the server's token key.
                 onTurn(turn, i -> i.requestState = token.state());
                 try {
-                    return runExchange(method, req, ownedInput, token, call, principal, inputDicts, turn);
+                    return runExchange(method, effectiveRequest, actualInput, token, call, principal, inputDicts, turn);
                 } catch (Throwable t) {
                     if (turn != null) turn.thrown = t;
                     throw t;
@@ -405,6 +435,7 @@ public final class HttpStreamHandler {
             }
         }
         } finally {
+            if (resolved != null) resolved.root().close();
             closeDictionaries(inputDicts);
         }
     }

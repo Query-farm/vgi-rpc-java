@@ -4,12 +4,14 @@
 package farm.query.vgirpc.http.auth;
 
 import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.Payload;
 import com.nimbusds.jose.jwk.source.JWKSource;
 import com.nimbusds.jose.jwk.source.JWKSourceBuilder;
 import com.nimbusds.jose.proc.JWSKeySelector;
 import com.nimbusds.jose.proc.JWSVerificationKeySelector;
 import com.nimbusds.jose.proc.SecurityContext;
 import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.JWTParser;
 import com.nimbusds.jwt.proc.ConfigurableJWTProcessor;
 import com.nimbusds.jwt.proc.DefaultJWTClaimsVerifier;
 import com.nimbusds.jwt.proc.DefaultJWTProcessor;
@@ -35,7 +37,7 @@ import java.util.Set;
  * endpoint. Backed by {@code nimbus-jose-jwt}; matches the Python
  * {@code jwt_authenticate} factory: multiple issuers/audiences accepted,
  * automatic JWKS refresh on unknown {@code kid}, principal pulled from a
- * configurable claim (default {@code sub}).
+ * configurable non-blank string claim (default {@code sub}).
  */
 public final class JwtAuthenticator implements Authenticator {
 
@@ -106,21 +108,32 @@ public final class JwtAuthenticator implements Authenticator {
      * @param token the raw compact JWT
      * @return an authenticated {@link AuthContext} carrying all token claims
      * @throws MissingCredentials if {@code token} is null or empty
-     * @throws InvalidCredentials if signature, issuer, audience, or a required claim fails
+     * @throws InvalidCredentials if signature, issuer, audience, a required
+     *         claim, or the principal claim fails validation
      */
     public AuthContext validateBearer(String token) throws AuthException {
         if (token == null || token.isEmpty()) {
             throw new MissingCredentials("Missing bearer token", CHALLENGE);
         }
+        JWTClaimsSet claims;
+        Map<String, Object> rawClaims;
         try {
-            JWTClaimsSet claims = processor.process(token, null);
-            Object rawPrincipal = claims.getClaim(principalClaim);
-            String principal = rawPrincipal == null ? "" : rawPrincipal.toString();
-            Map<String, Object> claimsMap = new LinkedHashMap<>(claims.getClaims());
-            return new AuthContext(domain, true, principal, claimsMap);
+            claims = processor.process(token, null);
+            rawClaims = new Payload(JWTParser.parse(token).getParsedParts()[1]).toJSONObject();
         } catch (Exception e) {
             throw new InvalidCredentials("Invalid JWT: " + e.getMessage(), CHALLENGE);
         }
+
+        Object rawPrincipal = rawClaims == null ? null : rawClaims.get(principalClaim);
+        if (!(rawPrincipal instanceof String principal) || principal.isBlank()) {
+            throw new InvalidCredentials(
+                    "Invalid JWT: principal claim '" + principalClaim
+                            + "' must be a non-blank string",
+                    CHALLENGE);
+        }
+
+        Map<String, Object> claimsMap = new LinkedHashMap<>(claims.getClaims());
+        return new AuthContext(domain, true, principal, claimsMap);
     }
 
     /**
@@ -192,7 +205,11 @@ public final class JwtAuthenticator implements Authenticator {
             try { this.jwksUri = URI.create(uri).toURL(); return this; }
             catch (Exception e) { throw new IllegalArgumentException("bad jwksUri: " + uri, e); }
         }
-        /** JWT claim mapped to {@link AuthContext#principal()} (default {@code "sub"}). */
+        /**
+         * JWT string claim mapped to {@link AuthContext#principal()} (default
+         * {@code "sub"}). Tokens where this claim is absent, null, non-string,
+         * or blank are rejected.
+         */
         public Builder principalClaim(String c) { this.principalClaim = c; return this; }
         /** Auth domain label recorded on the resulting {@link AuthContext} (default {@code "jwt"}). */
         public Builder domain(String d) { this.domain = d; return this; }
