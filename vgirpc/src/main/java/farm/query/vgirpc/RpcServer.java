@@ -537,10 +537,42 @@ public final class RpcServer {
         }
     }
 
+    /**
+     * Whether an incoming parameter schema satisfies the declared one.
+     *
+     * <p>Not plain equality, because a DICTIONARY-ENCODED utf8 column satisfies a
+     * declared plain utf8 one. This library deliberately declares enum-shaped
+     * fields as plain utf8 and resolves dict-encoded values on read (see
+     * {@code SchemaDerivation}) — but the contract check was exact, so a client
+     * sending the dictionary encoding it was entitled to send was rejected before
+     * the tolerant reader ever saw it. The reader's tolerance was unreachable.</p>
+     *
+     * @param actual the schema the peer sent
+     * @param expected the schema derived from the service interface
+     * @return whether the call may proceed
+     */
+    private static boolean schemasCompatible(Schema actual, Schema expected) {
+        if (actual.equals(expected)) return true;
+        List<Field> a = actual.getFields();
+        List<Field> e = expected.getFields();
+        if (a.size() != e.size()) return false;
+        for (int i = 0; i < a.size(); i++) {
+            Field af = a.get(i);
+            Field ef = e.get(i);
+            if (af.equals(ef)) continue;
+            boolean dictUtf8 = af.getDictionary() != null
+                    && af.getName().equals(ef.getName())
+                    && af.isNullable() == ef.isNullable()
+                    && ef.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8;
+            if (!dictUtf8) return false;
+        }
+        return true;
+    }
+
     /** Validate the exact parameter schema/cardinality before handler dispatch. */
     private static void validateParameterContract(String method, Schema actualSchema,
                                                   int rows, Schema expectedSchema) {
-        if (!actualSchema.equals(expectedSchema)) {
+        if (!schemasCompatible(actualSchema, expectedSchema)) {
             throw new ClassCastException(
                     "parameter schema mismatch for '" + method + "': expected "
                             + expectedSchema + ", got " + actualSchema);
