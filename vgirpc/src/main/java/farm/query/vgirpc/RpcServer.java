@@ -563,6 +563,7 @@ public final class RpcServer {
             boolean dictUtf8 = af.getDictionary() != null
                     && af.getName().equals(ef.getName())
                     && af.isNullable() == ef.isNullable()
+                    && af.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8
                     && ef.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8;
             if (!dictUtf8) return false;
         }

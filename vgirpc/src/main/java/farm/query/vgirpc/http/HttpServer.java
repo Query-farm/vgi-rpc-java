@@ -1922,7 +1922,7 @@ public final class HttpServer {
                                 + "' but metadata has '" + wireMethod + "'");
             }
             Schema actualSchema = reader.wireSchema();
-            if (!actualSchema.equals(info.paramsSchema())) {
+            if (!schemasCompatible(actualSchema, info.paramsSchema())) {
                 throw new ClassCastException(
                         "parameter schema mismatch for '" + urlMethod + "': expected "
                                 + info.paramsSchema() + ", got " + actualSchema);
@@ -1943,6 +1943,31 @@ public final class HttpServer {
                                 + " row(s), got " + rows);
             }
         }
+    }
+
+    /**
+     * Match the raw-transport parameter contract: a dictionary-encoded UTF-8
+     * field is a valid wire representation of the corresponding declared
+     * plain UTF-8 field. Dictionary values are resolved by the IPC reader
+     * before reflective binding.
+     */
+    static boolean schemasCompatible(Schema actual, Schema expected) {
+        if (actual.equals(expected)) return true;
+        List<Field> actualFields = actual.getFields();
+        List<Field> expectedFields = expected.getFields();
+        if (actualFields.size() != expectedFields.size()) return false;
+        for (int i = 0; i < actualFields.size(); i++) {
+            Field actualField = actualFields.get(i);
+            Field expectedField = expectedFields.get(i);
+            if (actualField.equals(expectedField)) continue;
+            boolean dictionaryUtf8 = actualField.getDictionary() != null
+                    && actualField.getName().equals(expectedField.getName())
+                    && actualField.isNullable() == expectedField.isNullable()
+                    && actualField.getType() instanceof ArrowType.Utf8
+                    && expectedField.getType() instanceof ArrowType.Utf8;
+            if (!dictionaryUtf8) return false;
+        }
+        return true;
     }
 
     /** Return an HTTP 400 whose body remains a typed Arrow RPC error. */
