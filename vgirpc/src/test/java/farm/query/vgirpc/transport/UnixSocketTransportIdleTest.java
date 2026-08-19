@@ -6,6 +6,8 @@ package farm.query.vgirpc.transport;
 import farm.query.vgirpc.RpcServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
@@ -29,6 +31,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * accept loop ran forever, leaving stale worker JVMs alive across test runs
  * and silently shadowing rebuilt classes.
  */
+@DisabledOnOs(value = OS.WINDOWS,
+        disabledReason = "Windows does not support Unix-domain listeners")
 final class UnixSocketTransportIdleTest {
 
     /** Marker service — the test never actually dispatches anything. */
