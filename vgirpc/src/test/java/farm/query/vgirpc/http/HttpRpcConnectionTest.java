@@ -15,6 +15,7 @@ import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.schema.ArrowSerializableRecord;
 import farm.query.vgirpc.schema.StreamHeader;
 import farm.query.vgirpc.wire.Allocators;
+import farm.query.vgirpc.wire.Metadata;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -35,6 +36,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -79,6 +81,19 @@ final class HttpRpcConnectionTest {
     private static final CountDownLatch CANCELLED = new CountDownLatch(1);
     /** Fired by {@link CountingProducer#onCancel}. */
     private static final CountDownLatch PRODUCER_CANCELLED = new CountDownLatch(1);
+
+    @Test
+    void disabledExternalResolutionRedactsThePointerUrl() {
+        String secret = "unit-secret-signature";
+        RpcError error = assertThrows(RpcError.class, () -> HttpRpcConnection.failOnPointerBatch(Map.of(
+                Metadata.LOCATION,
+                "https://alice:password@example.com/data?X-Amz-Signature=" + secret + "#fragment-secret")));
+        assertTrue(error.getMessage().contains("https://example.com/data"));
+        assertFalse(error.getMessage().contains("alice"));
+        assertFalse(error.getMessage().contains("password"));
+        assertFalse(error.getMessage().contains(secret));
+        assertFalse(error.getMessage().contains("fragment-secret"));
+    }
 
     /** Stream header — the record a client must consume before the body stream. */
     public record Head(String tag, long total) implements ArrowSerializableRecord {}

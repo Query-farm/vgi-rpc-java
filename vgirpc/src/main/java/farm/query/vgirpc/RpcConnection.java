@@ -188,15 +188,22 @@ public final class RpcConnection implements AutoCloseable {
                         throw Wire.errorFromMetadata(md);
                     }
                     // Transparent resolution of external-location pointer batches.
-                    if (locationResolver != null
-                            && farm.query.vgirpc.external.LocationResolver.isPointer(root.getRowCount(), md)) {
+                    if (farm.query.vgirpc.external.LocationResolver.isPointer(root.getRowCount(), md)) {
+                        String safeUrl = farm.query.vgirpc.external.LocationResolver.redactUrl(
+                                md.get(farm.query.vgirpc.wire.Metadata.LOCATION));
+                        if (locationResolver == null) {
+                            throw new RpcError("ExternalLocationError",
+                                    "response contained an externalized batch ("
+                                            + farm.query.vgirpc.wire.Metadata.LOCATION + "=" + safeUrl
+                                            + ") but this connection has no ExternalLocationConfig", "");
+                        }
                         farm.query.vgirpc.external.LocationResolver.Resolved resolved;
                         try {
                             resolved = locationResolver.resolve(md);
                         } catch (Exception fe) {
                             throw new RpcError("ExternalLocationError",
-                                    "failed to resolve " + md.get(farm.query.vgirpc.wire.Metadata.LOCATION)
-                                            + ": " + fe.getMessage(), "");
+                                    "failed to resolve " + safeUrl + " ("
+                                            + fe.getClass().getSimpleName() + ")", "");
                         }
                         try {
                             Object result = ClientMarshalling.decodeResult(info, resolved.root());

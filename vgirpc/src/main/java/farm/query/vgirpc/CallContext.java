@@ -186,13 +186,9 @@ public final class CallContext {
             throw new RuntimeException("a session is already bound to this request");
         }
         // Registry holds the canonical Entry (with the per-session lock and
-        // authoritative expiry); bind it directly into the scope.
-        SessionRegistry.Entry entry = s.registry.open(state, ttlSecondsOrNull, s.principalKey);
-        // Acquire the session lock so any *other* concurrent request for the
-        // same session (only possible if the client races a fresh call against
-        // the in-flight one) serializes behind us. The matching unlock runs
-        // when the SessionScope is popped in HttpServer.
-        entry.lock().lock();
+        // authoritative expiry) and returns it with the opening request's
+        // lease already held; bind it directly into the scope.
+        SessionRegistry.Entry entry = s.openLease(state, ttlSecondsOrNull);
         long now = System.currentTimeMillis() / 1000;
         s.bindEntry(entry, SessionScope.ACTION_OPEN);
         String tokenB64 = s.mintSessionToken(entry.sessionId, now, entry.expiresAtSeconds);
@@ -235,9 +231,6 @@ public final class CallContext {
         SessionRegistry.Entry entry = s.entry();
         if (entry != null) {
             s.registry.close(entry.sessionId, s.principalKey);
-            // Release the per-session lock held by either open/resume so other
-            // calls (including a later close on the same thread) don't deadlock.
-            try { entry.lock().unlock(); } catch (IllegalMonitorStateException ignore) { }
         }
         s.clearEntry();
         s.setAction(SessionScope.ACTION_CLOSE);

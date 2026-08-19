@@ -258,7 +258,8 @@ public final class HttpRpcConnection implements AutoCloseable {
     static void failOnPointerBatch(Map<String, String> meta) {
         throw new RpcError("ExternalLocationError",
                 "the worker returned an externalized batch (" + Metadata.LOCATION + "="
-                        + meta.get(Metadata.LOCATION) + "); HttpRpcConnection does not resolve "
+                        + LocationResolver.redactUrl(meta.get(Metadata.LOCATION))
+                        + "); HttpRpcConnection does not resolve "
                         + "external locations", "");
     }
 

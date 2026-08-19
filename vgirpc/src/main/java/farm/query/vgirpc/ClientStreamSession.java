@@ -325,9 +325,10 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
      */
     private AnnotatedBatch resolvePointerBatch(Map<String, String> pointerMeta) {
         String url = pointerMeta.get(Metadata.LOCATION);
+        String safeUrl = LocationResolver.redactUrl(url);
         if (locationResolver == null) {
             throw new RpcError("ExternalLocationError",
-                    "stream produced an externalized batch (" + Metadata.LOCATION + "=" + url
+                    "stream produced an externalized batch (" + Metadata.LOCATION + "=" + safeUrl
                             + ") but this connection has no ExternalLocationConfig; "
                             + "construct RpcConnection with one to resolve it", "");
         }
@@ -336,7 +337,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             resolved = locationResolver.resolve(pointerMeta);
         } catch (Exception fe) {
             throw new RpcError("ExternalLocationError",
-                    "failed to resolve " + url + ": " + fe.getMessage(), "");
+                    "failed to resolve " + safeUrl + " (" + fe.getClass().getSimpleName() + ")", "");
         }
         // Held for release on the next read / close — see the resolvedRoot field.
         resolvedRoot = resolved.root();

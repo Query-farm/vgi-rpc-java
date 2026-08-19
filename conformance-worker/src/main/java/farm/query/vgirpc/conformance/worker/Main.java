@@ -264,6 +264,7 @@ public final class Main {
         switch (mode) {
             case "http" -> serveHttp(server, tokenKey, tokenTtl, authenticator, preHandlers, fakeStorage,
                     maxRequestBytes >= 0 ? maxRequestBytes : externalizeThreshold,
+                    maxRequestBytes >= 0,
                     maxResponseBytes, maxExternalizedResponseBytes,
                     stickyEnabled, stickyTtl, responseCompression,
                     // Only require mode denies, so only require mode advertises.
@@ -509,6 +510,7 @@ public final class Main {
                                    List<HttpPreHandler> preHandlers,
                                    FakeStorage fakeStorage,
                                    long maxRequestBytes,
+                                   boolean advertiseMaxRequestBytes,
                                    long maxResponseBytes,
                                    long maxExternalizedResponseBytes,
                                    boolean stickyEnabled,
@@ -534,6 +536,10 @@ public final class Main {
         // no compression, whatever the client asks for. null would mean "unset"
         // and fall back to the default set, so the empty list is load-bearing.
         if (!responseCompression) cb.supportedEncodings(List.of());
+        if (advertiseMaxRequestBytes) {
+            cb.maxRequestBytes(maxRequestBytes)
+              .advertiseMaxRequestBytes(true);
+        }
         if (maxResponseBytes > 0) cb.advertisedMaxResponseBytes(maxResponseBytes);
         if (maxExternalizedResponseBytes > 0)
             cb.advertisedMaxExternalizedResponseBytes(maxExternalizedResponseBytes);

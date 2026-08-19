@@ -58,6 +58,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 final class ClientStreamExternalLocationTest {
 
+    private static final String URL_SECRET = "unit-secret-signature";
+
     private static final Schema OUT_SCHEMA = new Schema(List.of(
             new Field("n", FieldType.notNullable(new ArrowType.Int(64, true)), null)));
 
@@ -113,12 +115,16 @@ final class ClientStreamExternalLocationTest {
     }
 
     public interface BulkService {
+        String echo(String value);
+
         RpcStream<BulkProducer> bulk(long batches);
 
         RpcStream<Doubler> doubling();
     }
 
     public static final class Impl implements BulkService {
+        @Override public String echo(String value) { return value; }
+
         @Override public RpcStream<BulkProducer> bulk(long batches) {
             return RpcStream.producer(OUT_SCHEMA, new BulkProducer(batches));
         }
@@ -161,10 +167,28 @@ final class ClientStreamExternalLocationTest {
         }
     }
 
+    /** Storage returning a credential-bearing URL whose object is deliberately absent. */
+    private final class MissingSecretStorage implements ExternalStorage {
+        @Override public URI upload(byte[] body, String contentEncoding) {
+            return URI.create("http://alice:password@127.0.0.1:" + storagePort
+                    + "/missing/object?X-Amz-Credential=credential&X-Amz-Signature="
+                    + URL_SECRET + "#fragment-secret");
+        }
+    }
+
     private ExternalLocationConfig config() {
         return ExternalLocationConfig.builder()
                 .storage(new MapStorage())
                 .thresholdBytes(16)     // force externalisation of any real batch
+                .urlValidator(ExternalLocationConfig.permissiveValidator())
+                .build();
+    }
+
+    private ExternalLocationConfig missingSecretConfig() {
+        return ExternalLocationConfig.builder()
+                .storage(new MissingSecretStorage())
+                .thresholdBytes(16)
+                .maxRetries(0)
                 .urlValidator(ExternalLocationConfig.permissiveValidator())
                 .build();
     }
@@ -250,12 +274,40 @@ final class ClientStreamExternalLocationTest {
         // fetch the payload. The rows exist and are unreachable — the one thing
         // the client must not do is hand back the pointer's empty root and let the
         // caller believe it saw the whole stream.
-        try (Harness h = Harness.start(config(), null)) {
+        try (Harness h = Harness.start(missingSecretConfig(), null)) {
             RpcStream<BulkProducer> stream = h.client().bulk(1);
             RpcError err = assertThrows(RpcError.class,
                     () -> drain(stream, new ArrayList<>(), new ArrayList<>()));
             assertTrue(err.getMessage().contains(Metadata.LOCATION),
                     "the failure must name the unresolvable location: " + err.getMessage());
+            assertCredentialSafe(err.getMessage());
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void disabledUnaryResolutionRedactsThePointerUrl() throws Exception {
+        try (Harness h = Harness.start(missingSecretConfig(), null)) {
+            RpcError err = assertThrows(RpcError.class,
+                    () -> h.client().echo("externalized unary payload"));
+            assertCredentialSafe(err.getMessage());
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void resolverFailuresRedactUrlsForUnaryAndStreamingCalls() throws Exception {
+        ExternalLocationConfig failing = missingSecretConfig();
+        try (Harness h = Harness.start(failing, config())) {
+            RpcError unary = assertThrows(RpcError.class, () -> h.client().echo("externalized unary payload"));
+            assertCredentialSafe(unary.getMessage());
+        }
+
+        try (Harness h = Harness.start(failing, config())) {
+            RpcStream<BulkProducer> stream = h.client().bulk(1);
+            RpcError streaming = assertThrows(RpcError.class,
+                    () -> drain(stream, new ArrayList<>(), new ArrayList<>()));
+            assertCredentialSafe(streaming.getMessage());
         }
     }
 
@@ -299,6 +351,15 @@ final class ClientStreamExternalLocationTest {
         } finally {
             session.close();
         }
+    }
+
+    private static void assertCredentialSafe(String message) {
+        assertTrue(message.contains("http://127.0.0.1:"), "redacted URL should retain a useful route: " + message);
+        assertFalse(message.contains("alice"));
+        assertFalse(message.contains("password"));
+        assertFalse(message.contains("X-Amz-Credential"));
+        assertFalse(message.contains(URL_SECRET));
+        assertFalse(message.contains("fragment-secret"));
     }
 
     /** Server on a daemon thread, client on the test thread, joined by a pipe pair. */

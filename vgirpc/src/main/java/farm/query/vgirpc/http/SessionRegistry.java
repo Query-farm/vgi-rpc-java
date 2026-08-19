@@ -18,11 +18,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * and a per-entry {@link ReentrantLock} so concurrent calls on the same
  * session run serially.
  *
- * <p>Hot paths (request open / lookup / close) are non-blocking on a
- * {@link ConcurrentHashMap}; the drain flag and shutdown are flipped via
- * an {@link AtomicBoolean}. A daemon reaper thread sweeps expired entries
- * once per second to bound memory growth without forcing every request
- * to scan.</p>
+ * <p>Map lookup uses a {@link ConcurrentHashMap}; acquiring, closing, and
+ * expiring an entry also take its per-session lock so state cannot be closed
+ * while a request is using it. A daemon reaper thread sweeps expired entries
+ * once per second to bound memory growth without forcing every request to
+ * scan.</p>
  */
 public final class SessionRegistry {
 
@@ -37,6 +37,7 @@ public final class SessionRegistry {
         public final String principalKey;
         public final ReentrantLock lock;
         private final AtomicBoolean closed = new AtomicBoolean(false);
+        private final AtomicBoolean closeRequested = new AtomicBoolean(false);
 
         Entry(byte[] sessionId, Object state, long expiresAtSeconds,
               String principalKey, ReentrantLock lock) {
@@ -65,6 +66,19 @@ public final class SessionRegistry {
                 try { ac.close(); } catch (Exception ignore) { /* swallow */ }
             }
         }
+
+        boolean isClosed() { return closed.get(); }
+
+        void requestClose() { closeRequested.set(true); }
+
+        void closeIfRequestedAndQuiescent() {
+            if (!closeRequested.get() || closed.get() || !lock.tryLock()) return;
+            try {
+                if (closeRequested.get()) closeStateOnce();
+            } finally {
+                lock.unlock();
+            }
+        }
     }
 
     private final ConcurrentHashMap<String, Entry> entries = new ConcurrentHashMap<>();
@@ -90,7 +104,7 @@ public final class SessionRegistry {
     /** @return whether the registry is draining (new opens rejected, existing sessions kept). */
     public boolean isDraining() { return draining.get(); }
     /** Enter or leave drain mode. */
-    public void setDraining(boolean v) { draining.set(v); }
+    public synchronized void setDraining(boolean v) { draining.set(v); }
 
     /** Lazily start the reaper thread on first request. Hot path: a volatile
      *  read returns immediately once the reaper is up; the synchronized
@@ -122,7 +136,16 @@ public final class SessionRegistry {
      * Mint a fresh session id and return the live registry entry. Throws
      * {@link ServerDrainingError} when the server has entered drain mode.
      */
-    public Entry open(Object state, Long ttlSecondsOrNull, String principalKey) {
+    public synchronized Entry open(Object state, Long ttlSecondsOrNull, String principalKey) {
+        return openEntry(state, ttlSecondsOrNull, principalKey, false);
+    }
+
+    /** Internal opening path that publishes the entry with its request lease held. */
+    synchronized Entry openLease(Object state, Long ttlSecondsOrNull, String principalKey) {
+        return openEntry(state, ttlSecondsOrNull, principalKey, true);
+    }
+
+    private Entry openEntry(Object state, Long ttlSecondsOrNull, String principalKey, boolean acquireLease) {
         if (draining.get()) {
             throw new ServerDrainingError("server is draining; not accepting new sticky sessions");
         }
@@ -132,28 +155,62 @@ public final class SessionRegistry {
                 ? ttlSecondsOrNull : defaultTtlSeconds;
         long expires = (System.currentTimeMillis() / 1000) + ttl;
         Entry e = new Entry(sessionId, state, expires, principalKey, new ReentrantLock());
+        // The HTTP path acquires before publishing while holding the registry
+        // monitor. A concurrent shutdown cannot close state in the gap between
+        // insertion and the opening request obtaining its lease. Public open()
+        // keeps its historical unlocked return contract.
+        if (acquireLease) e.lock.lock();
         entries.put(hex(sessionId), e);
         return e;
     }
 
     /**
-     * Look up a session. Returns {@code null} on miss / principal
-     * mismatch / expiry (evicting the expired entry as a side-effect,
-     * invoking {@link AutoCloseable#close()} if available).
+     * Backward-compatible unlocked lookup. HTTP dispatch uses
+     * {@link #acquire(byte[], String)} so its state remains live through use.
      */
     public Entry get(byte[] sessionId, String principalKey) {
+        Entry entry = acquire(sessionId, principalKey);
+        if (entry != null) release(entry);
+        return entry;
+    }
+
+    /**
+     * Acquire a session lease. Returns the entry with its per-session lock
+     * held, or {@code null} on miss / principal mismatch / expiry. Callers
+     * must pair a successful result with {@link #release(Entry)}.
+     */
+    Entry acquire(byte[] sessionId, String principalKey) {
         String key = hex(sessionId);
         Entry e = entries.get(key);
         if (e == null) return null;
-        long now = System.currentTimeMillis() / 1000;
-        if (now > e.expiresAtSeconds) {
-            if (entries.remove(key, e)) e.closeStateOnce();
-            return null;
+        e.lock.lock();
+        boolean acquired = false;
+        try {
+            // The map must still name this exact entry after the lock is held.
+            // Otherwise close/expiry won the lookup-to-lock race and the state
+            // may already have received AutoCloseable.close().
+            if (entries.get(key) != e || e.isClosed()) return null;
+            long now = System.currentTimeMillis() / 1000;
+            if (now > e.expiresAtSeconds) {
+                if (entries.remove(key, e)) e.closeStateOnce();
+                return null;
+            }
+            if (!e.principalKey.equals(principalKey)) return null;
+            acquired = true;
+            return e;
+        } finally {
+            if (!acquired) {
+                e.lock.unlock();
+                e.closeIfRequestedAndQuiescent();
+            }
         }
-        if (!e.principalKey.equals(principalKey)) {
-            return null;
-        }
-        return e;
+    }
+
+    /** Release a lease returned by {@link #acquire(byte[], String)}. */
+    void release(Entry entry) {
+        if (entry == null || !entry.lock.isHeldByCurrentThread()) return;
+        entry.lock.unlock();
+        entry.closeIfRequestedAndQuiescent();
     }
 
     /**
@@ -166,10 +223,15 @@ public final class SessionRegistry {
         String key = hex(sessionId);
         Entry e = entries.get(key);
         if (e == null) return false;
-        if (!e.principalKey.equals(principalKey)) return false;
-        if (!entries.remove(key, e)) return false;
-        e.closeStateOnce();
-        return true;
+        e.lock.lock();
+        try {
+            if (entries.get(key) != e || !e.principalKey.equals(principalKey)) return false;
+            if (!entries.remove(key, e)) return false;
+            e.closeStateOnce();
+            return true;
+        } finally {
+            e.lock.unlock();
+        }
     }
 
     /** Drop all entries past their TTL. Returns count evicted. */
@@ -178,19 +240,38 @@ public final class SessionRegistry {
         int evicted = 0;
         for (Iterator<Map.Entry<String, Entry>> it = entries.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<String, Entry> me = it.next();
-            if (now > me.getValue().expiresAtSeconds) {
-                it.remove();
-                me.getValue().closeStateOnce();
-                evicted++;
+            Entry e = me.getValue();
+            if (now > e.expiresAtSeconds) {
+                e.lock.lock();
+                try {
+                    if (entries.get(me.getKey()) == e && now > e.expiresAtSeconds
+                            && entries.remove(me.getKey(), e)) {
+                        e.closeStateOnce();
+                        evicted++;
+                    }
+                } finally {
+                    e.lock.unlock();
+                }
             }
         }
         return evicted;
     }
 
-    /** Evict everything; called from HttpServer shutdown. */
-    public void shutdown() {
-        for (Entry e : entries.values()) e.closeStateOnce();
-        entries.clear();
+    /**
+     * Evict everything without waiting for in-flight request leases. Entries
+     * that are quiescent close here; active entries close on final release.
+     */
+    public synchronized void shutdown() {
+        draining.set(true);
+        for (Map.Entry<String, Entry> me : entries.entrySet()) {
+            Entry e = me.getValue();
+            if (entries.remove(me.getKey(), e)) {
+                e.requestClose();
+                // Never close state under a request that invoked shutdown
+                // reentrantly while holding this entry's lease.
+                if (!e.lock.isHeldByCurrentThread()) e.closeIfRequestedAndQuiescent();
+            }
+        }
         if (reaper != null) reaper.interrupt();
     }
 

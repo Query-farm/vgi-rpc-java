@@ -10,14 +10,17 @@ import org.junit.jupiter.api.Timeout;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.SocketChannel;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Regression test for the idle-timeout watchdog in
@@ -74,6 +77,34 @@ final class UnixSocketTransportIdleTest {
         assertFalse(serverThread.isAlive(),
                 "server should exit after connection closes + idle window elapses");
         assertNull(failure.get());
+    }
+
+    @Test
+    @Timeout(5)
+    void refusesToDeleteARegularFileAtTheSocketPath() throws Exception {
+        Path path = uniqueSocketPath();
+        Files.writeString(path, "user data");
+
+        assertThrows(FileAlreadyExistsException.class,
+                () -> UnixSocketTransport.serveForever(
+                        path, new RpcServer(Empty.class, new EmptyImpl()), 100L));
+        assertEquals("user data", Files.readString(path));
+    }
+
+    @Test
+    @Timeout(5)
+    void refusesToDeleteASymlinkAtTheSocketPath() throws Exception {
+        Path path = uniqueSocketPath();
+        Path target = path.resolveSibling("target.txt");
+        Files.writeString(target, "target data");
+        Files.createSymbolicLink(path, target);
+
+        assertThrows(FileAlreadyExistsException.class,
+                () -> UnixSocketTransport.serveForever(
+                        path, new RpcServer(Empty.class, new EmptyImpl()), 100L));
+        assertTrue(Files.isSymbolicLink(path));
+        assertEquals(target, Files.readSymbolicLink(path));
+        assertEquals("target data", Files.readString(target));
     }
 
     @Test

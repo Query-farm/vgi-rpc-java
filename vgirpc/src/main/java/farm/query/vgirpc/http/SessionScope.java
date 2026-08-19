@@ -48,6 +48,7 @@ public final class SessionScope {
 
     // Mutable per-request fields:
     private SessionRegistry.Entry entry;
+    private SessionRegistry.Entry leasedEntry;
     private byte[] sessionId;
     private String action = ACTION_NONE;
     private String mintTokenB64;
@@ -99,6 +100,7 @@ public final class SessionScope {
     /** Bind a registry entry and record the dispatch action that produced it. */
     public void bindEntry(SessionRegistry.Entry e, String action) {
         this.entry = e;
+        this.leasedEntry = e;
         this.sessionId = e != null ? e.sessionId : null;
         this.action = action;
     }
@@ -126,6 +128,23 @@ public final class SessionScope {
 
     /** Clear the bound session after close so {@code CallContext.session()} returns null. */
     public void clearEntry() { this.entry = null; }
+
+    /**
+     * Open a session entry with its dispatch lease already held.
+     *
+     * <p>This is an internal bridge for {@link farm.query.vgirpc.CallContext};
+     * callers should use {@code CallContext.openSession} instead.</p>
+     */
+    public SessionRegistry.Entry openLease(Object state, Long ttlSecondsOrNull) {
+        return registry.openLease(state, ttlSecondsOrNull, principalKey);
+    }
+
+    /** Return and clear the entry whose registry lease this request owns. */
+    SessionRegistry.Entry takeLeasedEntry() {
+        SessionRegistry.Entry leased = leasedEntry;
+        leasedEntry = null;
+        return leased;
+    }
 
     /** Mint a fresh AEAD-sealed session token for the given session id.
      *  Encapsulates the master token key so user code holding a

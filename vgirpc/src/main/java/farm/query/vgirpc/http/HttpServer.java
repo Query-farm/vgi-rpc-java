@@ -1048,7 +1048,13 @@ public final class HttpServer {
      *
      * @throws Exception if Jetty fails to stop cleanly
      */
-    public void stop() throws Exception { jetty.stop(); }
+    public void stop() throws Exception {
+        try {
+            jetty.stop();
+        } finally {
+            if (sessionRegistry != null) sessionRegistry.shutdown();
+        }
+    }
 
     /**
      * Block until the server thread terminates.
@@ -1525,14 +1531,10 @@ public final class HttpServer {
         if (!parsed.serverId().equals(rpc.serverId())) {
             throw new SessionLostError("session token rejected");
         }
-        SessionRegistry.Entry entry = sessionRegistry.get(parsed.sessionId(), principalKey);
+        SessionRegistry.Entry entry = sessionRegistry.acquire(parsed.sessionId(), principalKey);
         if (entry == null) {
             throw new SessionLostError("session token rejected");
         }
-        // Serialize concurrent calls on the same session: acquire the
-        // per-entry lock before dispatch. Released by releaseSessionLock()
-        // in the response-cleanup path.
-        entry.lock().lock();
         scope.bindEntry(entry, SessionScope.ACTION_RESUME);
         return scope;
     }
@@ -1542,12 +1544,9 @@ public final class HttpServer {
      *  holder (e.g. {@code CallContext.closeSession} already released it). */
     private static void releaseSessionLock(SessionScope scope) {
         if (scope == null) return;
-        SessionRegistry.Entry entry = scope.entry();
+        SessionRegistry.Entry entry = scope.takeLeasedEntry();
         if (entry == null) return;
-        java.util.concurrent.locks.ReentrantLock lock = entry.lock();
-        if (lock != null && lock.isHeldByCurrentThread()) {
-            try { lock.unlock(); } catch (IllegalMonitorStateException ignore) { }
-        }
+        scope.registry.release(entry);
     }
 
     private static String computePrincipalKey(AuthContext auth) {
@@ -1982,16 +1981,21 @@ public final class HttpServer {
                     "Content-Encoding '" + token + "' is not enabled on this server", enabledEncodings());
         }
         if (MediaTypes.ZSTD.equals(token)) {
-            long size = Zstd.getFrameContentSize(body);
-            if (size <= 0) throw new IOException("zstd frame has unknown size");
-            byte[] out = new byte[(int) size];
-            long ret = Zstd.decompress(out, body);
-            if (Zstd.isError(ret)) {
-                throw new IOException("zstd decompress failed: " + Zstd.getErrorName(ret));
+            try {
+                return ContentCodec.zstdDecompress(body, maxRequestBytes);
+            } catch (ContentCodec.OutputTooLargeException e) {
+                throw decodedRequestTooLarge(e);
             }
-            return out;
         }
         return gzipDecompress(body, maxRequestBytes);
+    }
+
+    private PayloadTooLargeException decodedRequestTooLarge(Exception cause) {
+        PayloadTooLargeException error = new PayloadTooLargeException(
+                "decoded request body exceeds max_request_bytes=" + maxRequestBytes
+                        + "; large batches must use the external-location protocol");
+        error.initCause(cause);
+        return error;
     }
 
     /**
@@ -2148,7 +2152,9 @@ public final class HttpServer {
             while ((n = gz.read(chunk)) > 0) {
                 total += n;
                 if (maxOutput > 0 && total > maxOutput) {
-                    throw new IOException("gzip request body exceeds " + maxOutput + " bytes");
+                    throw new PayloadTooLargeException(
+                            "decoded request body exceeds max_request_bytes=" + maxOutput
+                                    + "; large batches must use the external-location protocol");
                 }
                 out.write(chunk, 0, n);
             }

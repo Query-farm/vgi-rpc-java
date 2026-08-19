@@ -44,7 +44,7 @@ public final class ContentCodec {
             String name = codings[i].trim().toLowerCase(Locale.ROOT);
             if (name.isEmpty()) continue;
             if (MediaTypes.ZSTD.equals(name)) {
-                result = zstdDecompress(result);
+                result = zstdDecompress(result, maxOutputSize);
             } else if (MediaTypes.GZIP.equals(name)) {
                 result = gzipDecompress(result, maxOutputSize);
             }
@@ -53,12 +53,23 @@ public final class ContentCodec {
         return result;
     }
 
-    private static byte[] zstdDecompress(byte[] data) throws IOException {
+    static byte[] zstdDecompress(byte[] data, long maxOutputSize) throws IOException {
         long size = Zstd.getFrameContentSize(data);
         if (size <= 0) throw new IOException("zstd frame has unknown size");
-        byte[] out = new byte[(int) size];
+        if (maxOutputSize > 0 && size > maxOutputSize) {
+            throw new OutputTooLargeException(
+                    "zstd body expands to " + size + " bytes, exceeding " + maxOutputSize);
+        }
+        if (size > Integer.MAX_VALUE) {
+            throw new OutputTooLargeException(
+                    "zstd body expands beyond the JVM byte-array limit: " + size);
+        }
+        byte[] out = new byte[Math.toIntExact(size)];
         long ret = Zstd.decompress(out, data);
         if (Zstd.isError(ret)) throw new IOException("zstd decompress failed: " + Zstd.getErrorName(ret));
+        if (ret != size) {
+            throw new IOException("zstd decompressed size mismatch: expected " + size + ", got " + ret);
+        }
         return out;
     }
 
@@ -71,11 +82,16 @@ public final class ContentCodec {
             while ((n = gz.read(chunk)) > 0) {
                 total += n;
                 if (maxOutput > 0 && total > maxOutput) {
-                    throw new IOException("gzip body exceeds " + maxOutput + " bytes");
+                    throw new OutputTooLargeException("gzip body exceeds " + maxOutput + " bytes");
                 }
                 out.write(chunk, 0, n);
             }
             return out.toByteArray();
         }
+    }
+
+    /** Internal marker allowing the HTTP server to map decoded-size refusal to 413. */
+    static final class OutputTooLargeException extends IOException {
+        OutputTooLargeException(String message) { super(message); }
     }
 }

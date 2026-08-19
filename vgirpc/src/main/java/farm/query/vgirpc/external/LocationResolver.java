@@ -47,6 +47,22 @@ public final class LocationResolver {
     }
 
     /**
+     * Render an external-location URL without userinfo, query credentials, or
+     * fragments. Safe for exception messages and logs.
+     *
+     * @param url untrusted external-location URL text
+     * @return scheme/host/port/path only, or a fixed redacted marker
+     */
+    public static String redactUrl(String url) {
+        if (url == null) return "<redacted-url>";
+        try {
+            return ExternalFetcher.safeUri(URI.create(url));
+        } catch (IllegalArgumentException invalid) {
+            return "<redacted-url>";
+        }
+    }
+
+    /**
      * Resolve a pointer batch to its underlying data batch. Ownership of the
      * returned root transfers to the caller (must close). {@code metaOut} is
      * populated with the merged custom metadata minus {@code vgi_rpc.location}

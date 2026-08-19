@@ -231,6 +231,26 @@ def conformance_http_no_compression_port() -> Iterator[int]:
 
 
 @pytest.fixture(scope="session")
+def conformance_http_small_request_cap_port() -> Iterator[int]:
+    """Java worker with the shared suite's deliberately small request cap."""
+    proc = subprocess.Popen(
+        [JAVA_WORKER, "--http", "--max-request-bytes", "4096"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+        yield port
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="session")
 def conformance_http_strict_cap_port() -> Iterator[int]:
     """Spawn an HTTP worker with strict response caps (1 MiB) for cap-overshoot tests."""
     proc = subprocess.Popen(
