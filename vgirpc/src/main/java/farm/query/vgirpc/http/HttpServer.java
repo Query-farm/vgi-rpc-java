@@ -12,6 +12,7 @@ import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.CallOutcome;
 import farm.query.vgirpc.RpcMethodInfo;
 import farm.query.vgirpc.RpcServer;
+import farm.query.vgirpc.TransportKind;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.SessionLostError;
 import farm.query.vgirpc.external.ExternalResponseBudget;
@@ -1075,6 +1076,9 @@ public final class HttpServer {
 
         @Override
         protected void service(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            // Lazy per-process notification matches pre-fork-safe semantics:
+            // a failed hook leaves the kind unset and the next request retries.
+            rpc.notifyTransport(TransportKind.HTTP);
             // Set capability headers on every response (parity with the Python
             // _CapabilitiesMiddleware: announce externalisation contract upfront).
             applyCapabilityHeaders(req, resp);

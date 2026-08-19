@@ -7,6 +7,7 @@ import farm.query.vgirpc.AnnotatedBatch;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.CallContext;
+import farm.query.vgirpc.TransportKind;
 import farm.query.vgirpc.CallOutcome;
 import farm.query.vgirpc.DispatchHook;
 import farm.query.vgirpc.DispatchInfo;
@@ -655,7 +656,7 @@ public final class HttpStreamHandler {
     private CallContext buildCallContext(String method, Consumer<Message> sink) {
         AuthScope.Scope scope = AuthScope.current();
         return new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                rpc.serverId(), method, rpc.protocolName(), "");
+                rpc.serverId(), method, rpc.protocolName(), "", TransportKind.HTTP);
     }
 
     /** Principal for state-token key derivation; empty string for anonymous. */

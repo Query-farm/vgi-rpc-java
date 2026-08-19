@@ -10,19 +10,25 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import httpx2 as httpx  # reference renamed httpx -> httpx2 in vgi-rpc 0.40.0
 import pytest
-
 from vgi_rpc.conformance import ConformanceService
 from vgi_rpc.http import http_connect
 from vgi_rpc.log import Message
-from vgi_rpc.rpc import ShmPipeTransport, SubprocessTransport, _RpcProxy, tcp_connect, unix_connect
+from vgi_rpc.rpc import (
+    ShmPipeTransport,
+    SubprocessTransport,
+    _RpcProxy,
+    tcp_connect,
+    unix_connect,
+)
 from vgi_rpc.shm import ShmSegment
 
 JAVA_WORKER = os.environ.get(
@@ -34,6 +40,12 @@ JAVA_WORKER = os.environ.get(
 # transport. Large enough that conformance batches ride the side-channel;
 # anything that overflows falls back to inline transfer (never an error).
 SHM_SEGMENT_BYTES = 128 * 1024 * 1024
+
+
+class _TransportKindProbe(Protocol):
+    """Versionless probe service; deliberately separate from ConformanceService."""
+
+    def report_transport_kind(self) -> str: ...
 
 
 @pytest.fixture(scope="session")
@@ -138,6 +150,17 @@ def _wait_for_tcp(host: str, port: int, timeout: float = 10.0) -> None:
     raise TimeoutError(f"TCP {host}:{port} did not start within {timeout}s")
 
 
+def _stop_process(proc: subprocess.Popen[bytes]) -> None:
+    """Terminate and reap a test worker, escalating when shutdown stalls."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
 @pytest.fixture(scope="session")
 def java_tcp_addr() -> Iterator[tuple[str, int]]:
     # port 0 ⇒ the worker asks the OS for a free loopback port and reports it
@@ -156,8 +179,7 @@ def java_tcp_addr() -> Iterator[tuple[str, int]]:
         _wait_for_tcp(host, port)
         yield (host, port)
     finally:
-        proc.terminate()
-        proc.wait(timeout=5)
+        _stop_process(proc)
 
 
 @pytest.fixture(scope="session")
@@ -248,6 +270,98 @@ def conformance_http_small_request_cap_port() -> Iterator[int]:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="class")
+def conformance_http_serve_start_fail_once_port() -> Iterator[int]:
+    """HTTP worker whose first lifecycle notification fails, then retries."""
+    proc = subprocess.Popen(
+        [JAVA_WORKER, "--http", "--fail-serve-start-once"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        # HTTP readiness would consume the injected first-request failure.
+        _wait_for_tcp("127.0.0.1", port)
+        yield port
+    finally:
+        _stop_process(proc)
+
+
+@pytest.fixture(scope="session")
+def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], ...]:
+    """Real Java worker probes for pipe, HTTP, Unix, and raw TCP."""
+
+    def pipe_probe() -> str:
+        transport = SubprocessTransport([JAVA_WORKER, "--transport-kind-probe"])
+        try:
+            return str(_RpcProxy(_TransportKindProbe, transport, None).report_transport_kind())
+        finally:
+            transport.close()
+
+    def http_probe() -> str:
+        proc = subprocess.Popen(
+            [JAVA_WORKER, "--transport-kind-probe", "--http"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            assert proc.stdout is not None
+            line = proc.stdout.readline().decode().strip()
+            assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+            port = int(line.split(":", 1)[1])
+            _wait_for_http(port)
+            with http_connect(_TransportKindProbe, f"http://127.0.0.1:{port}") as proxy:
+                return str(proxy.report_transport_kind())
+        finally:
+            _stop_process(proc)
+
+    def unix_probe() -> str:
+        path = _short_unix_path("kind")
+        proc = subprocess.Popen(
+            [JAVA_WORKER, "--transport-kind-probe", "--unix", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().decode().strip() == f"UNIX:{path}"
+            _wait_for_unix(path)
+            with unix_connect(_TransportKindProbe, path) as proxy:
+                return str(proxy.report_transport_kind())
+        finally:
+            _stop_process(proc)
+
+    def tcp_probe() -> str:
+        proc = subprocess.Popen(
+            [JAVA_WORKER, "--transport-kind-probe", "--tcp", "127.0.0.1:0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            assert proc.stdout is not None
+            line = proc.stdout.readline().decode().strip()
+            assert line.startswith("TCP:"), f"Expected TCP:<host>:<port>, got: {line!r}"
+            host, _, port_part = line[len("TCP:") :].rpartition(":")
+            port = int(port_part)
+            _wait_for_tcp(host, port)
+            with tcp_connect(_TransportKindProbe, host, port) as proxy:
+                return str(proxy.report_transport_kind())
+        finally:
+            _stop_process(proc)
+
+    probes: list[tuple[str, Callable[[], str]]] = [
+        ("pipe", pipe_probe),
+        ("http", http_probe),
+        ("tcp", tcp_probe),
+    ]
+    if sys.platform != "win32":
+        probes.append(("unix", unix_probe))
+    return tuple(probes)
 
 
 @pytest.fixture(scope="session")

@@ -8,6 +8,8 @@ import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.conformance.ConformanceService;
 import farm.query.vgirpc.conformance.ConformanceServiceImpl;
+import farm.query.vgirpc.conformance.TransportKindProbeService;
+import farm.query.vgirpc.conformance.TransportKindProbeServiceImpl;
 import farm.query.vgirpc.external.ExternalLocationConfig;
 import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.http.AuthFailure;
@@ -41,6 +43,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class Main {
 
@@ -49,12 +52,6 @@ public final class Main {
     private Main() {}
 
     public static void main(String[] args) throws Exception {
-        ConformanceService impl = new ConformanceServiceImpl();
-        RpcServer server = new RpcServer(ConformanceService.class, impl);
-        // Match the Python reference's ConformanceService.protocol_version so the
-        // describe conformance suite sees the same MAJOR.MINOR.PATCH label.
-        server.setProtocolVersion("1.0.0");
-
         byte[] tokenKey = null;
         long tokenTtl = 0;
         String mode = null;
@@ -120,6 +117,8 @@ public final class Main {
         // property is itself a conformance contract (TestTokenIntrospectionOffMode),
         // which runs against the plain worker.
         boolean introspect = false;
+        boolean transportKindProbe = false;
+        boolean failServeStartOnce = false;
         ArgCursor c = new ArgCursor(args);
         while (c.hasNext()) {
             String a = c.next();
@@ -200,8 +199,27 @@ public final class Main {
                 // Implies HTTP, and implies principal-header auth below so the
                 // introspector allowlist has something to check.
                 case "--introspect" -> { mode = "http"; introspect = true; }
+                case "--transport-kind-probe" -> transportKindProbe = true;
+                case "--fail-serve-start-once" -> failServeStartOnce = true;
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
+        }
+        RpcServer server;
+        if (transportKindProbe) {
+            server = new RpcServer(TransportKindProbeService.class, new TransportKindProbeServiceImpl());
+        } else {
+            server = new RpcServer(ConformanceService.class, new ConformanceServiceImpl());
+            // Match the Python reference's ConformanceService.protocol_version so the
+            // describe conformance suite sees the same MAJOR.MINOR.PATCH label.
+            server.setProtocolVersion("1.0.0");
+        }
+        if (failServeStartOnce) {
+            AtomicBoolean first = new AtomicBoolean(true);
+            server.setServeStartHook(kind -> {
+                if (first.compareAndSet(true, false)) {
+                    throw new IllegalStateException("conformance injected on_serve_start failure");
+                }
+            });
         }
         // Applied after the loop so flag order does not matter, and only when no
         // stronger mode was selected.

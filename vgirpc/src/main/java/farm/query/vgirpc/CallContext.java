@@ -26,6 +26,7 @@ public final class CallContext {
     private final String methodName;
     private final String protocolName;
     private final String requestId;
+    private final TransportKind kind;
 
     /**
      * Create a per-request context. Constructed by the framework at dispatch
@@ -47,6 +48,34 @@ public final class CallContext {
                        String methodName,
                        String protocolName,
                        String requestId) {
+        this(auth, emitClientLog, transportMetadata, serverId, methodName,
+                protocolName, requestId, null);
+    }
+
+    /**
+     * Create a per-request context including the selected transport kind.
+     *
+     * <p>The seven-argument constructor remains source-compatible and records
+     * an unknown ({@code null}) kind for callers constructing contexts outside
+     * the framework.</p>
+     *
+     * @param auth authenticated principal; {@code null} becomes {@link AuthContext#ANONYMOUS}
+     * @param emitClientLog sink for client-directed log messages
+     * @param transportMetadata transport-level request metadata
+     * @param serverId serving server id
+     * @param methodName RPC method name
+     * @param protocolName service/protocol name
+     * @param requestId request correlation id
+     * @param kind concrete transport, or {@code null} when unknown
+     */
+    public CallContext(AuthContext auth,
+                       Consumer<Message> emitClientLog,
+                       Map<String, Object> transportMetadata,
+                       String serverId,
+                       String methodName,
+                       String protocolName,
+                       String requestId,
+                       TransportKind kind) {
         this.auth = auth != null ? auth : AuthContext.ANONYMOUS;
         this.emitClientLog = emitClientLog;
         this.transportMetadata = transportMetadata != null
@@ -56,6 +85,7 @@ public final class CallContext {
         this.methodName = methodName;
         this.protocolName = protocolName;
         this.requestId = requestId != null ? requestId : "";
+        this.kind = kind;
     }
 
     /**
@@ -125,6 +155,14 @@ public final class CallContext {
      * @return the request id, or {@code ""} when the transport assigns none
      */
     public String requestId() { return requestId; }
+
+    /**
+     * Concrete transport handling this call.
+     *
+     * @return transport kind, or {@code null} only for contexts constructed
+     *     through the legacy constructor outside framework dispatch
+     */
+    public TransportKind kind() { return kind; }
 
     /**
      * Emit a client-directed log batch.

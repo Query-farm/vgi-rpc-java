@@ -17,6 +17,8 @@ import farm.query.vgirpc.shm.ShmResolver;
 import farm.query.vgirpc.shm.Shm;
 import farm.query.vgirpc.shm.ShmSession;
 import farm.query.vgirpc.transport.RpcTransport;
+import farm.query.vgirpc.transport.TcpSocketTransport;
+import farm.query.vgirpc.transport.UnixSocketTransport;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.IpcStreamWriter;
@@ -60,6 +62,9 @@ public final class RpcServer {
     private DispatchHook dispatchHook;
     private String protocolVersion = "";
     private String protocolHash = "";
+    private final Object transportLock = new Object();
+    private volatile TransportKind transportKind;
+    private Consumer<TransportKind> serveStartHook;
 
     /**
      * Create a server with a random 12-char server id and {@code __describe__} enabled.
@@ -198,6 +203,36 @@ public final class RpcServer {
      */
     public Object implementation() { return impl; }
 
+    /** Install an optional one-shot hook for each newly selected transport kind. */
+    public void setServeStartHook(Consumer<TransportKind> hook) { this.serveStartHook = hook; }
+
+    /** Current transport kind, or {@code null} before serving begins. */
+    public TransportKind transportKind() { return transportKind; }
+
+    /**
+     * Bind this server to {@code kind} and fire the configured startup hook.
+     * State is committed only after the hook succeeds, so a transient failure
+     * is retried on the next request. Calls for an already-bound kind are no-ops.
+     *
+     * @param kind concrete transport selected by the integration
+     */
+    public void notifyTransport(TransportKind kind) {
+        if (transportKind == kind) return;
+        synchronized (transportLock) {
+            if (transportKind == kind) return;
+            Consumer<TransportKind> hook = serveStartHook;
+            if (hook != null) hook.accept(kind);
+            transportKind = kind;
+        }
+    }
+
+    private void notifyRawTransport(RpcTransport transport) {
+        if (transportKind != null) return;
+        if (transport instanceof UnixSocketTransport) notifyTransport(TransportKind.UNIX);
+        else if (transport instanceof TcpSocketTransport) notifyTransport(TransportKind.TCP);
+        else notifyTransport(TransportKind.PIPE);
+    }
+
     /**
      * Loop serving requests until the transport closes. A single shared-memory
      * session is held for the lifetime of the connection. Recoverable per-call
@@ -207,6 +242,7 @@ public final class RpcServer {
      * @param transport the transport whose request/response streams are served
      */
     public void serve(RpcTransport transport) {
+        notifyRawTransport(transport);
         // One shared-memory session per connection: lazily attaches when the
         // client advertises a segment, and is munmap'd/closed when the loop
         // exits (never unlinked — the client owns the segment).
@@ -267,6 +303,7 @@ public final class RpcServer {
      * @param transport the transport whose next request stream is read and answered
      */
     public void serveOne(RpcTransport transport) {
+        notifyRawTransport(transport);
         serveOne(transport, null);
     }
 
@@ -529,7 +566,7 @@ public final class RpcServer {
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer())) {
             w.writeSchema(schema);
             CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                    serverId, info.name(), protocolName(), "");
+                    serverId, info.name(), protocolName(), "", transportKind);
             sink.bind(w, schema);
             try {
                 Object[] callArgs = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
@@ -589,7 +626,7 @@ public final class RpcServer {
         ClientLogSink sink = new ClientLogSink(serverId);
         AuthScope.Scope scope = AuthScope.current();
         CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                serverId, info.name(), protocolName(), "");
+                serverId, info.name(), protocolName(), "", transportKind);
 
         RpcStream<?> stream = runStreamInit(info, kwargs, ctx, transport);
         if (stream == null) return;  // init failed; error already reported + input drained
