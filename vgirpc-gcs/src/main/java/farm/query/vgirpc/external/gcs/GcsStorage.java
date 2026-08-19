@@ -15,6 +15,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -33,6 +34,7 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
     private final String bucket;
     private final String keyPrefix;
     private final Duration signDuration;
+    private final String signedUrlHost;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     /**
@@ -54,6 +56,7 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
         this.bucket = b.bucket;
         this.keyPrefix = b.keyPrefix.endsWith("/") ? b.keyPrefix : b.keyPrefix + "/";
         this.signDuration = b.signDuration;
+        this.signedUrlHost = b.signedUrlHost;
     }
 
     /**
@@ -74,10 +77,17 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
                 .setContentType("application/vnd.apache.arrow.stream");
         if (contentEncoding != null) blob.setContentEncoding(contentEncoding);
         storage.create(blob.build(), body);
-        URL url = storage.signUrl(BlobInfo.newBuilder(bucket, key).build(),
-                signDuration.toMillis(), TimeUnit.MILLISECONDS,
-                Storage.SignUrlOption.httpMethod(HttpMethod.GET),
-                Storage.SignUrlOption.withV4Signature());
+        var signOptions = new ArrayList<Storage.SignUrlOption>();
+        signOptions.add(Storage.SignUrlOption.httpMethod(HttpMethod.GET));
+        signOptions.add(Storage.SignUrlOption.withV4Signature());
+        if (signedUrlHost != null) {
+            signOptions.add(Storage.SignUrlOption.withHostName(signedUrlHost));
+        }
+        URL url = storage.signUrl(
+                BlobInfo.newBuilder(bucket, key).build(),
+                signDuration.toMillis(),
+                TimeUnit.MILLISECONDS,
+                signOptions.toArray(Storage.SignUrlOption[]::new));
         try {
             return url.toURI();
         } catch (URISyntaxException e) {
@@ -103,6 +113,7 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
         private final String bucket;
         private String keyPrefix = "vgi-rpc/";
         private Duration signDuration = Duration.ofHours(1);
+        private String signedUrlHost;
         private Storage storage;
 
         Builder(String bucket) { this.bucket = bucket; }
@@ -111,6 +122,16 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
         public Builder keyPrefix(String keyPrefix) { this.keyPrefix = keyPrefix; return this; }
         /** Validity window of the signed GET URLs (default one hour). */
         public Builder signDuration(Duration signDuration) { this.signDuration = signDuration; return this; }
+        /**
+         * Override only the host used in generated signed URLs. This is useful
+         * when uploads use an emulator or private API endpoint but recipients
+         * must receive URLs for a public gateway. By default the supplied
+         * {@link Storage} client's configured host is used.
+         */
+        public Builder signedUrlHost(String signedUrlHost) {
+            this.signedUrlHost = signedUrlHost;
+            return this;
+        }
         /**
          * Supply a pre-configured GCS client (e.g. for custom project/credentials).
          * A client provided here is not closed by {@link GcsStorage#close()}; when

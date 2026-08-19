@@ -8,6 +8,7 @@ import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
@@ -55,9 +56,16 @@ public final class S3Storage implements ExternalStorage, AutoCloseable {
 
         var sc = S3Client.builder()
                 .region(b.region)
-                .credentialsProvider(b.credentials);
+                .credentialsProvider(b.credentials)
+                // Every upload is a known-length byte array. Avoid the SDK's
+                // aws-chunked Content-Encoding, which otherwise becomes a
+                // duplicate header when the object itself is zstd encoded and
+                // is rejected by strict S3-compatible implementations.
+                .serviceConfiguration(S3Configuration.builder()
+                        .pathStyleAccessEnabled(b.forcePathStyle)
+                        .chunkedEncodingEnabled(false)
+                        .build());
         if (b.endpointOverride != null) sc.endpointOverride(b.endpointOverride);
-        if (b.forcePathStyle) sc.forcePathStyle(true);
         this.s3 = sc.build();
 
         var pb = S3Presigner.builder()

@@ -158,3 +158,12 @@ subprojects {
         }
     }
 }
+
+// Docker-backed storage tests are intentionally outside ordinary `build`/`check`
+// so contributors without a container runtime retain a hermetic unit-test lane.
+// CI invokes this aggregate task as a required Ubuntu job.
+tasks.register("storageIntegrationTest") {
+    description = "Runs the real S3 and GCS storage integration-test lanes."
+    group = "verification"
+    dependsOn(":vgirpc-s3:integrationTest", ":vgirpc-gcs:integrationTest")
+}
