@@ -188,6 +188,46 @@ def conformance_http_port(java_http_port: int) -> int:
     return java_http_port
 
 
+@pytest.fixture
+def conformance_resource_soak_target() -> Iterator[Any]:
+    """Expose one isolated JVM HTTP worker to the shared resource soak."""
+    from vgi_rpc.conformance._resource_soak_pytest import (
+        ResourceSoakLimits,
+        ResourceSoakTarget,
+    )
+
+    proc = subprocess.Popen(
+        [JAVA_WORKER, "--http"],
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
+        port = int(line.split(":", 1)[1])
+        _wait_for_http(port)
+
+        def connect() -> contextlib.AbstractContextManager[Any]:
+            return http_connect(ConformanceService, f"http://127.0.0.1:{port}")
+
+        yield ResourceSoakTarget(
+            name="java-http",
+            pid=proc.pid,
+            connect=connect,
+            limits=ResourceSoakLimits(
+                rss_growth_bytes=128 * 1024 * 1024,
+                rss_slope_bytes_per_epoch=16 * 1024 * 1024,
+                descriptor_growth=4,
+                thread_growth=8,
+                child_growth=0,
+            ),
+            warmup_multiplier=2,
+        )
+    finally:
+        _stop_process(proc)
+
+
 @pytest.fixture(scope="session")
 def conformance_http_auth_port() -> Iterator[int]:
     """Spawn a reject-all HTTP worker, so every RPC POST returns 401."""
