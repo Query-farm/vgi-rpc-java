@@ -187,13 +187,22 @@ public final class StateSerializer {
                 JsonNode node = root.get(fieldKey(f));
                 if (node == null || node.isNull()) continue;
                 Class<?> t = f.getType();
-                if      (t == int.class    || t == Integer.class) f.setInt(instance, node.asInt());
-                else if (t == long.class   || t == Long.class)    f.setLong(instance, node.asLong());
-                else if (t == double.class || t == Double.class)  f.setDouble(instance, node.asDouble());
-                else if (t == float.class  || t == Float.class)   f.setFloat(instance, (float) node.asDouble());
-                else if (t == boolean.class|| t == Boolean.class) f.setBoolean(instance, node.asBoolean());
-                else if (t == byte.class   || t == Byte.class)    f.setByte(instance, (byte) node.asInt());
-                else if (t == short.class  || t == Short.class)   f.setShort(instance, (short) node.asInt());
+                // Field.set, never Field.setInt/setLong/...: the typed setters accept
+                // ONLY a primitive field, so on the boxed half of each pair they throw
+                // "Can not set java.lang.Integer field X to (int)". Field.set handles
+                // both — it unboxes for a primitive field and stores the wrapper as-is
+                // for a boxed one. This stayed hidden until a stream state carried a
+                // non-null boxed field (SplitState.cacheTtl), which made every split
+                // scan fail over HTTP on the Java SDK while subprocess was unaffected,
+                // because StateSerializer exists only to carry state across the
+                // stateless HTTP request boundary.
+                if      (t == int.class    || t == Integer.class) f.set(instance, node.asInt());
+                else if (t == long.class   || t == Long.class)    f.set(instance, node.asLong());
+                else if (t == double.class || t == Double.class)  f.set(instance, node.asDouble());
+                else if (t == float.class  || t == Float.class)   f.set(instance, (float) node.asDouble());
+                else if (t == boolean.class|| t == Boolean.class) f.set(instance, node.asBoolean());
+                else if (t == byte.class   || t == Byte.class)    f.set(instance, (byte) node.asInt());
+                else if (t == short.class  || t == Short.class)   f.set(instance, (short) node.asInt());
                 else if (t == String.class)                       f.set(instance, node.asText());
                 // Generic types (List, Map, custom records, byte[]) round-trip via Jackson's
                 // CBOR databind. Use the field's generic type (List<Long>, Map<String,Double>, ...)
