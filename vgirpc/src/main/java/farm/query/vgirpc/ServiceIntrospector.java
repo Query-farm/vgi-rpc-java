@@ -70,13 +70,21 @@ public final class ServiceIntrospector {
         List<Field> fields = new ArrayList<>();
         Map<String, Type> paramTypes = new LinkedHashMap<>();
         boolean wantsCtx = false;
+        long nextDictId = 0;
         for (Parameter p : m.getParameters()) {
             if (CallContext.class.isAssignableFrom(p.getType())) {
                 wantsCtx = true;
                 continue;
             }
             String name = p.getName();
-            fields.add(SchemaDerivation.buildFieldForParameter(p));
+            // Dictionary ids only have to be unique within this schema, and the
+            // dictionary batch beside the params batch is keyed by them — so
+            // number them by position among the dict-encoded parameters.
+            Field pf = SchemaDerivation.buildFieldForParameter(p);
+            if (SchemaDerivation.wantsParameterDictionary(p)) {
+                pf = SchemaDerivation.withParameterDictionary(pf, p, nextDictId++);
+            }
+            fields.add(pf);
             paramTypes.put(name, p.getParameterizedType());
         }
         Schema paramsSchema = new Schema(fields);

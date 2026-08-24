@@ -892,6 +892,60 @@ def conformance_conn(
     return factory
 
 
+@pytest.fixture(params=["pipe", "subprocess", "subprocess_shm", "unix", "tcp"])
+def conformance_raw_conn(
+    request: pytest.FixtureRequest,
+    java_transport: SubprocessTransport,
+    java_unix_path: str,
+    java_tcp_addr: tuple[str, int],
+) -> ConnFactory:
+    """Connect only through transports exposing a persistent byte stream."""
+
+    def factory(
+        on_log: Callable[[Message], None] | None = None,
+    ) -> contextlib.AbstractContextManager[Any]:
+        if request.param == "pipe":
+
+            @contextlib.contextmanager
+            def _pipe_conn() -> Iterator[_RpcProxy]:
+                transport = SubprocessTransport([JAVA_WORKER])
+                try:
+                    yield _RpcProxy(ConformanceService, transport, on_log)
+                finally:
+                    transport.close()
+
+            return _pipe_conn()
+        if request.param == "subprocess":
+
+            @contextlib.contextmanager
+            def _shared_subproc() -> Iterator[_RpcProxy]:
+                yield _RpcProxy(ConformanceService, java_transport, on_log)
+
+            return _shared_subproc()
+        if request.param == "subprocess_shm":
+
+            @contextlib.contextmanager
+            def _shm_conn() -> Iterator[_RpcProxy]:
+                segment = ShmSegment.create(SHM_SEGMENT_BYTES)
+                transport = ShmPipeTransport(SubprocessTransport([JAVA_WORKER]), segment)
+                try:
+                    yield _RpcProxy(ConformanceService, transport, on_log)
+                finally:
+                    transport.close()
+                    segment.close()
+                    segment.unlink()
+
+            return _shm_conn()
+        if request.param == "unix":
+            return unix_connect(ConformanceService, java_unix_path, on_log=on_log)
+        if request.param == "tcp":
+            tcp_host, tcp_port = java_tcp_addr
+            return tcp_connect(ConformanceService, tcp_host, tcp_port, on_log=on_log)
+        raise AssertionError(f"non-raw conformance transport: {request.param}")
+
+    return factory
+
+
 # Import the canonical pytest suite from the vgi-rpc package.
 from vgi_rpc.conformance._pytest_suite import *  # noqa: F401,F403,E402
 

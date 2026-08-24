@@ -78,6 +78,8 @@ public final class HttpRpcStream<S extends StreamState> extends RpcStream<S> {
     private String stateToken;
     /** The call token minted at init and echoed on every later request. */
     private String callToken;
+    /** Whether this HTTP response has already yielded its single allowed data batch. */
+    private boolean dataSeenInCurrentResponse;
     private boolean closed;
 
     /**
@@ -324,6 +326,13 @@ public final class HttpRpcStream<S extends StreamState> extends RpcStream<S> {
             if (LocationResolver.isPointer(root.getRowCount(), md)) {
                 HttpRpcConnection.failOnPointerBatch(md);
             }
+            if (dataSeenInCurrentResponse) {
+                RpcError error = new RpcError("ProtocolError",
+                        method + ": HTTP stream response contained more than one data batch", "");
+                close();
+                throw error;
+            }
+            dataSeenInCurrentResponse = true;
             return new AnnotatedBatch(root, carriesToken ? stripTokens(md) : md,
                     currentReader.dictionaryProvider(), null);
         }
@@ -356,6 +365,7 @@ public final class HttpRpcStream<S extends StreamState> extends RpcStream<S> {
         // worker saying the stream is over, so it must not be inherited from
         // the previous turn.
         stateToken = null;
+        dataSeenInCurrentResponse = false;
         currentReader = new IpcStreamReader(new ByteArrayInputStream(body), Allocators.root());
     }
 

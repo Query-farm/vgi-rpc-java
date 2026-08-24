@@ -97,9 +97,14 @@ public final class ClientMarshalling {
                     w.writeBatch(zero, meta);
                 }
             } else {
-                try (VectorSchemaRoot root =
-                             Marshalling.encodeRow(info.paramsSchema(), wireKwargs, Allocators.root())) {
-                    w.writeBatch(root, meta);
+                // encodeRowForWire, not encodeRow: a parameter the schema marks
+                // dictionary-encoded has to travel as indices plus a dictionary
+                // batch, or a peer validating its parameter contract rejects the
+                // call for carrying utf8 where the contract says dictionary.
+                try (Marshalling.EncodedRow enc =
+                             Marshalling.encodeRowForWire(info.paramsSchema(), wireKwargs, Allocators.root())) {
+                    if (enc.provider() != null) w.writeBatch(enc.root(), meta, enc.provider());
+                    else w.writeBatch(enc.root(), meta);
                 }
             }
         }

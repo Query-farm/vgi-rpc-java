@@ -9,6 +9,11 @@ import farm.query.vgirpc.schema.ArrowSerializableRecord;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -57,14 +62,44 @@ public final class ParameterBinder {
 
     @SuppressWarnings({"rawtypes", "unchecked"})
     static Object adapt(Object val, Parameter p) {
-        Class<?> target = p.getType();
-        if (target == Optional.class) return Optional.ofNullable(val);
+        return adaptType(val, p.getParameterizedType());
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static Object adaptType(Object val, Type type) {
+        if (type instanceof ParameterizedType pt) {
+            Class<?> raw = (Class<?>) pt.getRawType();
+            if (raw == Optional.class) {
+                return Optional.ofNullable(adaptType(val, pt.getActualTypeArguments()[0]));
+            }
+            if (List.class.isAssignableFrom(raw) && val instanceof List<?> list) {
+                List<Object> out = new ArrayList<>(list.size());
+                Type elem = pt.getActualTypeArguments()[0];
+                for (Object item : list) out.add(adaptType(item, elem));
+                return out;
+            }
+            if (Map.class.isAssignableFrom(raw) && val instanceof Map<?, ?> map) {
+                Map<Object, Object> out = new LinkedHashMap<>(map.size());
+                Type key = pt.getActualTypeArguments()[0];
+                Type value = pt.getActualTypeArguments()[1];
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    out.put(adaptType(entry.getKey(), key), adaptType(entry.getValue(), value));
+                }
+                return out;
+            }
+            type = raw;
+        }
+        if (!(type instanceof Class<?> target)) return val;
         if (val == null) return null;
         if (target.isEnum() && val instanceof String s) {
             return Enum.valueOf((Class<Enum>) target.asSubclass(Enum.class), s);
         }
         if (ArrowSerializableRecord.class.isAssignableFrom(target) && val instanceof byte[] bytes) {
             return RecordCodec.deserializeFromBytes(bytes, (Class<? extends ArrowSerializableRecord>) target);
+        }
+        if (ArrowSerializableRecord.class.isAssignableFrom(target) && val instanceof Map<?, ?> map) {
+            return RecordCodec.fromRowMap(
+                    (Class<? extends ArrowSerializableRecord>) target, (Map<String, Object>) map);
         }
         return Numbers.coerce(target, val);
     }

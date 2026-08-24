@@ -68,10 +68,11 @@ public final class RecordCodec {
     public static byte[] serializeToBytes(ArrowSerializableRecord record) {
         Schema schema = SchemaDerivation.schemaForRecord(record.getClass());
         Map<String, Object> rowDict = toRowMap(record);
-        try (VectorSchemaRoot root = Marshalling.encodeRow(schema, rowDict, Allocators.root());
+        try (Marshalling.EncodedRow encoded =
+                     Marshalling.encodeRowForWire(schema, rowDict, Allocators.root());
              ByteArrayOutputStream bos = new ByteArrayOutputStream();
              IpcStreamWriter w = new IpcStreamWriter(bos)) {
-            w.writeBatch(root, null);
+            w.writeBatch(encoded.root(), null, encoded.provider());
             w.writeEos();
             return bos.toByteArray();
         } catch (Exception e) {

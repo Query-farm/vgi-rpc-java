@@ -9,6 +9,7 @@ import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.compression.NoCompressionCodec;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
@@ -81,6 +82,15 @@ public final class Externalizer {
                                             Map<String, String> existingMeta,
                                             ExternalLocationConfig config,
                                             Schema declaredSchema) throws Exception {
+        return maybeExternalize(root, existingMeta, config, declaredSchema, null);
+    }
+
+    /** Dictionary-aware variant used when an encoded batch is externalized. */
+    public static Pointer maybeExternalize(VectorSchemaRoot root,
+                                            Map<String, String> existingMeta,
+                                            ExternalLocationConfig config,
+                                            Schema declaredSchema,
+                                            DictionaryProvider dictionaryProvider) throws Exception {
         if (config == null || config.storage() == null) return null;
         if (root.getRowCount() == 0) return null;
 
@@ -97,7 +107,7 @@ public final class Externalizer {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         try (IpcStreamWriter w = new IpcStreamWriter(bos)) {
             if (wireSchema.equals(root.getSchema())) {
-                w.writeBatch(root, existingMeta);
+                w.writeBatch(root, existingMeta, dictionaryProvider);
             } else {
                 // Declare the enclosing stream's schema and write the root's
                 // buffers unchanged — byte-for-byte what inline delivery emits.

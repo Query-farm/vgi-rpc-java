@@ -42,6 +42,11 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.Text;
+import org.apache.arrow.vector.dictionary.Dictionary;
+import org.apache.arrow.vector.dictionary.DictionaryEncoder;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
+import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
+import org.apache.arrow.vector.types.pojo.FieldType;
 
 import java.lang.reflect.RecordComponent;
 import java.nio.charset.StandardCharsets;
@@ -75,6 +80,243 @@ public final class Marshalling {
         }
         root.setRowCount(1);
         return root;
+    }
+
+    /**
+     * A single-row parameter batch together with the dictionaries it references.
+     *
+     * <p>Returned by {@link #encodeRowForWire} because a dictionary-encoded
+     * column is only half of what goes on the wire: the batch carries indices,
+     * and the dictionary batch beside it carries the values. Handing back the
+     * root alone would produce a batch whose indices resolve against nothing.</p>
+     */
+    public static final class EncodedRow implements AutoCloseable {
+        private final VectorSchemaRoot root;
+        private final DictionaryProvider provider;
+        private final List<FieldVector> owned;
+
+        EncodedRow(VectorSchemaRoot root, DictionaryProvider provider, List<FieldVector> owned) {
+            this.root = root;
+            this.provider = provider;
+            this.owned = owned;
+        }
+
+        /** @return the batch to write. */
+        public VectorSchemaRoot root() { return root; }
+
+        /** @return the dictionaries this batch references, or {@code null} when it references none. */
+        public DictionaryProvider provider() { return provider; }
+
+        @Override
+        public void close() {
+            // The root closes the vectors it holds. `owned` is everything the
+            // root does NOT hold: the dictionary vectors, and the plain value
+            // vectors that were replaced by their encoded counterparts.
+            root.close();
+            for (FieldVector v : owned) v.close();
+        }
+    }
+
+    /**
+     * Build a single-row parameter batch, dictionary-encoding any column the
+     * schema marks as dictionary-encoded.
+     *
+     * <p>{@link #encodeRow} writes every column as its value type, which is
+     * right for a schema with no dictionaries and wrong for one with them: the
+     * declared schema then says {@code dictionary&lt;int16, utf8&gt;} while the
+     * batch carries plain {@code utf8}. A peer that validates its parameter
+     * contract rejects the call outright — which is exactly what a Python
+     * worker did to every Java-client {@code catalog_schema_contents_functions}
+     * call, with "expected Arrow type dictionary&lt;values=string,
+     * indices=int16&gt; but the request batch carried string".</p>
+     *
+     * <p>The values are written plainly first and then encoded, rather than
+     * built as indices directly, because {@link DictionaryEncoder} is what
+     * decides the index for a value — doing it by hand would mean reimplementing
+     * that agreement on both sides.</p>
+     *
+     * @param schema the declared parameter schema, dictionary encodings included
+     * @param values the parameter values, keyed by field name
+     * @param alloc the allocator for the batch and its dictionaries
+     * @return the batch and its dictionaries; close it after writing
+     */
+    public static EncodedRow encodeRowForWire(Schema schema, Map<String, Object> values,
+            BufferAllocator alloc) {
+        List<Field> fields = schema.getFields();
+        boolean anyDict = fields.stream().anyMatch(Marshalling::hasDictionary);
+        if (!anyDict) {
+            return new EncodedRow(encodeRow(schema, values, alloc), null, List.of());
+        }
+
+        // Build dictionaries from every encoded leaf, including leaves nested
+        // under list/map/struct. All leaves sharing an id share one value table.
+        Map<Long, LinkedHashMap<String, Integer>> indices = new LinkedHashMap<>();
+        Map<Long, DictionaryEncoding> encodings = new LinkedHashMap<>();
+        // Discover definitions from the schema first. Walking values alone is
+        // insufficient: an empty list/map (or a null optional container) can
+        // still declare a nested dictionary that Arrow requires the stream to
+        // publish, even though that dictionary has zero values.
+        for (Field f : fields) collectDictionaryDefinitions(f, indices, encodings);
+        for (Field f : fields) collectDictionaryValues(f, values.get(f.getName()), indices, encodings);
+
+        List<Field> memoryFields = new ArrayList<>(fields.size());
+        Map<String, Object> memoryValues = new LinkedHashMap<>();
+        for (Field f : fields) {
+            memoryFields.add(toDictionaryMemoryField(f));
+            memoryValues.put(f.getName(), toDictionaryMemoryValue(f, values.get(f.getName()), indices));
+        }
+
+        VectorSchemaRoot memoryRoot = encodeRow(new Schema(memoryFields), memoryValues, alloc);
+        DictionaryProvider.MapDictionaryProvider provider =
+                new DictionaryProvider.MapDictionaryProvider();
+        List<FieldVector> owned = new ArrayList<>();
+        boolean ok = false;
+        try {
+            for (Map.Entry<Long, LinkedHashMap<String, Integer>> entry : indices.entrySet()) {
+                VarCharVector dictVec = new VarCharVector("dictionary-" + entry.getKey(), alloc);
+                dictVec.allocateNew();
+                for (Map.Entry<String, Integer> value : entry.getValue().entrySet()) {
+                    dictVec.setSafe(value.getValue(), value.getKey().getBytes(StandardCharsets.UTF_8));
+                }
+                dictVec.setValueCount(entry.getValue().size());
+                owned.add(dictVec);
+                provider.put(new Dictionary(dictVec, encodings.get(entry.getKey())));
+            }
+            // The vectors carry Arrow's in-memory index representation, while
+            // the explicit fields retain the value type + DictionaryEncoding
+            // required in the IPC schema.
+            VectorSchemaRoot out = new VectorSchemaRoot(
+                    fields, memoryRoot.getFieldVectors(), memoryRoot.getRowCount());
+            ok = true;
+            return new EncodedRow(out, provider, owned);
+        } finally {
+            if (!ok) {
+                for (FieldVector v : owned) v.close();
+                memoryRoot.close();
+            }
+        }
+    }
+
+    private static boolean hasDictionary(Field f) {
+        if (f.getDictionary() != null) return true;
+        return f.getChildren().stream().anyMatch(Marshalling::hasDictionary);
+    }
+
+    private static String dictionaryString(Object value) {
+        return value instanceof Enum<?> e ? e.name() : value.toString();
+    }
+
+    private static void collectDictionaryDefinitions(
+            Field f,
+            Map<Long, LinkedHashMap<String, Integer>> indices,
+            Map<Long, DictionaryEncoding> encodings) {
+        if (f.getDictionary() != null) {
+            long id = f.getDictionary().getId();
+            indices.computeIfAbsent(id, ignored -> new LinkedHashMap<>());
+            encodings.putIfAbsent(id, f.getDictionary());
+        }
+        for (Field child : f.getChildren()) {
+            collectDictionaryDefinitions(child, indices, encodings);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> structValues(Object value) {
+        if (value instanceof ArrowSerializableRecord r) return RecordCodec.toRowMap(r);
+        return (Map<String, Object>) value;
+    }
+
+    private static void collectDictionaryValues(
+            Field f, Object value,
+            Map<Long, LinkedHashMap<String, Integer>> indices,
+            Map<Long, DictionaryEncoding> encodings) {
+        if (value instanceof Optional<?> optional) value = optional.orElse(null);
+        if (f.getDictionary() != null) {
+            long id = f.getDictionary().getId();
+            LinkedHashMap<String, Integer> dict = indices.computeIfAbsent(id, ignored -> new LinkedHashMap<>());
+            encodings.putIfAbsent(id, f.getDictionary());
+            if (value == null) return;
+            String text = dictionaryString(value);
+            dict.computeIfAbsent(text, ignored -> dict.size());
+            return;
+        }
+        if (value == null) return;
+        switch (f.getType().getTypeID()) {
+            case List -> {
+                Field child = f.getChildren().get(0);
+                for (Object item : (Iterable<?>) value) {
+                    collectDictionaryValues(child, item, indices, encodings);
+                }
+            }
+            case Map -> {
+                Field entries = f.getChildren().get(0);
+                Field key = entries.getChildren().get(0);
+                Field val = entries.getChildren().get(1);
+                for (Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
+                    collectDictionaryValues(key, entry.getKey(), indices, encodings);
+                    collectDictionaryValues(val, entry.getValue(), indices, encodings);
+                }
+            }
+            case Struct -> {
+                Map<String, Object> row = structValues(value);
+                for (Field child : f.getChildren()) {
+                    collectDictionaryValues(child, row.get(child.getName()), indices, encodings);
+                }
+            }
+            default -> { }
+        }
+    }
+
+    private static Field toDictionaryMemoryField(Field f) {
+        if (f.getDictionary() != null) {
+            return new Field(f.getName(),
+                    new FieldType(f.isNullable(), f.getDictionary().getIndexType(), null, f.getMetadata()),
+                    List.of());
+        }
+        List<Field> children = f.getChildren().stream()
+                .map(Marshalling::toDictionaryMemoryField).toList();
+        return new Field(f.getName(),
+                new FieldType(f.isNullable(), f.getType(), null, f.getMetadata()), children);
+    }
+
+    private static Object toDictionaryMemoryValue(
+            Field f, Object value, Map<Long, LinkedHashMap<String, Integer>> indices) {
+        if (value instanceof Optional<?> optional) value = optional.orElse(null);
+        if (value == null) return null;
+        if (f.getDictionary() != null) {
+            return indices.get(f.getDictionary().getId()).get(dictionaryString(value));
+        }
+        return switch (f.getType().getTypeID()) {
+            case List -> {
+                Field child = f.getChildren().get(0);
+                List<Object> out = new ArrayList<>();
+                for (Object item : (Iterable<?>) value) {
+                    out.add(toDictionaryMemoryValue(child, item, indices));
+                }
+                yield out;
+            }
+            case Map -> {
+                Field entries = f.getChildren().get(0);
+                Field key = entries.getChildren().get(0);
+                Field val = entries.getChildren().get(1);
+                Map<Object, Object> out = new LinkedHashMap<>();
+                for (Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
+                    out.put(toDictionaryMemoryValue(key, entry.getKey(), indices),
+                            toDictionaryMemoryValue(val, entry.getValue(), indices));
+                }
+                yield out;
+            }
+            case Struct -> {
+                Map<String, Object> row = structValues(value);
+                Map<String, Object> out = new LinkedHashMap<>();
+                for (Field child : f.getChildren()) {
+                    out.put(child.getName(), toDictionaryMemoryValue(
+                            child, row.get(child.getName()), indices));
+                }
+                yield out;
+            }
+            default -> value;
+        };
     }
 
     /** Read a single-row {@link VectorSchemaRoot} into an ordered map keyed by field name. */
@@ -508,7 +750,16 @@ public final class Marshalling {
     private static void writeMapValue(MapWriter w, Field f, Object value) {
         ArrowType ty = f.getType();
         switch (ty.getTypeID()) {
-            case Int -> w.value().bigInt().writeBigInt(((Number) value).longValue());
+            case Int -> {
+                int bits = ((ArrowType.Int) ty).getBitWidth();
+                long lv = ((Number) value).longValue();
+                switch (bits) {
+                    case 8 -> w.value().tinyInt().writeTinyInt((byte) lv);
+                    case 16 -> w.value().smallInt().writeSmallInt((short) lv);
+                    case 32 -> w.value().integer().writeInt((int) lv);
+                    default -> w.value().bigInt().writeBigInt(lv);
+                }
+            }
             case Utf8 -> {
                 byte[] bytes = ((String) value).getBytes(StandardCharsets.UTF_8);
                 try (var buf = farm.query.vgirpc.wire.Allocators.root().buffer(bytes.length)) {

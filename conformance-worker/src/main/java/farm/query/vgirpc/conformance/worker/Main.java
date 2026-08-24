@@ -211,7 +211,7 @@ public final class Main {
             server = new RpcServer(ConformanceService.class, new ConformanceServiceImpl());
             // Match the Python reference's ConformanceService.protocol_version so the
             // describe conformance suite sees the same MAJOR.MINOR.PATCH label.
-            server.setProtocolVersion("1.0.0");
+            server.setProtocolVersion("2.0.0");
         }
         if (failServeStartOnce) {
             AtomicBoolean first = new AtomicBoolean(true);

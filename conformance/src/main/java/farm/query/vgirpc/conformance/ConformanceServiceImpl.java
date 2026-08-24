@@ -8,7 +8,16 @@ import farm.query.vgirpc.ExchangeState;
 import farm.query.vgirpc.ProducerState;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.log.Level;
+import farm.query.vgirpc.marshal.Marshalling;
+import farm.query.vgirpc.wire.Allocators;
+import farm.query.vgirpc.wire.IpcStreamWriter;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.io.ByteArrayOutputStream;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +47,9 @@ public final class ConformanceServiceImpl implements ConformanceService {
 
     @Override public Optional<String> echo_optional_string(Optional<String> value) { return value; }
     @Override public Optional<Long> echo_optional_int(Optional<Long> value) { return value; }
+    @Override public Optional<Point> echo_optional_point(Optional<Point> point) { return point; }
+    @Override public Optional<Integer> echo_annotated_optional_int(Optional<Integer> value) { return value; }
+    @Override public Integer echo_outer_optional_non_null(Integer value) { return value; }
 
     @Override public Point echo_point(Point point) { return point; }
     @Override public BoundingBox echo_bounding_box(BoundingBox box) { return box; }
@@ -66,6 +78,18 @@ public final class ConformanceServiceImpl implements ConformanceService {
     @Override public ContainerWideTypes echo_container_wide_types(ContainerWideTypes data) { return data; }
     @Override public DeepNested echo_deep_nested(DeepNested data) { return data; }
     @Override public EmbeddedArrow echo_embedded_arrow(EmbeddedArrow data) { return data; }
+    @Override public NestedContainers pack_nested_containers(
+            List<Status> statuses, List<Point> points, Map<String, Status> status_by_name) {
+        return new NestedContainers(
+                statuses,
+                points,
+                status_by_name,
+                statuses,
+                statuses.isEmpty() ? Optional.empty() : Optional.of(statuses.get(0)),
+                points.isEmpty() ? Optional.empty() : Optional.of(points.get(0)),
+                Optional.of(taggedBatchBytes()));
+    }
+    @Override public List<Status> echo_status_list(List<Status> statuses) { return statuses; }
     @Override public String echo_dict_encoded_string(String value) { return value; }
 
     @Override public double add_floats(double a, double b) { return a + b; }
@@ -143,6 +167,29 @@ public final class ConformanceServiceImpl implements ConformanceService {
     }
     @Override public RpcStream<StreamStates.OversizedBatch> produce_oversized_batch(long rows_per_batch) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.OversizedBatch(rows_per_batch));
+    }
+    @Override public RpcStream<StreamStates.TickMetadata> produce_tick_metadata(long count) {
+        return RpcStream.producer(StreamStates.TICK_METADATA_SCHEMA, new StreamStates.TickMetadata(count));
+    }
+
+    private static byte[] taggedBatchBytes() {
+        Schema schema = new Schema(List.of(new Field(
+                "value", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, Allocators.root());
+             ByteArrayOutputStream out = new ByteArrayOutputStream();
+             IpcStreamWriter writer = new IpcStreamWriter(out)) {
+            root.allocateNew();
+            org.apache.arrow.vector.BigIntVector values =
+                    (org.apache.arrow.vector.BigIntVector) root.getVector("value");
+            values.setSafe(0, 1);
+            values.setSafe(1, 2);
+            root.setRowCount(2);
+            writer.writeBatch(root, null);
+            writer.writeEos();
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new RuntimeException("failed to build tagged conformance batch", e);
+        }
     }
 
     @Override public RpcStream<StreamStates.Counter> produce_with_header(long count) {

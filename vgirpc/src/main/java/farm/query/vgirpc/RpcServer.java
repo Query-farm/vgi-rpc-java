@@ -457,6 +457,24 @@ public final class RpcServer {
                     transport.writer().flush();
                     return;
                 }
+                // Application-protocol-version gate. Fires only when the
+                // operator declared a version via setProtocolVersion (empty =
+                // opt out). Placed after method resolution so an unknown method
+                // still reports as unknown, and after the __describe__ /
+                // transport-options short-circuits above — those are the
+                // diagnostic paths a MISMATCHED client uses to discover what the
+                // server expects, so gating them would hide the answer.
+                if (!protocolVersion.isEmpty()) {
+                    ProtocolVersionError pve =
+                            checkProtocolVersion(meta.get(farm.query.vgirpc.wire.Metadata.PROTOCOL_VERSION_KEY));
+                    if (pve != null) {
+                        Schema errorSchema = info.methodType() == MethodType.UNARY
+                                ? info.resultSchema() : RpcStream.EMPTY_SCHEMA;
+                        Wire.writeErrorStream(transport.writer(), errorSchema, pve, serverId);
+                        transport.writer().flush();
+                        return;
+                    }
+                }
                 try {
                     validateParameterContract(method, requestSchema,
                             parameterRows, info.paramsSchema());
@@ -559,15 +577,90 @@ public final class RpcServer {
         for (int i = 0; i < a.size(); i++) {
             Field af = a.get(i);
             Field ef = e.get(i);
-            if (af.equals(ef)) continue;
-            boolean dictUtf8 = af.getDictionary() != null
-                    && af.getName().equals(ef.getName())
-                    && af.isNullable() == ef.isNullable()
-                    && af.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8
-                    && ef.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8;
-            if (!dictUtf8) return false;
+            if (!fieldsCompatible(af, ef)) return false;
         }
         return true;
+    }
+
+    private static boolean fieldsCompatible(Field actual, Field expected) {
+        if (actual.equals(expected)) return true;
+        if (!actual.getName().equals(expected.getName())
+                || actual.isNullable() != expected.isNullable()) return false;
+        boolean dictionaryUtf8 =
+                (actual.getDictionary() != null || expected.getDictionary() != null)
+                && actual.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8
+                && expected.getType() instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8;
+        if (!dictionaryUtf8 && !actual.getType().equals(expected.getType())) return false;
+        if (actual.getChildren().size() != expected.getChildren().size()) return false;
+        for (int i = 0; i < actual.getChildren().size(); i++) {
+            if (!fieldsCompatible(actual.getChildren().get(i), expected.getChildren().get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Validate a client's declared application {@code protocol_version} against
+     * this server's.
+     *
+     * <p>An exact MAJOR.MINOR match is required; PATCH is ignored, so a patch
+     * release on either side stays compatible. Missing and malformed are
+     * mismatches too — a peer that cannot say what it speaks is not a peer that
+     * can be trusted to speak it.</p>
+     *
+     * <p>The message is directional on purpose: "mismatch" alone leaves an
+     * operator with two versions and no idea which side to move. It mirrors
+     * vgi-rpc's Python, Go, Rust and TypeScript servers byte-for-byte, because
+     * the same {@code .test} file asserts against all five.</p>
+     *
+     * @param clientVersion the version the client declared, or {@code null} when it declared none
+     * @return the error to return to the caller, or {@code null} when the versions are compatible
+     */
+    private ProtocolVersionError checkProtocolVersion(String clientVersion) {
+        String head = "VGI client/worker protocol_version mismatch.\n"
+                + "  Client: " + (clientVersion == null ? "<not declared>" : clientVersion) + "\n"
+                + "  Server: " + protocolVersion + "\n"
+                + "  Direction: ";
+        if (clientVersion == null) {
+            return new ProtocolVersionError(head
+                    + "the client did not send a vgi_rpc.protocol_version metadata key. "
+                    + "This is either a vgi-rpc framework bug or a non-VGI client "
+                    + "connecting to a VGI worker.");
+        }
+        int[] client = parseSemver(clientVersion);
+        int[] server = parseSemver(protocolVersion);
+        if (client == null || server == null) {
+            return new ProtocolVersionError(head
+                    + "client sent a malformed protocol_version. "
+                    + "Expected canonical semver MAJOR.MINOR.PATCH.");
+        }
+        if (client[0] == server[0] && client[1] == server[1]) {
+            return null;
+        }
+        boolean clientOlder = client[0] < server[0] || (client[0] == server[0] && client[1] < server[1]);
+        return new ProtocolVersionError(head + (clientOlder
+                ? "client is too old; upgrade the VGI extension/client to a version "
+                        + "supporting protocol_version " + protocolVersion + "."
+                : "server is too old; upgrade the VGI worker to a version "
+                        + "supporting protocol_version " + clientVersion + "."));
+    }
+
+    /** {@code MAJOR.MINOR.PATCH} as three ints, or {@code null} when not canonical semver. */
+    private static int[] parseSemver(String v) {
+        if (v == null) return null;
+        String[] parts = v.split("\\.");
+        if (parts.length != 3) return null;
+        int[] out = new int[3];
+        for (int i = 0; i < 3; i++) {
+            try {
+                out[i] = Integer.parseInt(parts[i]);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+            if (out[i] < 0) return null;
+        }
+        return out;
     }
 
     /** Validate the exact parameter schema/cardinality before handler dispatch. */
@@ -621,7 +714,9 @@ public final class RpcServer {
         Field resultField = schema.getFields().get(0);
         Map<String, Object> row = new LinkedHashMap<>();
         row.put(resultField.getName(), convertResult(result, info.resultType(), resultField));
-        try (VectorSchemaRoot root = Marshalling.encodeRow(schema, row, Allocators.root())) {
+        try (Marshalling.EncodedRow encoded =
+                     Marshalling.encodeRowForWire(schema, row, Allocators.root())) {
+            VectorSchemaRoot root = encoded.root();
             // Prefer the shared-memory side-channel; fall back to external-location,
             // then inline. The client resolves unary-response shm pointers on the
             // FunctionConnection path (ResolveUnaryShm); connections that never
@@ -633,13 +728,14 @@ public final class RpcServer {
                 }
                 return;
             }
-            Externalizer.Pointer ptr = Externalizer.maybeExternalize(root, null, externalConfig);
+            Externalizer.Pointer ptr = Externalizer.maybeExternalize(
+                    root, null, externalConfig, null, encoded.provider());
             if (ptr != null) {
                 try (VectorSchemaRoot pr = ptr.root()) {
-                    w.writeBatch(pr, ptr.customMetadata());
+                    w.writeBatch(pr, ptr.customMetadata(), encoded.provider());
                 }
             } else {
-                w.writeBatch(root, null);
+                w.writeBatch(root, null, encoded.provider());
             }
         }
     }
@@ -871,7 +967,7 @@ public final class RpcServer {
                 if (e.isData() && externalConfig != null && externalConfig.storage() != null) {
                     try {
                         Externalizer.Pointer ptr = Externalizer.maybeExternalize(
-                                e.root(), e.customMetadata(), externalConfig);
+                                e.root(), e.customMetadata(), externalConfig, null, effective);
                         if (ptr != null) {
                             try (VectorSchemaRoot pr = ptr.root()) {
                                 writer.writeBatch(pr, ptr.customMetadata(), effective);
@@ -942,8 +1038,9 @@ public final class RpcServer {
             // Flush buffered init-time log batches into the header IPC stream
             // (matches the Python reference: log batches precede the header batch).
             if (sink != null) sink.bind(w, schema);
-            try (VectorSchemaRoot root = Marshalling.encodeRow(schema, row, Allocators.root())) {
-                w.writeBatch(root, null);
+            try (Marshalling.EncodedRow encoded =
+                         Marshalling.encodeRowForWire(schema, row, Allocators.root())) {
+                w.writeBatch(encoded.root(), null, encoded.provider());
             }
         } finally {
             w.close();

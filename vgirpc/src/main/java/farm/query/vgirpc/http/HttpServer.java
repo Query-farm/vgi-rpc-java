@@ -1959,13 +1959,25 @@ public final class HttpServer {
         for (int i = 0; i < actualFields.size(); i++) {
             Field actualField = actualFields.get(i);
             Field expectedField = expectedFields.get(i);
-            if (actualField.equals(expectedField)) continue;
-            boolean dictionaryUtf8 = actualField.getDictionary() != null
-                    && actualField.getName().equals(expectedField.getName())
-                    && actualField.isNullable() == expectedField.isNullable()
-                    && actualField.getType() instanceof ArrowType.Utf8
-                    && expectedField.getType() instanceof ArrowType.Utf8;
-            if (!dictionaryUtf8) return false;
+            if (!fieldsCompatible(actualField, expectedField)) return false;
+        }
+        return true;
+    }
+
+    private static boolean fieldsCompatible(Field actual, Field expected) {
+        if (actual.equals(expected)) return true;
+        if (!actual.getName().equals(expected.getName())
+                || actual.isNullable() != expected.isNullable()) return false;
+        boolean dictionaryUtf8 =
+                (actual.getDictionary() != null || expected.getDictionary() != null)
+                && actual.getType() instanceof ArrowType.Utf8
+                && expected.getType() instanceof ArrowType.Utf8;
+        if (!dictionaryUtf8 && !actual.getType().equals(expected.getType())) return false;
+        if (actual.getChildren().size() != expected.getChildren().size()) return false;
+        for (int i = 0; i < actual.getChildren().size(); i++) {
+            if (!fieldsCompatible(actual.getChildren().get(i), expected.getChildren().get(i))) {
+                return false;
+            }
         }
         return true;
     }

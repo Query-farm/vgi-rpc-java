@@ -4,6 +4,7 @@
 package farm.query.vgirpc.log;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import farm.query.vgirpc.RpcError;
 import farm.query.vgirpc.wire.Metadata;
 
 import java.io.PrintWriter;
@@ -127,6 +128,7 @@ public final class Message {
      * cross-language conformance tests can match by name.
      */
     private static String mapExceptionType(Throwable t) {
+        if (t instanceof RpcError rpc) return rpc.errorType();
         if (t instanceof IllegalArgumentException) return "ValueError";
         if (t instanceof UnsupportedOperationException) return "NotImplementedError";
         if (t instanceof ClassCastException) return "TypeError";

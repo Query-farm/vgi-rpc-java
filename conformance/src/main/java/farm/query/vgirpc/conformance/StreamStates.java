@@ -13,6 +13,7 @@ import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.wire.Allocators;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.Float8Vector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -39,6 +40,9 @@ final class StreamStates {
     static final Schema COUNTER_SCHEMA = new Schema(List.of(i64("index"), i64("value")));
     static final Schema SCALE_SCHEMA   = new Schema(List.of(f64("value")));
     static final Schema ACCUM_SCHEMA   = new Schema(List.of(f64("running_sum"), i64("exchange_count")));
+    static final Schema TICK_METADATA_SCHEMA = new Schema(List.of(
+            i64("index"),
+            new Field("seen", FieldType.notNullable(new ArrowType.Utf8()), null)));
 
     /** Single int64 column {@code value} — used by the sticky session streams. */
     static final Schema COUNTER_SINGLE_SCHEMA = new Schema(List.of(i64("value")));
@@ -127,6 +131,32 @@ final class StreamStates {
             if (current >= count) { out.finish(); return; }
             out.emit(counterRow(current, current * 10));
             current++;
+        }
+    }
+
+    static final class TickMetadata extends ProducerState {
+        final long count;
+        long current;
+        TickMetadata(long count) { this.count = count; }
+
+        @Override public void produce(OutputCollector out, CallContext ctx) {
+            produce((AnnotatedBatch) null, out, ctx);
+        }
+
+        @Override public void produce(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
+            if (current >= count) { out.finish(); return; }
+            String seen = input != null
+                    ? input.customMetadata().getOrDefault("vgi.conformance.tick", "")
+                    : "";
+            VectorSchemaRoot root = VectorSchemaRoot.create(TICK_METADATA_SCHEMA, Allocators.root());
+            root.allocateNew();
+            ((BigIntVector) root.getVector("index")).setSafe(0, current);
+            ((VarCharVector) root.getVector("seen")).setSafe(
+                    0, seen.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(1);
+            out.emit(root);
+            current++;
+            if (current >= count) out.finish();
         }
     }
 

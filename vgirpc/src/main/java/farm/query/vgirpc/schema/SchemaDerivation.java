@@ -5,6 +5,7 @@ package farm.query.vgirpc.schema;
 
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -50,6 +51,10 @@ public final class SchemaDerivation {
 
     private static final Map<Class<?>, Schema> RECORD_SCHEMA_CACHE = new ConcurrentHashMap<>();
 
+    private static DictionaryEncoding stringDictionary(long id) {
+        return new DictionaryEncoding(id, false, new ArrowType.Int(16, true));
+    }
+
     /**
      * Derive an Arrow schema for an {@link ArrowSerializableRecord} class by walking
      * its record components. Cached. Uses {@code putIfAbsent} rather than
@@ -81,6 +86,46 @@ public final class SchemaDerivation {
         return buildTopLevelField(param.getName(), param.getParameterizedType(), param);
     }
 
+    /**
+     * Re-declare {@code f} as dictionary-encoded when its source is annotated
+     * {@link ArrowFieldType#DICT_INT16_UTF8}, or return it unchanged.
+     *
+     * <p>{@link ArrowFieldType#DICT_INT16_UTF8} maps to a bare {@code Utf8}
+     * arrow type, so on its own the annotation is only a marker: the derived
+     * field says plain utf8 and the batch carries plain utf8. That is fine for
+     * a reader, which resolves either — and wrong for a WRITER talking to a peer
+     * that validates its parameter contract, which is what a Python worker does.
+     * Every Java-client call of a method with such a parameter was rejected with
+     * "expected Arrow type dictionary&lt;values=string, indices=int16&gt; but the
+     * request batch carried string".</p>
+     *
+     * <p>Applied to PARAMETERS only. Result columns carry the same annotation and
+     * are deliberately left as plain utf8: every VGI reader resolves either
+     * encoding, no peer validates a result schema this strictly, and encoding
+     * them would mean threading a dictionary provider through every result and
+     * stream write path for no correctness gain.</p>
+     *
+     * @param f  the derived field
+     * @param annSource the parameter the field came from
+     * @param id the dictionary id, unique within this schema
+     * @return {@code f}, or a dictionary-encoded re-declaration of it
+     */
+    public static Field withParameterDictionary(Field f, AnnotatedElement annSource, long id) {
+        ArrowField override = annSource.getAnnotation(ArrowField.class);
+        if (override == null || override.value() != ArrowFieldType.DICT_INT16_UTF8) return f;
+        DictionaryEncoding enc = new DictionaryEncoding(id, /*ordered=*/false,
+                new ArrowType.Int(16, /*isSigned=*/true));
+        return new Field(f.getName(),
+                new FieldType(f.isNullable(), f.getType(), enc, f.getMetadata()),
+                f.getChildren());
+    }
+
+    /** @return true when {@code annSource} asks for a dictionary-encoded column. */
+    public static boolean wantsParameterDictionary(AnnotatedElement annSource) {
+        ArrowField override = annSource.getAnnotation(ArrowField.class);
+        return override != null && override.value() == ArrowFieldType.DICT_INT16_UTF8;
+    }
+
     /** Build a Field for the (single) result column of a unary method, named "result". */
     public static Field buildResultField(Method m) {
         Type returnType = m.getGenericReturnType();
@@ -97,7 +142,9 @@ public final class SchemaDerivation {
         Type unwrapped = unwrapOptional(type);
         ArrowField override = annSource.getAnnotation(ArrowField.class);
         if (override != null) {
-            return new Field(name, new FieldType(nullable, override.value().arrowType(), null),
+            DictionaryEncoding dictionary = override.value() == ArrowFieldType.DICT_INT16_UTF8
+                    ? stringDictionary(0) : null;
+            return new Field(name, new FieldType(nullable, override.value().arrowType(), dictionary),
                     Collections.emptyList());
         }
         Class<?> raw = rawClass(unwrapped);
@@ -161,7 +208,9 @@ public final class SchemaDerivation {
                 children = childFields(unwrapped);
             }
         }
-        FieldType ft = new FieldType(nullable, arrowType, /*dictionary=*/null);
+        DictionaryEncoding dictionary = rawClass(unwrapped).isEnum()
+                ? stringDictionary(0) : null;
+        FieldType ft = new FieldType(nullable, arrowType, dictionary);
         return new Field(name, ft, children);
     }
 
@@ -174,8 +223,10 @@ public final class SchemaDerivation {
                 return new Field(name, new FieldType(true, new ArrowType.List(), null), List.of(inner));
             }
         }
+        DictionaryEncoding dictionary = override.value() == ArrowFieldType.DICT_INT16_UTF8
+                ? stringDictionary(0) : null;
         return new Field(name,
-                new FieldType(true, override.value().arrowType(), null),
+                new FieldType(true, override.value().arrowType(), dictionary),
                 Collections.emptyList());
     }
 
@@ -265,7 +316,7 @@ public final class SchemaDerivation {
                 Field elem = buildField("item", args[0], NO_ANNS);
                 // Lists in Arrow conventionally name the child "item" with nullable=true.
                 Field nullable = new Field("item",
-                        new FieldType(true, elem.getType(), null),
+                        new FieldType(true, elem.getType(), elem.getDictionary()),
                         elem.getChildren());
                 return List.of(nullable);
             }
@@ -275,7 +326,7 @@ public final class SchemaDerivation {
                 Field keyNonNull = new Field("key",
                         new FieldType(false, key.getType(), null), key.getChildren());
                 Field valNullable = new Field("value",
-                        new FieldType(true, val.getType(), null), val.getChildren());
+                        new FieldType(true, val.getType(), val.getDictionary()), val.getChildren());
                 Field entries = new Field("entries",
                         new FieldType(false, new ArrowType.Struct(), null),
                         List.of(keyNonNull, valNullable));

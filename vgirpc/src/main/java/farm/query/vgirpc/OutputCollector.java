@@ -134,12 +134,14 @@ public final class OutputCollector {
      * @param customMetadata custom metadata to attach, or {@code null}
      * @param dictionaryProvider dictionaries for {@code root}'s dict-encoded
      *     fields, or {@code null} when there are none
-     * @throws IllegalStateException if a data batch was already emitted this tick
+     * @throws RpcError with type {@code ProtocolError} if a data batch was
+     *     already emitted this tick
      */
     public void emit(VectorSchemaRoot root, Map<String, String> customMetadata,
                        DictionaryProvider dictionaryProvider) {
         if (dataIdx >= 0) {
-            throw new IllegalStateException("only one data batch may be emitted per call");
+            throw new RpcError("ProtocolError",
+                    "only one data batch may be emitted per stream turn", "");
         }
         dataIdx = entries.size();
         entries.add(new Entry(root, customMetadata, true, dictionaryProvider));

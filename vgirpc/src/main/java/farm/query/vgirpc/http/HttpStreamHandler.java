@@ -691,7 +691,7 @@ public final class HttpStreamHandler {
                 // replacing it. That makes this the one error the transport must
                 // not advertise with X-VGI-RPC-Error — a client that believes it
                 // stops reading at the header stream's end-of-stream and never
-                // sees this batch. Matches the reference, whose producer loop
+                // sees this batch. Matches the reference, whose producer turn
                 // leaves the response status at a plain 200 here.
                 CallOutcome.suppressResponseFlag();
             }
@@ -737,8 +737,9 @@ public final class HttpStreamHandler {
         try {
             w.writeSchema(schema);
             sink.bind(w, schema);
-            try (VectorSchemaRoot root = Marshalling.encodeRow(schema, row, Allocators.root())) {
-                w.writeBatch(root, null);
+            try (Marshalling.EncodedRow encoded =
+                         Marshalling.encodeRowForWire(schema, row, Allocators.root())) {
+                w.writeBatch(encoded.root(), null, encoded.provider());
             }
         } finally {
             w.close();
@@ -867,10 +868,10 @@ public final class HttpStreamHandler {
                                    Map<String, String> meta, DictionaryProvider dicts,
                                    boolean isData) throws IOException {
         ExternalLocationConfig cfg = rpc.externalConfig();
-        if (isData && dicts == null && cfg != null && cfg.storage() != null) {
+        if (isData && cfg != null && cfg.storage() != null) {
             Externalizer.Pointer ptr;
             try {
-                ptr = Externalizer.maybeExternalize(root, meta, cfg, outputSchema);
+                ptr = Externalizer.maybeExternalize(root, meta, cfg, outputSchema, dicts);
             } catch (ExternalizedResponseCapExceededException cap) {
                 // A refusal, not a failure — see Externalizer's docs.
                 throw cap;
@@ -881,7 +882,7 @@ public final class HttpStreamHandler {
             }
             if (ptr != null) {
                 try (VectorSchemaRoot pointer = ptr.root()) {
-                    w.writeBatch(pointer, ptr.customMetadata());
+                    w.writeBatch(pointer, ptr.customMetadata(), dicts);
                 }
                 return;
             }

@@ -334,8 +334,12 @@ public final class Wire {
                     w.writeBatch(zero, meta);
                 }
             } else {
-                try (VectorSchemaRoot root = Marshalling.encodeRow(paramsSchema, kwargs, Allocators.root())) {
-                    w.writeBatch(root, meta);
+                // See ClientMarshalling.writeRequest: a dictionary-encoded
+                // parameter needs its dictionary batch written beside it.
+                try (Marshalling.EncodedRow enc =
+                             Marshalling.encodeRowForWire(paramsSchema, kwargs, Allocators.root())) {
+                    if (enc.provider() != null) w.writeBatch(enc.root(), meta, enc.provider());
+                    else w.writeBatch(enc.root(), meta);
                 }
             }
         }

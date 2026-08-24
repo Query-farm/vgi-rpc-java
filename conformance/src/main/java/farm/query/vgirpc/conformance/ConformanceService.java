@@ -9,6 +9,8 @@ import farm.query.vgirpc.ProducerState;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.schema.ArrowField;
 import farm.query.vgirpc.schema.ArrowFieldType;
+import farm.query.vgirpc.schema.Nullable;
+import farm.query.vgirpc.schema.ProtocolVersion;
 import farm.query.vgirpc.schema.StreamHeader;
 
 import java.util.List;
@@ -25,6 +27,7 @@ import java.util.Optional;
  * wire (the framework binds kwargs by parameter name), so do not normalise them
  * to Java {@code camelCase}.</p>
  */
+@ProtocolVersion("2.0.0")
 public interface ConformanceService {
 
     // --- Scalar echo --------------------------------------------------------
@@ -58,6 +61,14 @@ public interface ConformanceService {
 
     Optional<String> echo_optional_string(Optional<String> value);
     Optional<Long> echo_optional_int(Optional<Long> value);
+    Optional<Point> echo_optional_point(Optional<Point> point);
+
+    @Nullable @ArrowField(ArrowFieldType.INT32)
+    Optional<Integer> echo_annotated_optional_int(
+            @Nullable @ArrowField(ArrowFieldType.INT32) Optional<Integer> value);
+
+    @ArrowField(ArrowFieldType.INT32)
+    Integer echo_outer_optional_non_null(@ArrowField(ArrowFieldType.INT32) Integer value);
 
     // --- Dataclass round-trip -----------------------------------------------
 
@@ -124,6 +135,9 @@ public interface ConformanceService {
     ContainerWideTypes echo_container_wide_types(ContainerWideTypes data);
     DeepNested echo_deep_nested(DeepNested data);
     EmbeddedArrow echo_embedded_arrow(EmbeddedArrow data);
+    NestedContainers pack_nested_containers(
+            List<Status> statuses, List<Point> points, Map<String, Status> status_by_name);
+    List<Status> echo_status_list(List<Status> statuses);
 
     @ArrowField(ArrowFieldType.DICT_INT16_UTF8)
     String echo_dict_encoded_string(@ArrowField(ArrowFieldType.DICT_INT16_UTF8) String value);
@@ -157,6 +171,7 @@ public interface ConformanceService {
     RpcStream<? extends ProducerState> produce_error_mid_stream(long emit_before_error);
     RpcStream<? extends ProducerState> produce_error_on_init();
     RpcStream<? extends ProducerState> produce_oversized_batch(long rows_per_batch);
+    RpcStream<? extends ProducerState> produce_tick_metadata(long count);
 
     // --- Producer streams with headers --------------------------------------
 

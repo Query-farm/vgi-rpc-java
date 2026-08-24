@@ -119,7 +119,7 @@ public final class CallOutcome implements AutoCloseable {
      * away. Suppressing the flag keeps such a client on the streaming reader,
      * which finds the batch exactly where the protocol says it is.
      *
-     * <p>This is also what the Python reference does: its producer loop writes
+     * <p>This is also what the Python reference does: its producer-turn writer writes
      * the error batch and deliberately leaves {@code _current_response_status}
      * at 200, while init-method raises and cap overshoots — both of which
      * <em>replace</em> the body — set it.
