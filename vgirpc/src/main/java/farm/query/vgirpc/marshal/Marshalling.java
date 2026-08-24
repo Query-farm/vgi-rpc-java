@@ -561,6 +561,7 @@ public final class Marshalling {
                     w.varBinary().writeVarBinary(0, bytes.length, buf);
                 }
             }
+            case LargeBinary -> w.largeVarBinary().writeLargeVarBinary((byte[]) e);
             case Date -> w.dateDay().writeDateDay(((Number) e).intValue());
             case Time -> w.timeMicro().writeTimeMicro(((Number) e).longValue());
             case Timestamp -> {
