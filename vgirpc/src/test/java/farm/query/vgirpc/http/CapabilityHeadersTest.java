@@ -68,8 +68,11 @@ final class CapabilityHeadersTest {
     /** Boot a server whose producible codec set is {@code encodings}
      *  ({@code null} = leave unset, i.e. the default set). */
     private void start(List<String> encodings) throws Exception {
-        server = new HttpServer(new RpcServer(EchoService.class, new EchoImpl()),
-                HttpServer.Config.builder().prefix("/vgi").supportedEncodings(encodings).build());
+        startWithConfig(HttpServer.Config.builder().prefix("/vgi").supportedEncodings(encodings));
+    }
+
+    private void startWithConfig(HttpServer.Config.Builder config) throws Exception {
+        server = new HttpServer(new RpcServer(EchoService.class, new EchoImpl()), config.build());
         server.start();
         base = "http://127.0.0.1:" + server.port() + "/vgi";
     }
@@ -191,6 +194,21 @@ final class CapabilityHeadersTest {
                 .header(HttpHeaders.CONTENT_ENCODING, MediaTypes.GZIP)
                 .POST(HttpRequest.BodyPublishers.ofByteArray(gzip(request))));
         assertEquals(200, gzipResp.statusCode());
+    }
+
+    @Test
+    void internal_response_overflow_returns_413_instead_of_partial_arrow() throws Exception {
+        startWithConfig(HttpServer.Config.builder()
+                .prefix("/vgi")
+                .supportedEncodings(List.of())
+                .maxResponseBytes(128));
+
+        HttpResponse<byte[]> resp = post(request(base + "/echo")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(unaryRequest("small"))));
+
+        assertEquals(413, resp.statusCode());
+        assertTrue(new String(resp.body(), java.nio.charset.StandardCharsets.UTF_8)
+                .contains("external-location"));
     }
 
     // ---- helpers ---------------------------------------------------------

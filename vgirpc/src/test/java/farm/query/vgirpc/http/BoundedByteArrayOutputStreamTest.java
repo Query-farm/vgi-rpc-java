@@ -28,6 +28,7 @@ final class BoundedByteArrayOutputStreamTest {
         out.write(0);
         PayloadTooLargeException e = assertThrows(PayloadTooLargeException.class, () -> out.write(0));
         assertTrue(e.getMessage().contains("external-location"));
+        assertEquals(e, out.overflow());
     }
 
     @Test
@@ -45,5 +46,12 @@ final class BoundedByteArrayOutputStreamTest {
         BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(3);
         out.write(new byte[]{1, 2, 3}, 0, 3);
         assertEquals(3, out.size());
+    }
+
+    @Test
+    void http_defaults_leave_response_framing_headroom() {
+        HttpServer.Config defaults = HttpServer.Config.defaults();
+        assertEquals(16L << 20, defaults.maxRequestBytes());
+        assertEquals(64L << 20, defaults.maxResponseBytes());
     }
 }

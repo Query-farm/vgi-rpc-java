@@ -211,7 +211,8 @@ public final class HttpServer {
     private int port;
 
     /**
-     * Defaults: loopback bind, ephemeral port, no prefix, anonymous auth, 1-hour TTL, 16 MiB request/response cap.
+     * Defaults: loopback bind, ephemeral port, no prefix, anonymous auth,
+     * 1-hour TTL, 16 MiB request cap, and 64 MiB internal response ceiling.
      *
      * @param rpc the dispatcher serving the service
      */
@@ -337,10 +338,12 @@ public final class HttpServer {
      * @param authenticator    per-request authenticator; {@code null} = anonymous.
      * @param preHandlers      pre-route handlers run in order before dispatch.
      * @param maxRequestBytes  request body cap; defaults to
-     *                         {@value #DEFAULT_MAX_BYTES} bytes. Oversized requests
+     *                         {@value #DEFAULT_MAX_REQUEST_BYTES} bytes. Oversized requests
      *                         get HTTP 413 — large batches must use the
      *                         external-location protocol instead.
-     * @param maxResponseBytes response body cap; same rationale as request cap.
+     * @param maxResponseBytes internal serialized-response ceiling; defaults to
+     *                         {@value #DEFAULT_MAX_RESPONSE_BYTES} bytes and is
+     *                         distinct from the operator-facing advertised cap.
      * @param idleTimeoutMs    Jetty connector idle timeout in milliseconds.
      * @param zstdLevel        compression level for the {@code zstd}
      *                         Content-Encoding (1=fastest, 22=max). Default
@@ -499,8 +502,20 @@ public final class HttpServer {
         public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
         /** 2 hours — the ceiling Chromium honours for a preflight cache entry. */
         public static final long DEFAULT_CORS_MAX_AGE_SECONDS = 7200;
-        /** 16 MiB applies to both request body and serialized response. */
-        public static final long DEFAULT_MAX_BYTES = 16L << 20;
+        /** 16 MiB request-body ceiling. Larger inputs should use external locations. */
+        public static final long DEFAULT_MAX_REQUEST_BYTES = 16L << 20;
+        /**
+         * 64 MiB internal serialized-response ceiling. This is deliberately
+         * larger than the normal inline payload so Arrow IPC framing has room;
+         * operator-facing wire policy is configured separately.
+         */
+        public static final long DEFAULT_MAX_RESPONSE_BYTES = 64L << 20;
+        /**
+         * Historical shared request/response default, retained for source compatibility.
+         * New code should use the direction-specific constants.
+         */
+        @Deprecated
+        public static final long DEFAULT_MAX_BYTES = DEFAULT_MAX_REQUEST_BYTES;
         /** 30 seconds. */
         public static final long DEFAULT_IDLE_TIMEOUT_MS = 30_000;
         /**
@@ -609,8 +624,8 @@ public final class HttpServer {
             private long tokenTtlSeconds = DEFAULT_TOKEN_TTL_SECONDS;
             private Authenticator authenticator;
             private List<HttpPreHandler> preHandlers = List.of();
-            private long maxRequestBytes = DEFAULT_MAX_BYTES;
-            private long maxResponseBytes = DEFAULT_MAX_BYTES;
+            private long maxRequestBytes = DEFAULT_MAX_REQUEST_BYTES;
+            private long maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES;
             private long idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS;
             private int zstdLevel = DEFAULT_ZSTD_LEVEL;
             /** {@code null} = "unset", resolved to {@link Config#defaultSupportedEncodings()}
@@ -690,14 +705,14 @@ public final class HttpServer {
             /**
              * Request-body size cap in bytes; oversized requests get HTTP 413.
              *
-             * @param maxRequestBytes the cap (default {@value Config#DEFAULT_MAX_BYTES} bytes)
+             * @param maxRequestBytes the cap (default {@value Config#DEFAULT_MAX_REQUEST_BYTES} bytes)
              * @return this builder
              */
             public Builder maxRequestBytes(long maxRequestBytes) { this.maxRequestBytes = maxRequestBytes; return this; }
             /**
              * Response-body size cap in bytes (in-process memory bound).
              *
-             * @param maxResponseBytes the cap (default {@value Config#DEFAULT_MAX_BYTES} bytes)
+             * @param maxResponseBytes the cap (default {@value Config#DEFAULT_MAX_RESPONSE_BYTES} bytes)
              * @return this builder
              */
             public Builder maxResponseBytes(long maxResponseBytes) { this.maxResponseBytes = maxResponseBytes; return this; }
@@ -1478,6 +1493,12 @@ public final class HttpServer {
                  AutoCloseable sessPop = SessionScope.push(scope);
                  InMemoryTransport t = new InMemoryTransport(body, out)) {
                 rpc.serveOne(t);
+                // RpcServer deliberately contains dispatch failures so raw
+                // transports can keep serving. A bounded HTTP writer may have
+                // rejected a response inside that boundary, so surface the
+                // captured overflow here instead of shipping its partial IPC
+                // prefix as a successful response.
+                if (out.overflow() != null) throw out.overflow();
             } catch (PayloadTooLargeException e) {
                 writePayloadTooLarge(resp, e);
                 return;

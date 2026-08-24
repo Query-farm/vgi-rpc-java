@@ -14,6 +14,7 @@ import java.io.ByteArrayOutputStream;
 final class BoundedByteArrayOutputStream extends ByteArrayOutputStream {
 
     private final long limit;
+    private PayloadTooLargeException overflow;
 
     BoundedByteArrayOutputStream(long limit) {
         super(Math.toIntExact(Math.min(limit, 8192)));
@@ -34,8 +35,14 @@ final class BoundedByteArrayOutputStream extends ByteArrayOutputStream {
 
     private void ensureCapacity(int incoming) {
         if ((long) count + incoming > limit) {
-            throw new PayloadTooLargeException("output exceeds " + limit
+            overflow = new PayloadTooLargeException("output exceeds " + limit
                     + " bytes; large batches must use the external-location protocol");
+            throw overflow;
         }
+    }
+
+    /** Returns the overflow captured while a nested dispatcher owned this stream. */
+    PayloadTooLargeException overflow() {
+        return overflow;
     }
 }

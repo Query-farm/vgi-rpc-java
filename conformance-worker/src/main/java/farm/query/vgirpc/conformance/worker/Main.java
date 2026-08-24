@@ -558,7 +558,16 @@ public final class Main {
             cb.maxRequestBytes(maxRequestBytes)
               .advertiseMaxRequestBytes(true);
         }
-        if (maxResponseBytes > 0) cb.advertisedMaxResponseBytes(maxResponseBytes);
+        if (maxResponseBytes > 0) {
+            // The advertised cap is an operator policy checked after the body
+            // is serialized. Keep the internal safety ceiling above it so an
+            // overshoot can be replaced by the protocol's structured error.
+            long internalCeiling = maxResponseBytes > Long.MAX_VALUE / 2
+                    ? Long.MAX_VALUE
+                    : maxResponseBytes * 2;
+            cb.maxResponseBytes(Math.max(HttpServer.Config.DEFAULT_MAX_RESPONSE_BYTES, internalCeiling))
+              .advertisedMaxResponseBytes(maxResponseBytes);
+        }
         if (maxExternalizedResponseBytes > 0)
             cb.advertisedMaxExternalizedResponseBytes(maxExternalizedResponseBytes);
         if (stickyEnabled) {
