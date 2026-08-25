@@ -90,7 +90,14 @@ val java22TestTask = tasks.register<Test>("java22Test") {
     description = "FFM shared-memory tests; requires a JDK >= 22 runtime."
     group = "verification"
     testClassesDirs = java22Test.output.classesDirs
-    classpath = java22Test.runtimeClasspath
+    // java22.output MUST precede the rest of the classpath: a handful of classes (e.g.
+    // farm.query.vgirpc.launcher.PosixLauncherSupport) share their fully-qualified name
+    // between the Java 21 baseline (sourceSets["main"].output) and this Java 22 overlay —
+    // that's the whole point of the multi-release-JAR split — but a plain (non-MRJAR)
+    // test classpath has no version-aware resolution, so classpath ORDER alone decides
+    // which one wins. Without this, java22Test would silently exercise the baseline
+    // no-op/throwing implementation instead of the real FFM-backed one it exists to test.
+    classpath = files(java22.output) + java22Test.runtimeClasspath
     useJUnitPlatform()
     jvmArgs("--add-opens=java.base/java.nio=ALL-UNNAMED", "--enable-native-access=ALL-UNNAMED")
     // ShmResolverTest exercises the shm write/resolve mechanics with small

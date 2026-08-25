@@ -56,6 +56,10 @@ public final class Main {
         long tokenTtl = 0;
         String mode = null;
         String unixPath = null;
+        // Self-shutdown idle timeout for --unix, seconds; 0 = no timeout. Lets this worker double
+        // as a launch:-transport fixture (see docs/launcher-protocol.md's worker CLI surface —
+        // every launcher-managed worker must accept --unix PATH --idle-timeout SEC).
+        double unixIdleTimeoutSeconds = 0;
         // Raw-TCP target: host defaults to loopback; port 0 ⇒ OS auto-selects.
         String tcpHost = "127.0.0.1";
         int tcpPort = 0;
@@ -125,6 +129,7 @@ public final class Main {
             switch (a) {
                 case "--http" -> mode = "http";
                 case "--unix" -> { mode = "unix"; unixPath = c.requireValue(a); }
+                case "--idle-timeout" -> unixIdleTimeoutSeconds = Double.parseDouble(c.requireValue(a));
                 case "--tcp" -> {
                     mode = "tcp";
                     // Accept [HOST:]PORT; a bare PORT keeps the loopback default host.
@@ -288,7 +293,7 @@ public final class Main {
                     // Only require mode denies, so only require mode advertises.
                     httpProof && "require".equals(proofMode),
                     callStateCache, corsOrigins, introspect);
-            case "unix" -> serveUnix(server, Path.of(unixPath));
+            case "unix" -> serveUnix(server, Path.of(unixPath), (long) (unixIdleTimeoutSeconds * 1000));
             case "tcp" -> serveTcp(server, tcpHost, tcpPort);
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
         }
@@ -601,8 +606,8 @@ public final class Main {
         http.join();
     }
 
-    private static void serveUnix(RpcServer server, Path path) throws Exception {
-        UnixSocketTransport.serveForever(path, server);
+    private static void serveUnix(RpcServer server, Path path, long idleTimeoutMs) throws Exception {
+        UnixSocketTransport.serveForever(path, server, idleTimeoutMs);
     }
 
     /**
