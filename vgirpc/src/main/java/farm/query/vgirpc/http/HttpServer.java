@@ -15,6 +15,14 @@ import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.TransportKind;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.SessionLostError;
+import farm.query.vgirpc.identity.PeerAuthenticationPolicy;
+import farm.query.vgirpc.identity.PeerEvidenceSet;
+import farm.query.vgirpc.identity.PeerIdentityProvider;
+import farm.query.vgirpc.identity.PeerIdentityRejectedException;
+import farm.query.vgirpc.identity.PeerIdentityResult;
+import farm.query.vgirpc.identity.PeerIdentityStatus;
+import farm.query.vgirpc.identity.PeerIdentityUnavailableException;
+import farm.query.vgirpc.identity.PeerResolutionContext;
 import farm.query.vgirpc.external.ExternalResponseBudget;
 import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.external.UploadUrlProvider;
@@ -60,6 +68,17 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeoutException;
 
 /**
  * HTTP transport server for {@link RpcServer}. Each request is handled by a
@@ -164,6 +183,11 @@ public final class HttpServer {
     private final RpcServer rpc;
     private final HttpStreamHandler streamHandler;
     private final Authenticator authenticator;
+    private final List<PeerIdentityProvider> peerIdentityProviders;
+    private final PeerAuthenticationPolicy peerAuthenticationPolicy;
+    private final String peerServiceName;
+    private final long peerResolutionTimeoutMs;
+    private final ExecutorService peerIdentityExecutor;
     private final LandingInfo landingInfo;
     private final List<HttpPreHandler> preHandlers;
     private final Server jetty;
@@ -232,6 +256,14 @@ public final class HttpServer {
         this.streamHandler = new HttpStreamHandler(rpc, config.tokenKey(),
                 config.tokenTtlSeconds(), config.maxResponseBytes(), config.callStateCacheMaxEntries());
         this.authenticator = config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
+        this.peerIdentityProviders = config.peerIdentityProviders();
+        this.peerAuthenticationPolicy = config.peerAuthenticationPolicy();
+        this.peerServiceName = config.peerServiceName();
+        this.peerResolutionTimeoutMs = config.peerResolutionTimeoutMs();
+        this.peerIdentityExecutor = peerIdentityProviders.isEmpty() ? null : new ThreadPoolExecutor(
+                0, config.peerProviderConcurrency(), 60L, java.util.concurrent.TimeUnit.SECONDS,
+                new SynchronousQueue<>(), Thread.ofVirtual().name("vgi-peer-identity-", 0).factory(),
+                new ThreadPoolExecutor.AbortPolicy());
         this.landingInfo = config.landingInfo();
         this.preHandlers = config.preHandlers();
         this.prefix = config.prefix();
@@ -496,7 +528,68 @@ public final class HttpServer {
             TokenResolver introspectResolver,
             List<String> introspectPrincipals,
             long introspectTtlSeconds,
-            int introspectRateLimitPerSecond) {
+            int introspectRateLimitPerSecond,
+            List<PeerIdentityProvider> peerIdentityProviders,
+            PeerAuthenticationPolicy peerAuthenticationPolicy,
+            String peerServiceName,
+            long peerResolutionTimeoutMs,
+            int peerProviderConcurrency) {
+
+        /** Source-compatible constructor for the initial peer-identity configuration shape. */
+        public Config(
+                String host, int port, String prefix, byte[] tokenKey, long tokenTtlSeconds,
+                Authenticator authenticator, List<HttpPreHandler> preHandlers,
+                long maxRequestBytes, long maxResponseBytes, long idleTimeoutMs, int zstdLevel,
+                List<String> supportedEncodings, TlsConfig tls, boolean advertiseMaxRequestBytes,
+                UploadUrlProvider uploadUrlProvider, Long maxUploadBytes,
+                long advertisedMaxResponseBytes, long advertisedMaxExternalizedResponseBytes,
+                boolean proxyProofRequired, List<String> proxyAuthHeaders,
+                int callStateCacheMaxEntries, boolean stickyEnabled, long stickyDefaultTtlSeconds,
+                Map<String, String> stickyEchoHeaders, boolean exposeTestDrainAdmin,
+                LandingInfo landingInfo, List<String> corsOrigins, long corsMaxAgeSeconds,
+                TokenResolver introspectResolver, List<String> introspectPrincipals,
+                long introspectTtlSeconds, int introspectRateLimitPerSecond,
+                List<PeerIdentityProvider> peerIdentityProviders,
+                PeerAuthenticationPolicy peerAuthenticationPolicy, String peerServiceName,
+                long peerResolutionTimeoutMs) {
+            this(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator, preHandlers,
+                    maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, supportedEncodings,
+                    tls, advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
+                    advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
+                    proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries, stickyEnabled,
+                    stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin, landingInfo,
+                    corsOrigins, corsMaxAgeSeconds, introspectResolver, introspectPrincipals,
+                    introspectTtlSeconds, introspectRateLimitPerSecond, peerIdentityProviders,
+                    peerAuthenticationPolicy, peerServiceName, peerResolutionTimeoutMs, 64);
+        }
+
+        /**
+         * Source- and binary-compatible constructor from before peer identity
+         * providers were added. New fields take their disabled defaults.
+         */
+        public Config(
+                String host, int port, String prefix, byte[] tokenKey, long tokenTtlSeconds,
+                Authenticator authenticator, List<HttpPreHandler> preHandlers,
+                long maxRequestBytes, long maxResponseBytes, long idleTimeoutMs, int zstdLevel,
+                List<String> supportedEncodings, TlsConfig tls, boolean advertiseMaxRequestBytes,
+                UploadUrlProvider uploadUrlProvider, Long maxUploadBytes,
+                long advertisedMaxResponseBytes, long advertisedMaxExternalizedResponseBytes,
+                boolean proxyProofRequired, List<String> proxyAuthHeaders,
+                int callStateCacheMaxEntries, boolean stickyEnabled, long stickyDefaultTtlSeconds,
+                Map<String, String> stickyEchoHeaders, boolean exposeTestDrainAdmin,
+                LandingInfo landingInfo, List<String> corsOrigins, long corsMaxAgeSeconds,
+                TokenResolver introspectResolver, List<String> introspectPrincipals,
+                long introspectTtlSeconds, int introspectRateLimitPerSecond) {
+            this(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator, preHandlers,
+                    maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, supportedEncodings,
+                    tls, advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
+                    advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
+                    proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries, stickyEnabled,
+                    stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin, landingInfo,
+                    corsOrigins, corsMaxAgeSeconds, introspectResolver, introspectPrincipals,
+                    introspectTtlSeconds, introspectRateLimitPerSecond,
+                    List.of(), null, null, 5_000, 64);
+        }
 
         /** 1 hour. */
         public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
@@ -568,6 +661,7 @@ public final class HttpServer {
             stickyEchoHeaders = stickyEchoHeaders != null ? Map.copyOf(stickyEchoHeaders) : Map.of();
             corsOrigins = corsOrigins != null ? List.copyOf(corsOrigins) : List.of();
             introspectPrincipals = introspectPrincipals != null ? List.copyOf(introspectPrincipals) : List.of();
+            peerIdentityProviders = peerIdentityProviders != null ? List.copyOf(peerIdentityProviders) : List.of();
             supportedEncodings = supportedEncodings != null
                     ? normalizeEncodings(supportedEncodings)
                     : defaultSupportedEncodings();
@@ -595,6 +689,23 @@ public final class HttpServer {
             if (introspectTtlSeconds < 0) throw new IllegalArgumentException("introspectTtlSeconds must be >= 0");
             if (introspectRateLimitPerSecond < 0) {
                 throw new IllegalArgumentException("introspectRateLimitPerSecond must be >= 0");
+            }
+            if (peerResolutionTimeoutMs <= 0) {
+                throw new IllegalArgumentException("peerResolutionTimeoutMs must be > 0");
+            }
+            if (peerProviderConcurrency <= 0) {
+                throw new IllegalArgumentException("peerProviderConcurrency must be > 0");
+            }
+            if (peerProviderConcurrency < peerIdentityProviders.size()) {
+                throw new IllegalArgumentException(
+                        "peerProviderConcurrency must be at least the configured provider count");
+            }
+            java.util.HashSet<String> providerNames = new java.util.HashSet<>();
+            for (PeerIdentityProvider provider : peerIdentityProviders) {
+                if (provider == null || provider.provider() == null || provider.provider().isBlank()
+                        || !providerNames.add(provider.provider())) {
+                    throw new IllegalArgumentException("peer identity providers must have unique non-empty names");
+                }
             }
         }
 
@@ -651,6 +762,11 @@ public final class HttpServer {
             private List<String> introspectPrincipals = List.of();
             private long introspectTtlSeconds = TokenIntrospection.DEFAULT_TTL_SECONDS;
             private int introspectRateLimitPerSecond = TokenIntrospection.DEFAULT_RATE_LIMIT_PER_SECOND;
+            private List<PeerIdentityProvider> peerIdentityProviders = List.of();
+            private PeerAuthenticationPolicy peerAuthenticationPolicy;
+            private String peerServiceName;
+            private long peerResolutionTimeoutMs = 5_000;
+            private int peerProviderConcurrency = 64;
 
             /**
              * Listen address (default {@code "127.0.0.1"}). See {@link Config#host()}.
@@ -695,6 +811,20 @@ public final class HttpServer {
              * @return this builder
              */
             public Builder authenticator(Authenticator authenticator) { this.authenticator = authenticator; return this; }
+            /** Configure off-wire transport-peer evidence providers. */
+            public Builder peerIdentityProviders(List<PeerIdentityProvider> providers) {
+                this.peerIdentityProviders = providers != null ? providers : List.of(); return this;
+            }
+            /** Compose resolved peer evidence with application authentication. */
+            public Builder peerAuthenticationPolicy(PeerAuthenticationPolicy policy) {
+                this.peerAuthenticationPolicy = policy; return this;
+            }
+            /** Logical destination used by destination-scoped identity providers. */
+            public Builder peerServiceName(String serviceName) { this.peerServiceName = serviceName; return this; }
+            /** Total provider-resolution deadline in milliseconds. */
+            public Builder peerResolutionTimeoutMs(long timeoutMs) { this.peerResolutionTimeoutMs = timeoutMs; return this; }
+            /** Maximum provider calls that may remain active after request deadlines. */
+            public Builder peerProviderConcurrency(int limit) { this.peerProviderConcurrency = limit; return this; }
             /**
              * Pre-route handlers run in order before dispatch.
              *
@@ -1014,7 +1144,9 @@ public final class HttpServer {
                         stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
                         landingInfo, corsOrigins, corsMaxAgeSeconds,
                         introspectResolver, introspectPrincipals,
-                        introspectTtlSeconds, introspectRateLimitPerSecond);
+                        introspectTtlSeconds, introspectRateLimitPerSecond,
+                        peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
+                        peerResolutionTimeoutMs, peerProviderConcurrency);
             }
         }
 
@@ -1036,7 +1168,9 @@ public final class HttpServer {
                     stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
                     p, corsOrigins, corsMaxAgeSeconds,
                     introspectResolver, introspectPrincipals,
-                    introspectTtlSeconds, introspectRateLimitPerSecond);
+                    introspectTtlSeconds, introspectRateLimitPerSecond,
+                    peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
+                    peerResolutionTimeoutMs, peerProviderConcurrency);
         }
     }
 
@@ -1069,6 +1203,7 @@ public final class HttpServer {
             jetty.stop();
         } finally {
             if (sessionRegistry != null) sessionRegistry.shutdown();
+            if (peerIdentityExecutor != null) peerIdentityExecutor.shutdownNow();
         }
     }
 
@@ -1126,6 +1261,8 @@ public final class HttpServer {
                     // every route answers an outage the same way. A 401 would tell
                     // every caller to re-authenticate against a service that is
                     // simply down, and invite them to negative-cache the outage.
+                    writeServiceUnavailable(resp, e);
+                } catch (PeerIdentityUnavailableException e) {
                     writeServiceUnavailable(resp, e);
                 } catch (jakarta.servlet.ServletException se) {
                     throw new IOException(se);
@@ -1451,6 +1588,130 @@ public final class HttpServer {
         writeArrowResponse(req, resp, out.toByteArray());
     }
 
+    private record RequestIdentity(AuthContext auth, PeerEvidenceSet evidence) {}
+
+    /** Resolve application auth first, then transport evidence, without credential downgrade. */
+    private RequestIdentity authenticateIdentity(HttpServletRequest req) throws AuthException {
+        AuthContext auth = AuthContext.ANONYMOUS;
+        MissingCredentials missing = null;
+        try {
+            AuthContext resolved = authenticator.authenticate(req);
+            if (resolved != null) auth = resolved;
+        } catch (MissingCredentials e) {
+            if (peerAuthenticationPolicy == null) throw e;
+            missing = e;
+        }
+
+        PeerEvidenceSet evidence = PeerEvidenceSet.EMPTY;
+        if (!peerIdentityProviders.isEmpty()) {
+            // Keep the enforcement budget on the monotonic clock. The wall-clock
+            // deadline remains part of the provider contract (useful for LocalAPI
+            // and proxy calls), but clock adjustments must not lengthen or shorten
+            // the server's actual wait.
+            long startedNanos = System.nanoTime();
+            long timeoutNanos = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(peerResolutionTimeoutMs);
+            Instant deadline = Instant.now().plusMillis(peerResolutionTimeoutMs);
+            Map<String, List<String>> headers = new LinkedHashMap<>();
+            Enumeration<String> names = req.getHeaderNames();
+            if (names != null) {
+                while (names.hasMoreElements()) {
+                    String name = names.nextElement();
+                    headers.put(name, Collections.list(req.getHeaders(name)));
+                }
+            }
+            PeerResolutionContext context = new PeerResolutionContext(
+                    "http",
+                    req.getRemoteAddr(),
+                    formatEndpoint(req.getRemoteAddr(), req.getRemotePort()),
+                    null,
+                    formatEndpoint(req.getLocalAddr(), req.getLocalPort()),
+                    req.getHeader("Host"),
+                    peerServiceName,
+                    headers,
+                    Map.of("remote_addr", req.getRemoteAddr(), "request_uri", req.getRequestURI()),
+                    deadline);
+            List<Callable<PeerIdentityResult>> tasks = peerIdentityProviders.stream()
+                    .<Callable<PeerIdentityResult>>map(provider -> () -> {
+                        PeerIdentityResult result;
+                        try {
+                            result = provider.resolve(context);
+                        } catch (PeerIdentityRejectedException e) {
+                            return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.INVALID, List.of());
+                        } catch (PeerIdentityUnavailableException e) {
+                            return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.UNAVAILABLE, List.of());
+                        } catch (RuntimeException e) {
+                            throw new IllegalStateException("peer identity provider failed");
+                        }
+                        if (result == null || !provider.provider().equals(result.provider())) {
+                            throw new IllegalStateException("peer identity provider result mismatch");
+                        }
+                        return result;
+            }).toList();
+            try {
+                List<Future<PeerIdentityResult>> futures = new ArrayList<>(tasks.size());
+                List<PeerIdentityResult> results = new ArrayList<>(tasks.size());
+                for (int index = 0; index < tasks.size(); index++) {
+                    try {
+                        futures.add(peerIdentityExecutor.submit(tasks.get(index)));
+                        results.add(null);
+                    } catch (RejectedExecutionException e) {
+                        futures.add(null);
+                        results.add(new PeerIdentityResult(peerIdentityProviders.get(index).provider(),
+                                PeerIdentityStatus.UNAVAILABLE, List.of()));
+                    }
+                }
+                for (int index = 0; index < futures.size(); index++) {
+                    Future<PeerIdentityResult> future = futures.get(index);
+                    if (future == null) continue;
+                    long elapsedNanos = System.nanoTime() - startedNanos;
+                    long remainingNanos = Math.max(0L, timeoutNanos - elapsedNanos);
+                    try {
+                        if (future.isDone()) {
+                            results.set(index, future.get());
+                        } else if (remainingNanos == 0L) {
+                            future.cancel(true);
+                            results.set(index, new PeerIdentityResult(peerIdentityProviders.get(index).provider(),
+                                    PeerIdentityStatus.UNAVAILABLE, List.of()));
+                        } else {
+                            results.set(index, future.get(remainingNanos,
+                                    java.util.concurrent.TimeUnit.NANOSECONDS));
+                        }
+                    } catch (TimeoutException e) {
+                        future.cancel(true);
+                        results.set(index, new PeerIdentityResult(peerIdentityProviders.get(index).provider(),
+                                PeerIdentityStatus.UNAVAILABLE, List.of()));
+                    } catch (ExecutionException e) {
+                        throw new IllegalStateException("peer identity provider failed");
+                    }
+                }
+                evidence = new PeerEvidenceSet(results);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new PeerIdentityUnavailableException("peer identity resolution interrupted");
+            }
+        }
+
+        if (peerAuthenticationPolicy != null) {
+            try {
+                auth = peerAuthenticationPolicy.evaluate(evidence, auth);
+            } catch (PeerIdentityRejectedException e) {
+                throw new InvalidCredentials("peer identity rejected");
+            } catch (PeerIdentityUnavailableException e) {
+                throw new PeerIdentityUnavailableException(
+                        "peer identity unavailable", e.retryAfterSeconds());
+            } catch (RuntimeException e) {
+                throw new IllegalStateException("peer identity policy failed");
+            }
+        }
+        if (missing != null && (auth == null || !auth.authenticated())) throw missing;
+        return new RequestIdentity(auth != null ? auth : AuthContext.ANONYMOUS, evidence);
+    }
+
+    private static String formatEndpoint(String address, int port) {
+        if (address == null) return null;
+        return (address.indexOf(':') >= 0 ? "[" + address + "]" : address) + ":" + port;
+    }
+
     private void handleUnary(HttpServletRequest req, HttpServletResponse resp, String method) throws IOException {
         byte[] body;
         try {
@@ -1462,13 +1723,14 @@ public final class HttpServer {
             writeUnsupportedEncoding(resp, e);
             return;
         }
-        AuthContext auth;
+        RequestIdentity identity;
         try {
-            auth = authenticator.authenticate(req);
+            identity = authenticateIdentity(req);
         } catch (AuthException e) {
             writeUnauthorized(resp, e);
             return;
         }
+        AuthContext auth = identity.auth();
 
         try {
             validateDispatchRequest(body, method);
@@ -1489,7 +1751,7 @@ public final class HttpServer {
         BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         Map<String, Object> md = buildTransportMetadata(req);
         try {
-            try (AutoCloseable authPop = AuthScope.push(auth, md);
+            try (AutoCloseable authPop = AuthScope.push(auth, md, identity.evidence());
                  AutoCloseable sessPop = SessionScope.push(scope);
                  InMemoryTransport t = new InMemoryTransport(body, out)) {
                 rpc.serveOne(t);
@@ -1534,7 +1796,7 @@ public final class HttpServer {
      *  with a uniform message when a {@code VGI-Session} header was
      *  presented but doesn't match a live registry entry (no probing). */
     private SessionScope buildSessionScope(HttpServletRequest req, AuthContext auth) {
-        String principal = auth != null && auth.principal() != null ? auth.principal() : "";
+        String principal = stickyTokenIdentity(auth);
         String principalKey = computePrincipalKey(auth);
         boolean optIn = "true".equalsIgnoreCase(req.getHeader(StickyHeaders.SESSION_ACCEPT));
         SessionScope scope = new SessionScope(optIn, stickyEnabled, principalKey, principal,
@@ -1575,10 +1837,22 @@ public final class HttpServer {
     }
 
     private static String computePrincipalKey(AuthContext auth) {
-        if (auth == null || !auth.authenticated()) return "\0anonymous";
+        String binding = Tokens.evidenceBinding(auth);
+        if (auth == null || !auth.authenticated()) {
+            return binding != null ? "\0anonymous\0" + binding : "\0anonymous";
+        }
         String domain = auth.domain() != null ? auth.domain() : "";
         String principal = auth.principal() != null ? auth.principal() : "";
-        return "\1" + domain + "\0" + principal;
+        String key = "\1" + domain + "\0" + principal;
+        return binding != null ? key + "\0" + binding : key;
+    }
+
+    private static String stickyTokenIdentity(AuthContext auth) {
+        String principal = auth != null && auth.principal() != null ? auth.principal() : "";
+        String binding = Tokens.evidenceBinding(auth);
+        if (binding == null) return principal;
+        String domain = auth != null && auth.domain() != null ? auth.domain() : "";
+        return "\1" + domain + "\0" + principal + "\0" + binding;
     }
 
     /** Mint response headers for sticky-session opens / closes. */
@@ -1620,9 +1894,11 @@ public final class HttpServer {
             return;
         }
         AuthContext auth;
-        try { auth = authenticator.authenticate(req); }
-        catch (AuthException e) { resp.setStatus(HttpServletResponse.SC_OK); return; }
-        String principal = auth != null && auth.principal() != null ? auth.principal() : "";
+        try { auth = authenticateIdentity(req).auth(); }
+        catch (AuthException | PeerIdentityUnavailableException e) {
+            resp.setStatus(HttpServletResponse.SC_OK); return;
+        }
+        String principal = stickyTokenIdentity(auth);
         String principalKey = computePrincipalKey(auth);
         try {
             SessionToken parsed = SessionToken.unpack(
@@ -1672,7 +1948,7 @@ public final class HttpServer {
         }
         AuthContext auth;
         try {
-            auth = authenticator.authenticate(req);
+            auth = authenticateIdentity(req).auth();
         } catch (AuthException e) {
             auth = AuthContext.ANONYMOUS;
         }
@@ -1687,6 +1963,15 @@ public final class HttpServer {
      * "I could not find out", which a caller must retry instead.
      */
     private static void writeServiceUnavailable(HttpServletResponse resp, AuthUnavailableException e)
+            throws IOException {
+        resp.setHeader("Retry-After", Integer.toString(e.retryAfterSeconds()));
+        resp.setHeader("Cache-Control", "no-store");
+        writeJson(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, Map.of(
+                "error", "service_unavailable",
+                "detail", e.getMessage() != null ? e.getMessage() : ""));
+    }
+
+    private static void writeServiceUnavailable(HttpServletResponse resp, PeerIdentityUnavailableException e)
             throws IOException {
         resp.setHeader("Retry-After", Integer.toString(e.retryAfterSeconds()));
         resp.setHeader("Cache-Control", "no-store");
@@ -2236,13 +2521,14 @@ public final class HttpServer {
             writeUnsupportedEncoding(resp, e);
             return;
         }
-        AuthContext auth;
+        RequestIdentity identity;
         try {
-            auth = authenticator.authenticate(req);
+            identity = authenticateIdentity(req);
         } catch (AuthException e) {
             writeUnauthorized(resp, e);
             return;
         }
+        AuthContext auth = identity.auth();
 
         if (init) {
             try {
@@ -2264,7 +2550,7 @@ public final class HttpServer {
         byte[] out;
         Map<String, Object> md = buildTransportMetadata(req);
         try {
-            try (AutoCloseable authPop = AuthScope.push(auth, md);
+            try (AutoCloseable authPop = AuthScope.push(auth, md, identity.evidence());
                  AutoCloseable sessPop = SessionScope.push(scope)) {
                 out = init ? streamHandler.handleInit(method, body) : streamHandler.handleExchange(method, body);
             } catch (PayloadTooLargeException e) {

@@ -5,6 +5,7 @@ package farm.query.vgirpc;
 
 import farm.query.vgirpc.http.SessionRegistry;
 import farm.query.vgirpc.http.SessionScope;
+import farm.query.vgirpc.identity.PeerEvidenceSet;
 import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.log.Message;
 
@@ -20,6 +21,7 @@ import java.util.function.Consumer;
 public final class CallContext {
 
     private final AuthContext auth;
+    private final PeerEvidenceSet peerEvidence;
     private final Consumer<Message> emitClientLog;
     private final Map<String, Object> transportMetadata;
     private final String serverId;
@@ -76,7 +78,22 @@ public final class CallContext {
                        String protocolName,
                        String requestId,
                        TransportKind kind) {
+        this(auth, emitClientLog, transportMetadata, serverId, methodName,
+                protocolName, requestId, kind, PeerEvidenceSet.EMPTY);
+    }
+
+    /** Create a context including its immutable off-wire peer evidence snapshot. */
+    public CallContext(AuthContext auth,
+                       Consumer<Message> emitClientLog,
+                       Map<String, Object> transportMetadata,
+                       String serverId,
+                       String methodName,
+                       String protocolName,
+                       String requestId,
+                       TransportKind kind,
+                       PeerEvidenceSet peerEvidence) {
         this.auth = auth != null ? auth : AuthContext.ANONYMOUS;
+        this.peerEvidence = peerEvidence != null ? peerEvidence : PeerEvidenceSet.EMPTY;
         this.emitClientLog = emitClientLog;
         this.transportMetadata = transportMetadata != null
                 ? Collections.unmodifiableMap(transportMetadata)
@@ -94,6 +111,8 @@ public final class CallContext {
      * @return the caller's {@link AuthContext}; {@link AuthContext#ANONYMOUS} if unauthenticated
      */
     public AuthContext auth() { return auth; }
+    /** Verified or observed transport-peer evidence; empty when disabled. */
+    public PeerEvidenceSet peerEvidence() { return peerEvidence; }
     /**
      * Transport-level request metadata (e.g. {@code remote_addr} on HTTP).
      *

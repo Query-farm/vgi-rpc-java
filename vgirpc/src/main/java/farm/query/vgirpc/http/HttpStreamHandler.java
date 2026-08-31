@@ -398,7 +398,8 @@ public final class HttpStreamHandler {
             if (tokenB64 == null) {
                 return errorStream(new RuntimeException("Missing state token in exchange request"));
             }
-            String principal = currentPrincipal();
+            AuthContext auth = currentAuth();
+            String cacheIdentity = Tokens.cacheIdentity(auth);
             // Open the cursor FIRST: its AEAD tag covers the call id and its
             // AAD covers the caller, so the id is authenticated before it is
             // used to resolve anything. See resolveCall for why that ordering
@@ -406,13 +407,13 @@ public final class HttpStreamHandler {
             StateToken token;
             try {
                 token = StateToken.unpack(tokenB64.getBytes(StandardCharsets.US_ASCII),
-                        tokenKey, tokenTtlSeconds, principal);
+                        tokenKey, tokenTtlSeconds, auth);
             } catch (Exception e) {
                 return errorStream(e);
             }
             CallToken call;
             try {
-                call = resolveCall(token, req.meta().get(Metadata.CALL_STATE), principal);
+                call = resolveCall(token, req.meta().get(Metadata.CALL_STATE), auth, cacheIdentity);
             } catch (Exception e) {
                 return errorStream(e);
             }
@@ -428,7 +429,7 @@ public final class HttpStreamHandler {
                 // decode without the server's token key.
                 onTurn(turn, i -> i.requestState = token.state());
                 try {
-                    return runExchange(method, effectiveRequest, actualInput, token, call, principal, inputDicts, turn);
+                    return runExchange(method, effectiveRequest, actualInput, token, call, auth, inputDicts, turn);
                 } catch (Throwable t) {
                     if (turn != null) turn.thrown = t;
                     throw t;
@@ -443,7 +444,7 @@ public final class HttpStreamHandler {
 
     /** The body of {@code /exchange}, wrapped by {@link #handleExchange}'s telemetry. */
     private byte[] runExchange(String method, ExchangeRequest req, VectorSchemaRoot ownedInput,
-                                StateToken token, CallToken call, String principal,
+                                StateToken token, CallToken call, AuthContext auth,
                                 DictionaryProvider inputDicts, StreamTurn turn) throws Exception {
         Class<? extends StreamState> stateCls = stateTypes.get(method);
         if (stateCls == null) {
@@ -494,7 +495,7 @@ public final class HttpStreamHandler {
                 // diagnosable for the same worker code.
                 return errorStream(t, sink);
             }
-            return writeExchangeResponse(collector, state, token, outputSchema, isProducer, principal,
+            return writeExchangeResponse(collector, state, token, outputSchema, isProducer, auth,
                     inputDicts, turn, sink);
         }
     }
@@ -532,13 +533,13 @@ public final class HttpStreamHandler {
     }
 
     private byte[] writeExchangeResponse(OutputCollector collector, StreamState state, StateToken priorToken,
-                                         Schema outputSchema, boolean isProducer, String principal,
+                                         Schema outputSchema, boolean isProducer, AuthContext auth,
                                          DictionaryProvider inputDicts, StreamTurn turn,
                                          OutputCollectorSink sink) throws IOException {
         boolean finished = collector.finished();
         // Absent on the terminal turn: there is no outbound state when the
         // stream closes, which is exactly what its absence in the record means.
-        String newTokenStr = finished ? null : serializeContinuationToken(state, priorToken, principal, turn);
+        String newTokenStr = finished ? null : serializeContinuationToken(state, priorToken, auth, turn);
 
         BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
@@ -584,13 +585,13 @@ public final class HttpStreamHandler {
         return out.toByteArray();
     }
 
-    private String serializeContinuationToken(StreamState state, StateToken priorToken, String principal,
+    private String serializeContinuationToken(StreamState state, StateToken priorToken, AuthContext auth,
                                                StreamTurn turn) {
         byte[] newStateBytes = StateSerializer.serialize(state);
         onTurn(turn, i -> i.responseState = newStateBytes);
         StateToken newToken = new StateToken(newStateBytes, priorToken.callId(),
                 System.currentTimeMillis() / 1000);
-        return new String(newToken.pack(tokenKey, principal), StandardCharsets.US_ASCII);
+        return new String(newToken.pack(tokenKey, auth), StandardCharsets.US_ASCII);
     }
 
     /**
@@ -609,8 +610,9 @@ public final class HttpStreamHandler {
      * token is opened and verified, and its embedded call id must match the
      * one the cursor named.</p>
      */
-    private CallToken resolveCall(StateToken cursor, String callTokenB64, String principal) {
-        CallToken cached = callStates.get(cursor.callId(), principal);
+    private CallToken resolveCall(
+            StateToken cursor, String callTokenB64, AuthContext auth, String cacheIdentity) {
+        CallToken cached = callStates.get(cursor.callId(), cacheIdentity);
         if (cached != null) {
             return cached;
         }
@@ -618,20 +620,20 @@ public final class HttpStreamHandler {
             throw new IllegalArgumentException("Missing call token in exchange request");
         }
         CallToken call = CallToken.unpack(callTokenB64.getBytes(StandardCharsets.US_ASCII),
-                tokenKey, tokenTtlSeconds, principal);
+                tokenKey, tokenTtlSeconds, auth);
         if (!java.util.Arrays.equals(call.callId(), cursor.callId())) {
             // The cursor named a different call. Uniform message: reachable
             // only by pairing two tokens the same principal legitimately
             // holds, so it carries nothing worth distinguishing.
             throw new IllegalArgumentException("Malformed state token");
         }
-        callStates.put(cursor.callId(), principal, call);
+        callStates.put(cursor.callId(), cacheIdentity, call);
         return call;
     }
 
     /** Mint a stream's call id, call token, and first cursor at {@code /init}. */
     private Map<String, String> mintInitTokens(StreamState state, Schema outputSchema,
-                                                Schema inputSchema, String principal,
+                                                Schema inputSchema, AuthContext auth,
                                                 String streamId, StreamTurn turn) {
         byte[] callId = new byte[Tokens.CALL_ID_LEN];
         new java.security.SecureRandom().nextBytes(callId);
@@ -641,29 +643,26 @@ public final class HttpStreamHandler {
                 streamId, callId, now);
         // Warm the cache with what we already hold, so this stream's first
         // continuation does not have to open the token it was just handed.
-        callStates.put(callId, principal, call);
+        callStates.put(callId, Tokens.cacheIdentity(auth), call);
 
         byte[] stateBytes = StateSerializer.serialize(state);
         onTurn(turn, i -> i.responseState = stateBytes);
         StateToken cursor = new StateToken(stateBytes, callId, now);
         return Map.of(
                 Metadata.STREAM_STATE,
-                new String(cursor.pack(tokenKey, principal), StandardCharsets.US_ASCII),
+                new String(cursor.pack(tokenKey, auth), StandardCharsets.US_ASCII),
                 Metadata.CALL_STATE,
-                new String(call.pack(tokenKey, principal), StandardCharsets.US_ASCII));
+                new String(call.pack(tokenKey, auth), StandardCharsets.US_ASCII));
     }
 
     private CallContext buildCallContext(String method, Consumer<Message> sink) {
         AuthScope.Scope scope = AuthScope.current();
         return new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                rpc.serverId(), method, rpc.protocolName(), "", TransportKind.HTTP);
+                rpc.serverId(), method, rpc.protocolName(), "", TransportKind.HTTP, scope.peerEvidence());
     }
 
     /** Principal for state-token key derivation; empty string for anonymous. */
-    private static String currentPrincipal() {
-        String p = AuthScope.current().auth().principal();
-        return p != null ? p : "";
-    }
+    private static AuthContext currentAuth() { return AuthScope.current().auth(); }
 
     // --- Init helpers -----------------------------------------------------
 
@@ -707,7 +706,7 @@ public final class HttpStreamHandler {
                 // client knows to call /exchange to continue. Finished streams just EOS.
                 if (!coll.finished()) {
                     Map<String, String> md = mintInitTokens(state, outputSchema, inputSchema,
-                            currentPrincipal(), streamId, turn);
+                            currentAuth(), streamId, turn);
                     Wire.writeZeroBatch(w, outputSchema, md);
                 }
             }
@@ -720,7 +719,7 @@ public final class HttpStreamHandler {
         Schema outputSchema = streamResult.outputSchema();
         Schema inputSchema = streamResult.inputSchema();
         Map<String, String> md = mintInitTokens(streamResult.state(), outputSchema, inputSchema,
-                currentPrincipal(), streamId, turn);
+                currentAuth(), streamId, turn);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
             sink.bind(w, outputSchema);

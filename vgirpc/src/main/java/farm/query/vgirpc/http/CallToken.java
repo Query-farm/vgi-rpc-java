@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc.http;
 
+import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.http.auth.Crypto;
 
 import java.nio.ByteBuffer;
@@ -55,6 +56,7 @@ public record CallToken(
      * and a cursor token are not interchangeable even for the same principal.
      */
     private static final byte[] AAD_PREFIX = "vgi_rpc.call.v1\0".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] BOUND_AAD_PREFIX = "vgi_rpc.call.v2\0".getBytes(StandardCharsets.UTF_8);
 
     public CallToken {
         outputSchema = outputSchema.clone();
@@ -69,6 +71,15 @@ public record CallToken(
 
     /** Serialise, AEAD-seal, and base64-encode the token. */
     public byte[] pack(byte[] tokenKey, String principal) {
+        return packWithAad(tokenKey, Tokens.aad(AAD_PREFIX, principal));
+    }
+
+    /** Seal using domain, principal, and peer-evidence binding when present. */
+    public byte[] pack(byte[] tokenKey, AuthContext auth) {
+        return packWithAad(tokenKey, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth));
+    }
+
+    private byte[] packWithAad(byte[] tokenKey, byte[] aad) {
         byte[] streamIdBytes = streamId.getBytes(StandardCharsets.UTF_8);
         int payloadLen = 8 + Tokens.CALL_ID_LEN
                 + 4 + outputSchema.length
@@ -81,7 +92,7 @@ public record CallToken(
         putSegment(payload, inputSchema);
         putSegment(payload, streamIdBytes);
         byte[] sealed = Crypto.chacha20Poly1305Seal(
-                tokenKey, Tokens.packPayload(payload.array()), Tokens.aad(AAD_PREFIX, principal));
+                tokenKey, Tokens.packPayload(payload.array()), aad);
         byte[] wire = new byte[VERSION_LEN + sealed.length];
         wire[0] = VERSION;
         System.arraycopy(sealed, 0, wire, VERSION_LEN, sealed.length);
@@ -95,6 +106,15 @@ public record CallToken(
      * when {@code ttlSeconds <= 0}.
      */
     public static CallToken unpack(byte[] b64, byte[] tokenKey, long ttlSeconds, String principal) {
+        return unpackWithAad(b64, tokenKey, ttlSeconds, Tokens.aad(AAD_PREFIX, principal));
+    }
+
+    /** Open using domain, principal, and peer-evidence binding when present. */
+    public static CallToken unpack(byte[] b64, byte[] tokenKey, long ttlSeconds, AuthContext auth) {
+        return unpackWithAad(b64, tokenKey, ttlSeconds, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth));
+    }
+
+    private static CallToken unpackWithAad(byte[] b64, byte[] tokenKey, long ttlSeconds, byte[] aad) {
         byte[] raw;
         try {
             raw = Base64.getDecoder().decode(b64);
@@ -112,7 +132,7 @@ public record CallToken(
         System.arraycopy(raw, VERSION_LEN, sealed, 0, sealed.length);
         byte[] opened;
         try {
-            opened = Crypto.chacha20Poly1305Open(tokenKey, sealed, Tokens.aad(AAD_PREFIX, principal));
+            opened = Crypto.chacha20Poly1305Open(tokenKey, sealed, aad);
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("State token signature verification failed", e);
         }

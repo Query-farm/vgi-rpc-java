@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc;
 
+import farm.query.vgirpc.identity.PeerEvidenceSet;
 import java.util.Collections;
 import java.util.Map;
 
@@ -26,17 +27,23 @@ public final class AuthScope {
      * @param auth the authenticated principal for the current request
      * @param transportMetadata per-request transport metadata (e.g. {@code remote_addr})
      */
-    public record Scope(AuthContext auth, Map<String, Object> transportMetadata) {
+    public record Scope(AuthContext auth, Map<String, Object> transportMetadata, PeerEvidenceSet peerEvidence) {
         /** Normalises {@code null} components to anonymous auth and an empty, unmodifiable map. */
         public Scope {
             auth = auth != null ? auth : AuthContext.ANONYMOUS;
             transportMetadata = transportMetadata != null
                     ? Collections.unmodifiableMap(transportMetadata)
                     : Collections.emptyMap();
+            peerEvidence = peerEvidence != null ? peerEvidence : PeerEvidenceSet.EMPTY;
+        }
+
+        /** Source-compatible constructor for transports without peer evidence. */
+        public Scope(AuthContext auth, Map<String, Object> transportMetadata) {
+            this(auth, transportMetadata, PeerEvidenceSet.EMPTY);
         }
     }
 
-    private static final Scope DEFAULT = new Scope(AuthContext.ANONYMOUS, Collections.emptyMap());
+    private static final Scope DEFAULT = new Scope(AuthContext.ANONYMOUS, Collections.emptyMap(), PeerEvidenceSet.EMPTY);
     private static final ThreadLocal<Scope> CURRENT = ThreadLocal.withInitial(() -> DEFAULT);
 
     private AuthScope() {}
@@ -51,8 +58,14 @@ public final class AuthScope {
      * @return a handle that restores the previously active scope when closed
      */
     public static AutoCloseable push(AuthContext auth, Map<String, Object> transportMetadata) {
+        return push(auth, transportMetadata, PeerEvidenceSet.EMPTY);
+    }
+
+    /** Push authentication, transport metadata, and an immutable peer-evidence snapshot. */
+    public static AutoCloseable push(
+            AuthContext auth, Map<String, Object> transportMetadata, PeerEvidenceSet peerEvidence) {
         Scope previous = CURRENT.get();
-        CURRENT.set(new Scope(auth, transportMetadata));
+        CURRENT.set(new Scope(auth, transportMetadata, peerEvidence));
         return () -> CURRENT.set(previous);
     }
 

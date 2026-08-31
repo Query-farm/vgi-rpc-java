@@ -6,6 +6,7 @@ package farm.query.vgirpc.http;
 import com.github.luben.zstd.Zstd;
 
 import farm.query.vgirpc.http.auth.Crypto;
+import farm.query.vgirpc.AuthContext;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -67,6 +68,7 @@ public record StateToken(
 
     /** Prefix mixed into AEAD AAD to bind tokens to a format generation. */
     private static final byte[] AAD_PREFIX = "vgi_rpc.state.v4\0".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] BOUND_AAD_PREFIX = "vgi_rpc.state.v5\0".getBytes(StandardCharsets.UTF_8);
 
     /** Codec tags for the sealed payload. See {@link #packPayload}. */
     private static final byte CODEC_RAW = 0x00;
@@ -102,12 +104,21 @@ public record StateToken(
      * caller; pass {@code ""} (or {@code null}) for anonymous streams.
      */
     public byte[] pack(byte[] tokenKey, String principal) {
+        return packWithAad(tokenKey, aad(principal));
+    }
+
+    /** Seal using domain, principal, and peer-evidence binding when present. */
+    public byte[] pack(byte[] tokenKey, AuthContext auth) {
+        return packWithAad(tokenKey, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth));
+    }
+
+    private byte[] packWithAad(byte[] tokenKey, byte[] aad) {
         int payloadLen = 8 + Tokens.CALL_ID_LEN + 4 + state.length;
         ByteBuffer payload = ByteBuffer.allocate(payloadLen).order(ByteOrder.LITTLE_ENDIAN);
         payload.putLong(createdAt);
         payload.put(callId);
         putSegment(payload, state);
-        byte[] sealed = Crypto.chacha20Poly1305Seal(tokenKey, packPayload(payload.array()), aad(principal));
+        byte[] sealed = Crypto.chacha20Poly1305Seal(tokenKey, packPayload(payload.array()), aad);
         byte[] wire = new byte[VERSION_LEN + sealed.length];
         wire[0] = VERSION;
         System.arraycopy(sealed, 0, wire, VERSION_LEN, sealed.length);
@@ -123,6 +134,15 @@ public record StateToken(
      * TTL disabled when {@code ttlSeconds <= 0}.
      */
     public static StateToken unpack(byte[] b64, byte[] tokenKey, long ttlSeconds, String principal) {
+        return unpackWithAad(b64, tokenKey, ttlSeconds, aad(principal));
+    }
+
+    /** Open using domain, principal, and peer-evidence binding when present. */
+    public static StateToken unpack(byte[] b64, byte[] tokenKey, long ttlSeconds, AuthContext auth) {
+        return unpackWithAad(b64, tokenKey, ttlSeconds, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth));
+    }
+
+    private static StateToken unpackWithAad(byte[] b64, byte[] tokenKey, long ttlSeconds, byte[] aad) {
         byte[] raw;
         try {
             raw = Base64.getDecoder().decode(b64);
@@ -141,7 +161,7 @@ public record StateToken(
         System.arraycopy(raw, VERSION_LEN, sealed, 0, sealed.length);
         byte[] opened;
         try {
-            opened = Crypto.chacha20Poly1305Open(tokenKey, sealed, aad(principal));
+            opened = Crypto.chacha20Poly1305Open(tokenKey, sealed, aad);
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("State token signature verification failed", e);
         }

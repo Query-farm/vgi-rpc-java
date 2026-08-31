@@ -15,6 +15,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
 import java.util.function.BiConsumer;
+import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -82,6 +83,13 @@ public final class TcpSocketTransport implements RpcTransport {
      */
     public static TcpSocketTransport connect(String host, int port) throws IOException {
         return new TcpSocketTransport(new Socket(host, port));
+    }
+
+    /** Open a TCP connection through an explicit credential-free SOCKS5h proxy. */
+    public static TcpSocketTransport connect(
+            String host, int port, String proxy, Duration connectTimeout) throws IOException {
+        if (proxy == null) return connect(host, port);
+        return new TcpSocketTransport(Socks5h.connect(host, port, proxy, connectTimeout));
     }
 
     /**

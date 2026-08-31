@@ -692,7 +692,7 @@ public final class RpcServer {
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer())) {
             w.writeSchema(schema);
             CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                    serverId, info.name(), protocolName(), "", transportKind);
+                    serverId, info.name(), protocolName(), "", transportKind, scope.peerEvidence());
             sink.bind(w, schema);
             try {
                 Object[] callArgs = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
@@ -755,7 +755,7 @@ public final class RpcServer {
         ClientLogSink sink = new ClientLogSink(serverId);
         AuthScope.Scope scope = AuthScope.current();
         CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                serverId, info.name(), protocolName(), "", transportKind);
+                serverId, info.name(), protocolName(), "", transportKind, scope.peerEvidence());
 
         RpcStream<?> stream = runStreamInit(info, kwargs, ctx, transport);
         if (stream == null) return;  // init failed; error already reported + input drained

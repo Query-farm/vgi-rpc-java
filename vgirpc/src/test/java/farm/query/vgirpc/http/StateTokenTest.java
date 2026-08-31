@@ -3,9 +3,11 @@
 
 package farm.query.vgirpc.http;
 
+import farm.query.vgirpc.AuthContext;
 import org.junit.jupiter.api.Test;
 
 import java.util.Base64;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -27,6 +29,21 @@ final class StateTokenTest {
     private static final byte[] CALL_ID = {
             1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, (byte) 144, (byte) 233, 77, 55, 32
     };
+
+    @Test
+    void peerBoundTokensRejectChangedDigestAndDomain() {
+        AuthContext auth = new AuthContext("oauth", true, "alice",
+                Map.of("peer_evidence_binding", "evidence-digest"));
+        AuthContext changedDigest = new AuthContext("oauth", true, "alice",
+                Map.of("peer_evidence_binding", "other-digest"));
+        AuthContext changedDomain = new AuthContext("other", true, "alice",
+                Map.of("peer_evidence_binding", "evidence-digest"));
+        StateToken token = new StateToken(new byte[]{1}, CALL_ID, System.currentTimeMillis() / 1000);
+        byte[] packed = token.pack(KEY, auth);
+        assertArrayEquals(token.state(), StateToken.unpack(packed, KEY, 30, auth).state());
+        assertThrows(IllegalArgumentException.class, () -> StateToken.unpack(packed, KEY, 30, changedDigest));
+        assertThrows(IllegalArgumentException.class, () -> StateToken.unpack(packed, KEY, 30, changedDomain));
+    }
 
     @Test
     void roundtrips_state_output_input_streamId() {
@@ -290,6 +307,23 @@ final class StateTokenTest {
         byte[] otherId = CALL_ID.clone();
         otherId[0] ^= 0xff;
         assertNull(cache.get(otherId, "alice"), "a different call id must miss");
+    }
+
+    @Test
+    void call_state_cache_identity_includes_domain_and_peer_binding() {
+        CallStateCache cache = new CallStateCache(3600);
+        CallToken call = new CallToken(new byte[]{2}, new byte[]{3}, "sid", CALL_ID, 1_700_000_000L);
+        AuthContext alice = new AuthContext("oauth", true, "alice",
+                Map.of("peer_evidence_binding", "binding-a"));
+        AuthContext changedDomain = new AuthContext("mtls", true, "alice",
+                Map.of("peer_evidence_binding", "binding-a"));
+        AuthContext changedBinding = new AuthContext("oauth", true, "alice",
+                Map.of("peer_evidence_binding", "binding-b"));
+
+        cache.put(CALL_ID, Tokens.cacheIdentity(alice), call);
+        assertNotNull(cache.get(CALL_ID, Tokens.cacheIdentity(alice)));
+        assertNull(cache.get(CALL_ID, Tokens.cacheIdentity(changedDomain)));
+        assertNull(cache.get(CALL_ID, Tokens.cacheIdentity(changedBinding)));
     }
 
     @Test

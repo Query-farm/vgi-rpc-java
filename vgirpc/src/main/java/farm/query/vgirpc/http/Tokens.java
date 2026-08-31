@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc.http;
 
+import farm.query.vgirpc.AuthContext;
 import com.github.luben.zstd.Zstd;
 
 import java.nio.charset.StandardCharsets;
@@ -74,6 +75,42 @@ final class Tokens {
         System.arraycopy(prefix, 0, out, 0, prefix.length);
         System.arraycopy(tail, 0, out, prefix.length, tail.length);
         return out;
+    }
+
+    /** New AAD generation used only when transport evidence contributes a digest. */
+    static byte[] aad(byte[] legacyPrefix, byte[] boundPrefix, AuthContext auth) {
+        String binding = evidenceBinding(auth);
+        if (binding == null) return aad(legacyPrefix, auth != null ? auth.principal() : null);
+        byte[] identity;
+        if (auth == null || !auth.authenticated()) {
+            identity = "\0anonymous".getBytes(StandardCharsets.UTF_8);
+        } else {
+            byte[] domain = (auth.domain() != null ? auth.domain() : "").getBytes(StandardCharsets.UTF_8);
+            byte[] principal = (auth.principal() != null ? auth.principal() : "").getBytes(StandardCharsets.UTF_8);
+            identity = new byte[1 + domain.length + 1 + principal.length];
+            identity[0] = 0x01;
+            System.arraycopy(domain, 0, identity, 1, domain.length);
+            System.arraycopy(principal, 0, identity, 2 + domain.length, principal.length);
+        }
+        byte[] digest = binding.getBytes(StandardCharsets.UTF_8);
+        byte[] out = new byte[boundPrefix.length + identity.length + 1 + digest.length];
+        System.arraycopy(boundPrefix, 0, out, 0, boundPrefix.length);
+        System.arraycopy(identity, 0, out, boundPrefix.length, identity.length);
+        System.arraycopy(digest, 0, out, boundPrefix.length + identity.length + 1, digest.length);
+        return out;
+    }
+
+    static String evidenceBinding(AuthContext auth) {
+        Object value = auth != null ? auth.claims().get("peer_evidence_binding") : null;
+        return value instanceof String text && !text.isEmpty() ? text : null;
+    }
+
+    static String cacheIdentity(AuthContext auth) {
+        String authenticated = auth != null && auth.authenticated() ? "1" : "0";
+        String domain = auth != null && auth.domain() != null ? auth.domain() : "";
+        String principal = auth != null && auth.principal() != null ? auth.principal() : "";
+        String binding = evidenceBinding(auth);
+        return authenticated + "\0" + domain + "\0" + principal + "\0" + (binding != null ? binding : "");
     }
 
     /**
