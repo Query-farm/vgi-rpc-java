@@ -19,9 +19,20 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class MainTest {
+    @Test
+    void parsesRequiredProxyV2QualificationFlags() {
+        Main.Args args = Main.Args.parse(new String[] {
+            "--proxy-protocol-v2", "--trusted-proxy-address", "127.0.0.1"
+        });
+        assertTrue(args.flag("--proxy-protocol-v2"));
+        assertEquals("127.0.0.1", args.required("--trusted-proxy-address"));
+    }
+
     private static Main.Expectation tcpExpectation() {
         return new Main.Expectation(
                 "tailnet:test", "localapi", IdentityAssurance.LOCAL_DAEMON,

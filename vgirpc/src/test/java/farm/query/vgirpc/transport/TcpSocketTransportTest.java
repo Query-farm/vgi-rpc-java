@@ -15,12 +15,17 @@ import farm.query.vgirpc.identity.SubjectStability;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.io.IOException;
+import java.net.Socket;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -197,6 +202,154 @@ final class TcpSocketTransportTest {
     }
 
     @Test
+    @Timeout(20)
+    void timedOutProviderRetainsCapacityUntilItsCallableActuallyExits() throws Exception {
+        AtomicInteger resolutions = new AtomicInteger();
+        AtomicBoolean releaseProvider = new AtomicBoolean();
+        List<farm.query.vgirpc.identity.PeerIdentityStatus> observed =
+                new CopyOnWriteArrayList<>();
+        farm.query.vgirpc.identity.PeerIdentityProvider ignoresInterrupts =
+                new farm.query.vgirpc.identity.PeerIdentityProvider() {
+                    @Override public String provider() { return "ignores-interrupts"; }
+
+                    @Override public PeerIdentityResult resolve(
+                            farm.query.vgirpc.identity.PeerResolutionContext context) {
+                        resolutions.incrementAndGet();
+                        while (!releaseProvider.get()) {
+                            try {
+                                Thread.sleep(10L);
+                            } catch (InterruptedException ignored) {
+                                // Deliberately model an uncooperative provider. Its concurrency
+                                // permit must remain held until this callable really returns.
+                            }
+                        }
+                        return new PeerIdentityResult(provider(),
+                                farm.query.vgirpc.identity.PeerIdentityStatus.UNAVAILABLE);
+                    }
+                };
+        TcpServerOptions options = TcpServerOptions.builder()
+                .peerIdentityProviders(List.of(ignoresInterrupts))
+                .peerAuthenticationPolicy((evidence, auth) -> {
+                    observed.add(evidence.status("ignores-interrupts"));
+                    return auth;
+                })
+                .peerProviderConcurrency(1)
+                .identityResolutionTimeout(Duration.ofMillis(40))
+                .build();
+        AtomicReference<Integer> boundPort = new AtomicReference<>();
+        Thread serverThread = startServer(options, boundPort);
+        int port = awaitBoundPort(boundPort);
+
+        try {
+            try (RpcConnection connection = new RpcConnection(
+                    TcpSocketTransport.connect("127.0.0.1", port))) {
+                assertEquals("first", connection.proxy(EchoService.class).echo("first"));
+            }
+            try (RpcConnection connection = new RpcConnection(
+                    TcpSocketTransport.connect("127.0.0.1", port))) {
+                assertEquals("second", connection.proxy(EchoService.class).echo("second"));
+            }
+
+            assertEquals(1, resolutions.get(),
+                    "the second connection must not start another live provider call");
+            assertEquals(List.of(
+                    farm.query.vgirpc.identity.PeerIdentityStatus.UNAVAILABLE,
+                    farm.query.vgirpc.identity.PeerIdentityStatus.UNAVAILABLE), observed);
+        } finally {
+            releaseProvider.set(true);
+        }
+        serverThread.join(5_000L);
+    }
+
+    @Test
+    @Timeout(20)
+    void proxyV2UsesAssertedSourceAndPreservesFirstVgiBytes() throws Exception {
+        AtomicInteger resolutions = new AtomicInteger();
+        AtomicReference<farm.query.vgirpc.identity.PeerResolutionContext> observed =
+                new AtomicReference<>();
+        var provider = new farm.query.vgirpc.identity.PeerIdentityProvider() {
+            @Override public String provider() { return "test-peer"; }
+            @Override public PeerIdentityResult resolve(
+                    farm.query.vgirpc.identity.PeerResolutionContext context) {
+                resolutions.incrementAndGet();
+                observed.set(context);
+                return PeerIdentityResult.available(new PeerIdentity(
+                        provider(), "proxy_v2", IdentityAssurance.CONFIGURED_PROXY,
+                        "test-issuer", "tcp", PeerSubjectKind.WORKLOAD, "worker-1",
+                        SubjectStability.STABLE, true, Map.of(), Map.of(), false,
+                        "100.64.0.42", context.immediatePeer()));
+            }
+        };
+        TcpServerOptions options = TcpServerOptions.builder()
+                .proxyProtocolV2Required(true)
+                .trustedProxyAddresses(Set.of("127.0.0.1"))
+                .proxyPreambleTimeout(Duration.ofMillis(500))
+                .peerIdentityProviders(List.of(provider))
+                .peerAuthenticationPolicy(PeerAuthenticationPolicies.primary("test-peer"))
+                .build();
+        AtomicReference<Integer> boundPort = new AtomicReference<>();
+        Thread serverThread = startServer(options, boundPort);
+
+        Socket socket = new Socket("127.0.0.1", awaitBoundPort(boundPort));
+        socket.getOutputStream().write(ProxyProtocolV2Test.ipv4(
+                new byte[] {100, 64, 0, 42, 10, 0, 0, 9}, 51_234, 19_400,
+                new byte[] {(byte) 0xee, 0, 1, 7}));
+        socket.getOutputStream().flush();
+        try (RpcConnection connection = new RpcConnection(new TcpSocketTransport(socket))) {
+            EchoService service = connection.proxy(EchoService.class);
+            assertEquals("first:test-peer:available", service.identity(null, "first"));
+            assertEquals("second:test-peer:available", service.identity(null, "second"));
+        }
+
+        var context = observed.get();
+        assertEquals("127.0.0.1", context.immediatePeer());
+        assertTrue(context.sourceEndpoint().startsWith("127.0.0.1:"));
+        assertEquals("100.64.0.42:51234", context.assertedPeer());
+        assertEquals("10.0.0.9:19400", context.destinationAddress());
+        assertEquals("100.64.0.42:51234", context.metadata().get("asserted_peer"));
+        assertEquals(Boolean.TRUE, context.metadata().get("proxy_protocol_v2"));
+        assertEquals(1, resolutions.get());
+        serverThread.join(5_000L);
+    }
+
+    @Test
+    @Timeout(10)
+    void proxyV2RejectsUntrustedPeerBeforeReadingPreamble() throws Exception {
+        TcpServerOptions options = TcpServerOptions.builder()
+                .proxyProtocolV2Required(true)
+                .trustedProxyAddresses(Set.of("192.0.2.1"))
+                .proxyPreambleTimeout(Duration.ofSeconds(2))
+                .build();
+        AtomicReference<Integer> boundPort = new AtomicReference<>();
+        startServer(options, boundPort);
+
+        try (Socket socket = new Socket("127.0.0.1", awaitBoundPort(boundPort))) {
+            socket.setSoTimeout(1_000);
+            assertConnectionClosed(socket);
+        }
+    }
+
+    @Test
+    @Timeout(10)
+    void proxyV2AbsolutePreambleDeadlineStopsSlowloris() throws Exception {
+        TcpServerOptions options = TcpServerOptions.builder()
+                .proxyProtocolV2Required(true)
+                .trustedProxyAddresses(Set.of("127.0.0.1"))
+                .proxyPreambleTimeout(Duration.ofMillis(75))
+                .build();
+        AtomicReference<Integer> boundPort = new AtomicReference<>();
+        startServer(options, boundPort);
+
+        try (Socket socket = new Socket("127.0.0.1", awaitBoundPort(boundPort))) {
+            socket.getOutputStream().write(0x0d);
+            socket.getOutputStream().flush();
+            Thread.sleep(200L);
+            socket.setSoTimeout(1_000);
+            assertConnectionClosed(socket);
+        }
+    }
+
+    @Test
     @Timeout(10)
     void selfExitsAfterIdleTimeoutWithNoConnections() throws Exception {
         RpcServer server = new RpcServer(EchoService.class, new EchoImpl());
@@ -275,6 +428,35 @@ final class TcpSocketTransportTest {
                 boundPort.wait(remainingMs);
             }
             return boundPort.get();
+        }
+    }
+
+    private static Thread startServer(
+            TcpServerOptions options, AtomicReference<Integer> boundPort) {
+        RpcServer server = new RpcServer(EchoService.class, new EchoImpl());
+        Thread serverThread = new Thread(() -> {
+            try {
+                TcpSocketTransport.serveForever("127.0.0.1", 0, server, 200L,
+                        (host, port) -> {
+                            synchronized (boundPort) {
+                                boundPort.set(port);
+                                boundPort.notifyAll();
+                            }
+                        }, options);
+            } catch (IOException ignored) {
+                // The idle watchdog closes the listener.
+            }
+        });
+        serverThread.setDaemon(true);
+        serverThread.start();
+        return serverThread;
+    }
+
+    private static void assertConnectionClosed(Socket socket) throws IOException {
+        try {
+            assertEquals(-1, socket.getInputStream().read());
+        } catch (java.net.SocketException expectedReset) {
+            // A reset is also a prompt fail-closed rejection.
         }
     }
 }

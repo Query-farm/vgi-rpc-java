@@ -44,6 +44,7 @@ final class TailscaleLocalApiProviderTest {
         assertEquals(Map.of("kind", "destination_ip", "value", "100.100.100.100"),
                 first.identities().getFirst().attributes().get("capability_target"));
         assertEquals("100.64.0.1", first.identities().getFirst().sourceAddress());
+        assertEquals("127.0.0.1", first.identities().getFirst().proxyAddress());
     }
 
     @Test void taggedNodeIsThePrincipalAndStatusFailuresRemainDistinct() {

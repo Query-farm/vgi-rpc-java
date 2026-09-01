@@ -178,6 +178,11 @@ public final class Main {
 
     private static void runTcpServer(Args args) throws Exception {
         String issuer = args.required("--issuer");
+        boolean proxyProtocolV2 = args.flag("--proxy-protocol-v2");
+        if (!proxyProtocolV2 && args.optional("--trusted-proxy-address") != null) {
+            throw new IllegalArgumentException(
+                    "--trusted-proxy-address requires --proxy-protocol-v2");
+        }
         var provider = new TailscaleLocalApiProvider(issuer,
                 new TailscaleLocalApiProvider.UnixLocalApiClient(
                         Path.of(args.value("--localapi-socket", "/var/run/tailscale/tailscaled.sock")), null));
@@ -185,7 +190,7 @@ public final class Main {
                 issuer, "localapi", IdentityAssurance.LOCAL_DAEMON,
                 PeerSubjectKind.TAGGED_NODE, SubjectStability.STABLE,
                 args.required("--expected-capability"), "destination_ip", null,
-                args.required("--expected-tag"), true, false, null);
+                args.required("--expected-tag"), true, proxyProtocolV2, null);
         RpcServer rpc = new RpcServer(ConformanceService.class, new Probe(expected));
         rpc.setProtocolVersion("2.0.0");
         String host = args.value("--host", "0.0.0.0");
@@ -193,6 +198,10 @@ public final class Main {
                 .peerIdentityProviders(List.of(provider))
                 .peerAuthenticationPolicy(PeerAuthenticationPolicies.primary(PROVIDER))
                 .identityResolutionTimeout(Duration.ofSeconds(5))
+                .proxyProtocolV2Required(proxyProtocolV2)
+                .trustedProxyAddresses(proxyProtocolV2
+                        ? Set.of(args.required("--trusted-proxy-address")) : Set.of())
+                .proxyPreambleTimeout(Duration.ofSeconds(1))
                 .build();
         TcpSocketTransport.serveForever(host,
                 parsePort(args.value("--port", "19400")), rpc, 0L,
@@ -435,7 +444,8 @@ public final class Main {
         static Args parse(String[] raw) {
             Map<String, String> values = new LinkedHashMap<>();
             Set<String> flags = new java.util.LinkedHashSet<>();
-            Set<String> booleanFlags = Set.of("--expect-authenticated", "--expect-proxy");
+            Set<String> booleanFlags = Set.of(
+                    "--expect-authenticated", "--expect-proxy", "--proxy-protocol-v2");
             for (int index = 0; index < raw.length; index++) {
                 String name = raw[index];
                 if (!name.startsWith("--") || values.containsKey(name) || flags.contains(name)) {

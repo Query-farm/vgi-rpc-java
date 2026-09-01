@@ -114,7 +114,7 @@ public final class TailscaleLocalApiProvider implements PeerIdentityProvider {
             PeerIdentity identity = new PeerIdentity(PROVIDER, "localapi", IdentityAssurance.LOCAL_DAEMON,
                     issuer, context.transport(), kind, subject, SubjectStability.STABLE, true,
                     attributes, capabilities, true,
-                    normalizedSourceIp(context), null);
+                    normalizedSourceIp(context), normalizedProxyIp(context));
             return PeerIdentityResult.available(identity);
         } catch (LocalApiPermissionException e) {
             return result(PeerIdentityStatus.PERMISSION_DENIED);
@@ -523,6 +523,12 @@ public final class TailscaleLocalApiProvider implements PeerIdentityProvider {
 
     private static String normalizedSourceIp(PeerResolutionContext context) {
         try { return normalizeDestinationIp(whoisSourceAddress(context)); }
+        catch (IllegalArgumentException ignored) { return null; }
+    }
+
+    private static String normalizedProxyIp(PeerResolutionContext context) {
+        if (context.assertedPeer() == null) return null;
+        try { return normalizeDestinationIp(context.immediatePeer()); }
         catch (IllegalArgumentException ignored) { return null; }
     }
 

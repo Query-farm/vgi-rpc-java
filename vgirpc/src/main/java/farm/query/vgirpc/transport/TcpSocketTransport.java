@@ -36,7 +36,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeoutException;
 
@@ -46,13 +49,12 @@ import java.util.concurrent.TimeoutException;
  * speaks the same raw Arrow-IPC framing protocol; only the listening socket
  * differs (host:port instead of a filesystem path).
  *
- * <p><strong>Security:</strong> this transport carries <em>no</em>
- * authentication and <em>no</em> TLS. It is intended for trusted networks only
- * (co-located workers behind a private boundary). The serve loop defaults to
- * loopback ({@code 127.0.0.1}); binding a routable address exposes the
- * unauthenticated, unencrypted framing on the network. For untrusted networks
- * use the HTTP transport, which carries auth middleware and TLS via the
- * fronting server.
+ * <p><strong>Security:</strong> raw framing is unencrypted. The default listener
+ * has no identity provider and must remain inside a trusted network. An options
+ * overload can resolve direct socket identity or require a trusted PROXY v2
+ * preamble, but the backend must still be unreachable except through the
+ * configured proxy. For an Internet-facing service, terminate TLS at a trusted
+ * HTTP or TCP proxy before this listener.
  *
  * <p>Nagle's algorithm is disabled ({@code TCP_NODELAY}) so the lockstep
  * request/response framing is not delayed waiting to coalesce small writes.
@@ -196,17 +198,19 @@ public final class TcpSocketTransport implements RpcTransport {
                     }
                     active.incrementAndGet();
                     workers.submit(() -> {
-                        try (TcpSocketTransport t = new TcpSocketTransport(conn)) {
+                        try {
+                            ConnectionPeer peer = prepareConnectionPeer(conn, configuredOptions);
                             ResolvedIdentity identity = resolveIdentity(
-                                    conn, configuredOptions, identityWorkers, identitySlots);
-                            String source = endpoint(conn.getInetAddress().getHostAddress(), conn.getPort());
-                            try (AutoCloseable ignored = AuthScope.push(identity.auth(),
-                                    Map.of("remote_addr", source), identity.evidence())) {
+                                    peer, configuredOptions, identityWorkers, identitySlots);
+                            try (TcpSocketTransport t = new TcpSocketTransport(conn);
+                                 AutoCloseable ignored = AuthScope.push(identity.auth(),
+                                         peer.metadata(), identity.evidence())) {
                                 server.serve(t);
                             }
                         } catch (Exception ignore) {
                             // Per-connection failure must not take the accept loop down.
                         } finally {
+                            try { conn.close(); } catch (IOException ignore) {}
                             if (active.decrementAndGet() == 0) {
                                 idleSinceNanos.set(System.nanoTime());
                             }
@@ -224,8 +228,38 @@ public final class TcpSocketTransport implements RpcTransport {
 
     private record ResolvedIdentity(AuthContext auth, PeerEvidenceSet evidence) {}
 
+    private record ConnectionPeer(
+            String immediateAddress,
+            String sourceEndpoint,
+            String assertedPeer,
+            String destinationEndpoint,
+            Map<String, Object> metadata) {}
+
+    private static ConnectionPeer prepareConnectionPeer(Socket socket, TcpServerOptions options)
+            throws IOException {
+        String immediateAddress = socket.getInetAddress().getHostAddress();
+        String source = endpoint(immediateAddress, socket.getPort());
+        String destination = endpoint(socket.getLocalAddress().getHostAddress(), socket.getLocalPort());
+        if (!options.proxyProtocolV2Required()) {
+            return new ConnectionPeer(immediateAddress, source, null, destination,
+                    Map.of("remote_addr", source));
+        }
+        // The physical peer is authenticated against exact configured IPs before
+        // attacker-controlled preamble bytes are read or allocated.
+        if (!ProxyProtocolV2.isTrusted(options.trustedProxyAddresses(), socket.getInetAddress())) {
+            throw new IOException("immediate peer is not a trusted PROXY v2 sender");
+        }
+        ProxyProtocolV2.Address asserted = ProxyProtocolV2.read(
+                socket, options.proxyPreambleTimeout(), options.maximumProxyPreambleBytes());
+        String assertedSource = endpoint(asserted.source());
+        destination = endpoint(asserted.destination());
+        return new ConnectionPeer(immediateAddress, source, assertedSource, destination,
+                Map.of("remote_addr", source, "asserted_peer", assertedSource,
+                        "proxy_address", immediateAddress, "proxy_protocol_v2", true));
+    }
+
     private static ResolvedIdentity resolveIdentity(
-            Socket socket, TcpServerOptions options, ExecutorService identityWorkers,
+            ConnectionPeer peer, TcpServerOptions options, ExecutorService identityWorkers,
             Semaphore identitySlots) throws Exception {
         List<PeerIdentityProvider> providers = options.peerIdentityProviders();
         if (providers.isEmpty()) {
@@ -233,12 +267,9 @@ public final class TcpSocketTransport implements RpcTransport {
         }
         long timeoutNanos = options.identityResolutionTimeout().toNanos();
         long startedNanos = System.nanoTime();
-        String remoteAddress = socket.getInetAddress().getHostAddress();
-        String source = endpoint(remoteAddress, socket.getPort());
-        String destination = endpoint(socket.getLocalAddress().getHostAddress(), socket.getLocalPort());
         PeerResolutionContext context = new PeerResolutionContext(
-                "tcp", remoteAddress, source, null, destination, null,
-                options.peerServiceName(), Map.of(), Map.of("remote_addr", source),
+                "tcp", peer.immediateAddress(), peer.sourceEndpoint(), peer.assertedPeer(),
+                peer.destinationEndpoint(), null, options.peerServiceName(), Map.of(), peer.metadata(),
                 Instant.now().plus(options.identityResolutionTimeout()));
         List<Callable<PeerIdentityResult>> tasks = providers.stream()
                 .<Callable<PeerIdentityResult>>map(provider -> () -> {
@@ -254,8 +285,6 @@ public final class TcpSocketTransport implements RpcTransport {
                         return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.INVALID);
                     } catch (RuntimeException e) {
                         return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.INVALID);
-                    } finally {
-                        identitySlots.release();
                     }
                 }).toList();
         List<Future<PeerIdentityResult>> futures = new ArrayList<>(tasks.size());
@@ -266,8 +295,18 @@ public final class TcpSocketTransport implements RpcTransport {
                 results.add(new PeerIdentityResult(
                         providers.get(index).provider(), PeerIdentityStatus.UNAVAILABLE));
             } else {
-                futures.add(identityWorkers.submit(tasks.get(index)));
-                results.add(null);
+                ProviderFuture future = new ProviderFuture(tasks.get(index), identitySlots);
+                try {
+                    identityWorkers.execute(future);
+                    futures.add(future);
+                    results.add(null);
+                } catch (RejectedExecutionException e) {
+                    future.cancel(false);
+                    future.releaseRejected();
+                    futures.add(null);
+                    results.add(new PeerIdentityResult(
+                            providers.get(index).provider(), PeerIdentityStatus.UNAVAILABLE));
+                }
             }
         }
         for (int index = 0; index < futures.size(); index++) {
@@ -305,8 +344,39 @@ public final class TcpSocketTransport implements RpcTransport {
         return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.UNAVAILABLE);
     }
 
+    private static final class ProviderFuture extends FutureTask<PeerIdentityResult> {
+        private final Semaphore slots;
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        private ProviderFuture(Callable<PeerIdentityResult> callable, Semaphore slots) {
+            super(callable);
+            this.slots = slots;
+        }
+
+        @Override
+        public void run() {
+            try {
+                super.run();
+            } finally {
+                releaseOnce();
+            }
+        }
+
+        private void releaseRejected() {
+            releaseOnce();
+        }
+
+        private void releaseOnce() {
+            if (released.compareAndSet(false, true)) slots.release();
+        }
+    }
+
     private static String endpoint(String address, int port) {
         return address.contains(":") ? "[" + address + "]:" + port : address + ":" + port;
+    }
+
+    private static String endpoint(InetSocketAddress address) {
+        return endpoint(address.getAddress().getHostAddress(), address.getPort());
     }
 
     private static Thread startIdleWatchdog(ServerSocket ss,
