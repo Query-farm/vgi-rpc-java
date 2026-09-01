@@ -22,6 +22,8 @@ import java.util.Set;
 public final class ProxyProtocolV2 {
     /** Default upper bound: the fixed preamble, address block, and at most 520 bytes of TLVs. */
     public static final int DEFAULT_MAXIMUM_BYTES = 536;
+    /** Experimental TLV reserved for the VGI Iroh bridge EndpointId contract. */
+    public static final int VGI_IROH_ENDPOINT_TLV = 0xe0;
 
     private static final int FIXED_BYTES = 16;
     private static final byte[] SIGNATURE = {
@@ -32,6 +34,11 @@ public final class ProxyProtocolV2 {
 
     /** Asserted TCP source and destination endpoints from one trusted preamble. */
     public record Address(InetSocketAddress source, InetSocketAddress destination) {}
+
+    /** Lowercase hexadecimal Iroh EndpointId from the dedicated PROXY/UNSPEC form. */
+    public record IrohIdentity(String endpointId) {}
+
+    record ForwardedPeer(Address address, IrohIdentity irohIdentity) {}
 
     /**
      * Read exactly one bounded preamble. Bytes following its declared length remain unread.
@@ -44,6 +51,31 @@ public final class ProxyProtocolV2 {
 
     /** Parse one exact preamble, accepting only PROXY with TCP over IPv4 or IPv6. */
     public static Address parse(byte[] preamble, int maximumBytes) throws IOException {
+        return parseForwarded(preamble, maximumBytes, false).address();
+    }
+
+    /** Parse the opt-in PROXY/UNSPEC form carrying one bridge-verified EndpointId. */
+    public static IrohIdentity parseIrohIdentity(byte[] preamble, int maximumBytes)
+            throws IOException {
+        ForwardedPeer peer = parseForwarded(preamble, maximumBytes, true);
+        if (peer.irohIdentity() == null) {
+            throw invalid("VGI Iroh identity requires PROXY/UNSPEC");
+        }
+        return peer.irohIdentity();
+    }
+
+    /** Read exactly one dedicated Iroh preamble while preserving following VGI bytes. */
+    public static IrohIdentity readIrohIdentity(InputStream input, int maximumBytes)
+            throws IOException {
+        ForwardedPeer peer = readForwarded(input, maximumBytes, null, true);
+        if (peer.irohIdentity() == null) {
+            throw invalid("VGI Iroh identity requires PROXY/UNSPEC");
+        }
+        return peer.irohIdentity();
+    }
+
+    private static ForwardedPeer parseForwarded(
+            byte[] preamble, int maximumBytes, boolean allowIrohIdentity) throws IOException {
         int limit = validateMaximum(maximumBytes);
         if (preamble == null || preamble.length < FIXED_BYTES) {
             throw invalid("truncated PROXY v2 fixed preamble");
@@ -59,15 +91,20 @@ public final class ProxyProtocolV2 {
         int expected = FIXED_BYTES + unsignedShort(preamble, 14);
         if (preamble.length != expected) throw invalid("truncated or overlong PROXY v2 preamble");
 
+        int familyProtocol = preamble[13] & 0xff;
         int addressBytes;
         InetSocketAddress source;
         InetSocketAddress destination;
-        if ((preamble[13] & 0xff) == 0x11) {
+        if (familyProtocol == 0x00 && allowIrohIdentity) {
+            addressBytes = 0;
+            source = null;
+            destination = null;
+        } else if (familyProtocol == 0x11) {
             addressBytes = 12;
             requireBody(preamble, addressBytes, "IPv4");
             source = endpoint(Arrays.copyOfRange(preamble, 16, 20), unsignedShort(preamble, 24));
             destination = endpoint(Arrays.copyOfRange(preamble, 20, 24), unsignedShort(preamble, 26));
-        } else if ((preamble[13] & 0xff) == 0x21) {
+        } else if (familyProtocol == 0x21) {
             addressBytes = 36;
             requireBody(preamble, addressBytes, "IPv6");
             source = endpoint(normalizeMapped(Arrays.copyOfRange(preamble, 16, 32)),
@@ -79,17 +116,46 @@ public final class ProxyProtocolV2 {
         }
 
         int offset = FIXED_BYTES + addressBytes;
+        byte[] endpointId = null;
         while (offset < preamble.length) {
             if (preamble.length - offset < 3) throw invalid("truncated PROXY v2 TLV header");
+            int type = preamble[offset] & 0xff;
             int length = unsignedShort(preamble, offset + 1);
             offset += 3;
             if (length > preamble.length - offset) throw invalid("truncated PROXY v2 TLV value");
+            if (type == VGI_IROH_ENDPOINT_TLV && allowIrohIdentity) {
+                if (endpointId != null) throw invalid("duplicate VGI Iroh identity TLV");
+                if (length != 33 || (preamble[offset] & 0xff) != 1) {
+                    throw invalid("invalid VGI Iroh identity TLV");
+                }
+                endpointId = Arrays.copyOfRange(preamble, offset + 1, offset + 33);
+            }
             offset += length;
         }
-        return new Address(source, destination);
+        if (familyProtocol == 0x00 && endpointId == null) {
+            throw invalid("PROXY/UNSPEC requires one VGI Iroh identity TLV");
+        }
+        if (endpointId != null && familyProtocol != 0x00) {
+            throw invalid("VGI Iroh identity requires PROXY/UNSPEC");
+        }
+        Address address = source != null ? new Address(source, destination) : null;
+        IrohIdentity iroh = endpointId != null
+                ? new IrohIdentity(java.util.HexFormat.of().formatHex(endpointId)) : null;
+        return new ForwardedPeer(address, iroh);
     }
 
     static Address read(Socket socket, Duration timeout, int maximumBytes) throws IOException {
+        return readSocket(socket, timeout, maximumBytes, false).address();
+    }
+
+    static ForwardedPeer readAllowingIroh(
+            Socket socket, Duration timeout, int maximumBytes) throws IOException {
+        return readSocket(socket, timeout, maximumBytes, true);
+    }
+
+    private static ForwardedPeer readSocket(
+            Socket socket, Duration timeout, int maximumBytes, boolean allowIrohIdentity)
+            throws IOException {
         if (timeout == null || timeout.isZero() || timeout.isNegative()) {
             throw new IllegalArgumentException("PROXY v2 preamble timeout must be positive");
         }
@@ -103,13 +169,13 @@ public final class ProxyProtocolV2 {
         long started = System.nanoTime();
         int previousTimeout = socket.getSoTimeout();
         try {
-            return read(socket.getInputStream(), maximumBytes, () -> {
+            return readForwarded(socket.getInputStream(), maximumBytes, () -> {
                 long elapsed = System.nanoTime() - started;
                 long remaining = timeoutNanos - Math.max(0L, elapsed);
                 if (remaining <= 0L) throw new SocketTimeoutException("PROXY v2 preamble timed out");
                 long millis = Math.max(1L, ((remaining - 1L) / 1_000_000L) + 1L);
                 socket.setSoTimeout((int) Math.min(Integer.MAX_VALUE, millis));
-            });
+            }, allowIrohIdentity);
         } catch (SocketTimeoutException error) {
             throw new SocketTimeoutException("PROXY v2 preamble timed out");
         } finally {
@@ -139,6 +205,12 @@ public final class ProxyProtocolV2 {
 
     private static Address read(InputStream input, int maximumBytes, BeforeRead beforeRead)
             throws IOException {
+        return readForwarded(input, maximumBytes, beforeRead, false).address();
+    }
+
+    private static ForwardedPeer readForwarded(
+            InputStream input, int maximumBytes, BeforeRead beforeRead, boolean allowIrohIdentity)
+            throws IOException {
         int limit = validateMaximum(maximumBytes);
         byte[] fixed = new byte[FIXED_BYTES];
         readExactly(input, fixed, 0, fixed.length, beforeRead, "fixed preamble");
@@ -146,7 +218,7 @@ public final class ProxyProtocolV2 {
         if (total > limit) throw invalid("PROXY v2 preamble exceeds configured limit");
         byte[] preamble = Arrays.copyOf(fixed, total);
         readExactly(input, preamble, FIXED_BYTES, total - FIXED_BYTES, beforeRead, "body");
-        return parse(preamble, limit);
+        return parseForwarded(preamble, limit, allowIrohIdentity);
     }
 
     private static void readExactly(InputStream input, byte[] buffer, int offset, int length,

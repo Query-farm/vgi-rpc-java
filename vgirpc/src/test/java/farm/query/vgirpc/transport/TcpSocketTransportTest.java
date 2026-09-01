@@ -45,6 +45,7 @@ final class TcpSocketTransportTest {
         String echo(String value);
         long add(long a, long b);
         String identity(CallContext context, String value);
+        String irohIdentity(CallContext context);
     }
 
     public static final class EchoImpl implements EchoService {
@@ -53,6 +54,13 @@ final class TcpSocketTransportTest {
         @Override public String identity(CallContext context, String value) {
             return value + ":" + context.auth().domain() + ":"
                     + context.peerEvidence().status("test-peer").wireValue();
+        }
+        @Override public String irohIdentity(CallContext context) {
+            PeerIdentity identity = context.peerEvidence().uniqueVerifiedSubject("iroh");
+            return context.auth().domain() + ":" + identity.issuer() + ":"
+                    + identity.subjectKey() + ":" + identity.assurance().wireValue() + ":"
+                    + identity.attributes().get("original_assurance") + ":"
+                    + identity.proxyAddress();
         }
     }
 
@@ -310,6 +318,58 @@ final class TcpSocketTransportTest {
         assertEquals(Boolean.TRUE, context.metadata().get("proxy_protocol_v2"));
         assertEquals(1, resolutions.get());
         serverThread.join(5_000L);
+    }
+
+    @Test
+    @Timeout(20)
+    void proxyV2PromotesForwardedIrohIdentityThroughExistingPolicy() throws Exception {
+        TcpServerOptions options = TcpServerOptions.builder()
+                .proxyProtocolV2Required(true)
+                .trustedProxyAddresses(Set.of("127.0.0.1"))
+                .proxyPreambleTimeout(Duration.ofMillis(500))
+                .irohProxyIssuer("production-mesh")
+                .peerAuthenticationPolicy(PeerAuthenticationPolicies.primary("iroh"))
+                .build();
+        AtomicReference<Integer> boundPort = new AtomicReference<>();
+        Thread serverThread = startServer(options, boundPort);
+
+        byte[] endpoint = new byte[32];
+        for (int index = 0; index < endpoint.length; index++) endpoint[index] = (byte) index;
+        Socket socket = new Socket("127.0.0.1", awaitBoundPort(boundPort));
+        socket.getOutputStream().write(ProxyProtocolV2Test.iroh(endpoint,
+                new byte[] {(byte) 0xee, 0, 1, 7}));
+        socket.getOutputStream().flush();
+        try (RpcConnection connection = new RpcConnection(new TcpSocketTransport(socket))) {
+            String identity = connection.proxy(EchoService.class).irohIdentity(null);
+            assertTrue(identity.startsWith("iroh:production-mesh:"
+                    + "000102030405060708090a0b0c0d0e0f"
+                    + "101112131415161718191a1b1c1d1e1f"
+                    + ":configured_proxy:cryptographic_peer:127.0.0.1:"));
+        }
+        serverThread.join(5_000L);
+    }
+
+    @Test
+    @Timeout(10)
+    void forwardedIrohPrimaryRejectsOrdinaryProxyAddressWithoutIdentity() throws Exception {
+        TcpServerOptions options = TcpServerOptions.builder()
+                .proxyProtocolV2Required(true)
+                .trustedProxyAddresses(Set.of("127.0.0.1"))
+                .proxyPreambleTimeout(Duration.ofMillis(500))
+                .irohProxyIssuer("production-mesh")
+                .peerAuthenticationPolicy(PeerAuthenticationPolicies.primary("iroh"))
+                .build();
+        AtomicReference<Integer> boundPort = new AtomicReference<>();
+        startServer(options, boundPort);
+
+        try (Socket socket = new Socket("127.0.0.1", awaitBoundPort(boundPort))) {
+            socket.getOutputStream().write(ProxyProtocolV2Test.ipv4(
+                    new byte[] {100, 64, 0, 42, 10, 0, 0, 9}, 51_234, 19_400,
+                    new byte[0]));
+            socket.getOutputStream().flush();
+            socket.setSoTimeout(1_000);
+            assertConnectionClosed(socket);
+        }
     }
 
     @Test

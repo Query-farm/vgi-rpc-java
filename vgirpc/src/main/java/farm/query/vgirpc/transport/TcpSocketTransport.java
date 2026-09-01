@@ -6,13 +6,17 @@ package farm.query.vgirpc.transport;
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.RpcServer;
+import farm.query.vgirpc.identity.IdentityAssurance;
 import farm.query.vgirpc.identity.PeerEvidenceSet;
+import farm.query.vgirpc.identity.PeerIdentity;
 import farm.query.vgirpc.identity.PeerIdentityProvider;
 import farm.query.vgirpc.identity.PeerIdentityRejectedException;
 import farm.query.vgirpc.identity.PeerIdentityResult;
 import farm.query.vgirpc.identity.PeerIdentityStatus;
 import farm.query.vgirpc.identity.PeerIdentityUnavailableException;
 import farm.query.vgirpc.identity.PeerResolutionContext;
+import farm.query.vgirpc.identity.PeerSubjectKind;
+import farm.query.vgirpc.identity.SubjectStability;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -233,6 +237,7 @@ public final class TcpSocketTransport implements RpcTransport {
             String sourceEndpoint,
             String assertedPeer,
             String destinationEndpoint,
+            String irohEndpointId,
             Map<String, Object> metadata) {}
 
     private static ConnectionPeer prepareConnectionPeer(Socket socket, TcpServerOptions options)
@@ -241,7 +246,7 @@ public final class TcpSocketTransport implements RpcTransport {
         String source = endpoint(immediateAddress, socket.getPort());
         String destination = endpoint(socket.getLocalAddress().getHostAddress(), socket.getLocalPort());
         if (!options.proxyProtocolV2Required()) {
-            return new ConnectionPeer(immediateAddress, source, null, destination,
+            return new ConnectionPeer(immediateAddress, source, null, destination, null,
                     Map.of("remote_addr", source));
         }
         // The physical peer is authenticated against exact configured IPs before
@@ -249,11 +254,21 @@ public final class TcpSocketTransport implements RpcTransport {
         if (!ProxyProtocolV2.isTrusted(options.trustedProxyAddresses(), socket.getInetAddress())) {
             throw new IOException("immediate peer is not a trusted PROXY v2 sender");
         }
-        ProxyProtocolV2.Address asserted = ProxyProtocolV2.read(
-                socket, options.proxyPreambleTimeout(), options.maximumProxyPreambleBytes());
+        ProxyProtocolV2.ForwardedPeer forwarded = options.irohProxyIssuer() != null
+                ? ProxyProtocolV2.readAllowingIroh(
+                        socket, options.proxyPreambleTimeout(), options.maximumProxyPreambleBytes())
+                : new ProxyProtocolV2.ForwardedPeer(ProxyProtocolV2.read(
+                        socket, options.proxyPreambleTimeout(), options.maximumProxyPreambleBytes()), null);
+        if (forwarded.irohIdentity() != null) {
+            String endpointId = forwarded.irohIdentity().endpointId();
+            return new ConnectionPeer(immediateAddress, source, null, destination, endpointId,
+                    Map.of("remote_addr", source, "proxy_address", immediateAddress,
+                            "proxy_protocol_v2", true, "iroh_endpoint_id", endpointId));
+        }
+        ProxyProtocolV2.Address asserted = forwarded.address();
         String assertedSource = endpoint(asserted.source());
         destination = endpoint(asserted.destination());
-        return new ConnectionPeer(immediateAddress, source, assertedSource, destination,
+        return new ConnectionPeer(immediateAddress, source, assertedSource, destination, null,
                 Map.of("remote_addr", source, "asserted_peer", assertedSource,
                         "proxy_address", immediateAddress, "proxy_protocol_v2", true));
     }
@@ -262,7 +277,8 @@ public final class TcpSocketTransport implements RpcTransport {
             ConnectionPeer peer, TcpServerOptions options, ExecutorService identityWorkers,
             Semaphore identitySlots) throws Exception {
         List<PeerIdentityProvider> providers = options.peerIdentityProviders();
-        if (providers.isEmpty()) {
+        if (providers.isEmpty() && peer.irohEndpointId() == null
+                && options.peerAuthenticationPolicy() == null) {
             return new ResolvedIdentity(AuthContext.ANONYMOUS, PeerEvidenceSet.EMPTY);
         }
         long timeoutNanos = options.identityResolutionTimeout().toNanos();
@@ -330,6 +346,15 @@ public final class TcpSocketTransport implements RpcTransport {
                 Thread.currentThread().interrupt();
                 throw new PeerIdentityUnavailableException("peer identity resolution interrupted");
             }
+        }
+        if (peer.irohEndpointId() != null) {
+            PeerIdentity identity = new PeerIdentity(
+                    "iroh", "proxy_protocol_v2", IdentityAssurance.CONFIGURED_PROXY,
+                    options.irohProxyIssuer(), "tcp", PeerSubjectKind.ENDPOINT,
+                    peer.irohEndpointId(), SubjectStability.STABLE, true,
+                    Map.of("original_assurance", IdentityAssurance.CRYPTOGRAPHIC_PEER.wireValue()),
+                    Map.of(), false, peer.irohEndpointId(), peer.sourceEndpoint());
+            results.addFirst(PeerIdentityResult.available(identity));
         }
         PeerEvidenceSet evidence = new PeerEvidenceSet(results);
         AuthContext auth = options.peerAuthenticationPolicy() != null

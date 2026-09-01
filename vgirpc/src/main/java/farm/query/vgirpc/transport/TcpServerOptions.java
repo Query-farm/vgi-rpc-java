@@ -22,6 +22,7 @@ public final class TcpServerOptions {
     private final Set<String> trustedProxyAddresses;
     private final Duration proxyPreambleTimeout;
     private final int maximumProxyPreambleBytes;
+    private final String irohProxyIssuer;
 
     private TcpServerOptions(Builder builder) {
         peerIdentityProviders = List.copyOf(builder.peerIdentityProviders);
@@ -33,6 +34,7 @@ public final class TcpServerOptions {
         trustedProxyAddresses = ProxyProtocolV2.normalizeTrustedAddresses(builder.trustedProxyAddresses);
         proxyPreambleTimeout = builder.proxyPreambleTimeout;
         maximumProxyPreambleBytes = builder.maximumProxyPreambleBytes;
+        irohProxyIssuer = builder.irohProxyIssuer;
         if (identityResolutionTimeout == null || identityResolutionTimeout.isZero()
                 || identityResolutionTimeout.isNegative()) {
             throw new IllegalArgumentException("identity resolution timeout must be positive");
@@ -44,7 +46,8 @@ public final class TcpServerOptions {
                 throw new IllegalArgumentException("peer identity providers must have unique non-empty names");
             }
         }
-        if (peerAuthenticationPolicy != null && peerIdentityProviders.isEmpty()) {
+        if (peerAuthenticationPolicy != null && peerIdentityProviders.isEmpty()
+                && irohProxyIssuer == null) {
             throw new IllegalArgumentException("peer authentication policy requires an identity provider");
         }
         if (peerProviderConcurrency <= 0 || peerProviderConcurrency < peerIdentityProviders.size()) {
@@ -61,6 +64,18 @@ public final class TcpServerOptions {
             throw new IllegalArgumentException(
                     "PROXY v2 requires at least one exact trusted proxy address");
         }
+        if (irohProxyIssuer != null) {
+            if (irohProxyIssuer.isBlank() || containsControl(irohProxyIssuer)) {
+                throw new IllegalArgumentException("Iroh proxy issuer must be non-empty text without controls");
+            }
+            if (!proxyProtocolV2Required) {
+                throw new IllegalArgumentException("Iroh proxy issuer requires PROXY v2");
+            }
+            if (names.contains("iroh")) {
+                throw new IllegalArgumentException(
+                        "forwarded Iroh identity conflicts with another iroh provider");
+            }
+        }
     }
 
     public static Builder builder() { return new Builder(); }
@@ -74,6 +89,11 @@ public final class TcpServerOptions {
     public Set<String> trustedProxyAddresses() { return trustedProxyAddresses; }
     public Duration proxyPreambleTimeout() { return proxyPreambleTimeout; }
     public int maximumProxyPreambleBytes() { return maximumProxyPreambleBytes; }
+    public String irohProxyIssuer() { return irohProxyIssuer; }
+
+    private static boolean containsControl(String value) {
+        return value.codePoints().anyMatch(code -> code <= 0x1f || code == 0x7f);
+    }
 
     /** Builder retaining anonymous behavior unless providers are explicitly configured. */
     public static final class Builder {
@@ -86,6 +106,7 @@ public final class TcpServerOptions {
         private Set<String> trustedProxyAddresses = Set.of();
         private Duration proxyPreambleTimeout = Duration.ofSeconds(1);
         private int maximumProxyPreambleBytes = ProxyProtocolV2.DEFAULT_MAXIMUM_BYTES;
+        private String irohProxyIssuer;
 
         public Builder peerIdentityProviders(List<PeerIdentityProvider> providers) {
             peerIdentityProviders = providers != null ? providers : List.of();
@@ -125,6 +146,11 @@ public final class TcpServerOptions {
         /** Bound the complete fixed preamble, address block, and unknown TLVs before allocation. */
         public Builder maximumProxyPreambleBytes(int maximumBytes) {
             maximumProxyPreambleBytes = maximumBytes;
+            return this;
+        }
+        /** Enable bridge-forwarded Iroh EndpointId evidence under this local issuer. */
+        public Builder irohProxyIssuer(String issuer) {
+            irohProxyIssuer = issuer;
             return this;
         }
         public TcpServerOptions build() { return new TcpServerOptions(this); }
