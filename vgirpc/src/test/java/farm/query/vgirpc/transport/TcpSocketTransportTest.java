@@ -3,14 +3,24 @@
 
 package farm.query.vgirpc.transport;
 
+import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.RpcConnection;
 import farm.query.vgirpc.RpcServer;
+import farm.query.vgirpc.identity.IdentityAssurance;
+import farm.query.vgirpc.identity.PeerAuthenticationPolicies;
+import farm.query.vgirpc.identity.PeerIdentity;
+import farm.query.vgirpc.identity.PeerIdentityResult;
+import farm.query.vgirpc.identity.PeerSubjectKind;
+import farm.query.vgirpc.identity.SubjectStability;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -29,11 +39,16 @@ final class TcpSocketTransportTest {
     public interface EchoService {
         String echo(String value);
         long add(long a, long b);
+        String identity(CallContext context, String value);
     }
 
     public static final class EchoImpl implements EchoService {
         @Override public String echo(String value) { return value; }
         @Override public long add(long a, long b) { return a + b; }
+        @Override public String identity(CallContext context, String value) {
+            return value + ":" + context.auth().domain() + ":"
+                    + context.peerEvidence().status("test-peer").wireValue();
+        }
     }
 
     @Test
@@ -68,6 +83,117 @@ final class TcpSocketTransportTest {
             assertEquals("again", proxy.echo("again"));
         }
         assertNull(failure.get(), "server thread propagated: " + failure.get());
+    }
+
+    @Test
+    @Timeout(20)
+    void snapshotsPeerIdentityOncePerConnection() throws Exception {
+        AtomicInteger resolutions = new AtomicInteger();
+        var provider = new farm.query.vgirpc.identity.PeerIdentityProvider() {
+            @Override public String provider() { return "test-peer"; }
+            @Override public PeerIdentityResult resolve(
+                    farm.query.vgirpc.identity.PeerResolutionContext context) {
+                resolutions.incrementAndGet();
+                assertEquals("tcp", context.transport());
+                assertTrue(context.sourceEndpoint().contains(":"));
+                return PeerIdentityResult.available(new PeerIdentity(
+                        provider(), "test_socket", IdentityAssurance.CRYPTOGRAPHIC_PEER,
+                        "test-issuer", "tcp", PeerSubjectKind.WORKLOAD, "worker-1",
+                        SubjectStability.STABLE, true, Map.of(), Map.of(), false,
+                        context.sourceEndpoint(), null));
+            }
+        };
+        TcpServerOptions options = TcpServerOptions.builder()
+                .peerIdentityProviders(List.of(provider))
+                .peerAuthenticationPolicy(PeerAuthenticationPolicies.primary("test-peer"))
+                .identityResolutionTimeout(Duration.ofSeconds(2))
+                .build();
+        RpcServer server = new RpcServer(EchoService.class, new EchoImpl());
+        AtomicReference<Integer> boundPort = new AtomicReference<>();
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        Thread serverThread = new Thread(() -> {
+            try {
+                TcpSocketTransport.serveForever("127.0.0.1", 0, server, 200L,
+                        (host, port) -> {
+                            synchronized (boundPort) {
+                                boundPort.set(port);
+                                boundPort.notifyAll();
+                            }
+                        }, options);
+            } catch (Exception e) {
+                failure.set(e);
+            }
+        }, "vgi-tcp-test-identity");
+        serverThread.setDaemon(true);
+        serverThread.start();
+
+        int port = awaitBoundPort(boundPort);
+        try (RpcConnection conn = new RpcConnection(TcpSocketTransport.connect("127.0.0.1", port))) {
+            EchoService proxy = conn.proxy(EchoService.class);
+            assertEquals("first:test-peer:available", proxy.identity(null, "first"));
+            assertEquals("second:test-peer:available", proxy.identity(null, "second"));
+            assertEquals(1, resolutions.get());
+        }
+        serverThread.join(5_000L);
+        assertNull(failure.get(), "server thread propagated: " + failure.get());
+    }
+
+    @Test
+    @Timeout(20)
+    void preservesCompletedInvalidEvidenceWhenSiblingTimesOut() throws Exception {
+        AtomicReference<List<farm.query.vgirpc.identity.PeerIdentityStatus>> observed = new AtomicReference<>();
+        farm.query.vgirpc.identity.PeerIdentityProvider hung = new farm.query.vgirpc.identity.PeerIdentityProvider() {
+            @Override public String provider() { return "hung"; }
+            @Override public PeerIdentityResult resolve(
+                    farm.query.vgirpc.identity.PeerResolutionContext context) {
+                try {
+                    Thread.sleep(10_000L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new farm.query.vgirpc.identity.PeerIdentityUnavailableException("interrupted");
+                }
+                throw new AssertionError("hung provider unexpectedly completed");
+            }
+        };
+        farm.query.vgirpc.identity.PeerIdentityProvider invalid = new farm.query.vgirpc.identity.PeerIdentityProvider() {
+            @Override public String provider() { return "invalid"; }
+            @Override public PeerIdentityResult resolve(
+                    farm.query.vgirpc.identity.PeerResolutionContext context) {
+                return new PeerIdentityResult(provider(), farm.query.vgirpc.identity.PeerIdentityStatus.INVALID);
+            }
+        };
+        TcpServerOptions options = TcpServerOptions.builder()
+                .peerIdentityProviders(List.of(hung, invalid))
+                .peerAuthenticationPolicy((evidence, auth) -> {
+                    observed.set(List.of(evidence.status("hung"), evidence.status("invalid")));
+                    return auth;
+                })
+                .identityResolutionTimeout(Duration.ofMillis(40))
+                .build();
+        RpcServer server = new RpcServer(EchoService.class, new EchoImpl());
+        AtomicReference<Integer> boundPort = new AtomicReference<>();
+        Thread serverThread = new Thread(() -> {
+            try {
+                TcpSocketTransport.serveForever("127.0.0.1", 0, server, 200L,
+                        (host, port) -> {
+                            synchronized (boundPort) {
+                                boundPort.set(port);
+                                boundPort.notifyAll();
+                            }
+                        }, options);
+            } catch (Exception ignored) {
+                // The idle watchdog closes the listener.
+            }
+        });
+        serverThread.setDaemon(true);
+        serverThread.start();
+        try (RpcConnection conn = new RpcConnection(
+                TcpSocketTransport.connect("127.0.0.1", awaitBoundPort(boundPort)))) {
+            assertEquals("ok", conn.proxy(EchoService.class).echo("ok"));
+        }
+        assertEquals(List.of(
+                farm.query.vgirpc.identity.PeerIdentityStatus.UNAVAILABLE,
+                farm.query.vgirpc.identity.PeerIdentityStatus.INVALID), observed.get());
     }
 
     @Test

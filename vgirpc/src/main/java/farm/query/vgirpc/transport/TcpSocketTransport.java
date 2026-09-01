@@ -3,7 +3,16 @@
 
 package farm.query.vgirpc.transport;
 
+import farm.query.vgirpc.AuthContext;
+import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.RpcServer;
+import farm.query.vgirpc.identity.PeerEvidenceSet;
+import farm.query.vgirpc.identity.PeerIdentityProvider;
+import farm.query.vgirpc.identity.PeerIdentityRejectedException;
+import farm.query.vgirpc.identity.PeerIdentityResult;
+import farm.query.vgirpc.identity.PeerIdentityStatus;
+import farm.query.vgirpc.identity.PeerIdentityUnavailableException;
+import farm.query.vgirpc.identity.PeerResolutionContext;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -14,6 +23,12 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
 import java.util.function.BiConsumer;
 import java.time.Duration;
 import java.util.concurrent.ExecutorService;
@@ -21,6 +36,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Raw-TCP ({@code AF_INET}) server/client transport — the network analog of
@@ -106,7 +124,7 @@ public final class TcpSocketTransport implements RpcTransport {
      * @throws IOException if the socket cannot be bound or the accept loop fails
      */
     public static void serveForever(String host, int port, RpcServer server) throws IOException {
-        serveForever(host, port, server, 0L, null);
+        serveForever(host, port, server, 0L, null, TcpServerOptions.defaults());
     }
 
     /**
@@ -137,7 +155,24 @@ public final class TcpSocketTransport implements RpcTransport {
     public static void serveForever(String host, int port, RpcServer server,
                                      long idleTimeoutMs, BiConsumer<String, Integer> onBound)
             throws IOException {
+        serveForever(host, port, server, idleTimeoutMs, onBound, TcpServerOptions.defaults());
+    }
+
+    /** Serve raw TCP with optional connection-snapshot peer identity. */
+    public static void serveForever(String host, int port, RpcServer server,
+                                     TcpServerOptions options) throws IOException {
+        serveForever(host, port, server, 0L, null, options);
+    }
+
+    /** Full raw-TCP listener overload retaining the existing lifecycle controls. */
+    public static void serveForever(String host, int port, RpcServer server,
+                                     long idleTimeoutMs, BiConsumer<String, Integer> onBound,
+                                     TcpServerOptions options) throws IOException {
+        if (options == null) options = TcpServerOptions.defaults();
+        final TcpServerOptions configuredOptions = options;
         ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
+        ExecutorService identityWorkers = Executors.newVirtualThreadPerTaskExecutor();
+        Semaphore identitySlots = new Semaphore(configuredOptions.peerProviderConcurrency());
         AtomicInteger active = new AtomicInteger();
         AtomicLong idleSinceNanos = new AtomicLong(System.nanoTime());
         try (ServerSocket ss = new ServerSocket()) {
@@ -162,7 +197,13 @@ public final class TcpSocketTransport implements RpcTransport {
                     active.incrementAndGet();
                     workers.submit(() -> {
                         try (TcpSocketTransport t = new TcpSocketTransport(conn)) {
-                            server.serve(t);
+                            ResolvedIdentity identity = resolveIdentity(
+                                    conn, configuredOptions, identityWorkers, identitySlots);
+                            String source = endpoint(conn.getInetAddress().getHostAddress(), conn.getPort());
+                            try (AutoCloseable ignored = AuthScope.push(identity.auth(),
+                                    Map.of("remote_addr", source), identity.evidence())) {
+                                server.serve(t);
+                            }
                         } catch (Exception ignore) {
                             // Per-connection failure must not take the accept loop down.
                         } finally {
@@ -177,7 +218,95 @@ public final class TcpSocketTransport implements RpcTransport {
             }
         } finally {
             workers.shutdown();
+            identityWorkers.shutdownNow();
         }
+    }
+
+    private record ResolvedIdentity(AuthContext auth, PeerEvidenceSet evidence) {}
+
+    private static ResolvedIdentity resolveIdentity(
+            Socket socket, TcpServerOptions options, ExecutorService identityWorkers,
+            Semaphore identitySlots) throws Exception {
+        List<PeerIdentityProvider> providers = options.peerIdentityProviders();
+        if (providers.isEmpty()) {
+            return new ResolvedIdentity(AuthContext.ANONYMOUS, PeerEvidenceSet.EMPTY);
+        }
+        long timeoutNanos = options.identityResolutionTimeout().toNanos();
+        long startedNanos = System.nanoTime();
+        String remoteAddress = socket.getInetAddress().getHostAddress();
+        String source = endpoint(remoteAddress, socket.getPort());
+        String destination = endpoint(socket.getLocalAddress().getHostAddress(), socket.getLocalPort());
+        PeerResolutionContext context = new PeerResolutionContext(
+                "tcp", remoteAddress, source, null, destination, null,
+                options.peerServiceName(), Map.of(), Map.of("remote_addr", source),
+                Instant.now().plus(options.identityResolutionTimeout()));
+        List<Callable<PeerIdentityResult>> tasks = providers.stream()
+                .<Callable<PeerIdentityResult>>map(provider -> () -> {
+                    try {
+                        PeerIdentityResult result = provider.resolve(context);
+                        if (result == null || !provider.provider().equals(result.provider())) {
+                            return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.INVALID);
+                        }
+                        return result;
+                    } catch (PeerIdentityUnavailableException e) {
+                        return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.UNAVAILABLE);
+                    } catch (PeerIdentityRejectedException e) {
+                        return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.INVALID);
+                    } catch (RuntimeException e) {
+                        return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.INVALID);
+                    } finally {
+                        identitySlots.release();
+                    }
+                }).toList();
+        List<Future<PeerIdentityResult>> futures = new ArrayList<>(tasks.size());
+        List<PeerIdentityResult> results = new ArrayList<>(tasks.size());
+        for (int index = 0; index < tasks.size(); index++) {
+            if (!identitySlots.tryAcquire()) {
+                futures.add(null);
+                results.add(new PeerIdentityResult(
+                        providers.get(index).provider(), PeerIdentityStatus.UNAVAILABLE));
+            } else {
+                futures.add(identityWorkers.submit(tasks.get(index)));
+                results.add(null);
+            }
+        }
+        for (int index = 0; index < futures.size(); index++) {
+            Future<PeerIdentityResult> future = futures.get(index);
+            if (future == null) continue;
+            long remainingNanos = Math.max(0L, timeoutNanos - (System.nanoTime() - startedNanos));
+            try {
+                if (future.isDone()) {
+                    results.set(index, future.get());
+                } else if (remainingNanos == 0L) {
+                    results.set(index, unavailable(providers.get(index), future));
+                } else {
+                    results.set(index, future.get(remainingNanos, TimeUnit.NANOSECONDS));
+                }
+            } catch (TimeoutException e) {
+                results.set(index, unavailable(providers.get(index), future));
+            } catch (ExecutionException e) {
+                results.set(index, new PeerIdentityResult(
+                        providers.get(index).provider(), PeerIdentityStatus.INVALID));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new PeerIdentityUnavailableException("peer identity resolution interrupted");
+            }
+        }
+        PeerEvidenceSet evidence = new PeerEvidenceSet(results);
+        AuthContext auth = options.peerAuthenticationPolicy() != null
+                ? options.peerAuthenticationPolicy().evaluate(evidence, AuthContext.ANONYMOUS)
+                : AuthContext.ANONYMOUS;
+        return new ResolvedIdentity(auth, evidence);
+    }
+
+    private static PeerIdentityResult unavailable(
+            PeerIdentityProvider provider, Future<PeerIdentityResult> future) {
+        future.cancel(true);
+        return new PeerIdentityResult(provider.provider(), PeerIdentityStatus.UNAVAILABLE);
+    }
+
+    private static String endpoint(String address, int port) {
+        return address.contains(":") ? "[" + address + "]:" + port : address + ":" + port;
     }
 
     private static Thread startIdleWatchdog(ServerSocket ss,

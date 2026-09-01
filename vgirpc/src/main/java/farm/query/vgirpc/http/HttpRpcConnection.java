@@ -18,6 +18,9 @@ import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.eclipse.jetty.client.BytesRequestContent;
+import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.Socks5Proxy;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -33,6 +36,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 
 /**
@@ -88,6 +94,8 @@ import java.util.function.Consumer;
 public final class HttpRpcConnection implements AutoCloseable {
 
     private final HttpClient http;
+    /** Jetty is used only for explicit SOCKS5h because the JDK HTTP client supports HTTP proxies only. */
+    private final org.eclipse.jetty.client.HttpClient socksHttp;
     /** Whether {@link #close()} owns the {@link HttpClient}; false when the caller supplied one. */
     private final boolean ownsHttpClient;
     /** Endpoint prefix with no trailing slash, e.g. {@code http://host:8080/vgi}. */
@@ -104,13 +112,31 @@ public final class HttpRpcConnection implements AutoCloseable {
         this.onLog = b.onLog != null ? b.onLog : m -> {};
         this.requestTimeout = b.requestTimeout;
         this.protocolVersion = b.protocolVersion;
-        if (b.httpClient != null) {
+        if (b.socksProxy != null) {
+            if (b.httpClient != null) {
+                throw new IllegalArgumentException("socks5hProxy cannot be combined with httpClient");
+            }
+            this.http = null;
+            this.socksHttp = new org.eclipse.jetty.client.HttpClient();
+            this.socksHttp.setConnectTimeout(b.connectTimeout.toMillis());
+            this.socksHttp.getProxyConfiguration().addProxy(
+                    new Socks5Proxy(b.socksProxy.host(), b.socksProxy.port()));
+            try {
+                this.socksHttp.start();
+            } catch (Exception e) {
+                try { this.socksHttp.stop(); } catch (Exception ignored) {}
+                throw new IllegalStateException("could not start SOCKS5h HTTP client", e);
+            }
+            this.ownsHttpClient = true;
+        } else if (b.httpClient != null) {
             this.http = b.httpClient;
+            this.socksHttp = null;
             this.ownsHttpClient = false;
         } else {
             this.http = HttpClient.newBuilder()
                     .connectTimeout(b.connectTimeout)
                     .build();
+            this.socksHttp = null;
             this.ownsHttpClient = true;
         }
     }
@@ -164,7 +190,15 @@ public final class HttpRpcConnection implements AutoCloseable {
      */
     @Override
     public void close() {
-        if (ownsHttpClient) http.close();
+        if (!ownsHttpClient) return;
+        if (http != null) http.close();
+        if (socksHttp != null) {
+            try {
+                socksHttp.stop();
+            } catch (Exception e) {
+                throw new IllegalStateException("could not stop SOCKS5h HTTP client", e);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -194,6 +228,7 @@ public final class HttpRpcConnection implements AutoCloseable {
      * @return the response body bytes (an Arrow IPC stream)
      */
     byte[] post(String url, byte[] body, String what) {
+        if (socksHttp != null) return postThroughSocks(url, body, what);
         HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(url))
                 .header(HttpHeaders.CONTENT_TYPE, HttpServer.ARROW_CONTENT_TYPE)
                 // Explicitly opt out of response compression. The server treats
@@ -217,16 +252,46 @@ public final class HttpRpcConnection implements AutoCloseable {
         return requireArrowBody(resp, what);
     }
 
+    private byte[] postThroughSocks(String url, byte[] body, String what) {
+        var request = socksHttp.POST(URI.create(url))
+                .headers(fields -> {
+                    fields.put(HttpHeaders.CONTENT_TYPE, HttpServer.ARROW_CONTENT_TYPE);
+                    fields.put(HttpHeaders.ACCEPT_ENCODING, MediaTypes.IDENTITY);
+                    headers.forEach(fields::put);
+                })
+                .body(new BytesRequestContent(HttpServer.ARROW_CONTENT_TYPE, body));
+        if (requestTimeout != null) {
+            request.timeout(requestTimeout.toNanos(), TimeUnit.NANOSECONDS);
+        }
+        try {
+            ContentResponse response = request.send();
+            return requireArrowBody(response.getStatus(),
+                    response.getHeaders().get(HttpHeaders.CONTENT_TYPE), response.getContent(), what);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RpcError("TransportError", what + ": interrupted", "");
+        } catch (TimeoutException e) {
+            throw new RpcError("TransportError", what + ": timed out", "");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            throw new RpcError("TransportError", what + ": " + cause, "");
+        }
+    }
+
     private static byte[] requireArrowBody(HttpResponse<byte[]> resp, String what) {
-        String contentType = resp.headers().firstValue(HttpHeaders.CONTENT_TYPE).orElse("");
+        return requireArrowBody(resp.statusCode(),
+                resp.headers().firstValue(HttpHeaders.CONTENT_TYPE).orElse(""), resp.body(), what);
+    }
+
+    private static byte[] requireArrowBody(int status, String contentType, byte[] body, String what) {
+        if (contentType == null) contentType = "";
         if (contentType.startsWith(HttpServer.ARROW_CONTENT_TYPE)) {
             // 200 or 500 alike: the body is a well-formed Arrow stream and any
             // error is in it. HttpServer answers a failed stream turn with 500
             // plus an error stream, so status alone is not the signal.
-            return resp.body();
+            return body;
         }
-        int status = resp.statusCode();
-        String detail = preview(resp.body());
+        String detail = preview(body);
         if (status == 401) {
             throw new RpcError("AuthenticationError",
                     what + ": unauthorized (HTTP 401)"
@@ -382,6 +447,7 @@ public final class HttpRpcConnection implements AutoCloseable {
         private Duration requestTimeout = Duration.ofMinutes(5);
         private Duration connectTimeout = Duration.ofSeconds(10);
         private HttpClient httpClient;
+        private ProxyEndpoint socksProxy;
         private String protocolVersion;
 
         private Builder(String endpoint) {
@@ -460,7 +526,23 @@ public final class HttpRpcConnection implements AutoCloseable {
          * @return this builder
          */
         public Builder connectTimeout(Duration timeout) {
+            if (timeout == null || timeout.isZero() || timeout.isNegative()) {
+                throw new IllegalArgumentException("connect timeout must be positive");
+            }
             this.connectTimeout = timeout;
+            return this;
+        }
+
+        /**
+         * Route every HTTP and HTTPS connection through an explicit credential-free SOCKS5h
+         * proxy. The origin hostname is sent to the proxy and is never resolved locally.
+         * Proxy failure is terminal and never falls back to a direct connection.
+         *
+         * @param proxyUri a {@code socks5h://host:port} URI without user info
+         * @return this builder
+         */
+        public Builder socks5hProxy(String proxyUri) {
+            this.socksProxy = parseSocks5hProxy(proxyUri);
             return this;
         }
 
@@ -474,6 +556,11 @@ public final class HttpRpcConnection implements AutoCloseable {
          * @param client the client to dispatch through
          * @return this builder
          */
+        public Builder httpClient(HttpClient client) {
+            this.httpClient = client;
+            return this;
+        }
+
         /**
          * Override the application protocol version stamped on every request.
          *
@@ -491,11 +578,6 @@ public final class HttpRpcConnection implements AutoCloseable {
             return this;
         }
 
-        public Builder httpClient(HttpClient client) {
-            this.httpClient = client;
-            return this;
-        }
-
         /**
          * Build the connection.
          *
@@ -503,4 +585,22 @@ public final class HttpRpcConnection implements AutoCloseable {
          */
         public HttpRpcConnection build() { return new HttpRpcConnection(this); }
     }
+
+    private static ProxyEndpoint parseSocks5hProxy(String value) {
+        URI uri;
+        try {
+            uri = URI.create(value);
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException("proxy must be credential-free socks5h://host:port", e);
+        }
+        if (!"socks5h".equals(uri.getScheme()) || uri.getRawUserInfo() != null
+                || uri.getHost() == null || uri.getPort() < 1 || uri.getPort() > 65535
+                || uri.getRawQuery() != null || uri.getRawFragment() != null
+                || !(uri.getRawPath() == null || uri.getRawPath().isEmpty())) {
+            throw new IllegalArgumentException("proxy must be credential-free socks5h://host:port");
+        }
+        return new ProxyEndpoint(uri.getHost(), uri.getPort());
+    }
+
+    private record ProxyEndpoint(String host, int port) {}
 }

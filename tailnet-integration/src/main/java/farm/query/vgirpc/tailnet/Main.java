@@ -9,7 +9,6 @@ import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import farm.query.vgirpc.AuthContext;
-import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.RpcConnection;
 import farm.query.vgirpc.RpcServer;
@@ -21,31 +20,25 @@ import farm.query.vgirpc.identity.PeerAuthenticationPolicies;
 import farm.query.vgirpc.identity.PeerAuthenticationPolicy;
 import farm.query.vgirpc.identity.PeerEvidenceSet;
 import farm.query.vgirpc.identity.PeerIdentity;
-import farm.query.vgirpc.identity.PeerIdentityResult;
 import farm.query.vgirpc.identity.PeerIdentityStatus;
-import farm.query.vgirpc.identity.PeerResolutionContext;
 import farm.query.vgirpc.identity.PeerSubjectKind;
 import farm.query.vgirpc.identity.SubjectStability;
 import farm.query.vgirpc.identity.TailscaleLocalApiProvider;
 import farm.query.vgirpc.schema.ProtocolVersion;
 import farm.query.vgirpc.transport.TcpSocketTransport;
+import farm.query.vgirpc.transport.TcpServerOptions;
 
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.Semaphore;
 
 /** Live-Tailnet qualification adapter; not a production proxy or deployment API. */
 public final class Main {
@@ -142,13 +135,12 @@ public final class Main {
     }
 
     private static void runHttpClient(Args args) throws Exception {
-        if (args.optional("--proxy") != null) {
-            throw new IllegalArgumentException(
-                    "Java HTTP SOCKS5h is unsupported because JDK HttpClient cannot guarantee remote DNS");
-        }
         HttpRpcConnection.Builder builder = HttpRpcConnection.builder(args.required("--url"))
                 .connectTimeout(Duration.ofSeconds(20))
                 .requestTimeout(Duration.ofSeconds(20));
+        if (args.optional("--proxy") != null) {
+            builder.socks5hProxy(args.optional("--proxy"));
+        }
         if (args.optional("--spoof-login") != null) {
             builder.header("Tailscale-User-Login", args.optional("--spoof-login"));
         }
@@ -196,63 +188,18 @@ public final class Main {
                 args.required("--expected-tag"), true, false, null);
         RpcServer rpc = new RpcServer(ConformanceService.class, new Probe(expected));
         rpc.setProtocolVersion("2.0.0");
-        serveQualifiedTcp(args.value("--host", "0.0.0.0"),
-                parsePort(args.value("--port", "19400")), rpc, provider);
-    }
-
-    /**
-     * Adapter-owned TCP identity wrapper. The production Java raw-TCP listener does not yet
-     * expose provider hooks, so this exists solely to qualify the existing provider/AuthScope
-     * pieces without claiming a new production listener API.
-     */
-    static void serveQualifiedTcp(
-            String host, int port, RpcServer rpc, TailscaleLocalApiProvider provider) throws Exception {
-        Semaphore active = new Semaphore(64);
-        try (ServerSocket listener = new ServerSocket()) {
-            listener.setReuseAddress(true);
-            listener.bind(new InetSocketAddress(host, port), 128);
-            System.out.println("TCP:" + host + ":" + listener.getLocalPort());
-            System.out.flush();
-            while (true) {
-                Socket socket = listener.accept();
-                if (!active.tryAcquire()) {
-                    socket.close();
-                    continue;
-                }
-                Thread.startVirtualThread(() -> {
-                    try {
-                        serveQualifiedConnection(socket, rpc, provider);
-                    } catch (Exception ignored) {
-                        // Provider and peer-controlled failures are intentionally not logged.
-                    } finally {
-                        active.release();
-                    }
-                });
-            }
-        }
-    }
-
-    private static void serveQualifiedConnection(
-            Socket socket, RpcServer rpc, TailscaleLocalApiProvider provider) throws Exception {
-        try (socket; TcpSocketTransport transport = new TcpSocketTransport(socket)) {
-            InetAddress remote = socket.getInetAddress();
-            InetAddress local = socket.getLocalAddress();
-            String source = endpoint(remote.getHostAddress(), socket.getPort());
-            PeerResolutionContext resolution = new PeerResolutionContext(
-                    "tcp", remote.getHostAddress(), source, null, local.getHostAddress(),
-                    null, null, Map.of(), Map.of("remote_addr", source),
-                    Instant.now().plusSeconds(5));
-            PeerIdentityResult result = provider.resolve(resolution);
-            PeerEvidenceSet evidence = new PeerEvidenceSet(List.of(result));
-            AuthContext auth = PeerAuthenticationPolicies.primary(PROVIDER)
-                    .evaluate(evidence, AuthContext.ANONYMOUS);
-            AutoCloseable authScope = AuthScope.push(auth, Map.of("remote_addr", source), evidence);
-            try {
-                rpc.serve(transport);
-            } finally {
-                authScope.close();
-            }
-        }
+        String host = args.value("--host", "0.0.0.0");
+        TcpServerOptions options = TcpServerOptions.builder()
+                .peerIdentityProviders(List.of(provider))
+                .peerAuthenticationPolicy(PeerAuthenticationPolicies.primary(PROVIDER))
+                .identityResolutionTimeout(Duration.ofSeconds(5))
+                .build();
+        TcpSocketTransport.serveForever(host,
+                parsePort(args.value("--port", "19400")), rpc, 0L,
+                (boundHost, boundPort) -> {
+                    System.out.println("TCP:" + boundHost + ":" + boundPort);
+                    System.out.flush();
+                }, options);
     }
 
     static void validateContext(CallContext context, Expectation expected) {
@@ -442,10 +389,6 @@ public final class Main {
         } catch (Exception error) {
             throw new IllegalStateException("SHA-256 unavailable", error);
         }
-    }
-
-    private static String endpoint(String address, int port) {
-        return address.indexOf(':') >= 0 ? "[" + address + "]:" + port : address + ":" + port;
     }
 
     private static int parsePort(String raw) {
