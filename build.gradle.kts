@@ -3,6 +3,7 @@ plugins {
     // Applied (below) only to the published library modules. Targets the
     // Sonatype Central Portal by default and handles signing + sources/javadoc.
     id("com.vanniktech.maven.publish") version "0.36.0" apply false
+    id("org.jetbrains.kotlin.jvm") version "2.2.21" apply false
 }
 
 allprojects {
@@ -17,11 +18,12 @@ allprojects {
 // Library modules published to Maven Central. The conformance/benchmark
 // service definitions and their runnable workers are internal test/bench
 // harnesses and are intentionally NOT published.
-val publishedModules = setOf("vgirpc", "vgirpc-oauth", "vgirpc-s3", "vgirpc-gcs")
+val publishedModules = setOf("vgirpc", "vgirpc-iroh", "vgirpc-oauth", "vgirpc-s3", "vgirpc-gcs")
 
 // One-line POM descriptions per published artifact.
 val moduleDescriptions = mapOf(
     "vgirpc" to "Transport-agnostic RPC framework built on Apache Arrow IPC.",
+    "vgirpc-iroh" to "Optional native Iroh transport for vgi-rpc via the official Kotlin/JVM binding.",
     "vgirpc-oauth" to "Optional OAuth/JWT (JWKS, PKCE, signed cookies) support for vgi-rpc.",
     "vgirpc-s3" to "Amazon S3 ExternalStorage backend for vgi-rpc.",
     "vgirpc-gcs" to "Google Cloud Storage ExternalStorage backend for vgi-rpc.",
