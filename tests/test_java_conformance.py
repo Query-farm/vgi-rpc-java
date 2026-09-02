@@ -1317,27 +1317,21 @@ class TestHttpResponseCapAccessLog:
         )
         self._assert_cap_error(conts[-1], "exchange_oversized")
 
-    def test_producer_soft_cap_is_not_logged_as_an_error(
+    def test_producer_overshoot_is_logged_as_an_error(
         self, conformance_http_capped_access_log: tuple[int, Path]
     ) -> None:
-        """A producer overshoot is covered by a continuation, so nothing failed.
+        """A producer overshoot is a strict structured error with no cursor."""
+        from vgi_rpc.rpc import RpcError
 
-        The negative control on the other two: the wire cap is *soft* for
-        producer streams -- the framework mints a continuation token instead of
-        failing -- so no error reaches the wire and every record must still say
-        ``ok``. An implementation that re-stated status from the mere presence
-        of a cap overshoot would fail here.
-        """
         port, log_path = conformance_http_capped_access_log
         target_rows = max(1024, (self._cap(port) * 2) // 16)
-        with http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy:
-            batches = list(proxy.produce_oversized_batch(rows_per_batch=target_rows))
-        assert sum(b.batch.num_rows for b in batches) == target_rows
+        with (
+            http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy,
+            pytest.raises(RpcError, match=r"max_response_bytes") as caught,
+        ):
+            list(proxy.produce_oversized_batch(rows_per_batch=target_rows))
+        assert caught.value.error_type == "ResponseTooLargeError"
 
         records = self._await_records(log_path, "produce_oversized_batch", 1)
         assert records, "the producer stream produced no access-log record"
-        for rec in records:
-            assert rec["status"] == "ok", (
-                f"a producer overshoot is absorbed by a continuation token, not an error; "
-                f"got status={rec['status']!r} error_message={rec.get('error_message')!r}"
-            )
+        self._assert_cap_error(records[-1], "produce_oversized_batch")
