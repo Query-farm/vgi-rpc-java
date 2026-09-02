@@ -29,6 +29,8 @@ public final class CallContext {
     private final String protocolName;
     private final String requestId;
     private final TransportKind kind;
+    private final Long responseLimitBytes;
+    private final Long preferredResponseBytes;
 
     /**
      * Create a per-request context. Constructed by the framework at dispatch
@@ -79,7 +81,7 @@ public final class CallContext {
                        String requestId,
                        TransportKind kind) {
         this(auth, emitClientLog, transportMetadata, serverId, methodName,
-                protocolName, requestId, kind, PeerEvidenceSet.EMPTY);
+                protocolName, requestId, kind, PeerEvidenceSet.EMPTY, null, null);
     }
 
     /** Create a context including its immutable off-wire peer evidence snapshot. */
@@ -92,6 +94,22 @@ public final class CallContext {
                        String requestId,
                        TransportKind kind,
                        PeerEvidenceSet peerEvidence) {
+        this(auth, emitClientLog, transportMetadata, serverId, methodName,
+                protocolName, requestId, kind, peerEvidence, null, null);
+    }
+
+    /** Create a context including negotiated off-wire response budgets. */
+    public CallContext(AuthContext auth,
+                       Consumer<Message> emitClientLog,
+                       Map<String, Object> transportMetadata,
+                       String serverId,
+                       String methodName,
+                       String protocolName,
+                       String requestId,
+                       TransportKind kind,
+                       PeerEvidenceSet peerEvidence,
+                       Long responseLimitBytes,
+                       Long preferredResponseBytes) {
         this.auth = auth != null ? auth : AuthContext.ANONYMOUS;
         this.peerEvidence = peerEvidence != null ? peerEvidence : PeerEvidenceSet.EMPTY;
         this.emitClientLog = emitClientLog;
@@ -103,6 +121,12 @@ public final class CallContext {
         this.protocolName = protocolName;
         this.requestId = requestId != null ? requestId : "";
         this.kind = kind;
+        Object metadataLimit = this.transportMetadata.get(RESPONSE_LIMIT_BYTES_KEY);
+        Object metadataPreferred = this.transportMetadata.get(PREFERRED_RESPONSE_BYTES_KEY);
+        this.responseLimitBytes = responseLimitBytes != null ? responseLimitBytes
+                : metadataLimit instanceof Number n ? n.longValue() : null;
+        this.preferredResponseBytes = preferredResponseBytes != null ? preferredResponseBytes
+                : metadataPreferred instanceof Number n ? n.longValue() : null;
     }
 
     /**
@@ -124,6 +148,10 @@ public final class CallContext {
     public static final String REQUEST_COOKIES_KEY = "vgi_request_cookies";
     /** Transport-metadata key for the mutable sink the transport drains into {@code Set-Cookie} (HTTP only). */
     public static final String RESPONSE_COOKIES_KEY = "vgi_response_cookies";
+    /** Internal transport-metadata key for the negotiated hard response budget. */
+    public static final String RESPONSE_LIMIT_BYTES_KEY = "vgi_response_limit_bytes";
+    /** Internal transport-metadata key for the server's clamped batching target. */
+    public static final String PREFERRED_RESPONSE_BYTES_KEY = "vgi_preferred_response_bytes";
 
     /**
      * Cookies presented on the request ({@code Cookie} header), name → value.
@@ -182,6 +210,12 @@ public final class CallContext {
      *     through the legacy constructor outside framework dispatch
      */
     public TransportKind kind() { return kind; }
+
+    /** Negotiated hard limit for this decoded Arrow IPC response, or null when unbounded. */
+    public Long responseLimitBytes() { return responseLimitBytes; }
+
+    /** Server batching target, clamped to {@link #responseLimitBytes()}, or null when unset. */
+    public Long preferredResponseBytes() { return preferredResponseBytes; }
 
     /**
      * Emit a client-directed log batch.

@@ -55,6 +55,7 @@ final class CorsPolicy {
             HttpHeaders.AUTHORIZATION,
             HttpHeaders.API_KEY,
             HttpHeaders.X_VGI_ACCEPT_ENCODING,
+            HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER,
             StickyHeaders.SESSION,
             StickyHeaders.SESSION_ACCEPT,
             ProxyProof.PROOF_HEADER));

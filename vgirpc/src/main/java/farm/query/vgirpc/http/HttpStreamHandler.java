@@ -261,6 +261,12 @@ public final class HttpStreamHandler {
 
     /** Handle {@code POST /{method}/init}. Returns response IPC bytes. */
     public byte[] handleInit(String method, byte[] requestBody) throws Exception {
+        return handleInit(method, requestBody, maxResponseBytes, null);
+    }
+
+    /** Handle init under a per-request negotiated hard limit and batching target. */
+    public byte[] handleInit(String method, byte[] requestBody, long responseLimitBytes,
+                             Long preferredResponseBytes) throws Exception {
         RpcMethodInfo info = rpc.methods().get(method);
         if (info == null) return errorStream(new IllegalArgumentException("Unknown method: " + method));
 
@@ -303,7 +309,7 @@ public final class HttpStreamHandler {
         }
 
         OutputCollectorSink sink = new OutputCollectorSink();
-        CallContext ctx = buildCallContext(method, sink);
+        CallContext ctx = buildCallContext(method, sink, responseLimitBytes, preferredResponseBytes);
 
         // Minted here rather than inside mintInitTokens so the init record
         // carries it even when the producer finishes in one turn and no
@@ -317,7 +323,8 @@ public final class HttpStreamHandler {
             // discrete body, has to re-frame the batch.
             onTurn(turn, i -> i.requestData = requestBody);
             try {
-                return runInit(method, info, kwargs, requestMeta, ctx, sink, streamId, turn);
+                return runInit(method, info, kwargs, requestMeta, ctx, sink, streamId, turn,
+                        responseLimitBytes, preferredResponseBytes);
             } catch (Throwable t) {
                 if (turn != null) turn.thrown = t;
                 throw t;
@@ -328,7 +335,8 @@ public final class HttpStreamHandler {
     /** The body of {@code /init}, wrapped by {@link #handleInit}'s telemetry. */
     private byte[] runInit(String method, RpcMethodInfo info, Map<String, Object> kwargs,
                             Map<String, String> requestMeta, CallContext ctx,
-                            OutputCollectorSink sink, String streamId, StreamTurn turn) throws Exception {
+                            OutputCollectorSink sink, String streamId, StreamTurn turn,
+                            long responseLimitBytes, Long preferredResponseBytes) throws Exception {
         RpcStream<?> streamResult;
         try {
             Object[] args = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
@@ -341,32 +349,27 @@ public final class HttpStreamHandler {
         // Record the concrete state class for this method so /exchange can rehydrate.
         stateTypes.put(method, streamResult.state().getClass());
 
-        // The /init response is soft-capped: producer streams may emit a single
-        // batch larger than maxResponseBytes and follow it with a continuation
-        // token so the client picks up the rest via /exchange.  Exchange-init
-        // responses are tiny (just a token) and never overflow.
-        //
-        // The bound here is a runaway-producer guard, not a contract: 16x the
-        // configured cap (or 256 MiB if no cap is set) is generous enough for
-        // any reasonable single-emit producer but stops {@code rows=Long.MAX}
-        // from OOM-ing the worker.
-        long hardCeiling = maxResponseBytes < Long.MAX_VALUE / 16
-                ? Math.max(maxResponseBytes * 16, 256L << 20)
-                : Long.MAX_VALUE;
-        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(hardCeiling);
+        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         if (streamResult.header() != null) {
             writeHeaderIpcStream(out, streamResult.header(), sink);
         }
         if (streamResult.isProducer()) {
-            writeProducerRun(out, streamResult, ctx, sink, requestMeta, streamId, turn);
+            writeProducerRun(out, streamResult, ctx, sink, requestMeta, streamId, turn,
+                    responseLimitBytes, preferredResponseBytes);
         } else {
-            writeExchangeInitToken(out, streamResult, sink, streamId, turn);
+            writeExchangeInitToken(out, streamResult, sink, streamId, turn, responseLimitBytes);
         }
         return out.toByteArray();
     }
 
     /** Handle {@code POST /{method}/exchange}. */
     public byte[] handleExchange(String method, byte[] requestBody) throws Exception {
+        return handleExchange(method, requestBody, maxResponseBytes, null);
+    }
+
+    /** Handle a continuation under the current request's client budget. */
+    public byte[] handleExchange(String method, byte[] requestBody, long responseLimitBytes,
+                                 Long preferredResponseBytes) throws Exception {
         RpcMethodInfo info = rpc.methods().get(method);
         if (info == null) return errorStream(new IllegalArgumentException("Unknown method: " + method));
 
@@ -429,7 +432,16 @@ public final class HttpStreamHandler {
                 // decode without the server's token key.
                 onTurn(turn, i -> i.requestState = token.state());
                 try {
-                    return runExchange(method, effectiveRequest, actualInput, token, call, auth, inputDicts, turn);
+                    long boundLimit = Math.min(responseLimitBytes, call.responseLimitBytes());
+                    Long boundPreferred = preferredResponseBytes == null ? null
+                            : Math.min(preferredResponseBytes, boundLimit);
+                    byte[] response = runExchange(method, effectiveRequest, actualInput, token, call, auth,
+                            inputDicts, turn, boundLimit, boundPreferred);
+                    if (response.length > boundLimit) {
+                        return errorStream(new farm.query.vgirpc.ResponseTooLargeError(
+                                method, response.length, boundLimit));
+                    }
+                    return response;
                 } catch (Throwable t) {
                     if (turn != null) turn.thrown = t;
                     throw t;
@@ -445,7 +457,8 @@ public final class HttpStreamHandler {
     /** The body of {@code /exchange}, wrapped by {@link #handleExchange}'s telemetry. */
     private byte[] runExchange(String method, ExchangeRequest req, VectorSchemaRoot ownedInput,
                                 StateToken token, CallToken call, AuthContext auth,
-                                DictionaryProvider inputDicts, StreamTurn turn) throws Exception {
+                                DictionaryProvider inputDicts, StreamTurn turn,
+                                long responseLimitBytes, Long preferredResponseBytes) throws Exception {
         Class<? extends StreamState> stateCls = stateTypes.get(method);
         if (stateCls == null) {
             return errorStream(new IllegalStateException(
@@ -464,7 +477,7 @@ public final class HttpStreamHandler {
         // after the first turn is worst on exactly the long streams whose
         // progress logs are the only in-band diagnostic a caller has.
         OutputCollectorSink sink = new OutputCollectorSink();
-        CallContext ctx = buildCallContext(method, sink);
+        CallContext ctx = buildCallContext(method, sink, responseLimitBytes, preferredResponseBytes);
 
         if (req.meta().containsKey(Metadata.CANCEL)) {
             onTurn(turn, i -> i.cancelled = true);
@@ -482,7 +495,9 @@ public final class HttpStreamHandler {
 
         try (VectorSchemaRoot maybeCast = castInput) {
             VectorSchemaRoot actualInput = maybeCast != null ? maybeCast : ownedInput;
-            OutputCollector collector = new OutputCollector(outputSchema, rpc.serverId(), isProducer);
+            OutputCollector collector = new OutputCollector(outputSchema, rpc.serverId(), isProducer,
+                    responseLimitBytes == Long.MAX_VALUE ? null : responseLimitBytes,
+                    preferredResponseBytes);
             try {
                 state.process(new AnnotatedBatch(actualInput, req.meta()), collector, ctx);
                 if (!collector.finished()) collector.validate();
@@ -634,13 +649,14 @@ public final class HttpStreamHandler {
     /** Mint a stream's call id, call token, and first cursor at {@code /init}. */
     private Map<String, String> mintInitTokens(StreamState state, Schema outputSchema,
                                                 Schema inputSchema, AuthContext auth,
-                                                String streamId, StreamTurn turn) {
+                                                String streamId, StreamTurn turn,
+                                                long responseLimitBytes) {
         byte[] callId = new byte[Tokens.CALL_ID_LEN];
         new java.security.SecureRandom().nextBytes(callId);
         long now = System.currentTimeMillis() / 1000;
 
         CallToken call = new CallToken(serializeSchema(outputSchema), serializeSchema(inputSchema),
-                streamId, callId, now);
+                streamId, callId, now, responseLimitBytes);
         // Warm the cache with what we already hold, so this stream's first
         // continuation does not have to open the token it was just handed.
         callStates.put(callId, Tokens.cacheIdentity(auth), call);
@@ -655,10 +671,13 @@ public final class HttpStreamHandler {
                 new String(call.pack(tokenKey, auth), StandardCharsets.US_ASCII));
     }
 
-    private CallContext buildCallContext(String method, Consumer<Message> sink) {
+    private CallContext buildCallContext(String method, Consumer<Message> sink,
+                                         long responseLimitBytes, Long preferredResponseBytes) {
         AuthScope.Scope scope = AuthScope.current();
         return new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                rpc.serverId(), method, rpc.protocolName(), "", TransportKind.HTTP, scope.peerEvidence());
+                rpc.serverId(), method, rpc.protocolName(), "", TransportKind.HTTP, scope.peerEvidence(),
+                responseLimitBytes == Long.MAX_VALUE ? null : responseLimitBytes,
+                preferredResponseBytes);
     }
 
     /** Principal for state-token key derivation; empty string for anonymous. */
@@ -669,7 +688,8 @@ public final class HttpStreamHandler {
     private void writeProducerRun(ByteArrayOutputStream out, RpcStream<?> streamResult,
                                    CallContext ctx, OutputCollectorSink sink,
                                    Map<String, String> requestMeta,
-                                   String streamId, StreamTurn turn) throws IOException {
+                                   String streamId, StreamTurn turn, long responseLimitBytes,
+                                   Long preferredResponseBytes) throws IOException {
         Schema outputSchema = streamResult.outputSchema();
         Schema inputSchema = streamResult.inputSchema();
         StreamState state = streamResult.state();
@@ -677,7 +697,9 @@ public final class HttpStreamHandler {
             w.writeSchema(outputSchema);
             sink.bind(w, outputSchema);
 
-            OutputCollector coll = new OutputCollector(outputSchema, rpc.serverId(), true);
+            OutputCollector coll = new OutputCollector(outputSchema, rpc.serverId(), true,
+                    responseLimitBytes == Long.MAX_VALUE ? null : responseLimitBytes,
+                    preferredResponseBytes);
             boolean error = false;
             try (VectorSchemaRoot tickInput =
                          VectorSchemaRoot.create(RpcStream.EMPTY_SCHEMA, Allocators.root())) {
@@ -706,7 +728,7 @@ public final class HttpStreamHandler {
                 // client knows to call /exchange to continue. Finished streams just EOS.
                 if (!coll.finished()) {
                     Map<String, String> md = mintInitTokens(state, outputSchema, inputSchema,
-                            currentAuth(), streamId, turn);
+                            currentAuth(), streamId, turn, responseLimitBytes);
                     Wire.writeZeroBatch(w, outputSchema, md);
                 }
             }
@@ -715,11 +737,12 @@ public final class HttpStreamHandler {
 
     private void writeExchangeInitToken(ByteArrayOutputStream out, RpcStream<?> streamResult,
                                          OutputCollectorSink sink,
-                                         String streamId, StreamTurn turn) throws IOException {
+                                         String streamId, StreamTurn turn,
+                                         long responseLimitBytes) throws IOException {
         Schema outputSchema = streamResult.outputSchema();
         Schema inputSchema = streamResult.inputSchema();
         Map<String, String> md = mintInitTokens(streamResult.state(), outputSchema, inputSchema,
-                currentAuth(), streamId, turn);
+                currentAuth(), streamId, turn, responseLimitBytes);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
             sink.bind(w, outputSchema);

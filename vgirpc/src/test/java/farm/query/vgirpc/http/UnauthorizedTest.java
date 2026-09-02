@@ -72,6 +72,16 @@ final class UnauthorizedTest {
         }
     }
 
+    private HttpResponse<String> postMalformedBudget(String path) throws Exception {
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
+            return client.send(HttpRequest.newBuilder(URI.create(base + path))
+                            .timeout(Duration.ofSeconds(10))
+                            .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "1")
+                            .POST(HttpRequest.BodyPublishers.ofByteArray(new byte[0])).build(),
+                    HttpResponse.BodyHandlers.ofString());
+        }
+    }
+
     // ---- reason classification -------------------------------------------
 
     /**
@@ -86,6 +96,13 @@ final class UnauthorizedTest {
         assertEquals(AuthReason.INVALID_CREDENTIAL, new InvalidCredentials("bad token").reason());
         assertEquals(AuthReason.EXPIRED_CREDENTIAL,
                 new AuthFailure(AuthReason.EXPIRED_CREDENTIAL, "stale").reason());
+    }
+
+    @Test
+    void rpc_authentication_precedes_budget_and_body_parsing() throws Exception {
+        start(request -> { throw new InvalidCredentials("bad token"); }, List.of());
+        assertEquals(401, postMalformedBudget("/echo").statusCode());
+        assertEquals(401, postMalformedBudget("/echo/init").statusCode());
     }
 
     /** A failure that names no reason lands on the fallback rather than a guess. */

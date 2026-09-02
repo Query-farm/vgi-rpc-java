@@ -19,12 +19,14 @@ import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.eclipse.jetty.client.BytesRequestContent;
-import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.InputStreamResponseListener;
+import org.eclipse.jetty.client.Response;
 import org.eclipse.jetty.client.Socks5Proxy;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -93,6 +95,9 @@ import java.util.function.Consumer;
  */
 public final class HttpRpcConnection implements AutoCloseable {
 
+    /** Native-client default receive budget: 256 MiB of decoded Arrow IPC. */
+    public static final long DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES = 256L << 20;
+
     private final HttpClient http;
     /** Jetty is used only for explicit SOCKS5h because the JDK HTTP client supports HTTP proxies only. */
     private final org.eclipse.jetty.client.HttpClient socksHttp;
@@ -105,6 +110,10 @@ public final class HttpRpcConnection implements AutoCloseable {
     private final Duration requestTimeout;
     /** Caller-supplied override for the service interface's own declared version, or {@code null}. */
     private final String protocolVersion;
+    private final Long acceptedMaxResponseBytes;
+    private volatile boolean responseBudgetSupportVerified;
+    /** Strictly validated decoded cap advertised by OPTIONS /health, or null. */
+    private volatile Long advertisedMaxResponseBytes;
 
     private HttpRpcConnection(Builder b) {
         this.endpoint = b.endpoint;
@@ -112,6 +121,7 @@ public final class HttpRpcConnection implements AutoCloseable {
         this.onLog = b.onLog != null ? b.onLog : m -> {};
         this.requestTimeout = b.requestTimeout;
         this.protocolVersion = b.protocolVersion;
+        this.acceptedMaxResponseBytes = b.acceptedMaxResponseBytes;
         if (b.socksProxy != null) {
             if (b.httpClient != null) {
                 throw new IllegalArgumentException("socks5hProxy cannot be combined with httpClient");
@@ -228,6 +238,7 @@ public final class HttpRpcConnection implements AutoCloseable {
      * @return the response body bytes (an Arrow IPC stream)
      */
     byte[] post(String url, byte[] body, String what) {
+        ensureResponseBudgetSupport();
         if (socksHttp != null) return postThroughSocks(url, body, what);
         HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(url))
                 .header(HttpHeaders.CONTENT_TYPE, HttpServer.ARROW_CONTENT_TYPE)
@@ -237,19 +248,35 @@ public final class HttpRpcConnection implements AutoCloseable {
                 // server has to guess at.
                 .header(HttpHeaders.ACCEPT_ENCODING, MediaTypes.IDENTITY)
                 .POST(HttpRequest.BodyPublishers.ofByteArray(body));
+        if (acceptedMaxResponseBytes != null) {
+            req.header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+                    Long.toString(acceptedMaxResponseBytes));
+        }
         if (requestTimeout != null) req.timeout(requestTimeout);
         headers.forEach(req::header);
 
-        HttpResponse<byte[]> resp;
+        HttpResponse<InputStream> resp;
         try {
-            resp = http.send(req.build(), HttpResponse.BodyHandlers.ofByteArray());
+            resp = http.send(req.build(), HttpResponse.BodyHandlers.ofInputStream());
         } catch (IOException e) {
             throw new RpcError("TransportError", what + ": " + e, "");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RpcError("TransportError", what + ": interrupted", "");
         }
-        return requireArrowBody(resp, what);
+        byte[] responseBody;
+        try (InputStream input = resp.body()) {
+            requireExactBudgetSupport(resp.headers().allValues(
+                    HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER), what, resp.statusCode());
+            Long currentAdvertised = parseAdvertisedMaxResponseBytes(resp.headers().allValues(
+                    HttpServer.MAX_RESPONSE_BYTES_HEADER), what, resp.statusCode());
+            responseBody = readBounded(input,
+                    effectiveDecodedResponseLimit(currentAdvertised), what);
+        } catch (IOException e) {
+            throw new RpcError("TransportError", what + ": " + e, "");
+        }
+        return requireArrowBody(resp.statusCode(),
+                resp.headers().firstValue(HttpHeaders.CONTENT_TYPE).orElse(""), responseBody, what);
     }
 
     private byte[] postThroughSocks(String url, byte[] body, String what) {
@@ -257,6 +284,10 @@ public final class HttpRpcConnection implements AutoCloseable {
                 .headers(fields -> {
                     fields.put(HttpHeaders.CONTENT_TYPE, HttpServer.ARROW_CONTENT_TYPE);
                     fields.put(HttpHeaders.ACCEPT_ENCODING, MediaTypes.IDENTITY);
+                    if (acceptedMaxResponseBytes != null) {
+                        fields.put(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+                                Long.toString(acceptedMaxResponseBytes));
+                    }
                     headers.forEach(fields::put);
                 })
                 .body(new BytesRequestContent(HttpServer.ARROW_CONTENT_TYPE, body));
@@ -264,9 +295,24 @@ public final class HttpRpcConnection implements AutoCloseable {
             request.timeout(requestTimeout.toNanos(), TimeUnit.NANOSECONDS);
         }
         try {
-            ContentResponse response = request.send();
+            InputStreamResponseListener listener = new InputStreamResponseListener();
+            request.send(listener);
+            Response response = awaitHeaders(listener);
+            byte[] responseBody;
+            try (InputStream input = listener.getInputStream()) {
+                requireExactBudgetSupport(response.getHeaders().getValuesList(
+                        HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER), what,
+                        response.getStatus());
+                Long currentAdvertised = parseAdvertisedMaxResponseBytes(
+                        response.getHeaders().getValuesList(HttpServer.MAX_RESPONSE_BYTES_HEADER),
+                        what, response.getStatus());
+                responseBody = readBounded(input,
+                        effectiveDecodedResponseLimit(currentAdvertised), what);
+            }
             return requireArrowBody(response.getStatus(),
-                    response.getHeaders().get(HttpHeaders.CONTENT_TYPE), response.getContent(), what);
+                    response.getHeaders().get(HttpHeaders.CONTENT_TYPE), responseBody, what);
+        } catch (IOException e) {
+            throw new RpcError("TransportError", what + ": " + e, "");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RpcError("TransportError", what + ": interrupted", "");
@@ -276,11 +322,6 @@ public final class HttpRpcConnection implements AutoCloseable {
             Throwable cause = e.getCause() == null ? e : e.getCause();
             throw new RpcError("TransportError", what + ": " + cause, "");
         }
-    }
-
-    private static byte[] requireArrowBody(HttpResponse<byte[]> resp, String what) {
-        return requireArrowBody(resp.statusCode(),
-                resp.headers().firstValue(HttpHeaders.CONTENT_TYPE).orElse(""), resp.body(), what);
     }
 
     private static byte[] requireArrowBody(int status, String contentType, byte[] body, String what) {
@@ -300,6 +341,154 @@ public final class HttpRpcConnection implements AutoCloseable {
         throw new RpcError("HttpError",
                 what + ": HTTP " + status + " with a non-Arrow body"
                         + (detail.isEmpty() ? "" : " — " + detail), "");
+    }
+
+    private static byte[] readBounded(InputStream input, long limit, String what) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream((int) Math.min(limit, 64L << 10));
+        byte[] chunk = new byte[8192];
+        long total = 0;
+        int n;
+        while ((n = input.read(chunk)) != -1) {
+            total += n;
+            if (total > limit) {
+                throw new RpcError("ResponseTooLargeError",
+                        what + " exceeds max_response_bytes (" + total + " > " + limit + ")", "");
+            }
+            out.write(chunk, 0, n);
+        }
+        return out.toByteArray();
+    }
+
+    private static void requireExactBudgetSupport(java.util.List<String> values,
+                                                   String what, int status) {
+        if (values.size() != 1 || !"true".equals(values.getFirst())) {
+            throw new RpcError("ProtocolError",
+                    what + ": response does not advertise exactly one "
+                            + HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER + ": true",
+                    "", "", "http_" + status);
+        }
+    }
+
+    private Response awaitHeaders(InputStreamResponseListener listener)
+            throws InterruptedException, TimeoutException, ExecutionException {
+        long timeoutNanos = requestTimeout == null ? Long.MAX_VALUE : requestTimeout.toNanos();
+        return listener.get(timeoutNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private void ensureResponseBudgetSupport() {
+        if (acceptedMaxResponseBytes == null || responseBudgetSupportVerified) return;
+        synchronized (this) {
+            if (responseBudgetSupportVerified) return;
+            Long advertised = socksHttp != null
+                    ? discoverResponseBudgetThroughSocks()
+                    : discoverResponseBudgetWithJdkClient();
+            advertisedMaxResponseBytes = advertised;
+            responseBudgetSupportVerified = true;
+        }
+    }
+
+    private Long discoverResponseBudgetWithJdkClient() {
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(endpoint + "/health"))
+                .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+                        Long.toString(acceptedMaxResponseBytes))
+                .method("OPTIONS", HttpRequest.BodyPublishers.noBody());
+        if (requestTimeout != null) request.timeout(requestTimeout);
+        headers.forEach(request::header);
+        try {
+            HttpResponse<Void> response = http.send(request.build(), HttpResponse.BodyHandlers.discarding());
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new RpcError("ProtocolError",
+                        "server does not advertise "
+                                + HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER
+                                + ": true (HTTP " + response.statusCode() + ")", "");
+            }
+            requireExactBudgetSupport(response.headers().allValues(
+                    HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER),
+                    "OPTIONS /health", response.statusCode());
+            return parseAdvertisedMaxResponseBytes(response.headers().allValues(
+                    HttpServer.MAX_RESPONSE_BYTES_HEADER), "OPTIONS /health", response.statusCode());
+        } catch (IOException e) {
+            throw new RpcError("TransportError", "response-budget discovery: " + e, "");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RpcError("TransportError", "response-budget discovery: interrupted", "");
+        }
+    }
+
+    private Long discoverResponseBudgetThroughSocks() {
+        var request = socksHttp.newRequest(URI.create(endpoint + "/health"))
+                .method("OPTIONS");
+        request.headers(fields -> {
+            fields.put(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+                    Long.toString(acceptedMaxResponseBytes));
+            headers.forEach(fields::put);
+        });
+        if (requestTimeout != null) request.timeout(requestTimeout.toNanos(), TimeUnit.NANOSECONDS);
+        try {
+            InputStreamResponseListener listener = new InputStreamResponseListener();
+            request.send(listener);
+            Response response = awaitHeaders(listener);
+            try (InputStream ignored = listener.getInputStream()) {
+                if (response.getStatus() < 200 || response.getStatus() >= 300) {
+                    throw new RpcError("ProtocolError",
+                            "server does not advertise "
+                                    + HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER
+                                    + ": true (HTTP " + response.getStatus() + ")", "");
+                }
+                requireExactBudgetSupport(response.getHeaders().getValuesList(
+                                HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER),
+                        "OPTIONS /health", response.getStatus());
+                return parseAdvertisedMaxResponseBytes(response.getHeaders().getValuesList(
+                                HttpServer.MAX_RESPONSE_BYTES_HEADER),
+                        "OPTIONS /health", response.getStatus());
+            }
+        } catch (IOException e) {
+            throw new RpcError("TransportError", "response-budget discovery: " + e, "");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RpcError("TransportError", "response-budget discovery: interrupted", "");
+        } catch (TimeoutException e) {
+            throw new RpcError("TransportError", "response-budget discovery: timed out", "");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            throw new RpcError("TransportError", "response-budget discovery: " + cause, "");
+        }
+    }
+
+    private long effectiveDecodedResponseLimit(Long currentAdvertised) {
+        long local = acceptedMaxResponseBytes == null ? Long.MAX_VALUE : acceptedMaxResponseBytes;
+        Long advertised = advertisedMaxResponseBytes;
+        long effective = advertised == null ? local : Math.min(local, advertised);
+        return currentAdvertised == null ? effective : Math.min(effective, currentAdvertised);
+    }
+
+    private static Long parseAdvertisedMaxResponseBytes(java.util.List<String> values,
+                                                         String what, int status) {
+        if (values.isEmpty()) return null;
+        if (values.size() != 1) {
+            throw invalidAdvertisedResponseBudget(what, status);
+        }
+        String value = values.getFirst();
+        if (value == null || value.isEmpty() || value.indexOf(',') >= 0
+                || !value.matches("[1-9][0-9]*")) {
+            throw invalidAdvertisedResponseBudget(what, status);
+        }
+        try {
+            long parsed = Long.parseLong(value);
+            if (parsed < (64L << 10) || parsed > 9_007_199_254_740_991L) {
+                throw new NumberFormatException();
+            }
+            return parsed;
+        } catch (NumberFormatException e) {
+            throw invalidAdvertisedResponseBudget(what, status);
+        }
+    }
+
+    private static RpcError invalidAdvertisedResponseBudget(String what, int status) {
+        return new RpcError("ProtocolError",
+                what + ": response header " + HttpServer.MAX_RESPONSE_BYTES_HEADER
+                        + " must be exactly one ASCII integer between 65536 and "
+                        + "9007199254740991", "", "", "http_" + status);
     }
 
     /** First 200 bytes of a non-Arrow body, for an error message a human can act on. */
@@ -449,6 +638,7 @@ public final class HttpRpcConnection implements AutoCloseable {
         private HttpClient httpClient;
         private ProxyEndpoint socksProxy;
         private String protocolVersion;
+        private Long acceptedMaxResponseBytes = DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES;
 
         private Builder(String endpoint) {
             if (endpoint == null || endpoint.isBlank()) {
@@ -485,7 +675,20 @@ public final class HttpRpcConnection implements AutoCloseable {
          * @return this builder
          */
         public Builder header(String name, String value) {
+            if (HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER.equalsIgnoreCase(name)) {
+                throw new IllegalArgumentException("use acceptedMaxResponseBytes() for " + name);
+            }
             headers.put(name, value);
+            return this;
+        }
+
+        /** Largest decoded Arrow IPC response this native client will accept. */
+        public Builder acceptedMaxResponseBytes(long bytes) {
+            if (bytes < (64L << 10) || bytes > 9_007_199_254_740_991L) {
+                throw new IllegalArgumentException(
+                        "acceptedMaxResponseBytes must be between 65536 and 9007199254740991");
+            }
+            this.acceptedMaxResponseBytes = bytes;
             return this;
         }
 

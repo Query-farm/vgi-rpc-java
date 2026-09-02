@@ -46,9 +46,10 @@ public record CallToken(
         byte[] inputSchema,
         String streamId,
         byte[] callId,
-        long createdAt) {
+        long createdAt,
+        long responseLimitBytes) {
 
-    private static final byte VERSION = 1;
+    private static final byte VERSION = 2;
     private static final int VERSION_LEN = 1;
 
     /**
@@ -63,6 +64,12 @@ public record CallToken(
         inputSchema = inputSchema.clone();
         callId = callId.clone();
         streamId = streamId != null ? streamId : "";
+    }
+
+    /** Compatibility constructor for callers that do not negotiate a response budget. */
+    public CallToken(byte[] outputSchema, byte[] inputSchema, String streamId,
+                     byte[] callId, long createdAt) {
+        this(outputSchema, inputSchema, streamId, callId, createdAt, Long.MAX_VALUE);
     }
 
     @Override public byte[] outputSchema() { return outputSchema.clone(); }
@@ -81,12 +88,13 @@ public record CallToken(
 
     private byte[] packWithAad(byte[] tokenKey, byte[] aad) {
         byte[] streamIdBytes = streamId.getBytes(StandardCharsets.UTF_8);
-        int payloadLen = 8 + Tokens.CALL_ID_LEN
+        int payloadLen = 8 + 8 + Tokens.CALL_ID_LEN
                 + 4 + outputSchema.length
                 + 4 + inputSchema.length
                 + 4 + streamIdBytes.length;
         ByteBuffer payload = ByteBuffer.allocate(payloadLen).order(ByteOrder.LITTLE_ENDIAN);
         payload.putLong(createdAt);
+        payload.putLong(responseLimitBytes);
         payload.put(callId);
         putSegment(payload, outputSchema);
         putSegment(payload, inputSchema);
@@ -139,11 +147,12 @@ public record CallToken(
         // Decompress only after authentication: nothing an attacker supplies
         // reaches the decoder without the token key.
         byte[] plaintext = Tokens.unpackPayload(opened);
-        if (plaintext.length < 8 + Tokens.CALL_ID_LEN) {
+        if (plaintext.length < 16 + Tokens.CALL_ID_LEN) {
             throw new IllegalArgumentException("Malformed state token");
         }
         ByteBuffer bb = ByteBuffer.wrap(plaintext).order(ByteOrder.LITTLE_ENDIAN);
         long createdAt = bb.getLong();
+        long responseLimitBytes = bb.getLong();
         byte[] callId = new byte[Tokens.CALL_ID_LEN];
         bb.get(callId);
         if (ttlSeconds > 0) {
@@ -157,7 +166,8 @@ public record CallToken(
         byte[] inputSchema = getSegment(bb);
         byte[] streamIdBytes = getSegment(bb);
         return new CallToken(outputSchema, inputSchema,
-                new String(streamIdBytes, StandardCharsets.UTF_8), callId, createdAt);
+                new String(streamIdBytes, StandardCharsets.UTF_8), callId, createdAt,
+                responseLimitBytes);
     }
 
     private static void putSegment(ByteBuffer b, byte[] seg) {

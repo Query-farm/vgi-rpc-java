@@ -54,6 +54,8 @@ public final class OutputCollector {
     private final Schema outputSchema;
     private final String serverId;
     private final boolean producerMode;
+    private final Long responseLimitBytes;
+    private final Long preferredResponseBytes;
     private final List<Entry> entries = new ArrayList<>();
     private boolean finished;
     private int dataIdx = -1;
@@ -67,9 +69,17 @@ public final class OutputCollector {
      * @param producerMode whether {@link #finish()} is permitted (producer streams)
      */
     public OutputCollector(Schema outputSchema, String serverId, boolean producerMode) {
+        this(outputSchema, serverId, producerMode, null, null);
+    }
+
+    /** Create a collector carrying the negotiated off-wire response budgets. */
+    public OutputCollector(Schema outputSchema, String serverId, boolean producerMode,
+                           Long responseLimitBytes, Long preferredResponseBytes) {
         this.outputSchema = outputSchema;
         this.serverId = serverId;
         this.producerMode = producerMode;
+        this.responseLimitBytes = responseLimitBytes;
+        this.preferredResponseBytes = preferredResponseBytes;
     }
 
     /**
@@ -78,6 +88,10 @@ public final class OutputCollector {
      * @return the schema all emitted and zero-row batches must conform to
      */
     public Schema outputSchema() { return outputSchema; }
+    /** Negotiated hard response limit, or null when unbounded. */
+    public Long responseLimitBytes() { return responseLimitBytes; }
+    /** Server batching target, clamped to the hard limit, or null when unset. */
+    public Long preferredResponseBytes() { return preferredResponseBytes; }
     /**
      * Whether {@link #finish()} has been called (producer streams).
      *

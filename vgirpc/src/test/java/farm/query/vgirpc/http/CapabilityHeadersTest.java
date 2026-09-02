@@ -5,8 +5,17 @@ package farm.query.vgirpc.http;
 
 import com.github.luben.zstd.Zstd;
 import farm.query.vgirpc.RpcConnection;
+import farm.query.vgirpc.RpcError;
 import farm.query.vgirpc.RpcServer;
+import farm.query.vgirpc.external.UploadUrlProvider;
 import farm.query.vgirpc.transport.RpcTransport;
+import farm.query.vgirpc.wire.Allocators;
+import farm.query.vgirpc.wire.IpcStreamReader;
+import farm.query.vgirpc.wire.IpcStreamWriter;
+import farm.query.vgirpc.wire.Metadata;
+import farm.query.vgirpc.wire.Wire;
+import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -21,13 +30,16 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * {@code VGI-Supported-Encodings} end to end: a live server advertises exactly
@@ -89,6 +101,70 @@ final class CapabilityHeadersTest {
         String advertised = advertised(resp);
         assertEquals(String.join(", ", HttpServer.Config.defaultSupportedEncodings()), advertised);
         assertFalse(advertised.contains(MediaTypes.IDENTITY));
+        assertEquals("true", resp.headers()
+                .firstValue(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER).orElseThrow());
+    }
+
+    @Test
+    void options_health_rejects_invalid_present_response_budgets_as_arrow_value_errors()
+            throws Exception {
+        start(null);
+        List<HttpRequest> requests = List.of(
+                request(base + "/health")
+                        .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "invalid")
+                        .method("OPTIONS", HttpRequest.BodyPublishers.noBody()).build(),
+                request(base + "/health")
+                        .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "65535")
+                        .method("OPTIONS", HttpRequest.BodyPublishers.noBody()).build(),
+                request(base + "/health")
+                        .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "65536")
+                        .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "65537")
+                        .method("OPTIONS", HttpRequest.BodyPublishers.noBody()).build());
+
+        try (HttpClient client = newClient()) {
+            for (HttpRequest request : requests) {
+                HttpResponse<byte[]> resp = client.send(request,
+                        HttpResponse.BodyHandlers.ofByteArray());
+                assertEquals(400, resp.statusCode());
+                assertEquals("true", resp.headers()
+                        .firstValue(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER)
+                        .orElseThrow());
+                assertEquals("true", resp.headers()
+                        .firstValue(HttpServer.RPC_ERROR_HEADER).orElseThrow());
+                assertTrue(resp.headers().firstValue("Content-Type").orElseThrow()
+                        .startsWith("application/vnd.apache.arrow.stream"));
+                try (IpcStreamReader reader = new IpcStreamReader(
+                        new java.io.ByteArrayInputStream(resp.body()), Allocators.root())) {
+                    RpcError error = Wire.errorFromMetadata(reader.readNextBatch());
+                    assertEquals("ValueError", error.errorType());
+                }
+            }
+        }
+    }
+
+    @Test
+    void hosting_and_application_response_caps_advertise_the_tighter_limit() throws Exception {
+        startWithConfig(HttpServer.Config.builder().prefix("/vgi")
+                .maxResponseBytes(8L << 20)
+                .hostingMaxResponseBytes(2L << 20)
+                .preferredResponseBytes(4L << 20));
+        HttpResponse<Void> resp = options(base + "/health");
+        assertEquals(Long.toString(2L << 20), resp.headers()
+                .firstValue(HttpServer.MAX_RESPONSE_BYTES_HEADER).orElseThrow());
+    }
+
+    @Test
+    void response_budget_configuration_enforces_the_shared_numeric_range() {
+        assertThrows(IllegalArgumentException.class, () -> HttpServer.Config.builder()
+                .maxResponseBytes((64L << 10) - 1).build());
+        assertThrows(IllegalArgumentException.class, () -> HttpServer.Config.builder()
+                .hostingMaxResponseBytes((64L << 10) - 1).build());
+        assertThrows(IllegalArgumentException.class, () -> HttpServer.Config.builder()
+                .preferredResponseBytes((64L << 10) - 1).build());
+        assertThrows(IllegalArgumentException.class, () -> HttpServer.Config.builder()
+                .advertisedMaxResponseBytes(9_007_199_254_740_992L).build());
+        assertThrows(IllegalArgumentException.class, () -> HttpRpcConnection.builder("http://example.invalid")
+                .acceptedMaxResponseBytes((64L << 10) - 1));
     }
 
     /** A narrowed set is advertised verbatim — the same mechanism
@@ -197,18 +273,81 @@ final class CapabilityHeadersTest {
     }
 
     @Test
-    void internal_response_overflow_returns_413_instead_of_partial_arrow() throws Exception {
+    void negotiated_response_overflow_returns_structured_rpc_error() throws Exception {
         startWithConfig(HttpServer.Config.builder()
                 .prefix("/vgi")
                 .supportedEncodings(List.of())
-                .maxResponseBytes(128));
+                .maxResponseBytes(64L << 10));
 
         HttpResponse<byte[]> resp = post(request(base + "/echo")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(unaryRequest("small"))));
+                .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, Long.toString(64L << 10))
+                .POST(HttpRequest.BodyPublishers.ofByteArray(unaryRequest(PAYLOAD))));
 
-        assertEquals(413, resp.statusCode());
-        assertTrue(new String(resp.body(), java.nio.charset.StandardCharsets.UTF_8)
-                .contains("external-location"));
+        assertEquals(200, resp.statusCode());
+        assertEquals("true", resp.headers().firstValue(HttpServer.RPC_ERROR_HEADER).orElseThrow());
+        assertTrue(resp.body().length < (64L << 10), "the structured refusal must fit the negotiated cap");
+
+        try (HttpRpcConnection client = HttpRpcConnection.builder(base).build()) {
+            RpcError error = assertThrows(RpcError.class,
+                    () -> client.proxy(EchoService.class).echo(PAYLOAD));
+            assertEquals("ResponseTooLargeError", error.errorType());
+            assertTrue(error.errorMessage().contains("max_response_bytes"));
+            assertTrue(error.errorMessage().contains("echo"));
+        }
+    }
+
+    @Test
+    void malformed_or_combined_client_budget_is_http_400_before_dispatch() throws Exception {
+        start(List.of());
+        byte[] body = unaryRequest("small");
+        HttpResponse<byte[]> malformed = post(request(base + "/echo")
+                .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "01")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)));
+        assertEquals(400, malformed.statusCode());
+
+        HttpResponse<byte[]> combined = post(request(base + "/echo")
+                .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "65536, 131072")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)));
+        assertEquals(400, combined.statusCode());
+    }
+
+    @Test
+    void upload_url_authenticates_before_budget_and_body_parsing() throws Exception {
+        startWithConfig(HttpServer.Config.builder().prefix("/vgi")
+                .supportedEncodings(List.of())
+                .authenticator(request -> { throw new InvalidCredentials("bad token"); })
+                .uploadUrlProvider(() -> new UploadUrlProvider.UploadUrl(
+                        "https://upload.invalid", "https://download.invalid", Instant.now())));
+
+        HttpResponse<byte[]> resp = post(request(base + "/__upload_url__/init")
+                .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "1")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(new byte[0])));
+        assertEquals(401, resp.statusCode());
+        assertEquals("true", resp.headers()
+                .firstValue(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER).orElseThrow());
+    }
+
+    @Test
+    void upload_url_response_obeys_the_negotiated_budget() throws Exception {
+        String longPart = "x".repeat(700);
+        startWithConfig(HttpServer.Config.builder().prefix("/vgi")
+                .supportedEncodings(List.of())
+                .uploadUrlProvider(() -> new UploadUrlProvider.UploadUrl(
+                        "https://upload.invalid/" + longPart,
+                        "https://download.invalid/" + longPart, Instant.now())));
+
+        HttpResponse<byte[]> resp = post(request(base + "/__upload_url__/init")
+                .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, Long.toString(64L << 10))
+                .POST(HttpRequest.BodyPublishers.ofByteArray(uploadRequest(100))));
+        assertEquals(200, resp.statusCode());
+        assertEquals("true", resp.headers().firstValue(HttpServer.RPC_ERROR_HEADER).orElseThrow());
+        try (IpcStreamReader reader = new IpcStreamReader(
+                new java.io.ByteArrayInputStream(resp.body()), Allocators.root())) {
+            RpcError error = Wire.errorFromMetadata(reader.readNextBatch());
+            assertEquals("ResponseTooLargeError", error.errorType());
+            assertTrue(error.errorMessage().contains("__upload_url__"));
+            assertTrue(error.errorMessage().contains("max_response_bytes"));
+        }
     }
 
     // ---- helpers ---------------------------------------------------------
@@ -290,6 +429,22 @@ final class CapabilityHeadersTest {
             serverTransport.close();
         }
         return captured.toByteArray();
+    }
+
+    private static byte[] uploadRequest(long count) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(
+                     HttpServer.UPLOAD_URL_PARAMS_SCHEMA, Allocators.root());
+             IpcStreamWriter writer = new IpcStreamWriter(out)) {
+            BigIntVector counts = (BigIntVector) root.getVector("count");
+            counts.allocateNew(1);
+            counts.setSafe(0, count);
+            root.setRowCount(1);
+            writer.writeBatch(root, Map.of(
+                    Metadata.RPC_METHOD, HttpServer.UPLOAD_URL_METHOD,
+                    Metadata.REQUEST_VERSION_KEY, Metadata.REQUEST_VERSION));
+        }
+        return out.toByteArray();
     }
 
     /** Writes through to the transport while keeping a copy of the request bytes. */

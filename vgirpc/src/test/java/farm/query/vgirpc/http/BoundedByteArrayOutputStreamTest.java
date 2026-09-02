@@ -52,6 +52,6 @@ final class BoundedByteArrayOutputStreamTest {
     void http_defaults_leave_response_framing_headroom() {
         HttpServer.Config defaults = HttpServer.Config.defaults();
         assertEquals(16L << 20, defaults.maxRequestBytes());
-        assertEquals(64L << 20, defaults.maxResponseBytes());
+        assertEquals(Long.MAX_VALUE, defaults.maxResponseBytes());
     }
 }

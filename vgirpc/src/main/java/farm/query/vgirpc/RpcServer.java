@@ -893,7 +893,8 @@ public final class RpcServer {
             }
         }
 
-        OutputCollector out = new OutputCollector(outputSchema, serverId, isProducer);
+        OutputCollector out = new OutputCollector(outputSchema, serverId, isProducer,
+                ctx.responseLimitBytes(), ctx.preferredResponseBytes());
         long tp0 = System.nanoTime();
         try {
             state.process(new AnnotatedBatch(inputRoot, effectiveMeta), out, ctx);

@@ -109,6 +109,11 @@ public final class HttpServer {
     public static final String MAX_UPLOAD_BYTES_HEADER = "VGI-Max-Upload-Bytes";
     /** Capability response header: operator-configured cap on inline response bodies, in bytes. */
     public static final String MAX_RESPONSE_BYTES_HEADER = "VGI-Max-Response-Bytes";
+    /** Request header declaring the largest decoded Arrow IPC response the client accepts. */
+    public static final String ACCEPT_MAX_RESPONSE_BYTES_HEADER = "VGI-Accept-Max-Response-Bytes";
+    /** Capability response header proving that the server enforces the client response budget. */
+    public static final String ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER =
+            "VGI-Accept-Max-Response-Bytes-Support";
     /** Capability response header: operator-configured cap on externalized response payloads, in bytes. */
     public static final String MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER = "VGI-Max-Externalized-Response-Bytes";
     /** Capability response header: {@code "true"}/{@code "false"} — whether the {@link RpcServer} has an external-location config and can externalise oversized payloads. */
@@ -204,6 +209,9 @@ public final class HttpServer {
      *  in-process memory bound. */
     private final long advertisedMaxResponseBytes;
     private final long advertisedMaxExternalizedResponseBytes;
+    private final long hostingMaxRequestBytes;
+    private final long hostingMaxResponseBytes;
+    private final long preferredResponseBytes;
     /** Operator-declared: this worker's proxy-proof gate is in REQUIRE mode.
      *  Advertisement only — the gate is an opaque {@link Authenticator}, so the
      *  server has no way to read the posture back off it. */
@@ -254,7 +262,7 @@ public final class HttpServer {
     public HttpServer(RpcServer rpc, Config config) {
         this.rpc = rpc;
         this.streamHandler = new HttpStreamHandler(rpc, config.tokenKey(),
-                config.tokenTtlSeconds(), config.maxResponseBytes(), config.callStateCacheMaxEntries());
+                config.tokenTtlSeconds(), Long.MAX_VALUE, config.callStateCacheMaxEntries());
         this.authenticator = config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
         this.peerIdentityProviders = config.peerIdentityProviders();
         this.peerAuthenticationPolicy = config.peerAuthenticationPolicy();
@@ -275,6 +283,9 @@ public final class HttpServer {
         this.maxUploadBytes = config.maxUploadBytes();
         this.advertisedMaxResponseBytes = config.advertisedMaxResponseBytes();
         this.advertisedMaxExternalizedResponseBytes = config.advertisedMaxExternalizedResponseBytes();
+        this.hostingMaxRequestBytes = config.hostingMaxRequestBytes();
+        this.hostingMaxResponseBytes = config.hostingMaxResponseBytes();
+        this.preferredResponseBytes = config.preferredResponseBytes();
         this.proxyProofRequired = config.proxyProofRequired();
         // The proof gate contributes its header only in require mode: in allow
         // mode an absent proof never denies, so the note would misdirect.
@@ -533,7 +544,10 @@ public final class HttpServer {
             PeerAuthenticationPolicy peerAuthenticationPolicy,
             String peerServiceName,
             long peerResolutionTimeoutMs,
-            int peerProviderConcurrency) {
+            int peerProviderConcurrency,
+            long hostingMaxRequestBytes,
+            long hostingMaxResponseBytes,
+            long preferredResponseBytes) {
 
         /** Source-compatible constructor for the initial peer-identity configuration shape. */
         public Config(
@@ -560,7 +574,8 @@ public final class HttpServer {
                     stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin, landingInfo,
                     corsOrigins, corsMaxAgeSeconds, introspectResolver, introspectPrincipals,
                     introspectTtlSeconds, introspectRateLimitPerSecond, peerIdentityProviders,
-                    peerAuthenticationPolicy, peerServiceName, peerResolutionTimeoutMs, 64);
+                    peerAuthenticationPolicy, peerServiceName, peerResolutionTimeoutMs, 64,
+                    0, 0, 0);
         }
 
         /**
@@ -588,7 +603,7 @@ public final class HttpServer {
                     stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin, landingInfo,
                     corsOrigins, corsMaxAgeSeconds, introspectResolver, introspectPrincipals,
                     introspectTtlSeconds, introspectRateLimitPerSecond,
-                    List.of(), null, null, 5_000, 64);
+                    List.of(), null, null, 5_000, 64, 0, 0, 0);
         }
 
         /** 1 hour. */
@@ -602,7 +617,7 @@ public final class HttpServer {
          * larger than the normal inline payload so Arrow IPC framing has room;
          * operator-facing wire policy is configured separately.
          */
-        public static final long DEFAULT_MAX_RESPONSE_BYTES = 64L << 20;
+        public static final long DEFAULT_MAX_RESPONSE_BYTES = Long.MAX_VALUE;
         /**
          * Historical shared request/response default, retained for source compatibility.
          * New code should use the direction-specific constants.
@@ -666,7 +681,33 @@ public final class HttpServer {
                     ? normalizeEncodings(supportedEncodings)
                     : defaultSupportedEncodings();
             if (maxRequestBytes <= 0) throw new IllegalArgumentException("maxRequestBytes must be > 0");
-            if (maxResponseBytes <= 0) throw new IllegalArgumentException("maxResponseBytes must be > 0");
+            if (maxResponseBytes < (64L << 10) && maxResponseBytes != Long.MAX_VALUE) {
+                throw new IllegalArgumentException("maxResponseBytes must be >= 65536");
+            }
+            if (maxResponseBytes > 9_007_199_254_740_991L && maxResponseBytes != Long.MAX_VALUE) {
+                throw new IllegalArgumentException("maxResponseBytes must be <= 9007199254740991");
+            }
+            if (advertisedMaxResponseBytes > 0 && advertisedMaxResponseBytes < (64L << 10)) {
+                throw new IllegalArgumentException("advertisedMaxResponseBytes must be >= 65536 when set");
+            }
+            if (advertisedMaxResponseBytes > 9_007_199_254_740_991L) {
+                throw new IllegalArgumentException("advertisedMaxResponseBytes must be <= 9007199254740991");
+            }
+            if (hostingMaxResponseBytes > 0 && hostingMaxResponseBytes < (64L << 10)) {
+                throw new IllegalArgumentException("hostingMaxResponseBytes must be >= 65536 when set");
+            }
+            if (hostingMaxRequestBytes < 0) throw new IllegalArgumentException("hostingMaxRequestBytes must be >= 0");
+            if (hostingMaxResponseBytes < 0) throw new IllegalArgumentException("hostingMaxResponseBytes must be >= 0");
+            if (hostingMaxResponseBytes > 9_007_199_254_740_991L) {
+                throw new IllegalArgumentException("hostingMaxResponseBytes must be <= 9007199254740991");
+            }
+            if (preferredResponseBytes < 0) throw new IllegalArgumentException("preferredResponseBytes must be >= 0");
+            if (preferredResponseBytes > 0 && preferredResponseBytes < (64L << 10)) {
+                throw new IllegalArgumentException("preferredResponseBytes must be >= 65536 when set");
+            }
+            if (preferredResponseBytes > 9_007_199_254_740_991L) {
+                throw new IllegalArgumentException("preferredResponseBytes must be <= 9007199254740991");
+            }
             if (idleTimeoutMs < 0) throw new IllegalArgumentException("idleTimeoutMs must be >= 0");
             if (zstdLevel < 1 || zstdLevel > 22) throw new IllegalArgumentException("zstdLevel must be in [1, 22]");
             if (callStateCacheMaxEntries < 0) {
@@ -748,6 +789,9 @@ public final class HttpServer {
             private Long maxUploadBytes;
             private long advertisedMaxResponseBytes;
             private long advertisedMaxExternalizedResponseBytes;
+            private long hostingMaxRequestBytes;
+            private long hostingMaxResponseBytes;
+            private long preferredResponseBytes;
             private boolean proxyProofRequired;
             private List<String> proxyAuthHeaders = List.of();
             private int callStateCacheMaxEntries = CallStateCache.DEFAULT_MAX_ENTRIES;
@@ -846,6 +890,12 @@ public final class HttpServer {
              * @return this builder
              */
             public Builder maxResponseBytes(long maxResponseBytes) { this.maxResponseBytes = maxResponseBytes; return this; }
+            /** Provider-neutral hosting request ceiling; zero means unset. */
+            public Builder hostingMaxRequestBytes(long bytes) { this.hostingMaxRequestBytes = bytes; return this; }
+            /** Provider-neutral hosting response ceiling; zero means unset. */
+            public Builder hostingMaxResponseBytes(long bytes) { this.hostingMaxResponseBytes = bytes; return this; }
+            /** Advisory server batching target; zero means unset. */
+            public Builder preferredResponseBytes(long bytes) { this.preferredResponseBytes = bytes; return this; }
             /**
              * Jetty connector idle timeout in milliseconds.
              *
@@ -936,6 +986,10 @@ public final class HttpServer {
              */
             public Builder advertisedMaxExternalizedResponseBytes(long v) {
                 this.advertisedMaxExternalizedResponseBytes = v; return this;
+            }
+            /** Hard cap for externalized response payloads; zero means unset. */
+            public Builder maxExternalizedResponseBytes(long v) {
+                return advertisedMaxExternalizedResponseBytes(v);
             }
             /**
              * Advertise {@code VGI-Proxy-Proof-Required: true} on every response.
@@ -1146,7 +1200,8 @@ public final class HttpServer {
                         introspectResolver, introspectPrincipals,
                         introspectTtlSeconds, introspectRateLimitPerSecond,
                         peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
-                        peerResolutionTimeoutMs, peerProviderConcurrency);
+                        peerResolutionTimeoutMs, peerProviderConcurrency,
+                        hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes);
             }
         }
 
@@ -1170,7 +1225,8 @@ public final class HttpServer {
                     introspectResolver, introspectPrincipals,
                     introspectTtlSeconds, introspectRateLimitPerSecond,
                     peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
-                    peerResolutionTimeoutMs, peerProviderConcurrency);
+                    peerResolutionTimeoutMs, peerProviderConcurrency,
+                    hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes);
         }
     }
 
@@ -1273,8 +1329,18 @@ public final class HttpServer {
         }
 
         @Override
-        protected void doOptions(HttpServletRequest req, HttpServletResponse resp) {
+        protected void doOptions(HttpServletRequest req, HttpServletResponse resp) throws IOException {
             // Used by clients as the canonical capability-discovery target.
+            // OPTIONS is intentionally outside the RPC authentication path so
+            // load balancers and browser preflights can discover capabilities.
+            // If a deployment adds an auth boundary ahead of this servlet, it
+            // has already run before this transport-owned validation.
+            try {
+                parseAcceptedMaxResponseBytes(req);
+            } catch (IllegalArgumentException e) {
+                writeBadRequestArrow(req, resp, e);
+                return;
+            }
             resp.setHeader("Cache-Control", "public, max-age=300");
             resp.setStatus(HttpServletResponse.SC_OK);
         }
@@ -1409,12 +1475,15 @@ public final class HttpServer {
 
     /** Set capability-advertisement headers on every response. */
     private void applyCapabilityHeaders(HttpServletRequest req, HttpServletResponse resp) {
-        if (advertiseMaxRequestBytes) {
-            resp.setHeader(MAX_REQUEST_BYTES_HEADER, Long.toString(maxRequestBytes));
+        long requestLimit = configuredRequestLimit();
+        if (advertiseMaxRequestBytes || requestLimit != Long.MAX_VALUE) {
+            resp.setHeader(MAX_REQUEST_BYTES_HEADER, Long.toString(requestLimit));
         }
-        if (advertisedMaxResponseBytes > 0) {
-            resp.setHeader(MAX_RESPONSE_BYTES_HEADER, Long.toString(advertisedMaxResponseBytes));
+        long responseLimit = configuredResponseLimit();
+        if (responseLimit != Long.MAX_VALUE) {
+            resp.setHeader(MAX_RESPONSE_BYTES_HEADER, Long.toString(responseLimit));
         }
+        resp.setHeader(ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER, "true");
         if (advertisedMaxExternalizedResponseBytes > 0) {
             resp.setHeader(MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER,
                     Long.toString(advertisedMaxExternalizedResponseBytes));
@@ -1478,8 +1547,9 @@ public final class HttpServer {
                 // including the failures, and it is what lets a browser client
                 // quote an id the server's own log can be searched for.
                 HttpHeaders.REQUEST_ID));
-        if (advertiseMaxRequestBytes) expose.add(MAX_REQUEST_BYTES_HEADER);
-        if (advertisedMaxResponseBytes > 0) expose.add(MAX_RESPONSE_BYTES_HEADER);
+        if (advertiseMaxRequestBytes || configuredRequestLimit() != Long.MAX_VALUE) expose.add(MAX_REQUEST_BYTES_HEADER);
+        if (configuredResponseLimit() != Long.MAX_VALUE) expose.add(MAX_RESPONSE_BYTES_HEADER);
+        expose.add(ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER);
         if (advertisedMaxExternalizedResponseBytes > 0) expose.add(MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER);
         if (uploadUrlProvider != null) {
             expose.add(UPLOAD_URL_HEADER);
@@ -1505,11 +1575,72 @@ public final class HttpServer {
         return expose;
     }
 
+    private static long minConfigured(long current, long candidate) {
+        return candidate > 0 && candidate < current ? candidate : current;
+    }
+
+    private long configuredRequestLimit() {
+        return minConfigured(maxRequestBytes, hostingMaxRequestBytes);
+    }
+
+    private long configuredResponseLimit() {
+        long limit = maxResponseBytes;
+        limit = minConfigured(limit, advertisedMaxResponseBytes);
+        return minConfigured(limit, hostingMaxResponseBytes);
+    }
+
+    private long effectiveResponseLimit(Long accepted) {
+        return accepted == null ? configuredResponseLimit()
+                : Math.min(configuredResponseLimit(), accepted);
+    }
+
+    private Long effectivePreferredResponseBytes(long hardLimit) {
+        if (preferredResponseBytes <= 0) return null;
+        return Math.min(preferredResponseBytes, hardLimit);
+    }
+
+    /** Strictly parse one non-combined client response-budget header. */
+    private static Long parseAcceptedMaxResponseBytes(HttpServletRequest req) {
+        java.util.Enumeration<String> values = req.getHeaders(ACCEPT_MAX_RESPONSE_BYTES_HEADER);
+        if (values == null || !values.hasMoreElements()) return null;
+        String value = values.nextElement();
+        if (values.hasMoreElements() || value == null || value.isEmpty() || value.indexOf(',') >= 0
+                || !value.matches("[1-9][0-9]*")) {
+            throw new IllegalArgumentException(ACCEPT_MAX_RESPONSE_BYTES_HEADER
+                    + " must be one ASCII integer matching [1-9][0-9]*");
+        }
+        try {
+            long parsed = Long.parseLong(value);
+            if (parsed < (64L << 10) || parsed > 9_007_199_254_740_991L) {
+                throw new NumberFormatException();
+            }
+            return parsed;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(ACCEPT_MAX_RESPONSE_BYTES_HEADER
+                    + " must be between 65536 and 9007199254740991");
+        }
+    }
+
     private void handleUploadUrl(HttpServletRequest req, HttpServletResponse resp) throws IOException {
         if (uploadUrlProvider == null) {
             resp.sendError(HttpServletResponse.SC_NOT_FOUND);
             return;
         }
+        RequestIdentity identity;
+        try {
+            identity = authenticateIdentity(req);
+        } catch (AuthException e) {
+            writeUnauthorized(resp, e);
+            return;
+        }
+        Long acceptedMaxResponseBytes;
+        try {
+            acceptedMaxResponseBytes = parseAcceptedMaxResponseBytes(req);
+        } catch (IllegalArgumentException e) {
+            writeBadRequestArrow(req, resp, e);
+            return;
+        }
+        long responseLimit = effectiveResponseLimit(acceptedMaxResponseBytes);
         // Read & validate the request batch (carries vgi_rpc.method=__upload_url__ and a count column)
         byte[] body;
         try {
@@ -1551,9 +1682,20 @@ public final class HttpServer {
         }
         count = Math.max(1, Math.min(count, MAX_UPLOAD_URL_COUNT));
 
-        // Generate the URLs and write the response IPC stream.
+        // Generate the URLs and write the response IPC stream. Keep the
+        // authenticated identity in scope just like ordinary RPC dispatch so
+        // provider implementations cannot observe an anonymous synthetic call.
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try (VectorSchemaRoot root = VectorSchemaRoot.create(UPLOAD_URL_SCHEMA, Allocators.root());
+        Map<String, Object> transportMetadata = buildTransportMetadata(req);
+        if (responseLimit != Long.MAX_VALUE) {
+            transportMetadata.put(CallContext.RESPONSE_LIMIT_BYTES_KEY, responseLimit);
+        }
+        Long preferredLimit = effectivePreferredResponseBytes(responseLimit);
+        if (preferredLimit != null) {
+            transportMetadata.put(CallContext.PREFERRED_RESPONSE_BYTES_KEY, preferredLimit);
+        }
+        try (AutoCloseable ignored = AuthScope.push(identity.auth(), transportMetadata, identity.evidence());
+             VectorSchemaRoot root = VectorSchemaRoot.create(UPLOAD_URL_SCHEMA, Allocators.root());
              IpcStreamWriter w = new IpcStreamWriter(out)) {
             VarCharVector uploadVec = (VarCharVector) root.getVector("upload_url");
             VarCharVector downloadVec = (VarCharVector) root.getVector("download_url");
@@ -1584,6 +1726,13 @@ public final class HttpServer {
                 writeArrowResponse(req, resp, out.toByteArray());
                 return;
             }
+        } catch (Exception e) {
+            if (e instanceof IOException ioe) throw ioe;
+            throw new IOException(e);
+        }
+        if (out.size() > responseLimit) {
+            writeResponseCapError(req, resp, UPLOAD_URL_METHOD, out.size(), responseLimit);
+            return;
         }
         writeArrowResponse(req, resp, out.toByteArray());
     }
@@ -1713,6 +1862,24 @@ public final class HttpServer {
     }
 
     private void handleUnary(HttpServletRequest req, HttpServletResponse resp, String method) throws IOException {
+        RequestIdentity identity;
+        try {
+            identity = authenticateIdentity(req);
+        } catch (AuthException e) {
+            writeUnauthorized(resp, e);
+            return;
+        }
+        AuthContext auth = identity.auth();
+
+        Long acceptedMaxResponseBytes;
+        try {
+            acceptedMaxResponseBytes = parseAcceptedMaxResponseBytes(req);
+        } catch (IllegalArgumentException e) {
+            writeBadRequestArrow(req, resp, e);
+            return;
+        }
+        long responseLimit = effectiveResponseLimit(acceptedMaxResponseBytes);
+
         byte[] body;
         try {
             body = readBody(req);
@@ -1723,14 +1890,6 @@ public final class HttpServer {
             writeUnsupportedEncoding(resp, e);
             return;
         }
-        RequestIdentity identity;
-        try {
-            identity = authenticateIdentity(req);
-        } catch (AuthException e) {
-            writeUnauthorized(resp, e);
-            return;
-        }
-        AuthContext auth = identity.auth();
 
         try {
             validateDispatchRequest(body, method);
@@ -1748,8 +1907,15 @@ public final class HttpServer {
             return;
         }
 
-        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
+        BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(Long.MAX_VALUE);
         Map<String, Object> md = buildTransportMetadata(req);
+        if (responseLimit != Long.MAX_VALUE) {
+            md.put(CallContext.RESPONSE_LIMIT_BYTES_KEY, responseLimit);
+        }
+        Long unaryPreferred = effectivePreferredResponseBytes(responseLimit);
+        if (unaryPreferred != null) {
+            md.put(CallContext.PREFERRED_RESPONSE_BYTES_KEY, unaryPreferred);
+        }
         try {
             try (AutoCloseable authPop = AuthScope.push(auth, md, identity.evidence());
                  AutoCloseable sessPop = SessionScope.push(scope);
@@ -1785,8 +1951,8 @@ public final class HttpServer {
         // an Arrow EXCEPTION batch carrying the literal "max_response_bytes"
         // token, surfaced via 200 + X-VGI-RPC-Error: true so RPC clients
         // observe RpcError, not a transport failure.
-        if (advertisedMaxResponseBytes > 0 && out.size() > advertisedMaxResponseBytes) {
-            writeResponseCapError(req, resp, method, out.size(), advertisedMaxResponseBytes);
+        if (out.size() > responseLimit) {
+            writeResponseCapError(req, resp, method, out.size(), responseLimit);
             return;
         }
         writeArrowResponse(req, resp, out.toByteArray());
@@ -1992,9 +2158,7 @@ public final class HttpServer {
      *  body overshoots the operator-facing response cap. */
     private void writeResponseCapError(HttpServletRequest req, HttpServletResponse resp,
                                        String method, long actual, long limit) throws IOException {
-        writeCapError(req, resp, new RuntimeException(
-                "HTTP body exceeds max_response_bytes (" + actual + " > " + limit
-                        + ") for method '" + method + "'"));
+        writeCapError(req, resp, new farm.query.vgirpc.ResponseTooLargeError(method, actual, limit));
     }
 
     /**
@@ -2129,8 +2293,8 @@ public final class HttpServer {
     private byte[] readBody(HttpServletRequest req) throws IOException {
         byte[] body;
         try (InputStream in = req.getInputStream();
-             BoundedByteArrayOutputStream buf = new BoundedByteArrayOutputStream(maxRequestBytes)) {
-            copyBounded(in, buf, maxRequestBytes);
+             BoundedByteArrayOutputStream buf = new BoundedByteArrayOutputStream(configuredRequestLimit())) {
+            copyBounded(in, buf, configuredRequestLimit());
             body = buf.toByteArray();
         }
         // Measured before decompression: this is what the peer actually sent,
@@ -2329,17 +2493,17 @@ public final class HttpServer {
         }
         if (MediaTypes.ZSTD.equals(token)) {
             try {
-                return ContentCodec.zstdDecompress(body, maxRequestBytes);
+                return ContentCodec.zstdDecompress(body, configuredRequestLimit());
             } catch (ContentCodec.OutputTooLargeException e) {
                 throw decodedRequestTooLarge(e);
             }
         }
-        return gzipDecompress(body, maxRequestBytes);
+        return gzipDecompress(body, configuredRequestLimit());
     }
 
     private PayloadTooLargeException decodedRequestTooLarge(Exception cause) {
         PayloadTooLargeException error = new PayloadTooLargeException(
-                "decoded request body exceeds max_request_bytes=" + maxRequestBytes
+                "decoded request body exceeds max_request_bytes=" + configuredRequestLimit()
                         + "; large batches must use the external-location protocol");
         error.initCause(cause);
         return error;
@@ -2511,6 +2675,25 @@ public final class HttpServer {
 
     private void handleStream(HttpServletRequest req, HttpServletResponse resp,
                                String method, boolean init) throws IOException {
+        RequestIdentity identity;
+        try {
+            identity = authenticateIdentity(req);
+        } catch (AuthException e) {
+            writeUnauthorized(resp, e);
+            return;
+        }
+        AuthContext auth = identity.auth();
+
+        Long acceptedMaxResponseBytes;
+        try {
+            acceptedMaxResponseBytes = parseAcceptedMaxResponseBytes(req);
+        } catch (IllegalArgumentException e) {
+            writeBadRequestArrow(req, resp, e);
+            return;
+        }
+        long responseLimit = effectiveResponseLimit(acceptedMaxResponseBytes);
+        Long preferredLimit = effectivePreferredResponseBytes(responseLimit);
+
         byte[] body;
         try {
             body = readBody(req);
@@ -2521,14 +2704,6 @@ public final class HttpServer {
             writeUnsupportedEncoding(resp, e);
             return;
         }
-        RequestIdentity identity;
-        try {
-            identity = authenticateIdentity(req);
-        } catch (AuthException e) {
-            writeUnauthorized(resp, e);
-            return;
-        }
-        AuthContext auth = identity.auth();
 
         if (init) {
             try {
@@ -2549,10 +2724,18 @@ public final class HttpServer {
 
         byte[] out;
         Map<String, Object> md = buildTransportMetadata(req);
+        if (responseLimit != Long.MAX_VALUE) {
+            md.put(CallContext.RESPONSE_LIMIT_BYTES_KEY, responseLimit);
+        }
+        if (preferredLimit != null) {
+            md.put(CallContext.PREFERRED_RESPONSE_BYTES_KEY, preferredLimit);
+        }
         try {
             try (AutoCloseable authPop = AuthScope.push(auth, md, identity.evidence());
                  AutoCloseable sessPop = SessionScope.push(scope)) {
-                out = init ? streamHandler.handleInit(method, body) : streamHandler.handleExchange(method, body);
+                out = init
+                        ? streamHandler.handleInit(method, body, responseLimit, preferredLimit)
+                        : streamHandler.handleExchange(method, body, responseLimit, preferredLimit);
             } catch (PayloadTooLargeException e) {
                 writePayloadTooLarge(resp, e);
                 return;
@@ -2575,14 +2758,8 @@ public final class HttpServer {
         // External-channel cap: hard on producer /init too, unlike the wire cap
         // below — see writeExternalizedCapErrorIfViolated.
         if (writeExternalizedCapErrorIfViolated(req, resp)) return;
-        // Wire-cap enforcement: /exchange strict-fails on overshoot (mirrors
-        // Python's TestHttpResponseCap.test_exchange_strict_fail), while /init
-        // is soft-capped — a producer that emits one batch larger than the
-        // cap is allowed through because HttpStreamHandler appends a
-        // continuation token so the client can resume via /exchange
-        // (TestHttpResponseCapSoftWire.test_producer_overshoot_uses_continuation).
-        if (!init && advertisedMaxResponseBytes > 0 && out.length > advertisedMaxResponseBytes) {
-            writeResponseCapError(req, resp, method, out.length, advertisedMaxResponseBytes);
+        if (out.length > responseLimit) {
+            writeResponseCapError(req, resp, method, out.length, responseLimit);
             return;
         }
         writeArrowResponse(req, resp, out);
