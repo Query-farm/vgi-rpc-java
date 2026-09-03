@@ -44,6 +44,7 @@ Artifacts are published to Maven Central under the `farm.query` group.
 ```kotlin
 dependencies {
     implementation("farm.query:vgirpc:0.8.0")          // core: protocol, transports, HTTP, schema
+    implementation("farm.query:vgirpc-iroh:0.8.0")     // optional: official native Iroh binding
     implementation("farm.query:vgirpc-oauth:0.8.0")    // optional: JWT / OAuth / PKCE auth
     implementation("farm.query:vgirpc-s3:0.8.0")       // optional: S3 external storage
     implementation("farm.query:vgirpc-gcs:0.8.0")      // optional: GCS external storage
@@ -119,6 +120,7 @@ try (RpcConnection conn = new RpcConnection(transport)) {
 | Module | Purpose |
 |---|---|
 | **`vgirpc`** | Core library — wire protocol, transports, HTTP server/client (Jetty 12), schema derivation, marshalling, external-location support, shared-memory primitive. |
+| **`vgirpc-iroh`** | Optional official Kotlin/JVM Iroh provider for raw Arrow mux and HTTP semantics. |
 | **`vgirpc-oauth`** | Optional OAuth/JWT support (JWKS validation, PKCE, signed cookies). Split out so core users don't pull `nimbus-jose-jwt`. |
 | **`vgirpc-s3`** | Amazon S3 `ExternalStorage` backend for large-batch externalization. |
 | **`vgirpc-gcs`** | Google Cloud Storage `ExternalStorage` backend. |
@@ -132,6 +134,27 @@ try (RpcConnection conn = new RpcConnection(transport)) {
 | **Unix socket** (`UnixSocketTransport`) | Co-located processes over a domain socket. |
 | **shared memory** | Zero-copy batch transfer for co-located processes; auto-negotiated on JDK 22+, transparent pipe fallback otherwise. |
 | **HTTP** (`HttpServer` / Jetty 12) | Networked, stateless-server streaming; auth via authenticators. |
+| **Iroh Arrow mux** (`IrohTransports`) | Stateful, authenticated QUIC to an `iroh://` worker. |
+| **HTTP over Iroh** (`HttpRpcConnection.irohBuilder`) | Existing HTTP state/continuation semantics carried over authenticated `iroh-http/2`. |
+
+Both Iroh modes use the official `computer.iroh` JVM binding from the optional
+`vgirpc-iroh` module. HTTP over Iroh retains the ordinary HTTP client’s OPTIONS
+discovery, response budgets, headers, authentication, and continuation logic:
+
+```java
+try (var connection = HttpRpcConnection.irohBuilder(
+        "httpi://<64-lowercase-hex-endpoint-id>/vgi",
+        IrohTransportOptions.defaults())
+        .bearerToken(accessToken)
+        .buildIroh()) {
+    Calculator calculator = connection.proxy(Calculator.class);
+    double result = calculator.add(2.0, 3.0);
+}
+```
+
+The provider owns one authenticated Iroh connection, opens one bidirectional
+stream per HTTP request, and closes it with the `HttpRpcConnection`. It does not
+start or download a helper executable.
 
 ## Method types
 

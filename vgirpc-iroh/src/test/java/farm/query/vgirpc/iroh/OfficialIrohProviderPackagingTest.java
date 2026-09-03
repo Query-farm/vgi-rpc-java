@@ -13,5 +13,6 @@ final class OfficialIrohProviderPackagingTest {
     @Test void serviceLoaderFindsOfficialProvider() {
         assertTrue(ServiceLoader.load(IrohTransportProvider.class).stream()
                 .anyMatch(provider -> provider.type().equals(OfficialIrohTransportProvider.class)));
+        assertTrue(new OfficialIrohTransportProvider().supportsHttp());
     }
 }

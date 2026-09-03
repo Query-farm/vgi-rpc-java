@@ -13,6 +13,16 @@ import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgirpc.schema.ArrowSerializableRecord;
+import farm.query.vgirpc.transport.IrohDispatchCertainty;
+import farm.query.vgirpc.transport.IrohEndpoint;
+import farm.query.vgirpc.transport.IrohErrorCategory;
+import farm.query.vgirpc.transport.IrohErrorStage;
+import farm.query.vgirpc.transport.IrohHttpRequest;
+import farm.query.vgirpc.transport.IrohHttpResponse;
+import farm.query.vgirpc.transport.IrohHttpTransport;
+import farm.query.vgirpc.transport.IrohTransportException;
+import farm.query.vgirpc.transport.IrohTransportOptions;
+import farm.query.vgirpc.transport.IrohTransportProvider;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.Metadata;
@@ -37,7 +47,9 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.ServiceLoader;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -101,6 +113,8 @@ public final class HttpRpcConnection implements AutoCloseable {
     private final HttpClient http;
     /** Jetty is used only for explicit SOCKS5h because the JDK HTTP client supports HTTP proxies only. */
     private final org.eclipse.jetty.client.HttpClient socksHttp;
+    /** Typed HTTP/1.1-over-Iroh transport; mutually exclusive with both HTTP clients. */
+    private final IrohHttpTransport irohHttp;
     /** Whether {@link #close()} owns the {@link HttpClient}; false when the caller supplied one. */
     private final boolean ownsHttpClient;
     /** Endpoint prefix with no trailing slash, e.g. {@code http://host:8080/vgi}. */
@@ -115,14 +129,21 @@ public final class HttpRpcConnection implements AutoCloseable {
     /** Strictly validated decoded cap advertised by OPTIONS /health, or null. */
     private volatile Long advertisedMaxResponseBytes;
 
-    private HttpRpcConnection(Builder b) {
+    private HttpRpcConnection(Builder b) { this(b, null); }
+
+    private HttpRpcConnection(Builder b, IrohHttpTransport irohHttp) {
         this.endpoint = b.endpoint;
         this.headers = Map.copyOf(b.headers);
         this.onLog = b.onLog != null ? b.onLog : m -> {};
         this.requestTimeout = b.requestTimeout;
         this.protocolVersion = b.protocolVersion;
         this.acceptedMaxResponseBytes = b.acceptedMaxResponseBytes;
-        if (b.socksProxy != null) {
+        this.irohHttp = irohHttp;
+        if (irohHttp != null) {
+            this.http = null;
+            this.socksHttp = null;
+            this.ownsHttpClient = true;
+        } else if (b.socksProxy != null) {
             if (b.httpClient != null) {
                 throw new IllegalArgumentException("socks5hProxy cannot be combined with httpClient");
             }
@@ -160,6 +181,40 @@ public final class HttpRpcConnection implements AutoCloseable {
      * @return a new builder
      */
     public static Builder builder(String endpoint) { return new Builder(endpoint); }
+
+    /**
+     * Build a configurable HTTP-semantics connection over {@code iroh-http/2}
+     * using the installed native provider.
+     *
+     * <p>After applying ordinary builder options, call {@link Builder#buildIroh()}.
+     * The resulting connection owns and closes the provider transport.</p>
+     */
+    public static Builder irohBuilder(String endpoint, IrohTransportOptions options)
+            throws IOException {
+        IrohTransportProvider provider = ServiceLoader.load(IrohTransportProvider.class)
+                .findFirst().orElseThrow(() -> new IrohTransportException(
+                        "httpi:// requires the optional official Kotlin/JVM Iroh provider",
+                        IrohErrorStage.BIND, IrohErrorCategory.UNSUPPORTED,
+                        IrohDispatchCertainty.NOT_SENT));
+        return irohBuilder(endpoint, options, provider);
+    }
+
+    /** Build an Iroh HTTP connection with default endpoint and timeout options. */
+    public static Builder irohBuilder(String endpoint) throws IOException {
+        return irohBuilder(endpoint, IrohTransportOptions.defaults());
+    }
+
+    /** Build a configurable HTTP-semantics connection with an explicit provider. */
+    public static Builder irohBuilder(String rawEndpoint, IrohTransportOptions options,
+                                      IrohTransportProvider provider) {
+        if (provider == null) throw new NullPointerException("provider");
+        IrohEndpoint parsed = IrohEndpoint.parse(rawEndpoint);
+        if (parsed.scheme() != IrohEndpoint.Scheme.HTTPI) {
+            throw new IllegalArgumentException("Iroh HTTP connection requires httpi://");
+        }
+        return new Builder("http://iroh.invalid" + parsed.basePath(), parsed,
+                options == null ? IrohTransportOptions.defaults() : options, provider);
+    }
 
     /**
      * Create a typed dynamic proxy that implements {@code serviceInterface},
@@ -201,6 +256,14 @@ public final class HttpRpcConnection implements AutoCloseable {
     @Override
     public void close() {
         if (!ownsHttpClient) return;
+        if (irohHttp != null) {
+            try {
+                irohHttp.close();
+            } catch (IOException e) {
+                throw new IllegalStateException("could not close Iroh HTTP transport", e);
+            }
+            return;
+        }
         if (http != null) http.close();
         if (socksHttp != null) {
             try {
@@ -239,6 +302,7 @@ public final class HttpRpcConnection implements AutoCloseable {
      */
     byte[] post(String url, byte[] body, String what) {
         ensureResponseBudgetSupport();
+        if (irohHttp != null) return postThroughIroh(url, body, what);
         if (socksHttp != null) return postThroughSocks(url, body, what);
         HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(url))
                 .header(HttpHeaders.CONTENT_TYPE, HttpServer.ARROW_CONTENT_TYPE)
@@ -277,6 +341,37 @@ public final class HttpRpcConnection implements AutoCloseable {
         }
         return requireArrowBody(resp.statusCode(),
                 resp.headers().firstValue(HttpHeaders.CONTENT_TYPE).orElse(""), responseBody, what);
+    }
+
+    private byte[] postThroughIroh(String url, byte[] body, String what) {
+        Map<String, List<String>> requestHeaders = new LinkedHashMap<>();
+        requestHeaders.put(HttpHeaders.CONTENT_TYPE, List.of(HttpServer.ARROW_CONTENT_TYPE));
+        requestHeaders.put(HttpHeaders.ACCEPT_ENCODING, List.of(MediaTypes.IDENTITY));
+        if (acceptedMaxResponseBytes != null) {
+            requestHeaders.put(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+                    List.of(Long.toString(acceptedMaxResponseBytes)));
+        }
+        headers.forEach((name, value) -> requestHeaders.put(name, List.of(value)));
+        IrohHttpResponse response;
+        try {
+            response = irohHttp.execute(new IrohHttpRequest("POST", URI.create(url).getRawPath(),
+                    requestHeaders, body, effectiveRequestTimeout(),
+                    effectiveDecodedResponseLimit(null)));
+        } catch (IOException e) {
+            throw transportRpcError(what, e);
+        }
+        requireExactBudgetSupport(response.headerValues(
+                HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER), what, response.status());
+        Long currentAdvertised = parseAdvertisedMaxResponseBytes(response.headerValues(
+                HttpServer.MAX_RESPONSE_BYTES_HEADER), what, response.status());
+        byte[] responseBody = response.body();
+        long limit = effectiveDecodedResponseLimit(currentAdvertised);
+        if (responseBody.length > limit) {
+            throw new RpcError("ResponseTooLargeError",
+                    what + " exceeds max_response_bytes (" + responseBody.length + " > " + limit + ")", "");
+        }
+        return requireArrowBody(response.status(), response.firstHeader(HttpHeaders.CONTENT_TYPE),
+                responseBody, what);
     }
 
     private byte[] postThroughSocks(String url, byte[] body, String what) {
@@ -381,10 +476,47 @@ public final class HttpRpcConnection implements AutoCloseable {
             if (responseBudgetSupportVerified) return;
             Long advertised = socksHttp != null
                     ? discoverResponseBudgetThroughSocks()
+                    : irohHttp != null ? discoverResponseBudgetThroughIroh()
                     : discoverResponseBudgetWithJdkClient();
             advertisedMaxResponseBytes = advertised;
             responseBudgetSupportVerified = true;
         }
+    }
+
+    private Long discoverResponseBudgetThroughIroh() {
+        Map<String, List<String>> requestHeaders = new LinkedHashMap<>();
+        requestHeaders.put(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER,
+                List.of(Long.toString(acceptedMaxResponseBytes)));
+        headers.forEach((name, value) -> requestHeaders.put(name, List.of(value)));
+        try {
+            IrohHttpResponse response = irohHttp.execute(new IrohHttpRequest(
+                    "OPTIONS", URI.create(endpoint + "/health").getRawPath(), requestHeaders,
+                    new byte[0], effectiveRequestTimeout(), 64L << 10));
+            if (response.status() < 200 || response.status() >= 300) {
+                throw new RpcError("ProtocolError",
+                        "server does not advertise "
+                                + HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER
+                                + ": true (HTTP " + response.status() + ")", "");
+            }
+            requireExactBudgetSupport(response.headerValues(
+                            HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER),
+                    "OPTIONS /health", response.status());
+            return parseAdvertisedMaxResponseBytes(response.headerValues(
+                            HttpServer.MAX_RESPONSE_BYTES_HEADER),
+                    "OPTIONS /health", response.status());
+        } catch (IOException e) {
+            throw transportRpcError("response-budget discovery", e);
+        }
+    }
+
+    private Duration effectiveRequestTimeout() {
+        return requestTimeout == null ? Duration.ofDays(3650) : requestTimeout;
+    }
+
+    private static RpcError transportRpcError(String what, IOException cause) {
+        RpcError error = new RpcError("TransportError", what + ": " + cause, "");
+        error.initCause(cause);
+        return error;
     }
 
     private Long discoverResponseBudgetWithJdkClient() {
@@ -639,6 +771,9 @@ public final class HttpRpcConnection implements AutoCloseable {
         private ProxyEndpoint socksProxy;
         private String protocolVersion;
         private Long acceptedMaxResponseBytes = DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES;
+        private IrohEndpoint irohEndpoint;
+        private IrohTransportOptions irohOptions;
+        private IrohTransportProvider irohProvider;
 
         private Builder(String endpoint) {
             if (endpoint == null || endpoint.isBlank()) {
@@ -647,6 +782,14 @@ public final class HttpRpcConnection implements AutoCloseable {
             String trimmed = endpoint.trim();
             while (trimmed.endsWith("/")) trimmed = trimmed.substring(0, trimmed.length() - 1);
             this.endpoint = trimmed;
+        }
+
+        private Builder(String endpoint, IrohEndpoint irohEndpoint,
+                        IrohTransportOptions irohOptions, IrohTransportProvider irohProvider) {
+            this(endpoint);
+            this.irohEndpoint = irohEndpoint;
+            this.irohOptions = irohOptions;
+            this.irohProvider = irohProvider;
         }
 
         /**
@@ -745,6 +888,9 @@ public final class HttpRpcConnection implements AutoCloseable {
          * @return this builder
          */
         public Builder socks5hProxy(String proxyUri) {
+            if (irohEndpoint != null) {
+                throw new IllegalArgumentException("socks5hProxy does not apply to httpi://");
+            }
             this.socksProxy = parseSocks5hProxy(proxyUri);
             return this;
         }
@@ -760,6 +906,9 @@ public final class HttpRpcConnection implements AutoCloseable {
          * @return this builder
          */
         public Builder httpClient(HttpClient client) {
+            if (irohEndpoint != null) {
+                throw new IllegalArgumentException("httpClient does not apply to httpi://");
+            }
             this.httpClient = client;
             return this;
         }
@@ -786,7 +935,26 @@ public final class HttpRpcConnection implements AutoCloseable {
          *
          * @return a ready connection
          */
-        public HttpRpcConnection build() { return new HttpRpcConnection(this); }
+        public HttpRpcConnection build() {
+            if (irohEndpoint != null) {
+                throw new IllegalStateException("call buildIroh() for an httpi:// connection");
+            }
+            return new HttpRpcConnection(this);
+        }
+
+        /** Open the configured {@code iroh-http/2} provider and build the connection. */
+        public HttpRpcConnection buildIroh() throws IOException {
+            if (irohEndpoint == null) {
+                throw new IllegalStateException("buildIroh() requires HttpRpcConnection.irohBuilder()");
+            }
+            IrohHttpTransport transport = irohProvider.openHttp(irohEndpoint, irohOptions);
+            if (transport == null) {
+                throw new IrohTransportException("Iroh provider returned a null HTTP transport",
+                        IrohErrorStage.OPEN_STREAM, IrohErrorCategory.UNAVAILABLE,
+                        IrohDispatchCertainty.NOT_SENT);
+            }
+            return new HttpRpcConnection(this, transport);
+        }
     }
 
     private static ProxyEndpoint parseSocks5hProxy(String value) {
