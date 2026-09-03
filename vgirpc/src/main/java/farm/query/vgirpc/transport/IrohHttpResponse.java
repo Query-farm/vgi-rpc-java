@@ -9,7 +9,12 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-/** Bounded HTTP response returned by an {@code iroh-http/2} provider. */
+/**
+ * Bounded HTTP response returned by an {@code iroh-http/2} provider. Ownership
+ * of the body buffer transfers to the synchronous caller; consumers must treat
+ * it as read-only. Avoiding defensive copies matters at VGI's negotiated
+ * hundreds-of-megabytes response sizes.
+ */
 public record IrohHttpResponse(int status, Map<String, List<String>> headers, byte[] body) {
     public IrohHttpResponse {
         if (status < 100 || status > 999) {
@@ -19,10 +24,8 @@ public record IrohHttpResponse(int status, Map<String, List<String>> headers, by
         if (headers != null) headers.forEach((name, values) -> copied.put(
                 name.toLowerCase(Locale.ROOT), values == null ? List.of() : List.copyOf(values)));
         headers = Collections.unmodifiableMap(copied);
-        body = body == null ? new byte[0] : body.clone();
+        body = body == null ? new byte[0] : body;
     }
-
-    @Override public byte[] body() { return body.clone(); }
 
     /** All values for a case-insensitive HTTP field name. */
     public List<String> headerValues(String name) {

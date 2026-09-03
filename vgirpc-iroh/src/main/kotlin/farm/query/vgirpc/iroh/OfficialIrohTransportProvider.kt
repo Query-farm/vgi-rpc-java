@@ -366,9 +366,10 @@ internal fun encodeHttpRequest(request: IrohHttpRequest, remoteId: String): Byte
         }
     }
     if (!hasHost) line("Host: $remoteId")
-    line("Content-Length: ${request.body().size}")
+    val body = request.body()
+    line("Content-Length: ${body.size}")
     line("")
-    out.write(request.body())
+    out.write(body)
     return out.toByteArray()
 }
 
