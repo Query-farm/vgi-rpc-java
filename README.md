@@ -43,11 +43,11 @@ Artifacts are published to Maven Central under the `farm.query` group.
 
 ```kotlin
 dependencies {
-    implementation("farm.query:vgirpc:0.8.0")          // core: protocol, transports, HTTP, schema
-    implementation("farm.query:vgirpc-iroh:0.8.0")     // optional: official native Iroh binding
-    implementation("farm.query:vgirpc-oauth:0.8.0")    // optional: JWT / OAuth / PKCE auth
-    implementation("farm.query:vgirpc-s3:0.8.0")       // optional: S3 external storage
-    implementation("farm.query:vgirpc-gcs:0.8.0")      // optional: GCS external storage
+    implementation("farm.query:vgirpc:0.24.0")          // core: protocol, transports, HTTP, schema
+    implementation("farm.query:vgirpc-iroh:0.24.0")     // optional: official native Iroh binding
+    implementation("farm.query:vgirpc-oauth:0.24.0")    // optional: JWT / OAuth / PKCE auth
+    implementation("farm.query:vgirpc-s3:0.24.0")       // optional: S3 external storage
+    implementation("farm.query:vgirpc-gcs:0.24.0")      // optional: GCS external storage
 }
 ```
 
@@ -57,7 +57,7 @@ dependencies {
 <dependency>
   <groupId>farm.query</groupId>
   <artifactId>vgirpc</artifactId>
-  <version>0.8.0</version>
+  <version>0.24.0</version>
 </dependency>
 ```
 

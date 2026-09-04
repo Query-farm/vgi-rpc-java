@@ -12,7 +12,7 @@ permissions:
 env:
   # Exact source for the Rust HTTP bridge used by the native Kotlin/JVM Iroh
   # integration lane. Keep this pinned so Rust main cannot change Java CI.
-  VGI_RPC_IROH_RUST_REV: a38130b1fb2ff63186e0ec3e16e342c5a21ba489
+  VGI_RPC_IROH_RUST_REV: 9e7dfb59686682be0ff4a46183988e2724416393
 
 jobs:
   test:
