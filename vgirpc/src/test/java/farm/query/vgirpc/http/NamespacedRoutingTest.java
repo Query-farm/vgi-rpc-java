@@ -94,7 +94,7 @@ final class NamespacedRoutingTest {
 
     @BeforeEach
     void start() throws Exception {
-        RpcServer rpc = new RpcServer(EchoService.class, new EchoImpl(), "srv-ns", true);
+        RpcServer rpc = new RpcServer(EchoService.class, new EchoImpl(), "srv-ns");
         rpc.setIdentity(IdentityImpl.builder()
                 .resolveToken(token -> "good".equals(token) ? new TokenIdentity("bob", "ci-key") : null)
                 .introspectPrincipals("alice")
@@ -221,7 +221,7 @@ final class NamespacedRoutingTest {
      */
     @Test
     void refusesARawRequestThatNamesNoProtocol() throws Exception {
-        RpcServer rpc = new RpcServer(EchoService.class, new EchoImpl(), "srv-raw", true);
+        RpcServer rpc = new RpcServer(EchoService.class, new EchoImpl(), "srv-raw");
         RpcError err = assertThrows(RpcError.class, () -> serveRaw(rpc,
                 request(null, "echo", utf8Schema(List.of("value")),
                         new LinkedHashMap<>(Map.of("value", "hi")))));
@@ -231,7 +231,7 @@ final class NamespacedRoutingTest {
     /** The same request with the key present dispatches, so the refusal above is about the key. */
     @Test
     void servesARawRequestThatNamesTheProtocol() throws Exception {
-        RpcServer rpc = new RpcServer(EchoService.class, new EchoImpl(), "srv-raw", true);
+        RpcServer rpc = new RpcServer(EchoService.class, new EchoImpl(), "srv-raw");
         Map<String, Object> row = serveRaw(rpc,
                 request("EchoService", "echo", utf8Schema(List.of("value")),
                         new LinkedHashMap<>(Map.of("value", "hi"))));

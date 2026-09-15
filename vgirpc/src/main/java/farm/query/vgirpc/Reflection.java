@@ -22,6 +22,8 @@ import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.complex.impl.UnionListWriter;
 import org.apache.arrow.vector.complex.writer.BaseWriter;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.ipc.WriteChannel;
+import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -168,9 +170,26 @@ public final class Reflection {
         };
     }
 
+    /**
+     * Serialise a Schema to the minimal Arrow IPC schema-message bytes.
+     *
+     * <p>Inherited from {@code Introspect}, which went out with {@code __describe__}. It is a
+     * plain Arrow helper rather than anything describe owned, and reflection is now its only
+     * caller -- so it moved here rather than leaving a retired class alive to hold it.
+     */
+    static byte[] serializeSchema(Schema schema) {
+        try (ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+            WriteChannel ch = new WriteChannel(Channels.newChannel(bos));
+            MessageSerializer.serialize(ch, schema);
+            return bos.toByteArray();
+        } catch (Exception e) {
+            throw new RuntimeException("schema serialize failed", e);
+        }
+    }
+
     /** Serialize a schema, or return empty bytes when there is none. */
     private static byte[] schemaIpc(Schema schema) {
-        return schema == null ? new byte[0] : Introspect.serializeSchema(schema);
+        return schema == null ? new byte[0] : serializeSchema(schema);
     }
 
     private static byte[] headerIpc(RpcMethodInfo info) {
@@ -178,7 +197,7 @@ public final class Reflection {
         if (headerType == null || !ArrowSerializableRecord.class.isAssignableFrom(headerType)) {
             return new byte[0];
         }
-        return Introspect.serializeSchema(
+        return serializeSchema(
                 SchemaDerivation.schemaForRecord(headerType.asSubclass(ArrowSerializableRecord.class)));
     }
 

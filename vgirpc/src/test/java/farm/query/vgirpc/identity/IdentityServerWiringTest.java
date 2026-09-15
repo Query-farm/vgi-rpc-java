@@ -60,7 +60,7 @@ final class IdentityServerWiringTest {
                             1000.0 + ttl, "g1");
 
     private static RpcServer serverWith(IdentityImpl impl) {
-        RpcServer server = new RpcServer(App.class, new App() { }, "srv123", true);
+        RpcServer server = new RpcServer(App.class, new App() { }, "srv123");
         server.setIdentity(impl);
         return server;
     }
@@ -195,7 +195,7 @@ final class IdentityServerWiringTest {
     /** With no identity configured at all the protocol is not routed. */
     @Test
     void anUnconfiguredProtocolIsNotRouted() {
-        RpcServer bare = new RpcServer(App.class, new App() { }, "srv123", true);
+        RpcServer bare = new RpcServer(App.class, new App() { }, "srv123");
         RpcError err = assertThrows(RpcError.class, () ->
                 call(bare, caller("proxy"), Identity.PROTOCOL_NAME, "introspect_token",
                         new LinkedHashMap<>(Map.of("token", "good"))));
@@ -235,7 +235,7 @@ final class IdentityServerWiringTest {
     /** And is absent from it when the deployment configured nothing. */
     @Test
     void isAbsentFromListProtocolsWhenUnconfigured() throws Exception {
-        RpcServer bare = new RpcServer(App.class, new App() { }, "srv123", true);
+        RpcServer bare = new RpcServer(App.class, new App() { }, "srv123");
         Exchange got = call(bare, caller("proxy"), Reflection.PROTOCOL_NAME, "list_protocols",
                 new LinkedHashMap<>());
         assertEquals(List.of("App", Reflection.PROTOCOL_NAME),

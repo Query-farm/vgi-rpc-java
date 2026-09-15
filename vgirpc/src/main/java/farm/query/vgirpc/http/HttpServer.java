@@ -1433,10 +1433,10 @@ public final class HttpServer {
                 handleUploadUrl(req, resp);
                 return;
             }
-            // Server-level reserved methods (__describe__, __transport_options__) stay flat:
-            // they are owned by no protocol, and __describe__ in particular is the diagnostic
-            // path a mismatched client reaches for, so making it name a protocol first would
-            // remove the tool exactly when it is needed.
+            // Server-level reserved methods (__transport_options__) stay flat: they are owned by
+            // no protocol, so making one name a protocol would be asking the caller to route a
+            // thing that is not routed. Reflection took over the diagnostic role __describe__
+            // used to serve, and is an ordinary protocol reached the ordinary way.
             if (isReservedMethodName(rest)) {
                 try (ExternalResponseBudget budget =
                              ExternalResponseBudget.open(advertisedMaxExternalizedResponseBytes, rest)) {
@@ -1587,7 +1587,7 @@ public final class HttpServer {
         return null;
     }
 
-    /** Whether a flat path segment names a server-level reserved method (`__describe__`). */
+    /** Whether a flat path segment names a server-level reserved method (`__transport_options__`). */
     private static boolean isReservedMethodName(String segment) {
         return segment.length() > 4 && segment.startsWith("__") && segment.endsWith("__");
     }
@@ -1984,7 +1984,7 @@ public final class HttpServer {
      * Serve one unary call.
      *
      * @param binding the protocol the path resolved to, or {@code null} for a flat, server-level
-     *     reserved method such as {@code __describe__} -- which belongs to no protocol, so no
+     *     reserved method such as {@code __transport_options__} -- which belongs to no protocol, so no
      *     routing key is expected on it either
      */
     private void handleUnary(HttpServletRequest req, HttpServletResponse resp,
@@ -2521,12 +2521,12 @@ public final class HttpServer {
         if (binding == null) {
             // Flat reserved route: resolved against the server's built-ins, never against a
             // protocol's methods, and not a catch-all -- a reserved-shaped name this server does
-            // not offer stops here rather than falling through to a protocol lookup. There is no
-            // RpcMethodInfo for __describe__, so the parameter-contract check below is skipped
-            // and dispatch answers for it.
+            // not offer stops here rather than falling through to a protocol lookup. The refusal
+            // comes from RpcServer so this route and raw dispatch give the same answer; a client
+            // that learns "__describe__ is retired" on one transport and "no such method" on the
+            // other draws the wrong conclusion from whichever it happened to try.
             if (!rpc.reservedMethodNames().contains(urlMethod)) {
-                throw new MethodNotImplementedError(
-                        "This server does not implement the reserved method '" + urlMethod + "'.");
+                throw RpcServer.reservedMethodRefusal(urlMethod);
             }
             info = null;
         } else {

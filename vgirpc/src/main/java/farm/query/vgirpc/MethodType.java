@@ -6,7 +6,7 @@ package farm.query.vgirpc;
 /**
  * The kind of an RPC method: {@link #UNARY} (one request batch, one result batch)
  * or {@link #STREAM} (an initial exchange followed by lockstep ticks). Each constant
- * carries the {@code wireValue()} token used in {@code __describe__} responses, which
+ * carries the {@code wireValue()} token used in reflection descriptions, which
  * matches the Python reference.
  */
 public enum MethodType {
@@ -18,7 +18,7 @@ public enum MethodType {
     private final String wireValue;
     MethodType(String wireValue) { this.wireValue = wireValue; }
     /**
-     * The token identifying this method type in {@code __describe__} responses.
+     * The token identifying this method type in reflection descriptions.
      *
      * @return the wire string for this method type ({@code "unary"} / {@code "stream"})
      */

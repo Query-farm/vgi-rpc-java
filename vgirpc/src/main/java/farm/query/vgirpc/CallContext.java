@@ -193,7 +193,7 @@ public final class CallContext {
     /**
      * The service/protocol name (the service interface's simple name).
      *
-     * @return the protocol name advertised in {@code __describe__}
+     * @return the protocol name advertised by {@code vgi_rpc.Reflection.v1}
      */
     public String protocolName() { return protocolName; }
     /**

@@ -15,6 +15,7 @@ import farm.query.vgirpc.MethodType;
 import farm.query.vgirpc.OutputCollector;
 import farm.query.vgirpc.RpcMethodInfo;
 import farm.query.vgirpc.RpcServer;
+import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.StreamState;
 import farm.query.vgirpc.external.ExternalLocationConfig;
@@ -224,10 +225,11 @@ public final class HttpStreamHandler {
     /**
      * Start a turn's telemetry, or return {@code null} when nothing is listening.
      *
+     * @param protocol the protocol the request path resolved to
      * @param method the stream method being dispatched
      * @param streamId the stream's lifecycle id, shared by every turn
      */
-    private StreamTurn beginTurn(String method, String streamId) {
+    private StreamTurn beginTurn(String protocol, String method, String streamId) {
         DispatchHook hook = rpc.dispatchHook();
         if (hook == null) return null;
         DispatchInfo info = new DispatchInfo();
@@ -235,9 +237,14 @@ public final class HttpStreamHandler {
         info.methodType = "stream";
         info.streamId = streamId;
         info.serverId = rpc.serverId();
-        info.protocol = rpc.protocolName();
-        info.protocolHash = rpc.protocolHash();
-        info.protocolVersion = rpc.protocolVersion();
+        // From the binding the path resolved to, never the server's primary. It happens to be
+        // the primary for every stream this port hosts today -- neither framework protocol
+        // declares a streaming method -- which is exactly why reading it from the server here
+        // would look correct until the day one did. See RpcServer.protocolIdentityFor.
+        RpcServer.ProtocolIdentity owner = rpc.protocolIdentityFor(protocol);
+        info.protocol = owner.name();
+        info.protocolHash = owner.protocolHash();
+        info.protocolVersion = owner.protocolVersion();
         AuthScope.Scope scope = AuthScope.current();
         AuthContext auth = scope.auth();
         info.principal = auth != null && auth.principal() != null ? auth.principal() : "";
@@ -339,7 +346,7 @@ public final class HttpStreamHandler {
         // continuation token is ever issued — and so every later turn's record
         // can be joined to this one.
         String streamId = newStreamId();
-        try (StreamTurn turn = beginTurn(method, streamId)) {
+        try (StreamTurn turn = beginTurn(protocol, method, streamId)) {
             // The request body is already a self-contained Arrow IPC stream, so
             // it is logged verbatim: byte-faithful, metadata intact, and free.
             // Only the pipe transport, which reads from a shared stream with no
@@ -475,7 +482,7 @@ public final class HttpStreamHandler {
             // state is rehydrated, and produces no record — same boundary the
             // reference draws. The stream id rides in the call token, so every
             // continuation's record joins the init's without server state.
-            try (StreamTurn turn = beginTurn(method, call.streamId())) {
+            try (StreamTurn turn = beginTurn(protocol, method, call.streamId())) {
                 // The plaintext the client's opaque AEAD cursor decrypted to.
                 // Logging the ciphertext would give a reader nothing they could
                 // decode without the server's token key.

@@ -64,14 +64,24 @@ def java_transport() -> Iterator[SubprocessTransport]:
 
 @pytest.fixture(scope="session")
 def conformance_describe() -> Iterator[Any]:
-    """Real ``__describe__`` against the Java worker for TestDescribeConformance.
+    """Real ``vgi_rpc.Reflection.v1`` introspection against the Java worker.
 
     The upstream suite requires the host harness to supply the worker's
     ``ServiceDescription`` (rather than a throwaway in-process Python server), so
-    introspection is validated against the actual Java implementation. Uses its
-    own subprocess transport to stay isolated from the shared ``java_transport``
-    stream state. The describe payload is transport-independent server-side, so a
-    single transport exercises ``Introspect``/``serveDescribe`` fully.
+    introspection is validated against the actual Java implementation.
+
+    Named ``conformance_describe`` for the suite that consumes it, but it no
+    longer calls ``__describe__`` -- that method is retired, and this worker
+    refuses it with a message naming its replacement. ``introspect()`` is now two
+    reflection calls, ``list_protocols`` then ``describe``, and
+    ``ServiceDescription`` is a client-side view of the second rather than a wire
+    format. Reaching the worker's reflection implementation is the point; the
+    entry point that gets there is the reference's business.
+
+    Uses its own subprocess transport to stay isolated from the shared
+    ``java_transport`` stream state. Reflection's answer is transport-independent
+    server-side, so a single transport exercises ``Reflection``/``serveReflection``
+    fully.
     """
     from vgi_rpc.introspect import introspect
 

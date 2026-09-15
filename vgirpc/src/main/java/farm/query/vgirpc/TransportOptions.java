@@ -11,7 +11,7 @@ import java.util.Map;
 
 /**
  * The {@code __transport_options__} RPC method — a framework-level capability
- * handshake, parallel to {@link Introspect} ({@code __describe__}). The client
+ * handshake. The client
  * calls it once per worker (before {@code init}) to discover which transport
  * features the worker supports; SHM (and, later, compression / AEAD) is used
  * only when both peers advertise support.

@@ -20,11 +20,25 @@ public final class DispatchInfo {
     public String methodType = "unary";
     /** Identity of the serving {@link RpcServer} instance. */
     public String serverId = "";
-    /** Simple name of the service (protocol) interface being served. */
+    /**
+     * Wire name of the protocol that <em>owns the dispatched method</em>.
+     *
+     * <p>Not a server-wide default: a call to a co-hosted framework protocol names that
+     * protocol, not the application. Fill it from {@link RpcServer#protocolIdentityFor}, which
+     * returns this and {@link #protocolHash} together -- the two disagreeing is worse than
+     * either being wrong alone.
+     */
     public String protocol = "";
-    /** Protocol hash from {@code Introspect.computeProtocolHash}; identifies the exact method surface. */
+    /**
+     * Canonical digest of the protocol named by {@link #protocol}.
+     *
+     * <p>The registry key a consumer decodes archived records against, so it must be that
+     * protocol's digest and computed the canonical way
+     * ({@link farm.query.vgirpc.hash.ProtocolHash}) -- a legacy or primary-protocol digest here
+     * produces a record that is well-formed, passes the schema and decodes wrong.
+     */
     public String protocolHash = "";
-    /** Optional human-readable protocol version label set via {@link RpcServer#setProtocolVersion}; empty when unset. */
+    /** The version label of the protocol named by {@link #protocol}; empty when it declares none. */
     public String protocolVersion = "";
     /** Client-supplied request id for log correlation; empty when none was sent. */
     public String requestId = "";

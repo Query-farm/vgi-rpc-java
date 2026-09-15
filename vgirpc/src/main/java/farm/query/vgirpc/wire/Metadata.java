@@ -57,9 +57,9 @@ public final class Metadata {
     public static final String SHM_SEGMENT_NAME  = "vgi_rpc.shm_segment_name";
     public static final String SHM_SEGMENT_SIZE  = "vgi_rpc.shm_segment_size";
 
-    public static final String PROTOCOL_NAME     = "vgi_rpc.protocol_name";
-    public static final String DESCRIBE_VERSION_KEY = "vgi_rpc.describe_version";
-    public static final String PROTOCOL_HASH_KEY = "vgi_rpc.protocol_hash";
+    // vgi_rpc.protocol_name / vgi_rpc.describe_version / vgi_rpc.protocol_hash appeared only in
+    // the __describe__ response's custom metadata and went out with it. Reflection carries the
+    // same facts as ordinary fields on its payload, which is the point of it being a protocol.
     public static final String PROTOCOL_VERSION_KEY = "vgi_rpc.protocol_version";
 
     public static final String TRACEPARENT = "traceparent";

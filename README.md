@@ -27,7 +27,7 @@ This is a port of the Python reference implementation, [`vgi-rpc`](https://githu
 - **Transport-agnostic** — stdio pipe, subprocess, Unix domain socket, raw TCP socket (trusted networks — no auth/TLS), shared memory, or HTTP.
 - **Automatic schema inference** — Java types and `record` components map to Arrow types; `@ArrowField` refines them.
 - **Pluggable authentication** — `AuthContext` + authenticators for HTTP (bearer, mTLS/XFCC; JWT/OAuth in the optional `vgirpc-oauth` module).
-- **Runtime introspection** — opt-in `__describe__` RPC for dynamic service discovery, with a protocol hash that matches the Python reference byte-for-byte.
+- **Runtime introspection** — the `vgi_rpc.Reflection.v1` protocol (`list_protocols`, then `describe`) for dynamic service discovery, with a canonical protocol hash every port agrees on. The old `__describe__` RPC is retired; a request for it is refused with a message naming its replacement.
 - **Shared-memory transport** — zero-copy batch transfer between co-located processes (auto-negotiated on JDK 22+ via a multi-release overlay; transparent pipe fallback otherwise).
 - **Large-batch externalization** — oversized batches transparently spilled to S3 (`vgirpc-s3`) or GCS (`vgirpc-gcs`).
 

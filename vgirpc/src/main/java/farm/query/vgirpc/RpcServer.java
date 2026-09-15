@@ -48,6 +48,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
 /** Dispatches RPC requests to a service implementation over an {@link RpcTransport}. */
@@ -55,46 +56,58 @@ public final class RpcServer {
 
     private static final Logger LOG = LoggerFactory.getLogger(RpcServer.class);
 
+    /**
+     * Retired, and kept only so the refusal can say where introspection went.
+     *
+     * <p>A stale client told merely "no such method" cannot tell "retired" from "this server
+     * opted out of introspection", and those need different fixes.
+     */
+    public static final String RETIRED_DESCRIBE_METHOD = "__describe__";
+
     private final Class<?> serviceInterface;
     private final Object impl;
     private final String serverId;
     private final Map<String, RpcMethodInfo> methods;
-    private final boolean describeEnabled;
+    /** Canonical digests, keyed by protocol name. Memoised: computing one serialises every
+     *  method's schemas and canonicalises the JSON, and an access record needs one per dispatch. */
+    private final Map<String, String> bindingHashes = new ConcurrentHashMap<>();
     private LocationResolver locationResolver;
     private ExternalLocationConfig externalConfig;
     private DispatchHook dispatchHook;
     private IdentityImpl identity;
     private Map<String, RpcMethodInfo> identityMethods = Map.of();
     private String protocolVersion = "";
-    private String protocolHash = "";
     private final Object transportLock = new Object();
     private volatile TransportKind transportKind;
     private Consumer<TransportKind> serveStartHook;
 
     /**
-     * Create a server with a random 12-char server id and {@code __describe__} enabled.
+     * Create a server with a random 12-char server id.
      *
      * @param serviceInterface the service interface introspected for method schemas
      * @param impl the implementation instance calls are dispatched to
      */
     public RpcServer(Class<?> serviceInterface, Object impl) {
-        this(serviceInterface, impl, UUID.randomUUID().toString().replace("-", "").substring(0, 12), true);
+        this(serviceInterface, impl, UUID.randomUUID().toString().replace("-", "").substring(0, 12));
     }
 
     /**
      * Create a server with an explicit server id.
      *
+     * <p>There is no longer an {@code enableDescribe} flag: {@code __describe__} is retired and
+     * {@code vgi_rpc.Reflection.v1} is always hosted, so the flag had nothing left to turn off.
+     * A server that answered introspection only when asked nicely was a discovery mechanism a
+     * client could not rely on, which is most of why the ports drifted.
+     *
      * @param serviceInterface the service interface introspected for method schemas
      * @param impl the implementation instance calls are dispatched to
      * @param serverId stable identifier echoed in response metadata
-     * @param enableDescribe whether to answer the built-in {@code __describe__} introspection call
      */
-    public RpcServer(Class<?> serviceInterface, Object impl, String serverId, boolean enableDescribe) {
+    public RpcServer(Class<?> serviceInterface, Object impl, String serverId) {
         this.serviceInterface = serviceInterface;
         this.impl = impl;
         this.serverId = serverId;
         this.methods = new LinkedHashMap<>(ServiceIntrospector.describe(serviceInterface));
-        this.describeEnabled = enableDescribe;
     }
 
     /**
@@ -155,6 +168,9 @@ public final class RpcServer {
         Map<String, RpcMethodInfo> narrowed = impl == null ? Map.of() : identityMethods(impl);
         this.identity = narrowed.isEmpty() ? null : impl;
         this.identityMethods = narrowed;
+        // The narrowed table is part of identity's fingerprint -- that is the whole point of
+        // narrowing it -- so a memoised digest from before this call is stale.
+        bindingHashes.remove(Identity.PROTOCOL_NAME);
     }
 
     /**
@@ -182,15 +198,44 @@ public final class RpcServer {
      *
      * <p>Reserved names are owned by no protocol and are routed flat, so a transport routing on
      * the path needs the set to tell a reserved name this server offers from one it does not.
-     * {@code __describe__} is in it only when describe is enabled: a client probing for optional
-     * introspection needs the capability answer, not a routing complaint.
+     * {@code __describe__} is not in it -- it is retired, and a name this server does not offer
+     * is refused by {@link #reservedMethodRefusal}, which says so in the one case where "no such
+     * method" would be actively misleading.
      *
      * @return the reserved names, which are never protocol-namespaced
      */
     public java.util.Set<String> reservedMethodNames() {
-        return describeEnabled
-                ? java.util.Set.of(Introspect.METHOD_NAME, TransportOptions.METHOD_NAME)
-                : java.util.Set.of(TransportOptions.METHOD_NAME);
+        return java.util.Set.of(TransportOptions.METHOD_NAME);
+    }
+
+    /**
+     * The refusal for a reserved method this server does not implement.
+     *
+     * <p>Shared by every transport, because the two places that can answer a reserved name -- raw
+     * dispatch and the HTTP flat route's pre-check -- must give the same answer. A client that
+     * gets "retired, use reflection" on one transport and "no such method" on another learns the
+     * wrong thing from whichever it happened to try.
+     *
+     * <p>{@code __describe__} is special-cased and nothing else is. "Retired" and "this server
+     * was built without introspection" are indistinguishable from the caller's side and need
+     * opposite fixes -- update the client, or reconfigure the server -- so the one name whose
+     * answer is known gets a message naming its replacement. Every other reserved name keeps the
+     * plain capability answer, which is what a client probing for an optional method needs.
+     *
+     * @param method the reserved method name the caller asked for
+     * @return the error to write back; never thrown from here, so the caller controls framing
+     */
+    public static MethodNotImplementedError reservedMethodRefusal(String method) {
+        if (RETIRED_DESCRIBE_METHOD.equals(method)) {
+            // Reflection's name is imported rather than spelled: Java has no import cycle to
+            // dodge here, so there is no second copy of the string to drift from the first.
+            return new MethodNotImplementedError(
+                    "'" + RETIRED_DESCRIBE_METHOD + "' was retired. Introspection is now the '"
+                            + Reflection.PROTOCOL_NAME + "' protocol: call 'list_protocols' for "
+                            + "what this server hosts, then 'describe' for one protocol's methods.");
+        }
+        return new MethodNotImplementedError(
+                "This server does not implement the reserved method '" + method + "'.");
     }
 
     /**
@@ -239,23 +284,76 @@ public final class RpcServer {
     public String protocolVersion() { return protocolVersion; }
 
     /**
-     * SHA-256 hex digest of the canonical {@code __describe__} payload,
-     * computed lazily and cached. Stable within this port; cross-port byte
-     * equality with Python is not guaranteed.
+     * The canonical digest of this server's <em>primary</em> (application) protocol.
      *
-     * @return the hex-encoded protocol hash advertised as
-     *     {@code vgi_rpc.protocol_hash} in {@code __describe__} responses
+     * <p>Canonical, not the retired describe-payload digest this used to return. That one hashed
+     * serialized Arrow IPC bytes, so the same logical protocol hashed differently in every port
+     * and the field was comparable only against itself -- useless as the registry key
+     * {@code access-log-spec.md} makes it. See {@link farm.query.vgirpc.hash.ProtocolHash}.
+     *
+     * <p>For anything that names a method, prefer {@link #protocolIdentityFor}: the primary is
+     * the right answer only for a framework endpoint owned by no protocol.
+     *
+     * @return the 64-char lowercase hex digest of the primary protocol's canonical description
      */
     public String protocolHash() {
-        if (protocolHash.isEmpty()) {
-            Introspect.Built b = Introspect.build(protocolName(), methods, serverId, protocolVersion);
-            try {
-                protocolHash = b.customMetadata().getOrDefault(Metadata.PROTOCOL_HASH_KEY, "");
-            } finally {
-                b.root().close();
-            }
+        return bindingHash(protocolName(), methods);
+    }
+
+    /** Memoised canonical digest for one hosted protocol. */
+    private String bindingHash(String name, Map<String, RpcMethodInfo> table) {
+        return bindingHashes.computeIfAbsent(name, n -> Reflection.bindingHash(n, table));
+    }
+
+    /**
+     * How an access record must name the protocol that owns a dispatched method.
+     *
+     * @param name the owning protocol's wire name
+     * @param protocolHash that protocol's canonical digest
+     * @param protocolVersion that protocol's declared version label, or {@code ""}
+     */
+    public record ProtocolIdentity(String name, String protocolHash, String protocolVersion) {}
+
+    /**
+     * Resolve the identity an access record must carry for a call routed to {@code protocol}.
+     *
+     * <p>{@code access-log-spec.md} §3 makes {@code protocol} the wire name of the protocol that
+     * <em>owns the dispatched method</em>, "not a server-wide default", and {@code protocol_hash}
+     * the registry key for decoding archived records. Both therefore come from the resolved
+     * binding, and they come from it <em>together</em>: a record naming one protocol while
+     * carrying another's digest is decoded against the wrong description, and nothing about it
+     * looks wrong. It is well-formed, it passes the schema, and the dashboard it feeds is
+     * plausible. That is why this is one lookup returning both rather than two accessors a
+     * future call site can pair incorrectly.
+     *
+     * <p>Only a call to a <em>secondary</em> protocol can catch getting this wrong, because for
+     * an application method the primary <em>is</em> the owning binding -- which is how several
+     * ports, this one included, shipped the server-wide default and passed every test.
+     *
+     * <p>{@code null}, and any name this server does not host, resolve to the primary. That is
+     * the specified behaviour for the framework endpoints owned by no protocol
+     * ({@code __transport_options__}, {@code __upload_url__}), not a gap in it.
+     *
+     * @param protocol the routing key the request named, or {@code null} for an unrouted endpoint
+     * @return the owning protocol's name, canonical digest and version label
+     */
+    public ProtocolIdentity protocolIdentityFor(String protocol) {
+        if (Reflection.PROTOCOL_NAME.equals(protocol)) {
+            // Reflection's methods are framework-owned rather than registered, so the honest hash
+            // is over an empty method set -- the same table `serveReflection` describes itself
+            // with. It declares no version of its own; the application's label is not its.
+            return new ProtocolIdentity(
+                    Reflection.PROTOCOL_NAME, bindingHash(Reflection.PROTOCOL_NAME, Map.of()), "");
         }
-        return protocolHash;
+        if (identity != null && Identity.PROTOCOL_NAME.equals(protocol)) {
+            // Over the NARROWED table, matching what reflection advertises: a worker that only
+            // resolves credentials fingerprints differently from one that also mints grants.
+            return new ProtocolIdentity(
+                    Identity.PROTOCOL_NAME,
+                    bindingHash(Identity.PROTOCOL_NAME, identityMethods),
+                    "");
+        }
+        return new ProtocolIdentity(protocolName(), protocolHash(), protocolVersion);
     }
 
     /**
@@ -567,8 +665,24 @@ public final class RpcServer {
                     }
                     requestProtocol = routedProtocol;
                 }
+                // Reported to the dispatch hook like any other dispatch, now that the record
+                // can name the protocol that owns the method. It could not before: this port
+                // filled DispatchInfo.protocol from protocolName(), the APPLICATION protocol,
+                // so routing a reflection call through the hook unchanged would have filed it
+                // under the wrong name -- and a wrong protocol field fails silently, yielding a
+                // plausible dashboard rather than an error. Not logging framework protocols was
+                // the honest answer to that; `protocolIdentityFor` is the fix, and with it the
+                // reason to stay silent is gone.
                 if (Reflection.PROTOCOL_NAME.equals(requestProtocol)) {
-                    serveReflection(transport, method, kwargsSnapshot);
+                    try (HookedDispatch d = beginDispatch(method, MethodType.UNARY,
+                            Reflection.PROTOCOL_NAME, requestDataSnapshot)) {
+                        try {
+                            serveReflection(transport, method, kwargsSnapshot);
+                        } catch (Throwable t) {
+                            if (d != null) d.failed(t);
+                            throw t;
+                        }
+                    }
                     return;
                 }
                 // Identity is co-hosted the same way, and for the same reason: it is
@@ -578,27 +692,19 @@ public final class RpcServer {
                 // application protocol -- identity declares no version of its own, and
                 // gating it on somebody else's would make a proxy's ability to resolve
                 // a credential depend on a worker upgrade it has no part in.
-                //
-                // Like reflection, and DELIBERATELY like reflection, identity calls
-                // are not reported to the dispatch hook: returning here is ahead of
-                // the access-log block below, so nothing is logged for them. That is
-                // a decision, not an oversight. This port's DispatchInfo.protocol is
-                // filled from protocolName(), which is the APPLICATION protocol --
-                // so logging an identity call through the hook unchanged would file
-                // it under the wrong protocol, and a wrong protocol field fails
-                // silently: it yields a plausible dashboard rather than an error.
-                // Other ports (C#) took the other road and added per-protocol
-                // overrides to the access log. Doing that here means a change to
-                // DispatchInfo and to every hook that reads it, which is a
-                // cross-port change of its own rather than a detail of this one.
-                // Until then: no record beats a confidently mislabelled record.
                 if (identity != null && Identity.PROTOCOL_NAME.equals(requestProtocol)) {
-                    serveIdentity(transport, method, kwargsSnapshot, requestSchema,
-                            parameterRows, shm);
-                    return;
-                }
-                if (describeEnabled && Introspect.METHOD_NAME.equals(method)) {
-                    serveDescribe(transport);
+                    RpcMethodInfo idInfo = identityMethods.get(method);
+                    MethodType idType = idInfo == null ? MethodType.UNARY : idInfo.methodType();
+                    try (HookedDispatch d = beginDispatch(method, idType,
+                            Identity.PROTOCOL_NAME, requestDataSnapshot)) {
+                        try {
+                            serveIdentity(transport, method, kwargsSnapshot, requestSchema,
+                                    parameterRows, shm);
+                        } catch (Throwable t) {
+                            if (d != null) d.failed(t);
+                            throw t;
+                        }
+                    }
                     return;
                 }
                 if (TransportOptions.METHOD_NAME.equals(method)) {
@@ -620,15 +726,14 @@ public final class RpcServer {
                 // refused over a naming difference that costs nothing here.
                 if (requestProtocol == null) {
                     if (method.startsWith("__") && method.endsWith("__")) {
-                        // A reserved name this server does not offer -- __describe__ on a server
-                        // built with describe disabled, say. The answer is "no such method", not
-                        // "you failed to name a protocol": the caller did nothing wrong with
-                        // routing, and a client probing for optional introspection needs the
-                        // capability answer rather than a routing complaint.
+                        // A reserved name this server does not offer. The answer is "no such
+                        // method", not "you failed to name a protocol": the caller did nothing
+                        // wrong with routing, and a client probing for optional introspection
+                        // needs the capability answer rather than a routing complaint. The one
+                        // exception is __describe__, which is retired rather than merely absent
+                        // -- see reservedMethodRefusal.
                         Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
-                                new MethodNotImplementedError(
-                                        "This server does not implement the reserved method '"
-                                                + method + "'."),
+                                reservedMethodRefusal(method),
                                 serverId);
                         transport.writer().flush();
                         return;
@@ -653,7 +758,7 @@ public final class RpcServer {
                 // Application-protocol-version gate. Fires only when the
                 // operator declared a version via setProtocolVersion (empty =
                 // opt out). Placed after method resolution so an unknown method
-                // still reports as unknown, and after the __describe__ /
+                // still reports as unknown, and after the reflection /
                 // transport-options short-circuits above — those are the
                 // diagnostic paths a MISMATCHED client uses to discover what the
                 // server expects, so gating them would hide the answer.
@@ -680,60 +785,20 @@ public final class RpcServer {
                 }
                 Map<String, Object> kwargs = kwargsSnapshot;
 
-                // Build dispatch info + invoke hook
-                DispatchInfo dispatchInfo = null;
-                CallStatistics callStats = null;
-                Object hookToken = null;
-                Throwable handlerErr = null;
-                if (dispatchHook != null) {
-                    dispatchInfo = new DispatchInfo();
-                    dispatchInfo.method = method;
-                    dispatchInfo.methodType = info.methodType() == MethodType.UNARY ? "unary" : "stream";
-                    dispatchInfo.serverId = serverId;
-                    dispatchInfo.protocol = protocolName();
-                    dispatchInfo.protocolHash = protocolHash();
-                    dispatchInfo.protocolVersion = protocolVersion;
-                    AuthScope.Scope scope = AuthScope.current();
-                    dispatchInfo.principal = scope.auth() != null && scope.auth().principal() != null ? scope.auth().principal() : "";
-                    dispatchInfo.authDomain = scope.auth() != null && scope.auth().domain() != null ? scope.auth().domain() : "";
-                    dispatchInfo.authenticated = scope.auth() != null && scope.auth().authenticated();
-                    dispatchInfo.claims = scope.auth() != null ? scope.auth().claims() : null;
-                    dispatchInfo.transportMetadata = scope.transportMetadata();
-                    dispatchInfo.requestData = requestDataSnapshot;
-                    if ("stream".equals(dispatchInfo.methodType)) {
-                        dispatchInfo.streamId = AccessLogHook.randomStreamId();
-                    }
-                    callStats = new CallStatistics();
+                // The application protocol is the binding this resolved to, so `requestProtocol`
+                // is what names it -- not protocolName(), which would happen to agree here and
+                // be wrong for the two framework protocols above. One code path, one rule.
+                try (HookedDispatch d = beginDispatch(method, info.methodType(),
+                        requestProtocol, requestDataSnapshot)) {
                     try {
-                        hookToken = dispatchHook.onDispatchStart(dispatchInfo);
+                        if (info.methodType() == MethodType.UNARY) {
+                            serveUnary(transport, info, kwargs, shm);
+                        } else {
+                            serveStream(transport, info, kwargs, shm);
+                        }
                     } catch (Throwable t) {
-                        LOG.warn("dispatch hook start error: {}", t.toString());
-                    }
-                }
-
-                try {
-                    if (info.methodType() == MethodType.UNARY) {
-                        serveUnary(transport, info, kwargs, shm);
-                    } else {
-                        serveStream(transport, info, kwargs, shm);
-                    }
-                } catch (Throwable t) {
-                    handlerErr = t;
-                    throw t;
-                } finally {
-                    if (dispatchHook != null && dispatchInfo != null) {
-                        // Snapshot sticky-session state at end-of-dispatch so the access
-                        // log reflects open/resume/close that happened during the call.
-                        SessionScope scope = SessionScope.current();
-                        if (scope != null) {
-                            dispatchInfo.sessionId = scope.sessionIdHex();
-                            dispatchInfo.sessionAction = scope.action();
-                        }
-                        try {
-                            dispatchHook.onDispatchEnd(hookToken, dispatchInfo, callStats, handlerErr);
-                        } catch (Throwable t) {
-                            LOG.warn("dispatch hook end error: {}", t.toString());
-                        }
+                        if (d != null) d.failed(t);
+                        throw t;
                     }
                 }
                 transport.writer().flush();
@@ -746,6 +811,98 @@ public final class RpcServer {
             LOG.warn("serve error: {}", e.toString());
             e.printStackTrace(System.err);
         }
+    }
+
+    /**
+     * One dispatch's hook lifecycle: start fired at construction, end at {@link #close}.
+     *
+     * <p>Three paths through {@link #serveOne} now report -- the application protocol,
+     * reflection and identity -- and the end-of-call half is what a fourth would silently
+     * forget. Bundling both halves into a resource makes "fires exactly once, in a finally"
+     * a property of the type rather than of each call site remembering to write it.
+     */
+    private final class HookedDispatch implements AutoCloseable {
+        private final DispatchHook hook;
+        private final DispatchInfo info;
+        private final CallStatistics stats;
+        private final Object token;
+        private Throwable error;
+
+        private HookedDispatch(DispatchHook hook, DispatchInfo info, CallStatistics stats,
+                               Object token) {
+            this.hook = hook;
+            this.info = info;
+            this.stats = stats;
+            this.token = token;
+        }
+
+        /** Record the throwable that escaped the handler. */
+        void failed(Throwable t) {
+            this.error = t;
+        }
+
+        @Override
+        public void close() {
+            // Snapshot sticky-session state at end-of-dispatch so the access log reflects
+            // open/resume/close that happened during the call.
+            SessionScope scope = SessionScope.current();
+            if (scope != null) {
+                info.sessionId = scope.sessionIdHex();
+                info.sessionAction = scope.action();
+            }
+            try {
+                hook.onDispatchEnd(token, info, stats, error);
+            } catch (Throwable t) {
+                LOG.warn("dispatch hook end error: {}", t.toString());
+            }
+        }
+    }
+
+    /**
+     * Open a dispatch's telemetry, or return {@code null} when nothing is listening.
+     *
+     * <p>{@code null} is a legal try-with-resources value, so a caller writes the same block
+     * whether or not a hook is installed.
+     *
+     * @param method the method being dispatched
+     * @param methodType its kind, which decides whether a stream id is minted
+     * @param protocol the routing key the request named, or {@code null} for an unrouted endpoint
+     * @param requestData the request batch as a self-contained IPC stream, or {@code null}
+     * @return the open dispatch, or {@code null} when no hook is installed
+     */
+    private HookedDispatch beginDispatch(String method, MethodType methodType, String protocol,
+                                         byte[] requestData) {
+        DispatchHook hook = dispatchHook;
+        if (hook == null) return null;
+        DispatchInfo info = new DispatchInfo();
+        info.method = method;
+        info.methodType = methodType == MethodType.UNARY ? "unary" : "stream";
+        info.serverId = serverId;
+        // Read together from the binding the method resolved to. See protocolIdentityFor: the
+        // two fields disagreeing is worse than either being wrong alone.
+        ProtocolIdentity owner = protocolIdentityFor(protocol);
+        info.protocol = owner.name();
+        info.protocolHash = owner.protocolHash();
+        info.protocolVersion = owner.protocolVersion();
+        AuthScope.Scope scope = AuthScope.current();
+        AuthContext auth = scope.auth();
+        info.principal = auth != null && auth.principal() != null ? auth.principal() : "";
+        info.authDomain = auth != null && auth.domain() != null ? auth.domain() : "";
+        info.authenticated = auth != null && auth.authenticated();
+        info.claims = auth != null ? auth.claims() : null;
+        info.transportMetadata = scope.transportMetadata();
+        info.requestData = requestData;
+        if (methodType != MethodType.UNARY) {
+            info.streamId = AccessLogHook.randomStreamId();
+        }
+        CallStatistics stats = new CallStatistics();
+        Object token = null;
+        try {
+            token = hook.onDispatchStart(info);
+        } catch (Throwable t) {
+            LOG.warn("dispatch hook start error: {}", t.toString());
+        }
+        return new HookedDispatch(hook, info, stats, token);
     }
 
     /**
@@ -1241,16 +1398,6 @@ public final class RpcServer {
                     }
                 }
             }
-        }
-    }
-
-    private void serveDescribe(RpcTransport transport) throws IOException {
-        Introspect.Built built = Introspect.build(protocolName(), methods, serverId, protocolVersion);
-        try (IpcStreamWriter w = new IpcStreamWriter(transport.writer());
-             VectorSchemaRoot root = built.root()) {
-            w.writeBatch(root, built.customMetadata());
-        } finally {
-            transport.writer().flush();
         }
     }
 
