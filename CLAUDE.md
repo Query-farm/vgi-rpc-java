@@ -44,7 +44,13 @@ When the Python and Java implementations disagree, **Python is the reference**. 
 ./gradlew :vgirpc:jacocoMergedReport           # → .../jacocoMergedReport/
 ```
 
-`run_tests.sh` requires `JAVA_HOME=/opt/homebrew/opt/openjdk@21` (set inside the script) and the Python venv at `~/Development/vgi-rpc/.venv`. Full pytest output is written to `/tmp/pytest_java.txt`.
+`run_tests.sh` selects JDK 25 itself (honouring an existing `JAVA_HOME`) and needs a Python with the
+`vgi_rpc` reference package importable. It takes that interpreter from **`VGI_RPC_PYTHON`** when set,
+else prefers the reference venv at `~/Development/vgi-rpc-python/.venv`, else falls back to `python3`.
+`inspect.sh` honours the same variable. Point `VGI_RPC_PYTHON` at a checkout of
+[`vgi-rpc-python`](https://github.com/Query-farm/vgi-rpc-python) — **not** a `~/Development/vgi-rpc`
+sibling, which is an older tree without the multiservice routing work: running against it fails every
+HTTP test in a way that reads as a worker bug. Full pytest output is written to `/tmp/pytest_java.txt`.
 
 Before pushing: `./gradlew build` must pass, and `./run_tests.sh` must pass for the transports that apply to the change.
 
@@ -106,7 +112,7 @@ Package root: `farm.query.vgirpc`
 - All `VectorSchemaRoot`s allocate from `Allocators.root()` unless a sub-allocator is explicitly needed; closing them returns memory.
 - Metadata keys live in `wire/Metadata.java` — never hard-code the string `"vgi_rpc.*"` elsewhere.
 - Zero-row control batches (log, error, tick, pointer) go through `Wire.writeZeroBatch` — don't re-inline the allocate/setRowCount/writeBatch sequence.
-- Keep the wire path byte-compatible with Python. Before changing metadata keys, stream-state layout, or batch framing, check the Python implementation at `~/Development/vgi-rpc/vgi_rpc/`.
+- Keep the wire path byte-compatible with Python. Before changing metadata keys, stream-state layout, or batch framing, check the Python implementation in the reference checkout (`$VGI_RPC_PYTHON`'s tree, canonically `~/Development/vgi-rpc-python/vgi_rpc/`).
 
 ## Testing
 
@@ -153,6 +159,8 @@ That lane is a *pipe* run, where a whole stream call is one dispatch and one rec
 
 ## When in doubt
 
-1. Check the Python reference at `~/Development/vgi-rpc/vgi_rpc/` — behavior there is authoritative.
-2. Check `~/Development/vgi-rpc/CLAUDE.md` for the higher-level architectural summary.
+1. Check the Python reference at `~/Development/vgi-rpc-python/vgi_rpc/` — behavior there is
+   authoritative. That is the tree this port tracks; the similarly named `~/Development/vgi-rpc`
+   is an older checkout whose *higher* version number makes it look newer than it is.
+2. Check `~/Development/vgi-rpc-python/CLAUDE.md` for the higher-level architectural summary.
 3. Run `./run_tests.sh <keyword>` to see whether the conformance suite already exercises the behavior you're changing.

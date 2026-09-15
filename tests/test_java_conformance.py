@@ -1074,10 +1074,30 @@ class TestHttpStreamAccessLog:
     _STREAM_ID = re.compile(r"^[0-9a-f]{32}$")
 
     @staticmethod
+    def _log_lines(log_path: Path) -> int:
+        """Lines already in the log, so a test can read only what it caused.
+
+        The worker is session-scoped and ``--access-log`` appends for its whole
+        life, so every method name in here is shared ground: the imported
+        suite's ``test_a_stream_call_emits_one_record_per_turn`` drives
+        ``produce_n`` against this same worker. Filtering the whole file by
+        method therefore mixes two calls' turns together and the shape
+        assertions — one init, one ``stream_id`` — fail on traffic that was
+        individually correct. Snapshot before acting, read only after.
+        """
+        if not log_path.exists():
+            return 0
+        return len([ln for ln in log_path.read_text().splitlines() if ln.strip()])
+
+    @staticmethod
     def _await_records(
-        log_path: Path, method: str, minimum: int, timeout: float = 1.5
+        log_path: Path, method: str, minimum: int, timeout: float = 1.5, since: int = 0
     ) -> list[dict[str, Any]]:
         """Poll the log for at least *minimum* stream records naming *method*.
+
+        *since* is a line count from :meth:`_log_lines`; only records written
+        after it are considered, so a concurrent test's call to the same method
+        cannot be mistaken for a second init of this one.
 
         The record is written as the response completes, so this waits on the
         writer rather than racing it — a short wait, because the writer is
@@ -1098,8 +1118,9 @@ class TestHttpStreamAccessLog:
             if log_path.exists():
                 found = [
                     rec
-                    for line in log_path.read_text().splitlines()
-                    if line.strip()
+                    for line in [
+                        ln for ln in log_path.read_text().splitlines() if ln.strip()
+                    ][since:]
                     for rec in [json.loads(line)]
                     if rec.get("logger") == "vgi_rpc.access"
                     and rec.get("method") == method
@@ -1151,12 +1172,13 @@ class TestHttpStreamAccessLog:
     ) -> None:
         """A producer stream logs its init and each continuation."""
         port, log_path = conformance_http_access_log
+        since = self._log_lines(log_path)
         with http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy:
             values = [ab.batch.column("value")[0].as_py() for ab in proxy.produce_n(count=3)]
         assert values == [0, 10, 20]
 
         # init + one continuation per remaining batch.
-        records = self._await_records(log_path, "produce_n", 4)
+        records = self._await_records(log_path, "produce_n", 4, since=since)
         self._assert_stream_shape(records, "produce_n")
         # The init mints the first cursor; the turn that closes the stream mints
         # none, and its absence is the record saying so.
@@ -1173,6 +1195,7 @@ class TestHttpStreamAccessLog:
         from vgi_rpc.rpc import AnnotatedBatch
 
         port, log_path = conformance_http_access_log
+        since = self._log_lines(log_path)
         with (
             http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy,
             proxy.exchange_accumulate() as session,
@@ -1182,7 +1205,7 @@ class TestHttpStreamAccessLog:
         assert first.batch.column("running_sum")[0].as_py() == pytest.approx(3.0)
         assert second.batch.column("running_sum")[0].as_py() == pytest.approx(13.0)
 
-        records = self._await_records(log_path, "exchange_accumulate", 3)
+        records = self._await_records(log_path, "exchange_accumulate", 3, since=since)
         self._assert_stream_shape(records, "exchange_accumulate")
 
     def test_failing_stream_turn_is_logged_as_an_error(
@@ -1195,11 +1218,12 @@ class TestHttpStreamAccessLog:
         one place an operator looks for it.
         """
         port, log_path = conformance_http_access_log
+        since = self._log_lines(log_path)
         with http_connect(ConformanceService, f"http://127.0.0.1:{port}") as proxy:
             with pytest.raises(Exception):
                 list(proxy.produce_error_on_init())
 
-        records = self._await_records(log_path, "produce_error_on_init", 1)
+        records = self._await_records(log_path, "produce_error_on_init", 1, since=since)
         assert records, "a stream that raised on init produced no access-log record"
         rec = records[-1]
         assert rec["status"] == "error", f"expected status=error, got {rec['status']!r}"

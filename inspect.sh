@@ -15,15 +15,20 @@ if [[ -z "${JAVA_HOME:-}" ]] && [[ -x /usr/libexec/java_home ]]; then
 fi
 cd "$(dirname "$0")"
 
-# Python with vgi_rpc importable. Override with VGI_RPC_PYTHON; else prefer a
-# local reference venv, else system python3.
+# Python with the vgi_rpc reference package importable. Override with
+# VGI_RPC_PYTHON; else prefer a local reference venv, else system python3.
+#
+# Same order as run_tests.sh, and for the same reason: vgi-rpc-python is the
+# reference this port tracks, while the older vgi-rpc sibling disagrees on the
+# HTTP route shape, so running against it fails every HTTP test in a way that
+# reads as a worker bug.
 PY="${VGI_RPC_PYTHON:-}"
 if [[ -z "$PY" ]]; then
-    if [[ -x "$HOME/Development/vgi-rpc/.venv/bin/python" ]]; then
-        PY="$HOME/Development/vgi-rpc/.venv/bin/python"
-    else
-        PY="python3"
-    fi
+    for candidate in "$HOME/Development/vgi-rpc-python/.venv/bin/python" \
+                     "$HOME/Development/vgi-rpc/.venv/bin/python"; do
+        if [[ -x "$candidate" ]]; then PY="$candidate"; break; fi
+    done
+    PY="${PY:-python3}"
 fi
 PATTERN="${1:?usage: inspect.sh <test-pattern> [more pytest args...]}"
 shift || true
