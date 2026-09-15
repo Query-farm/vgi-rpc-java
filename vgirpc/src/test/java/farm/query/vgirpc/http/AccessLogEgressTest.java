@@ -88,7 +88,7 @@ final class AccessLogEgressTest {
         HttpResponse<byte[]> resp;
         try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
             resp = client.send(HttpRequest.newBuilder(
-                            URI.create("http://127.0.0.1:" + server.port() + "/vgi/echo"))
+                            URI.create("http://127.0.0.1:" + server.port() + "/vgi/EchoService/echo"))
                     .timeout(Duration.ofSeconds(30))
                     .header("Content-Type", "application/vnd.apache.arrow.stream")
                     .header(HttpHeaders.ACCEPT_ENCODING, "zstd, gzip")
@@ -129,7 +129,7 @@ final class AccessLogEgressTest {
         HttpResponse<byte[]> resp;
         try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
             resp = client.send(HttpRequest.newBuilder(
-                            URI.create("http://127.0.0.1:" + server.port() + "/vgi/echo"))
+                            URI.create("http://127.0.0.1:" + server.port() + "/vgi/EchoService/echo"))
                     .timeout(Duration.ofSeconds(30))
                     .header("Content-Type", "application/vnd.apache.arrow.stream")
                     .POST(HttpRequest.BodyPublishers.ofByteArray(request))
@@ -165,7 +165,7 @@ final class AccessLogEgressTest {
         HttpResponse<byte[]> resp;
         try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
             resp = client.send(HttpRequest.newBuilder(
-                            URI.create("http://127.0.0.1:" + server.port() + "/vgi/echo"))
+                            URI.create("http://127.0.0.1:" + server.port() + "/vgi/EchoService/echo"))
                     .timeout(Duration.ofSeconds(30))
                     .header("Content-Type", "application/vnd.apache.arrow.stream")
                     .POST(HttpRequest.BodyPublishers.ofByteArray(request))

@@ -247,7 +247,7 @@ final class CapabilityHeadersTest {
     void empty_set_rejects_a_compressed_request_body() throws Exception {
         start(List.of());
         byte[] request = unaryRequest(PAYLOAD);
-        HttpResponse<byte[]> resp = post(request(base + "/echo")
+        HttpResponse<byte[]> resp = post(request(base + "/EchoService/echo")
                 .header(HttpHeaders.CONTENT_ENCODING, MediaTypes.ZSTD)
                 .POST(HttpRequest.BodyPublishers.ofByteArray(Zstd.compress(request))));
 
@@ -260,13 +260,13 @@ final class CapabilityHeadersTest {
     void narrowed_set_rejects_the_dropped_codec_on_requests() throws Exception {
         start(List.of(MediaTypes.GZIP));
         byte[] request = unaryRequest("small");
-        HttpResponse<byte[]> zstdResp = post(request(base + "/echo")
+        HttpResponse<byte[]> zstdResp = post(request(base + "/EchoService/echo")
                 .header(HttpHeaders.CONTENT_ENCODING, MediaTypes.ZSTD)
                 .POST(HttpRequest.BodyPublishers.ofByteArray(Zstd.compress(request))));
         assertEquals(415, zstdResp.statusCode());
         assertEquals(MediaTypes.GZIP, advertised(zstdResp));
 
-        HttpResponse<byte[]> gzipResp = post(request(base + "/echo")
+        HttpResponse<byte[]> gzipResp = post(request(base + "/EchoService/echo")
                 .header(HttpHeaders.CONTENT_ENCODING, MediaTypes.GZIP)
                 .POST(HttpRequest.BodyPublishers.ofByteArray(gzip(request))));
         assertEquals(200, gzipResp.statusCode());
@@ -279,7 +279,7 @@ final class CapabilityHeadersTest {
                 .supportedEncodings(List.of())
                 .maxResponseBytes(64L << 10));
 
-        HttpResponse<byte[]> resp = post(request(base + "/echo")
+        HttpResponse<byte[]> resp = post(request(base + "/EchoService/echo")
                 .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, Long.toString(64L << 10))
                 .POST(HttpRequest.BodyPublishers.ofByteArray(unaryRequest(PAYLOAD))));
 
@@ -300,12 +300,12 @@ final class CapabilityHeadersTest {
     void malformed_or_combined_client_budget_is_http_400_before_dispatch() throws Exception {
         start(List.of());
         byte[] body = unaryRequest("small");
-        HttpResponse<byte[]> malformed = post(request(base + "/echo")
+        HttpResponse<byte[]> malformed = post(request(base + "/EchoService/echo")
                 .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "01")
                 .POST(HttpRequest.BodyPublishers.ofByteArray(body)));
         assertEquals(400, malformed.statusCode());
 
-        HttpResponse<byte[]> combined = post(request(base + "/echo")
+        HttpResponse<byte[]> combined = post(request(base + "/EchoService/echo")
                 .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "65536, 131072")
                 .POST(HttpRequest.BodyPublishers.ofByteArray(body)));
         assertEquals(400, combined.statusCode());
@@ -374,7 +374,7 @@ final class CapabilityHeadersTest {
 
     /** Ask for zstd on both accept headers — the eager client of the conformance case. */
     private HttpRequest.Builder zstdFirst() throws Exception {
-        return request(base + "/echo")
+        return request(base + "/EchoService/echo")
                 .header(HttpHeaders.ACCEPT_ENCODING, "zstd, gzip")
                 .header(HttpHeaders.X_VGI_ACCEPT_ENCODING, "zstd, gzip")
                 .POST(HttpRequest.BodyPublishers.ofByteArray(unaryRequest(PAYLOAD)));

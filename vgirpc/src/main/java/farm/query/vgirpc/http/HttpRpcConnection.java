@@ -240,10 +240,14 @@ public final class HttpRpcConnection implements AutoCloseable {
         String version = protocolVersion != null
                 ? protocolVersion
                 : ServiceIntrospector.protocolVersion(serviceInterface);
+        // The routing key rides both carriers: the path segment, so an edge can act on it, and
+        // vgi_rpc.protocol, which stays canonical. They are derived from one place here so they
+        // cannot disagree -- a disagreement is refused at the worker's dispatch boundary.
+        String protocol = ServiceIntrospector.protocolName(serviceInterface);
         return (T) Proxy.newProxyInstance(
                 serviceInterface.getClassLoader(),
                 new Class<?>[]{serviceInterface},
-                new ClientHandler(methods, version));
+                new ClientHandler(methods, protocol, version));
     }
 
     /**
@@ -280,7 +284,26 @@ public final class HttpRpcConnection implements AutoCloseable {
 
     Consumer<Message> onLog() { return onLog; }
 
-    String urlFor(String method, String suffix) { return endpoint + "/" + method + suffix; }
+    /**
+     * Build the URL for one RPC call: {@code {endpoint}/{protocol}/{method}{suffix}}.
+     *
+     * <p>Namespaced by protocol so an edge device can act on the routing key without an Arrow
+     * parser, and so co-hosted protocols -- reflection, identity -- are reachable over HTTP at
+     * all rather than only on the raw transports. The single source of truth for the route shape,
+     * shared with {@link HttpRpcStream}'s continuations.
+     *
+     * <p>Server-level reserved endpoints ({@code __upload_url__}) are owned by no protocol and
+     * stay flat; they are built at their own call sites.
+     *
+     * @param protocol the routing key of the hosted protocol
+     * @param method the RPC method name
+     * @param suffix {@code ""}, {@code "/init"} or {@code "/exchange"}
+     * @return the absolute request URL
+     */
+    String urlFor(String protocol, String method, String suffix) {
+        return endpoint + "/" + protocol + "/" + method + suffix;
+    }
+
 
     /**
      * POST an Arrow IPC body and return the response body, having established
@@ -670,10 +693,12 @@ public final class HttpRpcConnection implements AutoCloseable {
     private final class ClientHandler implements InvocationHandler {
 
         private final Map<String, RpcMethodInfo> methods;
+        private final String protocol;
         private final String protocolVersion;
 
-        ClientHandler(Map<String, RpcMethodInfo> methods, String protocolVersion) {
+        ClientHandler(Map<String, RpcMethodInfo> methods, String protocol, String protocolVersion) {
             this.methods = methods;
+            this.protocol = protocol;
             this.protocolVersion = protocolVersion;
         }
 
@@ -690,7 +715,7 @@ public final class HttpRpcConnection implements AutoCloseable {
         }
 
         private Object doUnary(RpcMethodInfo info, Method m, Object[] args) throws IOException {
-            byte[] response = post(urlFor(info.name(), ""), requestBody(info, m, args), info.name());
+            byte[] response = post(urlFor(protocol, info.name(), ""), requestBody(info, m, args), info.name());
             try (IpcStreamReader r = new IpcStreamReader(
                     new ByteArrayInputStream(response), Allocators.root())) {
                 while (true) {
@@ -707,7 +732,7 @@ public final class HttpRpcConnection implements AutoCloseable {
         }
 
         private Object doStream(RpcMethodInfo info, Method m, Object[] args) throws IOException {
-            byte[] response = post(urlFor(info.name(), "/init"),
+            byte[] response = post(urlFor(protocol, info.name(), "/init"),
                     requestBody(info, m, args), info.name() + "/init");
             // The init response is a *sequence* of IPC streams when the method
             // declares a header: the header stream, then the stream body. One
@@ -717,12 +742,12 @@ public final class HttpRpcConnection implements AutoCloseable {
             ArrowSerializableRecord header = null;
             Class<?> headerType = ClientMarshalling.resolveHeaderType(info);
             if (headerType != null) header = readHeaderStream(in, headerType);
-            return new HttpRpcStream<>(HttpRpcConnection.this, info.name(), in, header);
+            return new HttpRpcStream<>(HttpRpcConnection.this, protocol, info.name(), in, header);
         }
 
         private byte[] requestBody(RpcMethodInfo info, Method m, Object[] args) throws IOException {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            ClientMarshalling.writeRequest(buf, info, m, args, protocolVersion);
+            ClientMarshalling.writeRequest(buf, info, m, args, protocol, protocolVersion);
             return buf.toByteArray();
         }
 

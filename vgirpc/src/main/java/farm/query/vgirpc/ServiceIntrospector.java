@@ -40,6 +40,21 @@ public final class ServiceIntrospector {
     }
 
     /**
+     * The wire name of the protocol a service interface defines -- its routing key.
+     *
+     * <p>The interface's simple name, matching the reference, which uses the Protocol class name
+     * when it declares no explicit {@code protocol_name}. Read from one place because the server
+     * advertises it and the client stamps it on every request: derived separately on each side,
+     * they would drift, and a drifted routing key fails as a 404 rather than as a type error.
+     *
+     * @param serviceInterface the service interface
+     * @return the protocol name carried in {@code vgi_rpc.protocol} and in the HTTP path
+     */
+    public static String protocolName(Class<?> serviceInterface) {
+        return serviceInterface.getSimpleName();
+    }
+
+    /**
      * The application protocol version a service interface declares via
      * {@link farm.query.vgirpc.schema.ProtocolVersion}.
      *

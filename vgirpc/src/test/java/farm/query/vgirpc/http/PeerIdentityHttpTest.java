@@ -266,7 +266,7 @@ final class PeerIdentityHttpTest {
 
     private HttpResponse<String> rawPost() throws Exception {
         try (HttpClient client = HttpClient.newHttpClient()) {
-            return client.send(HttpRequest.newBuilder(URI.create(endpoint() + "/vgi/who"))
+            return client.send(HttpRequest.newBuilder(URI.create(endpoint() + "/vgi/IdentityService/who"))
                     .timeout(Duration.ofSeconds(5)).POST(HttpRequest.BodyPublishers.noBody()).build(),
                     HttpResponse.BodyHandlers.ofString());
         }

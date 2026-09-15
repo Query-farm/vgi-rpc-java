@@ -42,8 +42,15 @@ JAVA_WORKER = os.environ.get(
 SHM_SEGMENT_BYTES = 128 * 1024 * 1024
 
 
-class _TransportKindProbe(Protocol):
-    """Versionless probe service; deliberately separate from ConformanceService."""
+class TransportKindProbeService(Protocol):
+    """Versionless probe service; deliberately separate from ConformanceService.
+
+    Named for the interface the Java worker hosts, because a Protocol class name
+    *is* the routing key: it rides every request as ``vgi_rpc.protocol`` and, over
+    HTTP, as the path segment in ``{prefix}/{protocol}/{method}``. A driver-side
+    name that does not match the worker's is simply a call to a protocol nobody
+    hosts, which is a 404.
+    """
 
     def report_transport_kind(self) -> str: ...
 
@@ -339,7 +346,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
     def pipe_probe() -> str:
         transport = SubprocessTransport([JAVA_WORKER, "--transport-kind-probe"])
         try:
-            return str(_RpcProxy(_TransportKindProbe, transport, None).report_transport_kind())
+            return str(_RpcProxy(TransportKindProbeService, transport, None).report_transport_kind())
         finally:
             transport.close()
 
@@ -355,7 +362,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
             assert line.startswith("PORT:"), f"Expected PORT:<n>, got: {line!r}"
             port = int(line.split(":", 1)[1])
             _wait_for_http(port)
-            with http_connect(_TransportKindProbe, f"http://127.0.0.1:{port}") as proxy:
+            with http_connect(TransportKindProbeService, f"http://127.0.0.1:{port}") as proxy:
                 return str(proxy.report_transport_kind())
         finally:
             _stop_process(proc)
@@ -371,7 +378,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
             assert proc.stdout is not None
             assert proc.stdout.readline().decode().strip() == f"UNIX:{path}"
             _wait_for_unix(path)
-            with unix_connect(_TransportKindProbe, path) as proxy:
+            with unix_connect(TransportKindProbeService, path) as proxy:
                 return str(proxy.report_transport_kind())
         finally:
             _stop_process(proc)
@@ -389,7 +396,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
             host, _, port_part = line[len("TCP:") :].rpartition(":")
             port = int(port_part)
             _wait_for_tcp(host, port)
-            with tcp_connect(_TransportKindProbe, host, port) as proxy:
+            with tcp_connect(TransportKindProbeService, host, port) as proxy:
                 return str(proxy.report_transport_kind())
         finally:
             _stop_process(proc)

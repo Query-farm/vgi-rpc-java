@@ -165,6 +165,35 @@ public final class RpcServer {
     public IdentityImpl identity() { return identity; }
 
     /**
+     * The {@code vgi_rpc.Identity.v1} method table this server actually hosts.
+     *
+     * <p>Narrowed to the methods whose hooks the deployment configured, so a transport routing on
+     * the path answers "no such method" for an unconfigured one -- the same answer the raw
+     * dispatch gives, from the same table.
+     *
+     * @return the narrowed table; empty when the protocol is not hosted
+     */
+    public Map<String, RpcMethodInfo> identityMethodTable() {
+        return identityMethods;
+    }
+
+    /**
+     * The server-level reserved method names this server answers.
+     *
+     * <p>Reserved names are owned by no protocol and are routed flat, so a transport routing on
+     * the path needs the set to tell a reserved name this server offers from one it does not.
+     * {@code __describe__} is in it only when describe is enabled: a client probing for optional
+     * introspection needs the capability answer, not a routing complaint.
+     *
+     * @return the reserved names, which are never protocol-namespaced
+     */
+    public java.util.Set<String> reservedMethodNames() {
+        return describeEnabled
+                ? java.util.Set.of(Introspect.METHOD_NAME, TransportOptions.METHOD_NAME)
+                : java.util.Set.of(TransportOptions.METHOD_NAME);
+    }
+
+    /**
      * The {@code vgi_rpc.Identity.v1} method table {@code impl} hosts.
      *
      * <p>Narrowing the method set narrows the protocol hash with it, which is the point: a client
@@ -240,7 +269,7 @@ public final class RpcServer {
      *
      * @return the service interface's simple name
      */
-    public String protocolName() { return serviceInterface.getSimpleName(); }
+    public String protocolName() { return ServiceIntrospector.protocolName(serviceInterface); }
     /**
      * Introspected method table for the service interface.
      *
@@ -301,7 +330,7 @@ public final class RpcServer {
         try (ShmSession shm = new ShmSession()) {
             while (true) {
                 try {
-                    serveOne(transport, shm);
+                    serveCall(transport, shm, null);
                 } catch (EndOfStream e) {
                     return;
                 } catch (Throwable t) {
@@ -356,11 +385,30 @@ public final class RpcServer {
      */
     public void serveOne(RpcTransport transport) {
         notifyRawTransport(transport);
-        serveOne(transport, null);
+        serveCall(transport, null, null);
+    }
+
+    /**
+     * Handle exactly one RPC call whose protocol was already resolved by the transport.
+     *
+     * <p>HTTP routes on {@code {prefix}/{protocol}/{method}}, so by the time a request reaches
+     * here the binding is settled and the path is a carrier of the routing key in its own right.
+     * The metadata field stays canonical — it is the only carrier on stdio, unix and named pipes
+     * — so when the request also names a protocol the two must agree; when it does not, this is
+     * the single-carrier case and the path answers for it. That asymmetry is deliberate: a
+     * request that named nothing <em>and</em> arrived on a transport that names nothing is the
+     * one the required-key rule exists to reject.
+     *
+     * @param transport the transport whose next request stream is read and answered
+     * @param routedProtocol the protocol the transport resolved from the request path
+     */
+    public void serveOne(RpcTransport transport, String routedProtocol) {
+        notifyRawTransport(transport);
+        serveCall(transport, null, routedProtocol);
     }
 
     /** Handle exactly one RPC call, attaching/using the connection's shm session if present. */
-    private void serveOne(RpcTransport transport, ShmSession shmSession) {
+    private void serveCall(RpcTransport transport, ShmSession shmSession, String routedProtocol) {
         // Opened per call so a pipe/unix/TCP transport — which has no request
         // boundary of its own — still reports a raised method as status="error"
         // in the access log. Under HTTP the servlet already installed one
@@ -500,6 +548,25 @@ public final class RpcServer {
                 // mismatched, and gating it would deny the diagnosis it came
                 // for.
                 String requestProtocol = meta.get(farm.query.vgirpc.wire.Metadata.PROTOCOL);
+                if (routedProtocol != null) {
+                    // HTTP resolved the binding from the path. The metadata field is still
+                    // canonical when present, so a disagreement is refused rather than silently
+                    // preferring one carrier: unspecified, this is the
+                    // Content-Length/Transfer-Encoding shape, where the edge applies policy to
+                    // one protocol and the worker dispatches another.
+                    if (requestProtocol != null && !requestProtocol.equals(routedProtocol)) {
+                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                                new ProtocolNotSupportedError(
+                                        "Protocol mismatch: the request path resolved to '"
+                                                + routedProtocol + "' but the Arrow IPC "
+                                                + "custom_metadata 'vgi_rpc.protocol' says '"
+                                                + requestProtocol + "'. These must agree."),
+                                serverId);
+                        transport.writer().flush();
+                        return;
+                    }
+                    requestProtocol = routedProtocol;
+                }
                 if (Reflection.PROTOCOL_NAME.equals(requestProtocol)) {
                     serveReflection(transport, method, kwargsSnapshot);
                     return;
@@ -536,6 +603,43 @@ public final class RpcServer {
                 }
                 if (TransportOptions.METHOD_NAME.equals(method)) {
                     serveTransportOptions(transport);
+                    return;
+                }
+                // Required, with no single-protocol exemption -- and checked only now, after the
+                // reserved server-level built-ins above. Those belong to no protocol, and
+                // __describe__ in particular is the diagnostic path a confused client reaches
+                // for, so demanding a routing key first would remove the tool exactly when it is
+                // needed. An application call that named nothing is refused: an intermediary
+                // that rebuilds a request and drops the field must be told, not landed silently
+                // on whichever protocol happens to be first.
+                //
+                // The name is NOT required to equal protocolName(). This port hosts exactly one
+                // application protocol, so there is nothing to mis-route to, and peers whose
+                // Protocol class name differs from the Java interface's simple name (the
+                // conformance suite's transport-kind probe among them) would otherwise be
+                // refused over a naming difference that costs nothing here.
+                if (requestProtocol == null) {
+                    if (method.startsWith("__") && method.endsWith("__")) {
+                        // A reserved name this server does not offer -- __describe__ on a server
+                        // built with describe disabled, say. The answer is "no such method", not
+                        // "you failed to name a protocol": the caller did nothing wrong with
+                        // routing, and a client probing for optional introspection needs the
+                        // capability answer rather than a routing complaint.
+                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                                new MethodNotImplementedError(
+                                        "This server does not implement the reserved method '"
+                                                + method + "'."),
+                                serverId);
+                        transport.writer().flush();
+                        return;
+                    }
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                            new ProtocolNotSpecifiedError(
+                                    "Request carries no 'vgi_rpc.protocol' routing key. Every "
+                                            + "request must name the protocol it addresses. This "
+                                            + "server hosts: " + hostedProtocolNames() + "."),
+                            serverId);
+                    transport.writer().flush();
                     return;
                 }
                 RpcMethodInfo info = methods.get(method);

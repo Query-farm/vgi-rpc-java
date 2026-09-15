@@ -232,7 +232,7 @@ final class InBandStreamErrorHeaderTest {
     private HttpResponse<byte[]> post(String path, byte[] body) throws Exception {
         try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
             return client.send(HttpRequest.newBuilder(
-                            URI.create("http://127.0.0.1:" + server.port() + "/vgi/" + path))
+                            URI.create("http://127.0.0.1:" + server.port() + "/vgi/FailingStreamService/" + path))
                     .timeout(Duration.ofSeconds(30))
                     .header("Content-Type", ARROW)
                     .POST(HttpRequest.BodyPublishers.ofByteArray(body))

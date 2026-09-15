@@ -686,6 +686,28 @@ final class IdentityProtocolTest {
             }
         }
 
+        /**
+         * The eight codepoints {@code IDENTITY_V1_SPEC.md} §4 makes every port trim.
+         *
+         * <p>Pinned as an enumeration rather than as "whatever this language calls whitespace",
+         * because that phrase is itself a divergence one layer down: neither
+         * {@code Character.isWhitespace} (no {@code U+00A0}) nor {@code isSpaceChar} (no
+         * {@code U+0085}) spans the floor on its own, and an ASCII literal misses both. A port
+         * trimming narrower routes a padded JWS that another port refuses. Trimming wider is
+         * safe and this port does -- the assertion is the floor, not the ceiling.
+         */
+        @Test
+        void theEnumeratedTrimSetIsCovered() {
+            int[] mandated = {0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0};
+            for (int codepoint : mandated) {
+                String token = "aaa.bbb.ccc" + (char) codepoint;
+                assertThrows(TokenUnresolvedError.class,
+                        () -> IdentityImpl.rejectJwsShaped(token),
+                        () -> String.format("U+%04X must be trimmed before the shape test",
+                                codepoint));
+            }
+        }
+
         /** Whitespace-only never reaches a resolver either: it is not a credential. */
         @Test
         void aBlankCredentialIsNotACredential() {

@@ -10,11 +10,16 @@ import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
 import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.CallOutcome;
+import farm.query.vgirpc.MethodNotImplementedError;
+import farm.query.vgirpc.ProtocolNames;
+import farm.query.vgirpc.ProtocolNotSupportedError;
+import farm.query.vgirpc.Reflection;
 import farm.query.vgirpc.RpcMethodInfo;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.TransportKind;
 import farm.query.vgirpc.RpcStream;
 import farm.query.vgirpc.SessionLostError;
+import farm.query.vgirpc.identity.Identity;
 import farm.query.vgirpc.identity.PeerAuthenticationPolicy;
 import farm.query.vgirpc.identity.PeerEvidenceSet;
 import farm.query.vgirpc.identity.PeerIdentityProvider;
@@ -1375,6 +1380,20 @@ public final class HttpServer {
                 resp.getOutputStream().write(CLIENT_BUNDLE);
                 return;
             }
+            // A GET to a two-segment path is 404 unless that path really is an RPC route.
+            // Without this rule any unrelated two-segment path -- a /.well-known/... document
+            // among them -- matches the POST-only RPC route and is answered "method not
+            // allowed" by it, which reads as "this exists, use another verb".
+            int slash = p.indexOf('/');
+            if (slash > 0 && p.indexOf('/', slash + 1) < 0) {
+                String protocol = p.substring(0, slash);
+                if (protocol.indexOf('%') >= 0 || resolveBinding(protocol) == null) {
+                    resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+                    return;
+                }
+                resp.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
+                return;
+            }
             resp.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
         }
 
@@ -1414,10 +1433,48 @@ public final class HttpServer {
                 handleUploadUrl(req, resp);
                 return;
             }
-            boolean stream = rest.endsWith("/init") || rest.endsWith("/exchange");
-            boolean init = rest.endsWith("/init");
-            String methodName = !stream ? rest
-                    : rest.substring(0, rest.length() - (init ? "/init".length() : "/exchange".length()));
+            // Server-level reserved methods (__describe__, __transport_options__) stay flat:
+            // they are owned by no protocol, and __describe__ in particular is the diagnostic
+            // path a mismatched client reaches for, so making it name a protocol first would
+            // remove the tool exactly when it is needed.
+            if (isReservedMethodName(rest)) {
+                try (ExternalResponseBudget budget =
+                             ExternalResponseBudget.open(advertisedMaxExternalizedResponseBytes, rest)) {
+                    handleUnary(req, resp, null, rest);
+                }
+                return;
+            }
+            // Everything else is {protocol}/{method}[/init|/exchange].
+            int slash = rest.indexOf('/');
+            if (slash <= 0) {
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+                return;
+            }
+            String protocolSegment = rest.substring(0, slash);
+            String tail = rest.substring(slash + 1);
+            // A percent sign anywhere in the protocol segment is refused WITHOUT decoding. The
+            // name charset never requires percent-encoding, so a percent sign is a bug or an
+            // attempt to make the edge and this worker read different strings -- the
+            // Content-Length/Transfer-Encoding shape. `rest` is taken from the raw request URI
+            // for exactly this reason: getPathInfo() hands back an already-decoded path, and
+            // comparing decoded-against-raw is the bug, not the fix.
+            if (protocolSegment.indexOf('%') >= 0) {
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+                return;
+            }
+            RouteBinding binding = resolveBinding(protocolSegment);
+            if (binding == null) {
+                // Not hosted here, or not a protocol name at all: a routing failure, and 404 is
+                // the answer every proxy, WAF and load balancer understands without an Arrow
+                // parser. Checked before the grammar is echoed anywhere, so a request-supplied
+                // segment never reaches an error message, a log field or a metric label.
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+                return;
+            }
+            boolean stream = tail.endsWith("/init") || tail.endsWith("/exchange");
+            boolean init = tail.endsWith("/init");
+            String methodName = !stream ? tail
+                    : tail.substring(0, tail.length() - (init ? "/init".length() : "/exchange".length()));
             // An RPC method name never contains a slash, so a path still holding
             // one after the /init and /exchange suffixes names no route at all.
             // Answering 404 rather than dispatching it keeps a mistyped or
@@ -1436,9 +1493,9 @@ public final class HttpServer {
             try (ExternalResponseBudget budget =
                          ExternalResponseBudget.open(advertisedMaxExternalizedResponseBytes, methodName)) {
                 if (stream) {
-                    handleStream(req, resp, methodName, init);
+                    handleStream(req, resp, binding, methodName, init);
                 } else {
-                    handleUnary(req, resp, methodName);
+                    handleUnary(req, resp, binding, methodName);
                 }
             }
         }
@@ -1465,12 +1522,74 @@ public final class HttpServer {
             return false;
         }
 
+        /**
+         * The path under this server's prefix, <strong>undecoded</strong>.
+         *
+         * <p>Taken from {@link HttpServletRequest#getRequestURI()} rather than
+         * {@code getPathInfo()}, which the container hands back already percent-decoded. Routing
+         * on the decoded form while checking the raw one -- or the reverse -- is the
+         * Content-Length/Transfer-Encoding shape: the edge sees one string and the worker routes
+         * on another. Every segment below is therefore compared raw, and a percent sign in the
+         * protocol segment is refused rather than decoded.
+         *
+         * <p>Falls back to the decoded path only when the URI does not start with the configured
+         * prefix, which means the container routed this request by some rule this method does not
+         * model; answering from the decoded path is no worse than the behaviour that preceded it.
+         */
         private String pathInfo(HttpServletRequest req) {
+            String uri = req.getRequestURI();
+            if (uri != null && (prefix.isEmpty() || uri.startsWith(prefix))) {
+                String rest = uri.substring(prefix.length());
+                if (rest.startsWith("/")) rest = rest.substring(1);
+                return rest;
+            }
             String pi = req.getPathInfo();
             if (pi == null) return "";
             if (pi.startsWith("/")) pi = pi.substring(1);
             return pi;
         }
+    }
+
+    /**
+     * One protocol this server routes, with the method table its path segment resolves against.
+     *
+     * <p>{@code methods} is empty for a protocol whose methods this port answers without an
+     * {@link RpcMethodInfo} table (reflection); {@code methodNames} is always populated, because
+     * a path-routing transport has to answer "no such method" before it reads a body.
+     */
+    private record RouteBinding(String name, Map<String, RpcMethodInfo> methods,
+                                java.util.Set<String> methodNames) {}
+
+    /**
+     * Resolve a raw protocol path segment to a hosted binding, or {@code null}.
+     *
+     * <p>{@code null} is answered identically for "not a protocol name" and "not hosted here":
+     * both are 404, and the distinction is not worth a second message that echoes a
+     * request-supplied string. The grammar is checked before the lookup so such a string never
+     * reaches an error message, a log field or a metric label.
+     *
+     * <p>Identity resolves only when the deployment actually configured it. The protocol is
+     * <em>absent</em> rather than routed-and-refusing when omitted, which is what keeps a
+     * dependency upgrade from growing a credential-to-identity oracle on every existing worker.
+     */
+    private RouteBinding resolveBinding(String protocol) {
+        if (!ProtocolNames.isValid(protocol)) return null;
+        if (rpc.protocolName().equals(protocol)) {
+            return new RouteBinding(protocol, rpc.methods(), rpc.methods().keySet());
+        }
+        if (Reflection.PROTOCOL_NAME.equals(protocol)) {
+            return new RouteBinding(protocol, Map.of(), Reflection.METHOD_NAMES);
+        }
+        if (rpc.identity() != null && Identity.PROTOCOL_NAME.equals(protocol)) {
+            Map<String, RpcMethodInfo> table = rpc.identityMethodTable();
+            return new RouteBinding(protocol, table, table.keySet());
+        }
+        return null;
+    }
+
+    /** Whether a flat path segment names a server-level reserved method (`__describe__`). */
+    private static boolean isReservedMethodName(String segment) {
+        return segment.length() > 4 && segment.startsWith("__") && segment.endsWith("__");
     }
 
     /** Set capability-advertisement headers on every response. */
@@ -1861,7 +1980,15 @@ public final class HttpServer {
         return (address.indexOf(':') >= 0 ? "[" + address + "]" : address) + ":" + port;
     }
 
-    private void handleUnary(HttpServletRequest req, HttpServletResponse resp, String method) throws IOException {
+    /**
+     * Serve one unary call.
+     *
+     * @param binding the protocol the path resolved to, or {@code null} for a flat, server-level
+     *     reserved method such as {@code __describe__} -- which belongs to no protocol, so no
+     *     routing key is expected on it either
+     */
+    private void handleUnary(HttpServletRequest req, HttpServletResponse resp,
+                             RouteBinding binding, String method) throws IOException {
         RequestIdentity identity;
         try {
             identity = authenticateIdentity(req);
@@ -1892,7 +2019,14 @@ public final class HttpServer {
         }
 
         try {
-            validateDispatchRequest(body, method);
+            validateDispatchRequest(body, binding, method);
+        } catch (MethodNotImplementedError e) {
+            // Protocol hosted, method absent: the documented capability-probe signal, and
+            // deliberately a different answer from "protocol not hosted" (also 404) and from a
+            // malformed request (400). A client testing for an optional method has to be able to
+            // tell "you do not speak this protocol" from "you speak it but lack this method".
+            writeArrowError(req, resp, HttpServletResponse.SC_NOT_FOUND, e);
+            return;
         } catch (Exception e) {
             writeBadRequestArrow(req, resp, e);
             return;
@@ -1920,7 +2054,11 @@ public final class HttpServer {
             try (AutoCloseable authPop = AuthScope.push(auth, md, identity.evidence());
                  AutoCloseable sessPop = SessionScope.push(scope);
                  InMemoryTransport t = new InMemoryTransport(body, out)) {
-                rpc.serveOne(t);
+                // The path already resolved the binding, so it is handed to dispatch as the
+                // routing key. vgi_rpc.protocol stays canonical when the request carries it --
+                // a disagreement is refused there -- and its absence is the single-carrier case
+                // the path answers for.
+                rpc.serveOne(t, binding != null ? binding.name() : null);
                 // RpcServer deliberately contains dispatch failures so raw
                 // transports can keep serving. A bounded HTTP writer may have
                 // rejected a response inside that boundary, so surface the
@@ -2377,9 +2515,28 @@ public final class HttpServer {
      * reaching reflective parameter binding and becoming a successful 200 or
      * an application 500.</p>
      */
-    private void validateDispatchRequest(byte[] body, String urlMethod) throws IOException {
-        RpcMethodInfo info = rpc.methods().get(urlMethod);
-        if (info == null) throw new IllegalArgumentException("Unknown method: " + urlMethod);
+    private void validateDispatchRequest(byte[] body, RouteBinding binding, String urlMethod)
+            throws IOException {
+        RpcMethodInfo info;
+        if (binding == null) {
+            // Flat reserved route: resolved against the server's built-ins, never against a
+            // protocol's methods, and not a catch-all -- a reserved-shaped name this server does
+            // not offer stops here rather than falling through to a protocol lookup. There is no
+            // RpcMethodInfo for __describe__, so the parameter-contract check below is skipped
+            // and dispatch answers for it.
+            if (!rpc.reservedMethodNames().contains(urlMethod)) {
+                throw new MethodNotImplementedError(
+                        "This server does not implement the reserved method '" + urlMethod + "'.");
+            }
+            info = null;
+        } else {
+            if (!binding.methodNames().contains(urlMethod)) {
+                throw new MethodNotImplementedError("Protocol '" + binding.name()
+                        + "' has no method '" + urlMethod + "'. Available: "
+                        + new java.util.TreeSet<>(binding.methodNames()));
+            }
+            info = binding.methods().get(urlMethod);
+        }
         try (IpcStreamReader reader = new IpcStreamReader(
                 new ByteArrayInputStream(body), Allocators.root())) {
             Map<String, String> metadata = reader.readNextBatch();
@@ -2391,6 +2548,19 @@ public final class HttpServer {
                         "Method name mismatch: URL has '" + urlMethod
                                 + "' but metadata has '" + wireMethod + "'");
             }
+            // The path and vgi_rpc.protocol must agree when the request carries both. The
+            // metadata field is canonical -- it is the only carrier on stdio, unix and named
+            // pipes -- and the path segment is a required faithful projection, present so an
+            // edge device can act on the protocol without an Arrow parser. Left unchecked, edge
+            // policy is applied to one protocol while the worker dispatches another.
+            String declared = metadata.get(Metadata.PROTOCOL);
+            if (binding != null && declared != null && !declared.equals(binding.name())) {
+                throw new ProtocolNotSupportedError(
+                        "Protocol mismatch: the request path resolved to '" + binding.name()
+                                + "' but the Arrow IPC custom_metadata 'vgi_rpc.protocol' says '"
+                                + declared + "'. These must agree.");
+            }
+            if (info == null) return;
             Schema actualSchema = reader.wireSchema();
             if (!schemasCompatible(actualSchema, info.paramsSchema())) {
                 throw new ClassCastException(
@@ -2455,9 +2625,21 @@ public final class HttpServer {
     /** Return an HTTP 400 whose body remains a typed Arrow RPC error. */
     private void writeBadRequestArrow(HttpServletRequest req, HttpServletResponse resp, Throwable error)
             throws IOException {
+        writeArrowError(req, resp, HttpServletResponse.SC_BAD_REQUEST, error);
+    }
+
+    /**
+     * Answer a pre-dispatch refusal with a typed Arrow error batch under {@code status}.
+     *
+     * <p>4xx bodies stay valid Arrow IPC so a client reads one failure shape whether the request
+     * died in routing or in the method -- and the error carries its {@code error_kind}, which is
+     * what a capability probe branches on.
+     */
+    private void writeArrowError(HttpServletRequest req, HttpServletResponse resp, int status,
+                                 Throwable error) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         Wire.writeErrorStream(out, RpcStream.EMPTY_SCHEMA, error, rpc.serverId());
-        resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+        resp.setStatus(status);
         writeArrowResponse(req, resp, out.toByteArray());
     }
 
@@ -2674,7 +2856,7 @@ public final class HttpServer {
     }
 
     private void handleStream(HttpServletRequest req, HttpServletResponse resp,
-                               String method, boolean init) throws IOException {
+                               RouteBinding binding, String method, boolean init) throws IOException {
         RequestIdentity identity;
         try {
             identity = authenticateIdentity(req);
@@ -2707,11 +2889,22 @@ public final class HttpServer {
 
         if (init) {
             try {
-                validateDispatchRequest(body, method);
+                validateDispatchRequest(body, binding, method);
+            } catch (MethodNotImplementedError e) {
+                writeArrowError(req, resp, HttpServletResponse.SC_NOT_FOUND, e);
+                return;
             } catch (Exception e) {
                 writeBadRequestArrow(req, resp, e);
                 return;
             }
+        } else if (!binding.methodNames().contains(method)) {
+            // A continuation names its method in the path only; there is no init body to check
+            // it against. Refusing an unroutable one here keeps a stray /exchange from reaching
+            // the token layer at all.
+            writeArrowError(req, resp, HttpServletResponse.SC_NOT_FOUND,
+                    new MethodNotImplementedError("Protocol '" + binding.name()
+                            + "' has no method '" + method + "'."));
+            return;
         }
 
         SessionScope scope;
@@ -2733,9 +2926,15 @@ public final class HttpServer {
         try {
             try (AutoCloseable authPop = AuthScope.push(auth, md, identity.evidence());
                  AutoCloseable sessPop = SessionScope.push(scope)) {
+                // The routed protocol is sealed into the AEAD associated data of the cursor and
+                // call tokens, so a continuation presented on another protocol's route fails the
+                // tag check and is refused as an invalid token -- including on the call-state
+                // cache-hit path, where the call token is never opened at all.
                 out = init
-                        ? streamHandler.handleInit(method, body, responseLimit, preferredLimit)
-                        : streamHandler.handleExchange(method, body, responseLimit, preferredLimit);
+                        ? streamHandler.handleInit(binding.name(), method, body, responseLimit,
+                                preferredLimit)
+                        : streamHandler.handleExchange(binding.name(), method, body, responseLimit,
+                                preferredLimit);
             } catch (PayloadTooLargeException e) {
                 writePayloadTooLarge(resp, e);
                 return;

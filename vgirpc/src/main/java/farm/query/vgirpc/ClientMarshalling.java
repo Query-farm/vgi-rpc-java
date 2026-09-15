@@ -83,8 +83,35 @@ public final class ClientMarshalling {
      */
     public static void writeRequest(OutputStream out, RpcMethodInfo info, Method method, Object[] args,
                                     String protocolVersion) throws IOException {
+        writeRequest(out, info, method, args, null, protocolVersion);
+    }
+
+    /**
+     * As {@link #writeRequest(OutputStream, RpcMethodInfo, Method, Object[], String)},
+     * additionally stamping the routing key on the request batch as {@code vgi_rpc.protocol}.
+     *
+     * <p>Dispatch resolves the pair {@code (protocol, method)}, and the key is required on every
+     * request -- including against a server hosting exactly one protocol, because an exemption
+     * would let an intermediary that rebuilds a request and drops the field land silently on
+     * whichever protocol happened to be first. On stdio, unix and named pipes this metadata field
+     * is the <em>only</em> carrier; over HTTP the path segment projects it and the two must
+     * agree.
+     *
+     * @param out destination for the framed request; not closed by this method
+     * @param info the introspected method being called
+     * @param method the reflected interface method, used to name the arguments
+     * @param args the invocation arguments, positionally matching {@code method}
+     * @param protocol the protocol name to stamp; {@code null} or blank omits the key
+     * @param protocolVersion the version to stamp; {@code null} or blank omits the key
+     * @throws IOException if {@code out} fails
+     */
+    public static void writeRequest(OutputStream out, RpcMethodInfo info, Method method, Object[] args,
+                                    String protocol, String protocolVersion) throws IOException {
         Map<String, Object> wireKwargs = convertForWire(bindArgs(method, args), info);
         Map<String, String> meta = Wire.requestMetadata(info.name());
+        if (protocol != null && !protocol.isBlank()) {
+            meta.put(farm.query.vgirpc.wire.Metadata.PROTOCOL, protocol);
+        }
         if (protocolVersion != null && !protocolVersion.isBlank()) {
             meta.put(farm.query.vgirpc.wire.Metadata.PROTOCOL_VERSION_KEY, protocolVersion);
         }

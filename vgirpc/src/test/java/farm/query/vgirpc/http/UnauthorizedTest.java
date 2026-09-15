@@ -64,7 +64,7 @@ final class UnauthorizedTest {
     /** POST an empty body at a gated endpoint; auth runs before the body is parsed. */
     private HttpResponse<String> post(String accept) throws Exception {
         try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
-            HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(base + "/echo"))
+            HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(base + "/EchoService/echo"))
                     .timeout(Duration.ofSeconds(10))
                     .POST(HttpRequest.BodyPublishers.ofByteArray(new byte[0]));
             if (accept != null) b.header("Accept", accept);
@@ -101,8 +101,8 @@ final class UnauthorizedTest {
     @Test
     void rpc_authentication_precedes_budget_and_body_parsing() throws Exception {
         start(request -> { throw new InvalidCredentials("bad token"); }, List.of());
-        assertEquals(401, postMalformedBudget("/echo").statusCode());
-        assertEquals(401, postMalformedBudget("/echo/init").statusCode());
+        assertEquals(401, postMalformedBudget("/EchoService/echo").statusCode());
+        assertEquals(401, postMalformedBudget("/EchoService/echo/init").statusCode());
     }
 
     /** A failure that names no reason lands on the fallback rather than a guess. */

@@ -190,14 +190,28 @@ final class NativeClientConformanceTest {
         }
     }
 
+    /**
+     * Locate a Python interpreter with the reference {@code vgi_rpc} importable.
+     *
+     * <p>The sibling checkouts are tried newest-reference-first. This test drives the native Java
+     * client against a Python worker, so it is only meaningful against the reference this port
+     * currently tracks -- and the two checkouts differ on the HTTP route shape, which is exactly
+     * what the client builds. Run against the older one, every call 404s and the failure reads
+     * as a client bug rather than as a stale reference.
+     */
+    private static final List<String> REFERENCE_VENVS =
+            List.of("vgi-rpc-python/.venv/bin/python", "vgi-rpc/.venv/bin/python");
+
     private static String findPython() throws IOException, InterruptedException {
         String configured = System.getenv("VGI_RPC_PYTHON");
         if (configured != null && !configured.isBlank()) return configured;
-        Path cursor = Path.of("").toAbsolutePath();
-        while (cursor != null) {
-            Path candidate = cursor.resolveSibling("vgi-rpc/.venv/bin/python");
-            if (Files.isExecutable(candidate)) return candidate.toString();
-            cursor = cursor.getParent();
+        for (String relative : REFERENCE_VENVS) {
+            Path cursor = Path.of("").toAbsolutePath();
+            while (cursor != null) {
+                Path candidate = cursor.resolveSibling(relative);
+                if (Files.isExecutable(candidate)) return candidate.toString();
+                cursor = cursor.getParent();
+            }
         }
         Process probe = new ProcessBuilder("python3", "-c",
                 "import vgi_rpc.conformance.client_worker").start();

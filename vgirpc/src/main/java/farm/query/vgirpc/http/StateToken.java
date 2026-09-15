@@ -109,7 +109,23 @@ public record StateToken(
 
     /** Seal using domain, principal, and peer-evidence binding when present. */
     public byte[] pack(byte[] tokenKey, AuthContext auth) {
-        return packWithAad(tokenKey, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth));
+        return pack(tokenKey, auth, Tokens.SERVER_SCOPE);
+    }
+
+    /**
+     * Seal bound additionally to the protocol the stream started on.
+     *
+     * <p>A continuation that names a different protocol fails the AEAD tag check and is refused
+     * as an invalid token -- no comparison in application code, and nothing to forget on the
+     * call-state cache-hit path, where the call token is never opened at all.
+     *
+     * @param tokenKey the server's token key
+     * @param auth the caller's authenticated context
+     * @param protocol the routing key that owns this stream
+     * @return the base64 token
+     */
+    public byte[] pack(byte[] tokenKey, AuthContext auth, String protocol) {
+        return packWithAad(tokenKey, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth, protocol));
     }
 
     private byte[] packWithAad(byte[] tokenKey, byte[] aad) {
@@ -139,7 +155,27 @@ public record StateToken(
 
     /** Open using domain, principal, and peer-evidence binding when present. */
     public static StateToken unpack(byte[] b64, byte[] tokenKey, long ttlSeconds, AuthContext auth) {
-        return unpackWithAad(b64, tokenKey, ttlSeconds, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth));
+        return unpack(b64, tokenKey, ttlSeconds, auth, Tokens.SERVER_SCOPE);
+    }
+
+    /**
+     * Open a token that was sealed against {@code protocol}.
+     *
+     * <p>A cursor minted on one protocol and presented on another's route does not open, which is
+     * how a cross-protocol continuation is rejected: as an invalid token, indistinguishably from
+     * any other tag failure.
+     *
+     * @param b64 the base64 token as presented
+     * @param tokenKey the server's token key
+     * @param ttlSeconds the token lifetime; {@code <= 0} disables the check
+     * @param auth the caller's authenticated context
+     * @param protocol the routing key the request path resolved to
+     * @return the opened token
+     */
+    public static StateToken unpack(byte[] b64, byte[] tokenKey, long ttlSeconds, AuthContext auth,
+                                    String protocol) {
+        return unpackWithAad(b64, tokenKey, ttlSeconds,
+                Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth, protocol));
     }
 
     private static StateToken unpackWithAad(byte[] b64, byte[] tokenKey, long ttlSeconds, byte[] aad) {

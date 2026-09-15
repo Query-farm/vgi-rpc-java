@@ -83,7 +83,19 @@ public record CallToken(
 
     /** Seal using domain, principal, and peer-evidence binding when present. */
     public byte[] pack(byte[] tokenKey, AuthContext auth) {
-        return packWithAad(tokenKey, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth));
+        return pack(tokenKey, auth, Tokens.SERVER_SCOPE);
+    }
+
+    /**
+     * Seal bound additionally to the protocol the stream started on.
+     *
+     * @param tokenKey the server's token key
+     * @param auth the caller's authenticated context
+     * @param protocol the routing key that owns this stream
+     * @return the base64 token
+     */
+    public byte[] pack(byte[] tokenKey, AuthContext auth, String protocol) {
+        return packWithAad(tokenKey, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth, protocol));
     }
 
     private byte[] packWithAad(byte[] tokenKey, byte[] aad) {
@@ -119,7 +131,23 @@ public record CallToken(
 
     /** Open using domain, principal, and peer-evidence binding when present. */
     public static CallToken unpack(byte[] b64, byte[] tokenKey, long ttlSeconds, AuthContext auth) {
-        return unpackWithAad(b64, tokenKey, ttlSeconds, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth));
+        return unpack(b64, tokenKey, ttlSeconds, auth, Tokens.SERVER_SCOPE);
+    }
+
+    /**
+     * Open a token that was sealed against {@code protocol}.
+     *
+     * @param b64 the base64 token as presented
+     * @param tokenKey the server's token key
+     * @param ttlSeconds the token lifetime; {@code <= 0} disables the check
+     * @param auth the caller's authenticated context
+     * @param protocol the routing key the request path resolved to
+     * @return the opened token
+     */
+    public static CallToken unpack(byte[] b64, byte[] tokenKey, long ttlSeconds, AuthContext auth,
+                                   String protocol) {
+        return unpackWithAad(b64, tokenKey, ttlSeconds,
+                Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth, protocol));
     }
 
     private static CallToken unpackWithAad(byte[] b64, byte[] tokenKey, long ttlSeconds, byte[] aad) {

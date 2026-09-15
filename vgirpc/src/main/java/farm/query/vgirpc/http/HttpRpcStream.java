@@ -61,6 +61,7 @@ import java.util.function.Consumer;
 public final class HttpRpcStream<S extends StreamState> extends RpcStream<S> {
 
     private final HttpRpcConnection connection;
+    private final String protocol;
     private final String method;
     private final Consumer<Message> onLog;
     private final ArrowSerializableRecord header;
@@ -87,14 +88,16 @@ public final class HttpRpcStream<S extends StreamState> extends RpcStream<S> {
      * any) consumed.
      *
      * @param connection the connection that issues the continuation requests
+     * @param protocol the routing key the stream started on; every continuation must stay on it
      * @param method the RPC method name, used to build the {@code /exchange} URL
      * @param initBody the init response, positioned at the start of the stream body
      * @param header the decoded {@code @StreamHeader} record, or {@code null}
      * @throws IOException if the body is not a readable IPC stream
      */
-    HttpRpcStream(HttpRpcConnection connection, String method,
+    HttpRpcStream(HttpRpcConnection connection, String protocol, String method,
                   ByteArrayInputStream initBody, ArrowSerializableRecord header) throws IOException {
         this.connection = connection;
+        this.protocol = protocol;
         this.method = method;
         this.onLog = connection.onLog();
         this.header = header;
@@ -278,7 +281,7 @@ public final class HttpRpcStream<S extends StreamState> extends RpcStream<S> {
         if (closed) throw new RpcError("ProtocolError", "RpcStream has been closed or cancelled", "");
     }
 
-    private String url() { return connection.urlFor(method, "/exchange"); }
+    private String url() { return connection.urlFor(protocol, method, "/exchange"); }
 
     private String what(String phase) { return method + "/exchange (" + phase + ")"; }
 

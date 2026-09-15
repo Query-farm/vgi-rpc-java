@@ -28,13 +28,18 @@ cd "$(dirname "$0")"
 OUT=/tmp/pytest_java.txt
 # Python with the vgi_rpc reference package importable. Override with
 # VGI_RPC_PYTHON; else prefer a local reference venv, else system python3.
+#
+# vgi-rpc-python is tried first because it is the reference this port tracks and
+# the one CI clones. A stale sibling checkout is not a harmless fallback: the two
+# disagree on the HTTP route shape, so running against the older one fails every
+# HTTP test in a way that reads as a worker bug.
 PY="${VGI_RPC_PYTHON:-}"
 if [[ -z "$PY" ]]; then
-    if [[ -x "$HOME/Development/vgi-rpc/.venv/bin/python" ]]; then
-        PY="$HOME/Development/vgi-rpc/.venv/bin/python"
-    else
-        PY="python3"
-    fi
+    for candidate in "$HOME/Development/vgi-rpc-python/.venv/bin/python" \
+                     "$HOME/Development/vgi-rpc/.venv/bin/python"; do
+        if [[ -x "$candidate" ]]; then PY="$candidate"; break; fi
+    done
+    PY="${PY:-python3}"
 fi
 
 BUILD=1

@@ -31,7 +31,7 @@ final class HttpRpcStreamLockstepTest {
     void clientRejectsTwoDataBatchesInOneHttpTurn() throws Exception {
         byte[] response = twoBatchResponse();
         try (HttpRpcConnection connection = HttpRpcConnection.builder("http://127.0.0.1:1/vgi").build();
-             HttpRpcStream<ProducerState> stream = new HttpRpcStream<>(connection, "bad_producer",
+             HttpRpcStream<ProducerState> stream = new HttpRpcStream<>(connection, "BadService", "bad_producer",
                      new ByteArrayInputStream(response), null)) {
             AnnotatedBatch first = stream.tick();
             assertEquals(1L, ((BigIntVector) first.root().getVector(0)).get(0));

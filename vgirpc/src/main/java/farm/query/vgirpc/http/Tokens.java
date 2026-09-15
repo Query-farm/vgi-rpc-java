@@ -51,6 +51,44 @@ final class Tokens {
     private static final long MAX_PLAINTEXT_BYTES = 64L << 20;
 
     /**
+     * Scope for tokens that belong to the server rather than to any one protocol -- session
+     * tokens, which live at the un-namespaced prefix.
+     *
+     * <p>Spelled with a leading NUL so it cannot collide with a protocol name, which must start
+     * {@code [A-Za-z_]}. Naming it at every call site is deliberate: a new one then cannot
+     * silently inherit an unbound token.
+     */
+    static final String SERVER_SCOPE = "\u0000server";
+
+    /**
+     * Append the protocol scope that binds a token to the protocol its stream started on.
+     *
+     * <p>The protocol lives in the AAD rather than in the plaintext so a cross-protocol
+     * continuation fails the AEAD tag check -- it is refused exactly as an invalid token, with no
+     * comparison code to get wrong and nothing to forget on the call-state cache-hit path, where
+     * the call token is never opened at all. The cursor is always opened first, so binding it
+     * there covers both paths.
+     */
+    private static byte[] scoped(byte[] base, String protocol) {
+        byte[] p = (protocol != null ? protocol : SERVER_SCOPE).getBytes(StandardCharsets.UTF_8);
+        byte[] out = new byte[base.length + 1 + p.length];
+        System.arraycopy(base, 0, out, 0, base.length);
+        out[base.length] = 0x00;
+        System.arraycopy(p, 0, out, base.length + 1, p.length);
+        return out;
+    }
+
+    /** As {@link #aad(byte[], String)}, additionally bound to the owning protocol. */
+    static byte[] aad(byte[] prefix, String principal, String protocol) {
+        return scoped(aad(prefix, principal), protocol);
+    }
+
+    /** As {@link #aad(byte[], byte[], AuthContext)}, additionally bound to the owning protocol. */
+    static byte[] aad(byte[] legacyPrefix, byte[] boundPrefix, AuthContext auth, String protocol) {
+        return scoped(aad(legacyPrefix, boundPrefix, auth), protocol);
+    }
+
+    /**
      * Build the AAD that binds a token to its caller, under a prefix that
      * also binds it to its <em>kind</em>.
      *

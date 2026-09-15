@@ -189,7 +189,7 @@ final class TokenIntrospectionTest {
         start(HttpServer.Config.builder()
                 .prefix("/vgi")
                 .authenticator(req -> { throw new AuthUnavailableException("identity sidecar unreachable", 7, null); }));
-        HttpResponse<String> resp = post(base + "/echo", "not-arrow-but-auth-runs-first");
+        HttpResponse<String> resp = post(base + "/EchoService/echo", "not-arrow-but-auth-runs-first");
         assertEquals(503, resp.statusCode());
         assertNotEquals(401, resp.statusCode());
         assertEquals("7", resp.headers().firstValue("Retry-After").orElseThrow());

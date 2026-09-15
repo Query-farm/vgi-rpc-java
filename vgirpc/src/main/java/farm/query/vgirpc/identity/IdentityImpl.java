@@ -309,11 +309,14 @@ public final class IdentityImpl implements Identity {
      * would make the worker answer about a string the caller never sent.
      *
      * <p>The whitespace set is {@link #stripWhitespace} rather than {@link String#strip()}, for
-     * the same reason the anchors went: {@code strip()} uses
-     * {@link Character#isWhitespace(char)}, which deliberately excludes the non-breaking spaces
-     * (U+00A0, U+2007, U+202F) that the reference's {@code str.strip()} does remove. Left alone,
-     * a JWS padded with U+00A0 would be refused by Python and routed onward here -- a smaller
-     * copy of the bug being fixed.
+     * the same reason the anchors went: "whitespace" means different things in different
+     * languages, so {@code IDENTITY_V1_SPEC.md} §4 enumerates the floor every port must trim
+     * ({@code U+0009}-{@code U+000D}, {@code U+0020}, {@code U+0085}, {@code U+00A0}) instead of
+     * delegating it. No single Java predicate spans that set: {@code strip()} uses
+     * {@link Character#isWhitespace(char)}, which excludes the non-breaking spaces (U+00A0,
+     * U+2007, U+202F), and {@link Character#isSpaceChar(char)} excludes U+0085 NEL. Left alone, a
+     * JWS padded with either would be refused by Python and routed onward here -- a smaller copy
+     * of the bug being fixed.
      *
      * <p>A whitespace-only credential is refused for the same reason an empty one is: it is not a
      * credential. The length check stays against the <em>original</em>, because the megabytes a
@@ -400,18 +403,22 @@ public final class IdentityImpl implements Identity {
     }
 
     /**
-     * Strip leading and trailing whitespace, counting the non-breaking spaces as whitespace.
+     * Strip leading and trailing whitespace, over at least the set every port must trim.
      *
-     * <p>{@link Character#isWhitespace(char)} alone is not enough: it excludes U+00A0, U+2007 and
-     * U+202F by design, so {@link String#strip()} leaves a credential padded with them padded.
-     * Adding {@link Character#isSpaceChar(char)} brings in the whole {@code Zs}/{@code Zl}/
-     * {@code Zp} categories and lines this up with the reference's {@code str.strip()}.
+     * <p>The floor is <em>enumerated</em> by {@code IDENTITY_V1_SPEC.md} §4 --
+     * {@code U+0009}-{@code U+000D}, {@code U+0020}, {@code U+0085}, {@code U+00A0} -- rather
+     * than delegated to any language's own notion of whitespace, because "whitespace" is itself
+     * a divergence one layer down. No single Java predicate spans it:
+     * {@link Character#isWhitespace(char)} excludes {@code U+00A0} (and the other non-breaking
+     * spaces {@code U+2007}, {@code U+202F}) by design, and {@link Character#isSpaceChar(char)}
+     * excludes {@code U+0085} NEL. Either alone leaves a credential padded that Python and Go
+     * refuse -- a padded JWS routed onward here is the exact hole this guard exists to close.
      *
-     * <p>Erring wide is the safe direction, and that is why this is worth spelling out rather
-     * than reaching for the shorter call. Stripping <em>more</em> can only turn a padded JWS into
-     * a recognised one, or a blank-ish credential into an empty one -- both refusals. Stripping
-     * <em>less</em> is what lets a padded JWS reach a resolver, which is the failure this guard
-     * exists to prevent.
+     * <p>So the two predicates are combined and {@code U+0085} is named explicitly. The result
+     * is a strict superset of the mandated floor (it also covers {@code Zs}/{@code Zl}/
+     * {@code Zp}), which is the safe direction: stripping <em>more</em> can only turn a padded
+     * JWS into a recognised one, or a blank-ish credential into an empty one -- both refusals.
+     * Stripping <em>less</em> is the leak.
      *
      * @param token the credential as sent
      * @return the credential with surrounding whitespace removed, for shape-testing only
@@ -424,8 +431,16 @@ public final class IdentityImpl implements Identity {
         return token.substring(start, end);
     }
 
+    /**
+     * {@code U+0085} NEL: in the mandated trim set, and in neither Java predicate.
+     *
+     * <p>Named as a constant rather than inlined so the one codepoint that has to be spelled out
+     * by hand is greppable from the spec table.
+     */
+    private static final char NEL = '\u0085';
+
     private static boolean isPad(char c) {
-        return Character.isWhitespace(c) || Character.isSpaceChar(c);
+        return Character.isWhitespace(c) || Character.isSpaceChar(c) || c == NEL;
     }
 
     /**

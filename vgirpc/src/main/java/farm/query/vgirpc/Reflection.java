@@ -55,6 +55,17 @@ public final class Reflection {
      */
     public static final String PROTOCOL_NAME = "vgi_rpc.Reflection.v1";
 
+    /**
+     * The methods {@code vgi_rpc.Reflection.v1} offers.
+     *
+     * <p>Two, deliberately: {@code list_protocols} is the cheap question -- what is here -- and
+     * {@code describe} is the expensive one. Named here rather than only inside the dispatch
+     * switch because a transport that routes on the path ({@code {prefix}/{protocol}/{method}})
+     * has to answer "no such method" for anything else <em>before</em> it reads a body.
+     */
+    public static final java.util.Set<String> METHOD_NAMES =
+            java.util.Set.of("list_protocols", "describe");
+
     /** The default {@code idempotency}: a caller must assume the worst. */
     public static final String IDEMPOTENCY_UNKNOWN = "unknown";
 

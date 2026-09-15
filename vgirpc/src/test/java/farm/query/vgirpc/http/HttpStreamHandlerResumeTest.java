@@ -168,6 +168,42 @@ class HttpStreamHandlerResumeTest {
         assertNull(last.token(), "finished producer must not mint a token");
     }
 
+    /**
+     * A continuation must stay on the protocol its stream started on.
+     *
+     * <p>The routed protocol is sealed into the AEAD associated data of both the cursor and the
+     * call token, so a cursor minted under one and presented under another simply does not open.
+     * That is the point of putting it in the AAD rather than comparing it in application code:
+     * there is no comparison to forget, and nothing extra to remember on the call-state
+     * cache-hit path, where the call token is never opened at all. The failure is
+     * indistinguishable from any other invalid token, which is the one failure mode the client
+     * already handles.
+     */
+    @Test
+    void aContinuationCannotCrossProtocols() throws Exception {
+        RpcServer server = new RpcServer(CounterService.class, new CounterServiceImpl());
+        HttpStreamHandler handler = new HttpStreamHandler(server, KEY, 0, Long.MAX_VALUE);
+
+        Turn first = readTurn(handler.handleInit("CounterService", "count_to",
+                initRequest(server, "count_to", Map.of("limit", 3L)), Long.MAX_VALUE, null));
+        assertNull(first.error());
+        assertNotNull(first.token());
+
+        Turn crossed = readTurn(handler.handleExchange("SomeOtherProtocol", "count_to",
+                continuationRequest("count_to", first.token(), first.callToken()),
+                Long.MAX_VALUE, null));
+        assertNotNull(crossed.error(), "a cross-protocol continuation must not be served");
+        assertTrue(crossed.error().contains("signature") || crossed.error().contains("token"),
+                crossed.error());
+
+        // The control: the same tokens on the protocol they were minted under still resume.
+        Turn same = readTurn(handler.handleExchange("CounterService", "count_to",
+                continuationRequest("count_to", first.token(), first.callToken()),
+                Long.MAX_VALUE, null));
+        assertNull(same.error());
+        assertEquals(List.of(1L), same.values());
+    }
+
     @Test
     void wildcardImplStillLearnsFromInit() throws Exception {
         RpcServer server = new RpcServer(CounterService.class, new WildcardImpl());
