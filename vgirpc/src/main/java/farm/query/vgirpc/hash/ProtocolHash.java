@@ -28,13 +28,21 @@ import org.apache.arrow.vector.types.pojo.Schema;
  * a type token ({@code decimal128(38,9)}), so JCS's hardest rule -- number canonicalisation, and
  * the likeliest place for six ports to diverge -- never applies. Keep it that way.
  *
- * <p>Not in the preimage: server identity, docstrings, parameter defaults, language-specific
- * type names, the framework's own request/describe versions, and whether a stream is an
- * exchange. That last is an <em>implementation</em> property, not visible on the protocol
- * definition, so one port can determine it and another cannot -- and a field one port knows and
- * another does not cannot be part of a cross-language contract. It still reaches clients as
- * {@code stream_kind} on the description, where "unknown" is a sayable answer; a hash has no
- * such option.
+ * <p>Not in the preimage: server identity, docstrings, parameter defaults,
+ * language-specific type names, and the framework's own request/describe versions. Those vary
+ * across processes, builds and ports without changing what is on the wire.
+ *
+ * <p>Also not in the preimage: whether a stream is an exchange. Not because no port can
+ * determine it -- every port can, for most methods -- but because <em>which</em> methods a port
+ * can classify depends on how that port's registration works. A port that decides
+ * producer-vs-exchange from the returned stream cannot state it ahead of the call; a
+ * registration whose output schema is computed at run time may not carry the shape. So two
+ * ports can disagree about a method while neither is wrong, and a field one port can state and
+ * another cannot is not a contract.
+ *
+ * <p>It still reaches clients as {@code stream_kind} on the description, where "unknown" is a
+ * sayable answer. A hash has no such option -- which is the whole difference: a description may
+ * admit what it does not know, a fingerprint may not.
  */
 public final class ProtocolHash {
 
