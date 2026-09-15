@@ -511,6 +511,20 @@ public final class RpcServer {
                 // application protocol -- identity declares no version of its own, and
                 // gating it on somebody else's would make a proxy's ability to resolve
                 // a credential depend on a worker upgrade it has no part in.
+                //
+                // Like reflection, and DELIBERATELY like reflection, identity calls
+                // are not reported to the dispatch hook: returning here is ahead of
+                // the access-log block below, so nothing is logged for them. That is
+                // a decision, not an oversight. This port's DispatchInfo.protocol is
+                // filled from protocolName(), which is the APPLICATION protocol --
+                // so logging an identity call through the hook unchanged would file
+                // it under the wrong protocol, and a wrong protocol field fails
+                // silently: it yields a plausible dashboard rather than an error.
+                // Other ports (C#) took the other road and added per-protocol
+                // overrides to the access log. Doing that here means a change to
+                // DispatchInfo and to every hook that reads it, which is a
+                // cross-port change of its own rather than a detail of this one.
+                // Until then: no record beats a confidently mislabelled record.
                 if (identity != null && Identity.PROTOCOL_NAME.equals(requestProtocol)) {
                     serveIdentity(transport, method, kwargsSnapshot, requestSchema,
                             parameterRows, shm);

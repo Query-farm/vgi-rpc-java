@@ -288,19 +288,45 @@ public final class IdentityImpl implements Identity {
     }
 
     /**
-     * Refuse an empty, over-long, or JWS-shaped subject before it reaches a resolver.
+     * Refuse a blank, over-long, or JWS-shaped subject before it reaches a resolver.
      *
-     * <p>All three are one answer. A JWS arriving here is either a caller bug or an attempt to
+     * <p>All of them are one answer. A JWS arriving here is either a caller bug or an attempt to
      * have this worker vouch for a token its asker already rejected -- forwarding one would turn
      * this method into a laundering step, because an expired access token is still live at its
      * issuer for other resources.
      *
-     * @param token the subject credential
+     * <p><strong>The shape test runs against the whitespace-trimmed credential, while the
+     * resolver still receives what the caller actually sent.</strong> Trimming can only add
+     * refusals, never remove one, and it closes a padding bypass that this port had: with a
+     * strict full-region match, {@code "a.b.c\n"} is not JWS-shaped, so it was routed onward --
+     * precisely what this guard exists to stop. Anchor semantics are the least portable corner of
+     * seven regex dialects (the reference happened to refuse one trailing newline and admit two,
+     * as an artifact of Python's {@code $}; Go's {@code \A..\z} and this port's
+     * {@link java.util.regex.Matcher#matches()} refused neither), so the rule is to stop
+     * depending on them. Trimming first means the same thing everywhere.
+     *
+     * <p>Trimming is for the shape test <em>only</em>. Rewriting a credential before resolving it
+     * would make the worker answer about a string the caller never sent.
+     *
+     * <p>The whitespace set is {@link #stripWhitespace} rather than {@link String#strip()}, for
+     * the same reason the anchors went: {@code strip()} uses
+     * {@link Character#isWhitespace(char)}, which deliberately excludes the non-breaking spaces
+     * (U+00A0, U+2007, U+202F) that the reference's {@code str.strip()} does remove. Left alone,
+     * a JWS padded with U+00A0 would be refused by Python and routed onward here -- a smaller
+     * copy of the bug being fixed.
+     *
+     * <p>A whitespace-only credential is refused for the same reason an empty one is: it is not a
+     * credential. The length check stays against the <em>original</em>, because the megabytes a
+     * caller sent are the megabytes the framework had to hold.
+     *
+     * @param token the subject credential, exactly as the caller sent it
      * @throws TokenUnresolvedError when the credential is refused on shape alone
      */
     public static void rejectJwsShaped(String token) {
-        if (token == null || token.isEmpty() || token.length() > MAX_TOKEN_CHARS
-                || JWS_SHAPED.matcher(token).matches()) {
+        if (token == null) throw new TokenUnresolvedError("unresolved");
+        String candidate = stripWhitespace(token);
+        if (candidate.isEmpty() || token.length() > MAX_TOKEN_CHARS
+                || JWS_SHAPED.matcher(candidate).matches()) {
             throw new TokenUnresolvedError("unresolved");
         }
     }
@@ -371,6 +397,35 @@ public final class IdentityImpl implements Identity {
                             + "minting a grant; re-authenticate", age, maxAuthAge));
         }
         return authTime;
+    }
+
+    /**
+     * Strip leading and trailing whitespace, counting the non-breaking spaces as whitespace.
+     *
+     * <p>{@link Character#isWhitespace(char)} alone is not enough: it excludes U+00A0, U+2007 and
+     * U+202F by design, so {@link String#strip()} leaves a credential padded with them padded.
+     * Adding {@link Character#isSpaceChar(char)} brings in the whole {@code Zs}/{@code Zl}/
+     * {@code Zp} categories and lines this up with the reference's {@code str.strip()}.
+     *
+     * <p>Erring wide is the safe direction, and that is why this is worth spelling out rather
+     * than reaching for the shorter call. Stripping <em>more</em> can only turn a padded JWS into
+     * a recognised one, or a blank-ish credential into an empty one -- both refusals. Stripping
+     * <em>less</em> is what lets a padded JWS reach a resolver, which is the failure this guard
+     * exists to prevent.
+     *
+     * @param token the credential as sent
+     * @return the credential with surrounding whitespace removed, for shape-testing only
+     */
+    static String stripWhitespace(String token) {
+        int start = 0;
+        int end = token.length();
+        while (start < end && isPad(token.charAt(start))) start++;
+        while (end > start && isPad(token.charAt(end - 1))) end--;
+        return token.substring(start, end);
+    }
+
+    private static boolean isPad(char c) {
+        return Character.isWhitespace(c) || Character.isSpaceChar(c);
     }
 
     /**

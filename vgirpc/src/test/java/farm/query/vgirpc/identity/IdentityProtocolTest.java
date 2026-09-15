@@ -634,6 +634,113 @@ final class IdentityProtocolTest {
         }
     }
 
+    // --- the JWS shape test ------------------------------------------------
+
+    /**
+     * Whitespace must not be a way to walk a JWS past the guard.
+     *
+     * <p>The shape test runs against the trimmed credential while the resolver still receives
+     * what the caller sent, so trimming can only add refusals.
+     *
+     * <p>This exists because the ports diverged here and the reference was the accident:
+     * Python's {@code $} matches before a single trailing newline, so {@code "a.b.c\n"} was
+     * refused there -- while Go's {@code \A..\z}, JavaScript's unflagged {@code $} and this
+     * port's {@code matches()} routed it straight to the resolver, the one outcome the guard
+     * exists to prevent. Python was not even self-consistent about it, refusing one trailing
+     * newline and admitting two. Trimming first is the rule that means the same thing in seven
+     * regex dialects, because it depends on none of them.
+     */
+    @Nested
+    final class JwsShapeTestSurvivesTranslation {
+
+        /** No amount of surrounding whitespace makes a JWS resolvable. */
+        @Test
+        void paddingDoesNotSmuggleAJwsPastTheGuard() {
+            String[] padded = {
+                "aaa.bbb.ccc",
+                "aaa.bbb.ccc\n",
+                "aaa.bbb.ccc\n\n",
+                "  aaa.bbb.ccc  ",
+                "\taaa.bbb.ccc\r\n",
+            };
+            for (String token : padded) {
+                assertThrows(TokenUnresolvedError.class,
+                        () -> IdentityImpl.rejectJwsShaped(token),
+                        () -> "must be refused: " + escape(token));
+            }
+        }
+
+        /**
+         * Including the non-breaking spaces {@link String#strip()} would have left in place.
+         *
+         * <p>The reference's {@code str.strip()} removes these, so leaving them would be the same
+         * divergence one layer down: refused by Python, routed onward here.
+         */
+        @Test
+        void nonBreakingPaddingDoesNotSmuggleAJwsEither() {
+            String[] padded = {"\u00A0aaa.bbb.ccc\u00A0", "\u2007aaa.bbb.ccc", "aaa.bbb.ccc\u202F"};
+            for (String token : padded) {
+                assertThrows(TokenUnresolvedError.class,
+                        () -> IdentityImpl.rejectJwsShaped(token),
+                        () -> "must be refused: " + escape(token));
+            }
+        }
+
+        /** Whitespace-only never reaches a resolver either: it is not a credential. */
+        @Test
+        void aBlankCredentialIsNotACredential() {
+            for (String token : new String[] {"", "   ", "\n", "\t\r\n", "\u00A0"}) {
+                assertThrows(TokenUnresolvedError.class,
+                        () -> IdentityImpl.rejectJwsShaped(token),
+                        () -> "must be refused: " + escape(token));
+            }
+        }
+
+        /** Trimming tightens the JWS test; it must not refuse ordinary tokens. */
+        @Test
+        void anOpaqueCredentialStillReachesTheResolver() {
+            for (String token
+                    : new String[] {"opaque-token", "a.b.c.d", "two.segments", "sk_live_abc123"}) {
+                assertDoesNotThrow(() -> IdentityImpl.rejectJwsShaped(token),
+                        () -> "must be routed onward: " + escape(token));
+            }
+        }
+
+        /**
+         * Trimming is for the shape test only -- never for what is resolved.
+         *
+         * <p>Rewriting a credential before resolving it would make the worker answer about a
+         * string the caller never sent.
+         */
+        @Test
+        void theResolverReceivesTheCredentialUnmodified() {
+            List<String> seen = new ArrayList<>();
+            IdentityImpl impl = IdentityImpl.builder()
+                    .resolveToken(token -> { seen.add(token); return new TokenIdentity("p"); })
+                    .introspectPrincipals("proxy")
+                    .build();
+            impl.introspect_token("  padded-opaque-token  ", ctx(auth("proxy")));
+            assertEquals(List.of("  padded-opaque-token  "), seen);
+        }
+
+        /**
+         * The length cap is measured against the original, not the trimmed form.
+         *
+         * <p>The megabytes a caller sent are the megabytes the framework had to hold, so padding
+         * is not a way to buy a larger credential.
+         */
+        @Test
+        void theLengthCapAppliesToWhatWasActuallySent() {
+            String padded = " ".repeat(Identity.MAX_TOKEN_CHARS) + "short-token";
+            assertThrows(TokenUnresolvedError.class,
+                    () -> IdentityImpl.rejectJwsShaped(padded));
+        }
+
+        private String escape(String s) {
+            return "\"" + s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "\"";
+        }
+    }
+
     // --- the limiter -------------------------------------------------------
 
     /** Fixed-window, because the state is one integer rather than an aged float. */
