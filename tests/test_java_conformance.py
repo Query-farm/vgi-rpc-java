@@ -536,6 +536,40 @@ def conformance_http_introspect_port() -> Iterator[int]:
 
 
 @pytest.fixture(scope="session")
+def conformance_http_identity_port() -> Iterator[int]:
+    """Spawn an HTTP worker hosting ``vgi_rpc.Identity.v1`` with both hooks.
+
+    Backs the shared identity group. It needs its own worker because the
+    protocol is nearly all *guards*, and every guard reads deployment policy:
+    who may introspect, what a credential resolves to, whether a grant is
+    minted, how recently the caller authenticated. Against a worker whose
+    allowlist and hooks are unknown no cross-port assertion exists -- every
+    answer is explicable as policy -- so the policy is pinned by
+    ``IDENTITY_CONFORMANCE_FIXTURE.md`` and configured here by ``--identity``.
+
+    HTTP only, and deliberately: Identity's guards are all about an
+    authenticated caller, and HTTP is the transport that carries one. The
+    plain worker must *not* grow identity -- that it hosts none is itself an
+    assertion (``TestIdentityAbsentByDefault``).
+    """
+    yield from _start_http_worker("--identity", "both")
+
+
+@pytest.fixture(scope="session")
+def conformance_http_identity_introspect_only_port() -> Iterator[int]:
+    """Spawn the same binary with the mint hook left out.
+
+    Method-level narrowing -- that an unconfigured hook makes its method
+    *absent* rather than hosted-and-refusing, and shrinks the ``protocol_hash``
+    with it -- is only observable against a second worker configured with one
+    hook. Absent beats routed-and-refusing: it is what keeps a dependency
+    upgrade from growing a credential-to-identity oracle on every existing
+    worker.
+    """
+    yield from _start_http_worker("--identity", "introspect-only")
+
+
+@pytest.fixture(scope="session")
 def conformance_http_cors_port(conformance_fake_storage: str) -> Iterator[int]:
     """Spawn an HTTP worker that grants browser access to one fixed origin.
 

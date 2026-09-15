@@ -19,6 +19,10 @@ import farm.query.vgirpc.http.Authenticator;
 import farm.query.vgirpc.http.HttpPreHandler;
 import farm.query.vgirpc.http.HttpServer;
 import farm.query.vgirpc.http.TokenIdentity;
+import farm.query.vgirpc.identity.GrantRefusedError;
+import farm.query.vgirpc.identity.IdentityImpl;
+import farm.query.vgirpc.identity.IdentityUnavailableError;
+import farm.query.vgirpc.identity.IssuedGrant;
 import farm.query.vgirpc.http.auth.BearerAuthenticator;
 import farm.query.vgirpc.http.auth.JwtAuthenticator;
 import farm.query.vgirpc.http.auth.MTlsAuthenticator;
@@ -121,6 +125,11 @@ public final class Main {
         // property is itself a conformance contract (TestTokenIntrospectionOffMode),
         // which runs against the plain worker.
         boolean introspect = false;
+        // vgi_rpc.Identity.v1 is off unless asked for -- "a worker that configured no hook
+        // hosts no identity protocol at all" is itself a conformance contract
+        // (TestIdentityAbsentByDefault), and it is asserted against the *plain* worker, so
+        // this flag must never default to anything but off.
+        String identityMode = "off";
         boolean transportKindProbe = false;
         boolean failServeStartOnce = false;
         ArgCursor c = new ArgCursor(args);
@@ -204,6 +213,9 @@ public final class Main {
                 // Implies HTTP, and implies principal-header auth below so the
                 // introspector allowlist has something to check.
                 case "--introspect" -> { mode = "http"; introspect = true; }
+                // Implies HTTP: Identity's guards all read an authenticated caller, and HTTP is
+                // the only transport that carries one. Implies principal-header auth below.
+                case "--identity" -> { mode = "http"; identityMode = c.requireValue(a); }
                 case "--transport-kind-probe" -> transportKindProbe = true;
                 case "--fail-serve-start-once" -> failServeStartOnce = true;
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
@@ -229,6 +241,10 @@ public final class Main {
         // Applied after the loop so flag order does not matter, and only when no
         // stronger mode was selected.
         if (introspect && authenticator == null) authenticator = principalHeaderAuthenticator();
+        if (!"off".equals(identityMode)) {
+            server.setIdentity(conformanceIdentity(identityMode));
+            if (authenticator == null) authenticator = principalHeaderAuthenticator();
+        }
         if (httpProof) {
             authenticator = buildProofGate(
                     proofMode, proofOriginId, proofSecrets, proofSkew, proofReplayCache, authenticator);
@@ -394,7 +410,20 @@ public final class Main {
      *
      * <p>Requests without the header stay anonymous rather than being rejected: the
      * conformance suite probes {@code GET /health} and the capability endpoint before
-     * it authenticates anything.
+     * it authenticates anything. Absent means <em>unauthenticated</em>, not "anonymous but
+     * authenticated" -- the identity group relies on the absence to test fail-closed behaviour.
+     *
+     * <p>{@code X-Conformance-Auth-Time} is the one extension, and it lands in the claim map
+     * under {@code auth_time} <strong>verbatim as a string, unparsed</strong>. That is
+     * load-bearing: a fixture that parsed the value and dropped it when parsing failed would
+     * collapse "the credential carries an unusable auth_time" into "the credential carries no
+     * auth_time". Both answer {@code stale_auth}, so the test would stay green while the
+     * property it names went untested. The <em>guard</em> parses; the fixture only transports.
+     * Nothing else goes in the claim map.
+     *
+     * <p><strong>This authentication is trivially spoofable by anyone who can reach the
+     * port.</strong> It exists to give six language ports a deterministic authenticated caller
+     * without standing up an identity provider. It is a test fixture and must never be deployed.
      */
     private static Authenticator principalHeaderAuthenticator() {
         return request -> {
@@ -402,9 +431,16 @@ public final class Main {
             if (principal == null || principal.isEmpty()) {
                 return AuthContext.ANONYMOUS;
             }
-            return new AuthContext("conformance", true, principal, Collections.emptyMap());
+            String authTime = request.getHeader(CONFORMANCE_AUTH_TIME_HEADER);
+            Map<String, Object> claims = authTime == null
+                    ? Collections.emptyMap()
+                    : Map.of("auth_time", authTime);
+            return new AuthContext("conformance", true, principal, claims);
         };
     }
+
+    /** Carries the {@code auth_time} claim, verbatim and unparsed. See above. */
+    private static final String CONFORMANCE_AUTH_TIME_HEADER = "X-Conformance-Auth-Time";
 
     // Fixed values the shared TestTokenIntrospection group is written against:
     // it posts the subject credential and asserts the principal, so a port
@@ -452,6 +488,184 @@ public final class Main {
                     CONFORMANCE_SUBJECT_PRINCIPAL, CONFORMANCE_SUBJECT_TOKEN_NAME, CONFORMANCE_SUBJECT_TTL));
         }
         return Optional.empty();
+    }
+
+    // -----------------------------------------------------------------------
+    // vgi_rpc.Identity.v1 -- the pinned deployment policy
+    //
+    // IDENTITY_CONFORMANCE_FIXTURE.md is the normative contract for every value
+    // below; six ports configure them identically or the shared group asserts
+    // nothing. Two rules shape them and both matter more than they look.
+    //
+    // THE RESOLVER RESOLVES ALMOST EVERYTHING. Rejections are deliberately
+    // uniform -- unknown, expired, malformed and over-long are one answer -- so
+    // an over-long credential is *also* an unknown one. A test that probes the
+    // cap with a credential the resolver does not know cannot distinguish "the
+    // cap refused it" from "the cap let it through and the resolver refused it":
+    // delete the cap and the test stays green. With a resolver that answers for
+    // whatever it is handed, a rejection can only have come from a guard -- and
+    // a guard that fails to fire produces a *success*, which uniformity cannot
+    // disguise.
+    //
+    // BOTH HOOKS ARE PURE FUNCTIONS OF THEIR ARGUMENTS. No clock, no counter, no
+    // shared state: this worker must answer identically on the first call and
+    // the thousandth, and when the two methods land on different threads.
+    // -----------------------------------------------------------------------
+
+    /** The one credential the resolver reports as <em>unknown</em>. */
+    private static final String IDENTITY_TOKEN_UNKNOWN = "conformance-unknown-token";
+
+    /**
+     * Resolves to {@code ttl_seconds = 0}, and the group asserts the wire carries {@code 0}.
+     *
+     * <p>A resolver naming zero is saying <em>do not cache this</em>. The tempting normalisation
+     * of {@code <= 0} up to the 300 default silently converts that into five minutes of continued
+     * access after revocation.
+     */
+    private static final String IDENTITY_TOKEN_ZERO_TTL = "conformance-zero-ttl-token";
+
+    /**
+     * Resolves to an identity built with <strong>only</strong> the principal supplied.
+     *
+     * <p>{@code token_name} and {@code ttl_seconds} must land on their documented defaults by
+     * <em>omission</em>, so the single-argument constructor is load-bearing: passing {@code ""}
+     * and {@code 300} explicitly would test the wrong thing.
+     */
+    private static final String IDENTITY_TOKEN_MINIMAL = "conformance-minimal-token";
+
+    /**
+     * Two leading and two trailing ASCII spaces (U+0020), resolving to a distinguishable name.
+     *
+     * <p>The shape test runs on the trimmed credential while the resolver receives the untrimmed
+     * original. A port that trims once, up front, and resolves the result passes every other case
+     * in the group -- the padded credential still resolves, just via the catch-all rule -- so
+     * this is the only thing that can see it.
+     */
+    private static final String IDENTITY_TOKEN_PADDED_PROBE = "  conformance-padded-probe  ";
+    private static final String IDENTITY_TOKEN_PADDED_NAME = "conformance-padded";
+
+    /**
+     * Introspections admitted per caller per second.
+     *
+     * <p>Deliberately far above the default 20. Nearly every case in the shared group is an
+     * introspection, so a production-tuned limiter would fire mid-group and every resulting
+     * failure would read as the wrong guard. The limiter is covered port-locally instead.
+     */
+    private static final int IDENTITY_RATE_LIMIT = 100_000;
+
+    /** How recently a caller must have authenticated to mint -- the documented default. */
+    private static final double IDENTITY_MAX_AUTH_AGE = 900.0;
+
+    /** Prefix of a minted grant's token; the caller's own principal is appended. */
+    private static final String IDENTITY_GRANT_TOKEN_PREFIX = "conformance-grant-for:";
+
+    /** Separator between the principal and the echoed scopes. */
+    private static final String IDENTITY_SCOPE_SEPARATOR = "|";
+
+    /**
+     * 2030-01-01T00:00:00Z, fixed rather than {@code now + ttl}.
+     *
+     * <p>A constant can be asserted exactly, which also pins the float64 round trip.
+     * {@code expires_at} is a declaration rather than an enforcement -- the real lifetime lives
+     * inside the opaque token -- so nothing is lost.
+     */
+    private static final double IDENTITY_GRANT_EXPIRES_AT = 1893456000.0;
+
+    /** Correlation handle a full grant carries. */
+    private static final String IDENTITY_GRANT_ID = "conformance-grant-id";
+
+    /** The purpose this policy refuses, so {@code grant_refused} reaches the wire. */
+    private static final String IDENTITY_REFUSED_PURPOSE = "conformance-refused";
+
+    /** The purpose that mints without a {@code grant_id}, so its default is observable. */
+    private static final String IDENTITY_MINIMAL_PURPOSE = "conformance-minimal";
+
+    /**
+     * Resolve a credential under the fixed conformance policy.
+     *
+     * <p>Everything the table below has no rule for resolves. See the block comment above.
+     *
+     * @param token the credential, exactly as the caller sent it -- never a trimmed copy
+     * @return the identity, or {@code null} for the one credential this policy calls unknown
+     */
+    private static farm.query.vgirpc.identity.TokenIdentity identityResolveToken(String token) {
+        if (CONFORMANCE_UNAVAILABLE_TOKEN.equals(token)) {
+            throw new IdentityUnavailableError("conformance: mapping store unreachable");
+        }
+        if (IDENTITY_TOKEN_UNKNOWN.equals(token)) {
+            return null;
+        }
+        if (IDENTITY_TOKEN_ZERO_TTL.equals(token)) {
+            return new farm.query.vgirpc.identity.TokenIdentity(
+                    CONFORMANCE_SUBJECT_PRINCIPAL, CONFORMANCE_SUBJECT_TOKEN_NAME, 0);
+        }
+        if (IDENTITY_TOKEN_MINIMAL.equals(token)) {
+            // Principal only: the other two fields must reach their defaults by omission.
+            return new farm.query.vgirpc.identity.TokenIdentity(CONFORMANCE_SUBJECT_PRINCIPAL);
+        }
+        if (IDENTITY_TOKEN_PADDED_PROBE.equals(token)) {
+            return new farm.query.vgirpc.identity.TokenIdentity(
+                    CONFORMANCE_SUBJECT_PRINCIPAL, IDENTITY_TOKEN_PADDED_NAME, CONFORMANCE_SUBJECT_TTL);
+        }
+        return new farm.query.vgirpc.identity.TokenIdentity(
+                CONFORMANCE_SUBJECT_PRINCIPAL, CONFORMANCE_SUBJECT_TOKEN_NAME, CONFORMANCE_SUBJECT_TTL);
+    }
+
+    /**
+     * Mint a grant under the fixed conformance policy.
+     *
+     * <p>{@code ttlSeconds} is deliberately ignored: it is a request, the returned
+     * {@code expires_at} is authoritative, and honouring it would need a clock and make the value
+     * unassertable. The token embeds the caller's principal, which is how "the subject is the
+     * caller, never a parameter" becomes observable -- two callers making identical requests get
+     * two different tokens -- and echoes the scopes so the list's round trip is visible.
+     *
+     * @param principal the caller's authenticated principal, supplied by the framework
+     * @param purpose why the grant is wanted; two values carry policy meaning
+     * @param scopes what the grant may do, echoed into the token
+     * @param ttlSeconds ignored, see above
+     * @return the minted grant
+     */
+    private static IssuedGrant identityMintGrant(String principal, String purpose,
+                                                 List<String> scopes, long ttlSeconds) {
+        if (IDENTITY_REFUSED_PURPOSE.equals(purpose)) {
+            throw new GrantRefusedError("conformance: this purpose is refused");
+        }
+        String token = IDENTITY_GRANT_TOKEN_PREFIX + principal + IDENTITY_SCOPE_SEPARATOR
+                + String.join(",", scopes);
+        if (IDENTITY_MINIMAL_PURPOSE.equals(purpose)) {
+            // grant_id omitted, so its documented default ("") is observable.
+            return new IssuedGrant(token, IDENTITY_GRANT_EXPIRES_AT);
+        }
+        return new IssuedGrant(token, IDENTITY_GRANT_EXPIRES_AT, IDENTITY_GRANT_ID);
+    }
+
+    /**
+     * Build the identity implementation for one of the two fixture configurations.
+     *
+     * <p>{@code both} configures the resolve hook and the mint hook; {@code introspect-only}
+     * configures the resolve hook alone, so {@code issue_grant} is <em>absent</em> rather than
+     * hosted-and-refusing and the protocol hash narrows with it.
+     *
+     * @param mode {@code both} or {@code introspect-only}
+     * @return the configured implementation
+     */
+    private static IdentityImpl conformanceIdentity(String mode) {
+        IdentityImpl.Builder b = IdentityImpl.builder()
+                .resolveToken(Main::identityResolveToken)
+                .introspectPrincipals(CONFORMANCE_INTROSPECTOR)
+                .introspectRateLimit(IDENTITY_RATE_LIMIT)
+                .maxAuthAge(IDENTITY_MAX_AUTH_AGE);
+        switch (mode) {
+            case "both" -> b.mintGrant(Main::identityMintGrant);
+            case "introspect-only" -> { }
+            default -> {
+                System.err.println("unknown --identity value: " + mode
+                        + " (expected off, both, or introspect-only)");
+                System.exit(2);
+            }
+        }
+        return b.build();
     }
 
     /** Conformance-fixture affordance, never part of the protocol. */

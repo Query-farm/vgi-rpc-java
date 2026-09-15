@@ -220,6 +220,30 @@ final class IdentityServerWiringTest {
         assertEquals("g1", grant.grant_id());
     }
 
+    /**
+     * An anonymous raw transport cannot mint.
+     *
+     * <p>The third case of the raw-transport trio {@code IDENTITY_CONFORMANCE_FIXTURE.md} §7
+     * asks every port for. The shared conformance group is HTTP-only, because Identity's guards
+     * all read an authenticated caller and HTTP is the transport that carries one -- so the
+     * fail-closed behaviour of a transport carrying none has to be covered here.
+     *
+     * <p>{@code stale_auth} rather than a refusal of its own: a transport with no authenticated
+     * principal carries no {@code auth_time} either, and the freshness guard is what makes stdio
+     * and unix fail closed for free rather than by a special case somebody has to remember.
+     */
+    @Test
+    void anAnonymousRawTransportCannotMint() {
+        RpcServer server = serverWith(IdentityImpl.builder().mintGrant(MINTER).build());
+        Map<String, Object> args = new LinkedHashMap<>();
+        args.put("purpose", "reports");
+        args.put("scopes", List.of("read"));
+        args.put("ttl_seconds", 60L);
+        RpcError err = assertThrows(RpcError.class, () ->
+                call(server, AuthContext.ANONYMOUS, Identity.PROTOCOL_NAME, "issue_grant", args));
+        assertEquals(StaleAuthError.ERROR_KIND, err.errorKind());
+    }
+
     // --- reflection ---------------------------------------------------------
 
     /** Registered after reflection, so it appears in reflection's own output. */
