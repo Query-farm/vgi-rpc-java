@@ -52,12 +52,25 @@ public interface Identity {
     String PROTOCOL_NAME = "vgi_rpc.Identity.v1";
 
     /**
-     * Cap on a credential the framework will even attempt to resolve.
+     * Cap on a credential the framework will even attempt to resolve, in <strong>UTF-8
+     * bytes</strong>.
      *
      * <p>Anything longer is not a bearer token; refusing early keeps a resolver from being handed
      * megabytes.
+     *
+     * <p>Bytes, and the unit is spelled out because the ports reached for three different ones
+     * for the same constant: codepoints (Python, Rust), UTF-16 code units (Java, C#, TypeScript),
+     * bytes (Go, C++). All three agree for an ASCII credential -- which every real bearer token
+     * is -- so nothing observable changes for real traffic. It is fixed anyway, because
+     * "approximately the same limit" is exactly how this module's other divergences started and
+     * each turned out to be a hole once somebody measured it. Bytes is what the purpose implies
+     * (megabytes are bytes) and it is the most conservative of the three, so standardising on it
+     * can only refuse earlier.
+     *
+     * <p>{@link String#length()} is UTF-16 code units and is the wrong measure here: a credential
+     * of multibyte characters would get more than its intended allowance.
      */
-    int MAX_TOKEN_CHARS = 4096;
+    int MAX_TOKEN_BYTES = 4096;
 
     /**
      * Resolve an opaque bearer credential to the identity it authenticates as.

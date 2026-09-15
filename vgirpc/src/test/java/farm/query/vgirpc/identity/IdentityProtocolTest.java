@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -288,7 +289,7 @@ final class IdentityProtocolTest {
          */
         @Test
         void authorizationPrecedesEveryLookAtTheSubject() {
-            String oversize = "x".repeat(Identity.MAX_TOKEN_CHARS + 1);
+            String oversize = "x".repeat(Identity.MAX_TOKEN_BYTES + 1);
             for (String token : new String[] {"", oversize, "aaa.bbb.ccc"}) {
                 HasErrorKind err = assertThrows(IntrospectionRefusedError.class,
                         () -> resolving().introspect_token(token, ctx(auth("mallory"))),
@@ -310,13 +311,45 @@ final class IdentityProtocolTest {
         }
 
         /**
+         * The cap actually fires on the dispatch path -- not merely in the guard.
+         *
+         * <p>Uniform rejections make the obvious test vacuous. An over-long credential is also an
+         * unknown one, so probing {@code introspect_token} with a credential the resolver does not
+         * know cannot distinguish "the cap refused it" from "the cap let it through and the
+         * resolver refused it". Delete the length clause and {@link #rejectionsAreUniform} still
+         * passes: it is a test about uniformity and never was a test that the cap fires.
+         *
+         * <p>So the resolver here resolves <em>anything</em>, which means a refusal can only have
+         * come from the cap -- and the assertion that the resolver was never reached is the half
+         * that goes red when the guard is skipped. Mutation-checked: removing the length clause
+         * from {@code rejectJwsShaped} turns this test red.
+         */
+        @Test
+        void theCapFiresOnTheDispatchPathAndNotOnlyInTheGuard() {
+            List<String> seen = new ArrayList<>();
+            IdentityImpl impl = IdentityImpl.builder()
+                    .resolveToken(token -> { seen.add(token); return new TokenIdentity("bob"); })
+                    .introspectPrincipals("proxy")
+                    .build();
+            String oversize = "x".repeat(Identity.MAX_TOKEN_BYTES + 1);
+            assertThrows(TokenUnresolvedError.class,
+                    () -> impl.introspect_token(oversize, ctx(auth("proxy"))));
+            assertTrue(seen.isEmpty(), "an over-long credential must never reach the resolver");
+        }
+
+        /**
          * Unknown, malformed and over-long are one answer.
          *
          * <p>Distinguishing them would confirm that a guessed credential exists.
+         *
+         * <p>This is a test about <em>uniformity</em>, and deliberately not a test that any of
+         * the three guards fires -- its resolver refuses everything, so it passes with the cap
+         * removed. {@link #theCapFiresOnTheDispatchPathAndNotOnlyInTheGuard} is the one that
+         * proves the cap; do not read this one as covering it.
          */
         @Test
         void rejectionsAreUniform() {
-            String oversize = "x".repeat(Identity.MAX_TOKEN_CHARS + 1);
+            String oversize = "x".repeat(Identity.MAX_TOKEN_BYTES + 1);
             for (String token : new String[] {"", "unknown", oversize}) {
                 TokenUnresolvedError err = assertThrows(TokenUnresolvedError.class,
                         () -> resolving().introspect_token(token, ctx(auth("proxy"))));
@@ -360,6 +393,33 @@ final class IdentityProtocolTest {
             IdentityUnavailableError err = assertThrows(IdentityUnavailableError.class,
                     () -> impl.introspect_token("good", ctx(auth("proxy"))));
             assertTrue(err.retryAfterSeconds() > 0);
+        }
+
+        /**
+         * The retry delay has a default, and it survives a caller that names none.
+         *
+         * <p>Every port carries the same number, and it has to be <em>applied</em> rather than
+         * merely documented: a raiser required to supply the delay at every construction site is
+         * a raiser that eventually passes {@code 0}, and {@code 0} tells a client to retry a
+         * transient failure immediately -- turning one store outage into a retry storm against
+         * the store that is already down. So the no-arg spelling uses it and a non-positive
+         * explicit value is corrected to it.
+         */
+        @Test
+        void theRetryDelayDefaultsAndIsNeverNonPositive() {
+            assertEquals(5, IdentityUnavailableError.DEFAULT_RETRY_AFTER_SECONDS);
+            assertEquals(IdentityUnavailableError.DEFAULT_RETRY_AFTER_SECONDS,
+                    new IdentityUnavailableError("store is down").retryAfterSeconds());
+            for (int named : new int[] {0, -1, Integer.MIN_VALUE}) {
+                assertEquals(IdentityUnavailableError.DEFAULT_RETRY_AFTER_SECONDS,
+                        new IdentityUnavailableError("store is down", named, null)
+                                .retryAfterSeconds(),
+                        "retry-after=" + named + " must not reach a client");
+            }
+            // A delay the raiser actually chose is honoured, so the correction above cannot be
+            // mistaken for "the field is ignored".
+            assertEquals(30,
+                    new IdentityUnavailableError("store is down", 30, null).retryAfterSeconds());
         }
 
         /** Bounds, rather than closes, the oracle an allowlisted caller still has. */
@@ -718,6 +778,51 @@ final class IdentityProtocolTest {
             }
         }
 
+        /**
+         * The cap is measured in UTF-8 bytes, not UTF-16 code units.
+         *
+         * <p>{@code String.length()} counts UTF-16 code units, so a credential of multibyte
+         * characters would get up to three times its intended allowance. The ports reached for
+         * three different units for the same constant -- codepoints, UTF-16 code units, bytes --
+         * which agree for an ASCII credential and diverge for anything else. Bytes is what the
+         * purpose implies (the point is not handing a resolver megabytes) and the most
+         * conservative of the three, so standardising on it can only refuse earlier.
+         *
+         * <p>The credential below is over the cap in bytes and under it in UTF-16 units, which is
+         * exactly the gap the old measure let through.
+         */
+        @Test
+        void theCapIsMeasuredInUtf8Bytes() {
+            // U+00E9 is two UTF-8 bytes and one UTF-16 code unit.
+            String multibyte = "\u00e9".repeat(Identity.MAX_TOKEN_BYTES / 2 + 1);
+            assertTrue(multibyte.length() < Identity.MAX_TOKEN_BYTES,
+                    "the probe must be UNDER the cap when measured the old way");
+            assertTrue(multibyte.getBytes(StandardCharsets.UTF_8).length > Identity.MAX_TOKEN_BYTES,
+                    "the probe must be OVER the cap when measured in bytes");
+            assertThrows(TokenUnresolvedError.class,
+                    () -> IdentityImpl.rejectJwsShaped(multibyte));
+        }
+
+        /**
+         * A supplementary codepoint counts its four bytes once, not twice.
+         *
+         * <p>A surrogate pair is two {@code char}s and four UTF-8 bytes; counting each half
+         * separately would charge six and refuse a credential that is inside the cap. Pinned
+         * against {@code String.getBytes(UTF_8)} directly rather than against a hand-computed
+         * number, because the contract is "the same measure the encoder would produce".
+         */
+        @Test
+        void aSurrogatePairIsCountedAsOneCodepoint() {
+            String emoji = "\uD83D\uDE00".repeat(Identity.MAX_TOKEN_BYTES / 4);
+            assertEquals(Identity.MAX_TOKEN_BYTES,
+                    emoji.getBytes(StandardCharsets.UTF_8).length,
+                    "the probe must sit exactly ON the cap");
+            assertDoesNotThrow(() -> IdentityImpl.rejectJwsShaped(emoji),
+                    "a credential exactly at the cap is inside it");
+            assertThrows(TokenUnresolvedError.class,
+                    () -> IdentityImpl.rejectJwsShaped(emoji + "\uD83D\uDE00"));
+        }
+
         /** Trimming tightens the JWS test; it must not refuse ordinary tokens. */
         @Test
         void anOpaqueCredentialStillReachesTheResolver() {
@@ -753,7 +858,7 @@ final class IdentityProtocolTest {
          */
         @Test
         void theLengthCapAppliesToWhatWasActuallySent() {
-            String padded = " ".repeat(Identity.MAX_TOKEN_CHARS) + "short-token";
+            String padded = " ".repeat(Identity.MAX_TOKEN_BYTES) + "short-token";
             assertThrows(TokenUnresolvedError.class,
                     () -> IdentityImpl.rejectJwsShaped(padded));
         }

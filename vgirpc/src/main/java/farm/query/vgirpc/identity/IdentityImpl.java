@@ -320,7 +320,9 @@ public final class IdentityImpl implements Identity {
      *
      * <p>A whitespace-only credential is refused for the same reason an empty one is: it is not a
      * credential. The length check stays against the <em>original</em>, because the megabytes a
-     * caller sent are the megabytes the framework had to hold.
+     * caller sent are the megabytes the framework had to hold -- and it is measured in UTF-8
+     * bytes rather than {@link String#length()}'s UTF-16 code units, for the same reason: what is
+     * being bounded is what a resolver would have to handle. See {@link Identity#MAX_TOKEN_BYTES}.
      *
      * @param token the subject credential, exactly as the caller sent it
      * @throws TokenUnresolvedError when the credential is refused on shape alone
@@ -328,7 +330,7 @@ public final class IdentityImpl implements Identity {
     public static void rejectJwsShaped(String token) {
         if (token == null) throw new TokenUnresolvedError("unresolved");
         String candidate = stripWhitespace(token);
-        if (candidate.isEmpty() || token.length() > MAX_TOKEN_CHARS
+        if (candidate.isEmpty() || utf8Length(token) > MAX_TOKEN_BYTES
                 || JWS_SHAPED.matcher(candidate).matches()) {
             throw new TokenUnresolvedError("unresolved");
         }
@@ -441,6 +443,39 @@ public final class IdentityImpl implements Identity {
 
     private static boolean isPad(char c) {
         return Character.isWhitespace(c) || Character.isSpaceChar(c) || c == NEL;
+    }
+
+    /**
+     * The credential's length in UTF-8 bytes -- the unit {@link Identity#MAX_TOKEN_BYTES} is in.
+     *
+     * <p>Computed without materialising the encoded array: the point of the cap is to refuse a
+     * credential before anything expensive happens to it, and allocating a copy of a megabyte to
+     * discover it is a megabyte undoes part of that.
+     *
+     * @param token the credential as sent
+     * @return its length when encoded as UTF-8
+     */
+    private static int utf8Length(String token) {
+        int bytes = 0;
+        for (int i = 0; i < token.length(); i++) {
+            char c = token.charAt(i);
+            if (c < 0x80) {
+                bytes += 1;
+            } else if (c < 0x800) {
+                bytes += 2;
+            } else if (Character.isHighSurrogate(c) && i + 1 < token.length()
+                    && Character.isLowSurrogate(token.charAt(i + 1))) {
+                // One supplementary codepoint: four bytes for the pair, and the low surrogate
+                // must not then be counted again on its own.
+                bytes += 4;
+                i++;
+            } else {
+                // Includes an unpaired surrogate, which String.getBytes(UTF_8) replaces with the
+                // three-byte U+FFFD. Counting three keeps the two measures identical.
+                bytes += 3;
+            }
+        }
+        return bytes;
     }
 
     /**

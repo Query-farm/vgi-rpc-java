@@ -6,6 +6,7 @@ package farm.query.vgirpc.http;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import farm.query.vgirpc.AuthContext;
+import farm.query.vgirpc.identity.Identity;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
@@ -113,8 +114,13 @@ public final class TokenIntrospection {
      * Cap on a credential we will even attempt to resolve. Anything longer is
      * not a bearer token; refusing early keeps a resolver from being handed
      * megabytes.
+     *
+     * <p>Read from {@link Identity#MAX_TOKEN_BYTES} rather than kept as a second
+     * copy: this legacy route and the {@code vgi_rpc.Identity.v1} method bound
+     * the same thing for the same reason, and two constants that are supposed
+     * to be equal are two constants that will eventually differ.
      */
-    private static final int MAX_TOKEN_CHARS = 4096;
+    private static final int MAX_TOKEN_BYTES = Identity.MAX_TOKEN_BYTES;
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -316,7 +322,13 @@ public final class TokenIntrospection {
         JsonNode token = node.get("token");
         if (token == null || !token.isTextual()) return null;
         String value = token.asText();
-        if (value.isEmpty() || value.length() > MAX_TOKEN_CHARS) return null;
+        // UTF-8 bytes, not String.length()'s UTF-16 code units: what is bounded is what a
+        // resolver would have to handle. See Identity.MAX_TOKEN_BYTES for why the unit is
+        // spelled out rather than assumed.
+        if (value.isEmpty()
+                || value.getBytes(StandardCharsets.UTF_8).length > MAX_TOKEN_BYTES) {
+            return null;
+        }
         return value;
     }
 
