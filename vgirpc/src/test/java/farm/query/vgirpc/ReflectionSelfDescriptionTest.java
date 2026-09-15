@@ -75,7 +75,7 @@ final class ReflectionSelfDescriptionTest {
      * Reflection's canonical digest, shared by every port.
      *
      * <p>A literal, taken from the reference (python/go/typescript). See
-     * {@code REFLECTION_SELF_DESCRIPTION.md} in {@code vgi-rpc-sync}. The empty-table digest this
+     * {@code tools/cross-port/specs/REFLECTION_SELF_DESCRIPTION.md} in the Python reference. The empty-table digest this
      * port used to produce was {@code fafffd66fd1b98ee355cbcbd6a0fbe6f32b09088512bd1f04268a0a9427d79e9}.
      */
     private static final String REFLECTION_CANONICAL_HASH =
