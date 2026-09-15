@@ -11,6 +11,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Parameter;
 import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.WildcardType;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -130,16 +131,40 @@ public final class ServiceIntrospector {
         return ann != null ? ann.value() : null;
     }
 
+    /**
+     * Classify a stream from its declared state type.
+     *
+     * <p>{@code stream_kind} is the only field in a description that says whether a stream
+     * accepts input -- the description carries parameter, result and header schemas, but a
+     * stream's <em>input</em> schema arrives at init time. So returning UNKNOWN when the answer
+     * is in fact declared makes reflection unable to answer the question it exists for.
+     *
+     * <p>Handles the wildcard form, {@code RpcStream<? extends ProducerState>}, which is what
+     * every method in this repo's conformance service declares: Java's generics give a
+     * {@link WildcardType} there rather than a Class, and reading only the non-wildcard forms
+     * discarded a declaration that was right in front of it.
+     */
     private static StreamKind inferStreamKind(Type t) {
         if (t instanceof ParameterizedType pt) {
-            Type stateArg = pt.getActualTypeArguments()[0];
-            Class<?> stateRaw;
-            if (stateArg instanceof Class<?> c) stateRaw = c;
-            else if (stateArg instanceof ParameterizedType inner) stateRaw = (Class<?>) inner.getRawType();
-            else return StreamKind.UNKNOWN;
+            Class<?> stateRaw = rawStateType(pt.getActualTypeArguments()[0]);
+            if (stateRaw == null) return StreamKind.UNKNOWN;
             if (ExchangeState.class.isAssignableFrom(stateRaw)) return StreamKind.EXCHANGE;
             if (ProducerState.class.isAssignableFrom(stateRaw)) return StreamKind.PRODUCER;
         }
         return StreamKind.UNKNOWN;
+    }
+
+    /** The erased class behind a state type argument, or null when there is not one. */
+    private static Class<?> rawStateType(Type stateArg) {
+        if (stateArg instanceof Class<?> c) return c;
+        if (stateArg instanceof ParameterizedType inner) return (Class<?>) inner.getRawType();
+        if (stateArg instanceof WildcardType wildcard) {
+            // `? extends ProducerState` -- the upper bound is the declaration.
+            // A bare `?` bounds at Object, which classifies as neither, so it
+            // still falls through to UNKNOWN.
+            Type[] upper = wildcard.getUpperBounds();
+            if (upper.length == 1) return rawStateType(upper[0]);
+        }
+        return null;
     }
 }
