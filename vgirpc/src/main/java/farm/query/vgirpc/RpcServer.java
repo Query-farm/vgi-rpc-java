@@ -441,6 +441,17 @@ public final class RpcServer {
                     transport.writer().flush();
                     return;
                 }
+                // Reflection is a co-hosted protocol, routed by the same key as
+                // everything else and appearing in its own output. Handled
+                // before the version gate because it is exempt from it: this is
+                // what a version-mismatched client calls to learn what
+                // mismatched, and gating it would deny the diagnosis it came
+                // for.
+                String requestProtocol = meta.get(farm.query.vgirpc.wire.Metadata.PROTOCOL);
+                if (Reflection.PROTOCOL_NAME.equals(requestProtocol)) {
+                    serveReflection(transport, method, kwargsSnapshot);
+                    return;
+                }
                 if (describeEnabled && Introspect.METHOD_NAME.equals(method)) {
                     serveDescribe(transport);
                     return;
@@ -1010,6 +1021,101 @@ public final class RpcServer {
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer());
              VectorSchemaRoot root = built.root()) {
             w.writeBatch(root, built.customMetadata());
+        } finally {
+            transport.writer().flush();
+        }
+    }
+
+    /**
+     * Serve one call to {@code vgi_rpc.Reflection.v1}.
+     *
+     * <p>Two methods, deliberately. {@code list_protocols} is the cheap question -- what is here,
+     * and has it changed -- and the only one a client needs on a warm path, because the hash
+     * answers "has it changed" without transferring any schema. {@code describe} is the expensive
+     * one, asked once.
+     *
+     * <p>Self-description is not special-cased: reflection appears in its own output, so a client
+     * discovers it the same way it discovers everything else.
+     */
+    private void serveReflection(
+            RpcTransport transport, String method, Map<String, Object> kwargs) throws IOException {
+        String appHash = Reflection.bindingHash(protocolName(), methods);
+        // Reflection describes itself with no methods of its own in the table:
+        // they are framework-owned rather than registered, so the honest hash is
+        // over an empty method set.
+        Map<String, RpcMethodInfo> reflectionMethods = Map.of();
+        String reflHash = Reflection.bindingHash(Reflection.PROTOCOL_NAME, reflectionMethods);
+
+        byte[] payload;
+        if ("list_protocols".equals(method)) {
+            payload = Reflection.buildProtocolList(
+                    serverId == null ? "" : serverId,
+                    "",
+                    Metadata.REQUEST_VERSION,
+                    List.of(
+                            new Reflection.Summary(protocolName(), protocolVersion, appHash),
+                            new Reflection.Summary(Reflection.PROTOCOL_NAME, "", reflHash)));
+        } else if ("describe".equals(method)) {
+            String requested = readProtocolArgument(kwargs);
+            if (protocolName().equals(requested)) {
+                payload = Reflection.buildServiceDescription(
+                        protocolName(), protocolVersion, appHash, methods);
+            } else if (Reflection.PROTOCOL_NAME.equals(requested)) {
+                payload = Reflection.buildServiceDescription(
+                        Reflection.PROTOCOL_NAME, "", reflHash, reflectionMethods);
+            } else {
+                // Named, not silently empty: an empty description reads as
+                // "this protocol has no methods".
+                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                        new IllegalArgumentException(
+                                "This server does not host protocol '" + requested + "'. Hosted: ["
+                                        + protocolName() + ", " + Reflection.PROTOCOL_NAME + "]"),
+                        serverId);
+                transport.writer().flush();
+                return;
+            }
+        } else {
+            Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                    new IllegalArgumentException(
+                            "Protocol '" + Reflection.PROTOCOL_NAME + "' has no method '" + method
+                                    + "'. Available: [describe, list_protocols]"),
+                    serverId);
+            transport.writer().flush();
+            return;
+        }
+
+        // The framework's ordinary convention for a structured return: the
+        // payload rides as serialized bytes in a single `result` binary column.
+        writeReflectionResult(transport, payload);
+    }
+
+    /**
+     * Read the {@code protocol} argument off a {@code describe} request.
+     *
+     * <p>From the decoded kwargs rather than the reader's root: draining the request stream
+     * mutates that root, and the drain happens before dispatch -- which is exactly why the
+     * kwargs are snapshotted beforehand.
+     */
+    private static String readProtocolArgument(Map<String, Object> kwargs) {
+        Object v = kwargs == null ? null : kwargs.get("protocol");
+        return v == null ? "" : v.toString();
+    }
+
+    private void writeReflectionResult(RpcTransport transport, byte[] payload) throws IOException {
+        var schema = new org.apache.arrow.vector.types.pojo.Schema(List.of(
+                new org.apache.arrow.vector.types.pojo.Field(
+                        "result",
+                        org.apache.arrow.vector.types.pojo.FieldType.notNullable(
+                                new org.apache.arrow.vector.types.pojo.ArrowType.Binary()),
+                        null)));
+        Map<String, String> md = new LinkedHashMap<>();
+        md.put(Metadata.REQUEST_VERSION_KEY, Metadata.REQUEST_VERSION);
+        if (serverId != null) md.put(Metadata.SERVER_ID, serverId);
+        try (IpcStreamWriter w = new IpcStreamWriter(transport.writer());
+             VectorSchemaRoot root = VectorSchemaRoot.create(schema, Allocators.root())) {
+            ((org.apache.arrow.vector.VarBinaryVector) root.getVector("result")).setSafe(0, payload);
+            root.setRowCount(1);
+            w.writeBatch(root, md);
         } finally {
             transport.writer().flush();
         }

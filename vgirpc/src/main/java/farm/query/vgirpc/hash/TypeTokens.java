@@ -91,8 +91,31 @@ public final class TypeTokens {
         return anonChild(field, field.getName());
     }
 
-    /** Return the canonical token for {@code field}'s type. */
+    /**
+     * Return the canonical token for {@code field}'s type.
+     *
+     * <p>Dictionary encoding is checked first because arrow-java carries it on the <em>field</em>
+     * rather than on the data type -- unlike every other port's binding, where it is a
+     * {@code DictionaryType}. Reading only {@code getType()} spells a dictionary-encoded string
+     * as plain {@code utf8}, which is a silent divergence that survives an IPC round trip (the
+     * encoding is on the wire either way) and so is invisible to any comparison of decoded
+     * schemas. Only the hash catches it.
+     */
     public static String typeToken(Field field) {
+        var encoding = field.getDictionary();
+        if (encoding != null) {
+            var indexType = encoding.getIndexType();
+            String index =
+                    (indexType.getIsSigned() ? "int" : "uint") + indexType.getBitWidth();
+            String value = typeTokenOfType(field);
+            String token = "dictionary<index:" + index + ",value:" + value + ">";
+            return encoding.isOrdered() ? token + ",ordered" : token;
+        }
+        return typeTokenOfType(field);
+    }
+
+    /** The token for a field's declared type, ignoring any dictionary encoding. */
+    private static String typeTokenOfType(Field field) {
         ArrowType t = field.getType();
         List<Field> children = field.getChildren();
         return switch (t.getTypeID()) {
