@@ -110,7 +110,7 @@ final class AccessRecordIdentityTest {
 
         RpcServer.ProtocolIdentity refl = srv.protocolIdentityFor(Reflection.PROTOCOL_NAME);
         assertEquals(Reflection.PROTOCOL_NAME, refl.name());
-        assertEquals(Reflection.bindingHash(Reflection.PROTOCOL_NAME, Map.of()), refl.protocolHash());
+        assertEquals(Reflection.bindingHash(Reflection.PROTOCOL_NAME, Reflection.methodTable()), refl.protocolHash());
         // Reflection declares no version of its own, and the application's label is not its:
         // a record stamped 2.1.0 for a reflection call attributes the app's contract to it.
         assertEquals("", refl.protocolVersion());
@@ -202,7 +202,7 @@ final class AccessRecordIdentityTest {
         assertEquals(Reflection.PROTOCOL_NAME, rec.protocol,
                 "a reflection call filed under the application protocol merges two protocols' "
                         + "traffic into one bucket, and nothing about the record looks wrong");
-        assertEquals(Reflection.bindingHash(Reflection.PROTOCOL_NAME, Map.of()), rec.protocolHash);
+        assertEquals(Reflection.bindingHash(Reflection.PROTOCOL_NAME, Reflection.methodTable()), rec.protocolHash);
         assertNotEquals(srv.protocolHash(), rec.protocolHash,
                 "protocol_hash is the registry key for decoding archived records, so a record "
                         + "naming one protocol and carrying another's is decoded against the "

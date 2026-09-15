@@ -58,15 +58,65 @@ public final class Reflection {
     public static final String PROTOCOL_NAME = "vgi_rpc.Reflection.v1";
 
     /**
+     * The signatures of the two methods {@code vgi_rpc.Reflection.v1} offers.
+     *
+     * <p>Declared as an ordinary service interface, and introspected by the ordinary
+     * {@link ServiceIntrospector}, so reflection's method table is derived by the same machinery
+     * that derives every other protocol's. Hand-writing the table would put reflection's
+     * parameter and result schemas on a second code path -- the arrangement that let this port
+     * describe reflection as having no methods at all.
+     *
+     * <p>{@code byte[]} rather than a record type because that is what reflection actually puts
+     * on the wire: both methods answer with their payload serialized into a single {@code result}
+     * binary column, which is the framework's ordinary convention for a structured return, and
+     * which is what {@link #protocolListSchema()} and {@link #serviceDescriptionSchema()} describe
+     * the contents of. The interface is never implemented or invoked -- {@code RpcServer} answers
+     * both methods directly -- so it exists to state the surface, not to serve it.
+     */
+    interface Service {
+        /** Every protocol this server hosts, as a serialized {@code ProtocolList} batch. */
+        byte[] list_protocols();
+
+        /**
+         * One protocol's description, as a serialized {@code ServiceDescription} batch.
+         *
+         * @param protocol the wire name to describe
+         * @return the description
+         */
+        byte[] describe(String protocol);
+    }
+
+    /**
+     * The method table {@code vgi_rpc.Reflection.v1} describes itself with, and hashes over.
+     *
+     * <p>Self-description is not special-cased: a client discovers reflection the documented way
+     * -- {@code list_protocols}, then {@code describe} -- and must be able to learn from that how
+     * to call the protocol it is already calling. This port used to hash and describe reflection
+     * over an <em>empty</em> table, on the reasoning that its methods are framework-owned rather
+     * than registered. That inverts the contract: the table is what {@code describe} reports and
+     * what the hash is computed over, so an empty one is not honesty about an empty protocol, it
+     * is a protocol lying about itself. Four ports shipped it, and no port's own suite could see
+     * it, because each was internally consistent -- {@code list_protocols} advertised exactly the
+     * digest its own {@code describe} returned.
+     *
+     * @return the two-method table, keyed by method name
+     */
+    public static Map<String, RpcMethodInfo> methodTable() {
+        return ServiceIntrospector.describe(Service.class);
+    }
+
+    /**
      * The methods {@code vgi_rpc.Reflection.v1} offers.
      *
      * <p>Two, deliberately: {@code list_protocols} is the cheap question -- what is here -- and
      * {@code describe} is the expensive one. Named here rather than only inside the dispatch
      * switch because a transport that routes on the path ({@code {prefix}/{protocol}/{method}})
      * has to answer "no such method" for anything else <em>before</em> it reads a body.
+     *
+     * <p>Taken from {@link #methodTable()} rather than spelled a second time: a name routable but
+     * undescribed, or described but unroutable, is the drift this protocol exists to eliminate.
      */
-    public static final java.util.Set<String> METHOD_NAMES =
-            java.util.Set.of("list_protocols", "describe");
+    public static final java.util.Set<String> METHOD_NAMES = methodTable().keySet();
 
     /** The default {@code idempotency}: a caller must assume the worst. */
     public static final String IDEMPOTENCY_UNKNOWN = "unknown";

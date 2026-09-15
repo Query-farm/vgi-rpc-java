@@ -1553,9 +1553,10 @@ public final class HttpServer {
     /**
      * One protocol this server routes, with the method table its path segment resolves against.
      *
-     * <p>{@code methods} is empty for a protocol whose methods this port answers without an
-     * {@link RpcMethodInfo} table (reflection); {@code methodNames} is always populated, because
-     * a path-routing transport has to answer "no such method" before it reads a body.
+     * <p>{@code methods} is empty for a protocol this route does not pre-validate parameter
+     * schemas for (reflection, whose two methods {@code RpcServer} answers directly off the
+     * decoded kwargs); {@code methodNames} is always populated, because a path-routing transport
+     * has to answer "no such method" before it reads a body.
      */
     private record RouteBinding(String name, Map<String, RpcMethodInfo> methods,
                                 java.util.Set<String> methodNames) {}
@@ -1578,6 +1579,11 @@ public final class HttpServer {
             return new RouteBinding(protocol, rpc.methods(), rpc.methods().keySet());
         }
         if (Reflection.PROTOCOL_NAME.equals(protocol)) {
+            // The names come from reflection's own method table -- the same one it describes
+            // itself with -- so a name this route accepts is a name `describe` advertises.
+            // The table itself is withheld deliberately: reflection is dispatched off the
+            // decoded kwargs rather than through reflective parameter binding, so pre-validating
+            // a caller's params schema here would refuse requests the dispatch handles.
             return new RouteBinding(protocol, Map.of(), Reflection.METHOD_NAMES);
         }
         if (rpc.identity() != null && Identity.PROTOCOL_NAME.equals(protocol)) {

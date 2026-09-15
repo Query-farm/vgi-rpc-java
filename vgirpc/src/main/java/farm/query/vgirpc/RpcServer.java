@@ -339,11 +339,15 @@ public final class RpcServer {
      */
     public ProtocolIdentity protocolIdentityFor(String protocol) {
         if (Reflection.PROTOCOL_NAME.equals(protocol)) {
-            // Reflection's methods are framework-owned rather than registered, so the honest hash
-            // is over an empty method set -- the same table `serveReflection` describes itself
-            // with. It declares no version of its own; the application's label is not its.
+            // Over reflection's own two methods -- the same table `serveReflection` describes
+            // itself with. Framework-owned is not the same as absent: the table is what
+            // `describe` reports, so hashing an empty one would file every reflection call under
+            // the digest of a protocol that has no methods. It declares no version of its own;
+            // the application's label is not its.
             return new ProtocolIdentity(
-                    Reflection.PROTOCOL_NAME, bindingHash(Reflection.PROTOCOL_NAME, Map.of()), "");
+                    Reflection.PROTOCOL_NAME,
+                    bindingHash(Reflection.PROTOCOL_NAME, Reflection.methodTable()),
+                    "");
         }
         if (identity != null && Identity.PROTOCOL_NAME.equals(protocol)) {
             // Over the NARROWED table, matching what reflection advertises: a worker that only
@@ -1415,10 +1419,12 @@ public final class RpcServer {
     private void serveReflection(
             RpcTransport transport, String method, Map<String, Object> kwargs) throws IOException {
         String appHash = Reflection.bindingHash(protocolName(), methods);
-        // Reflection describes itself with no methods of its own in the table:
-        // they are framework-owned rather than registered, so the honest hash is
-        // over an empty method set.
-        Map<String, RpcMethodInfo> reflectionMethods = Map.of();
+        // Reflection describes itself with its own two methods in the table.
+        // They are answered here rather than registered by an application, but
+        // that is a statement about who implements them, not about whether they
+        // exist: a client that discovers this server the documented way must be
+        // able to learn from `describe` how to call the protocol it is calling.
+        Map<String, RpcMethodInfo> reflectionMethods = Reflection.methodTable();
         String reflHash = Reflection.bindingHash(Reflection.PROTOCOL_NAME, reflectionMethods);
         // Identity's hash is taken over its NARROWED method table, so a worker
         // that only resolves credentials fingerprints differently from one that
