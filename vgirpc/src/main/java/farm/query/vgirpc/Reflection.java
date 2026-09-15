@@ -173,6 +173,25 @@ public final class Reflection {
 
     /** One protocol's canonical fingerprint. */
     public static String bindingHash(String name, Map<String, RpcMethodInfo> methods) {
+        return ProtocolHash.computeProtocolHash(name, hashMethods(methods));
+    }
+
+    /**
+     * The exact preimage {@link #bindingHash} digests.
+     *
+     * <p>A hash mismatch between two ports is otherwise one bit of information. With the preimage
+     * in hand a failing port diffs two JSON documents and sees which method, field or type token
+     * it spells differently -- so a test that asserts a digest should report this on failure.
+     *
+     * @param name the protocol's wire name
+     * @param methods the protocol's method table
+     * @return the canonical JSON description
+     */
+    public static String bindingPreimage(String name, Map<String, RpcMethodInfo> methods) {
+        return ProtocolHash.canonicalDescription(name, hashMethods(methods));
+    }
+
+    private static List<HashMethod> hashMethods(Map<String, RpcMethodInfo> methods) {
         List<HashMethod> entries = new ArrayList<>(methods.size());
         for (RpcMethodInfo info : methods.values()) {
             boolean hasHeader = info.headerType() != null;
@@ -186,7 +205,7 @@ public final class Reflection {
                             info.resultSchema(),
                             hasHeader ? headerSchemaOf(info) : null));
         }
-        return ProtocolHash.computeProtocolHash(name, entries);
+        return entries;
     }
 
     private static Schema headerSchemaOf(RpcMethodInfo info) {

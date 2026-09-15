@@ -7,6 +7,8 @@ import farm.query.vgirpc.external.ExternalLocationConfig;
 import farm.query.vgirpc.external.Externalizer;
 import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.http.SessionScope;
+import farm.query.vgirpc.identity.Identity;
+import farm.query.vgirpc.identity.IdentityImpl;
 import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.marshal.ParameterBinder;
@@ -44,6 +46,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -60,6 +63,8 @@ public final class RpcServer {
     private LocationResolver locationResolver;
     private ExternalLocationConfig externalConfig;
     private DispatchHook dispatchHook;
+    private IdentityImpl identity;
+    private Map<String, RpcMethodInfo> identityMethods = Map.of();
     private String protocolVersion = "";
     private String protocolHash = "";
     private final Object transportLock = new Object();
@@ -131,6 +136,53 @@ public final class RpcServer {
      * @param hook the hook to invoke (e.g. {@link AccessLogHook}); {@code null} removes it
      */
     public void setDispatchHook(DispatchHook hook) { this.dispatchHook = hook; }
+
+    /**
+     * Host {@code vgi_rpc.Identity.v1} alongside the application protocol.
+     *
+     * <p>Absent by default, and <em>absent</em> rather than routed-and-refusing when omitted:
+     * that is what keeps a dependency upgrade from growing a credential-to-identity oracle on
+     * every existing worker. Registered after reflection so it appears in reflection's output,
+     * and narrowed to the methods whose hooks the deployment actually configured -- a worker that
+     * resolves credentials but does not mint grants hosts one method, and its protocol hash says
+     * so, because a server offering half the methods is not offering the same surface.
+     *
+     * <p>Passing an implementation that offers no method registers nothing at all.
+     *
+     * @param impl the guard-applying implementation, or {@code null} to host nothing
+     */
+    public void setIdentity(IdentityImpl impl) {
+        Map<String, RpcMethodInfo> narrowed = impl == null ? Map.of() : identityMethods(impl);
+        this.identity = narrowed.isEmpty() ? null : impl;
+        this.identityMethods = narrowed;
+    }
+
+    /**
+     * The identity implementation this server hosts, if any.
+     *
+     * @return the implementation, or {@code null} when the protocol is not hosted
+     */
+    public IdentityImpl identity() { return identity; }
+
+    /**
+     * The {@code vgi_rpc.Identity.v1} method table {@code impl} hosts.
+     *
+     * <p>Narrowing the method set narrows the protocol hash with it, which is the point: a client
+     * discovers a worker that cannot mint grants by reflecting on it, rather than by calling and
+     * reading an error.
+     *
+     * @param impl the implementation whose configured hooks decide the method set
+     * @return the narrowed table, in the interface's declaration order
+     */
+    public static Map<String, RpcMethodInfo> identityMethods(IdentityImpl impl) {
+        Set<String> offered = impl.offeredMethods();
+        Map<String, RpcMethodInfo> out = new LinkedHashMap<>();
+        for (Map.Entry<String, RpcMethodInfo> e
+                : ServiceIntrospector.describe(Identity.class).entrySet()) {
+            if (offered.contains(e.getKey())) out.put(e.getKey(), e.getValue());
+        }
+        return Collections.unmodifiableMap(out);
+    }
 
     /**
      * The installed dispatch hook, if any.
@@ -452,6 +504,18 @@ public final class RpcServer {
                     serveReflection(transport, method, kwargsSnapshot);
                     return;
                 }
+                // Identity is co-hosted the same way, and for the same reason: it is
+                // framework-owned, lives under the reserved prefix, and is routed by
+                // the ordinary protocol key. Handled here, before the application
+                // protocol's version gate, because that gate is a statement about the
+                // application protocol -- identity declares no version of its own, and
+                // gating it on somebody else's would make a proxy's ability to resolve
+                // a credential depend on a worker upgrade it has no part in.
+                if (identity != null && Identity.PROTOCOL_NAME.equals(requestProtocol)) {
+                    serveIdentity(transport, method, kwargsSnapshot, requestSchema,
+                            parameterRows, shm);
+                    return;
+                }
                 if (describeEnabled && Introspect.METHOD_NAME.equals(method)) {
                     serveDescribe(transport);
                     return;
@@ -697,23 +761,69 @@ public final class RpcServer {
 
     private void serveUnary(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs,
                             Shm shm) throws Exception {
+        serveUnary(transport, info, kwargs, shm, impl, protocolName());
+    }
+
+    /**
+     * Serve one unary call against {@code target}, reported as belonging to {@code proto}.
+     *
+     * <p>Parameterised on the target because a co-hosted framework protocol -- identity -- is
+     * answered by an object that is not the application implementation. Everything else is
+     * deliberately shared: an identity method must marshal, report errors and carry an error kind
+     * exactly the way an application method does, and a second copy of this loop is a second
+     * place for that to drift.
+     */
+    private void serveUnary(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs,
+                            Shm shm, Object target, String proto) throws Exception {
         Schema schema = info.resultSchema();
         ClientLogSink sink = new ClientLogSink(serverId);
         AuthScope.Scope scope = AuthScope.current();
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer())) {
             w.writeSchema(schema);
             CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                    serverId, info.name(), protocolName(), "", transportKind, scope.peerEvidence());
+                    serverId, info.name(), proto, "", transportKind, scope.peerEvidence());
             sink.bind(w, schema);
             try {
                 Object[] callArgs = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
-                Object result = info.reflectMethod().invoke(impl, callArgs);
+                Object result = info.reflectMethod().invoke(target, callArgs);
                 writeResult(w, info, result, shm);
             } catch (Throwable t) {
                 Throwable inner = unwrap(t);
                 Wire.writeZeroBatch(w, schema, Wire.errorMetadata(inner, serverId));
             }
         }
+    }
+
+    /**
+     * Serve one call to {@code vgi_rpc.Identity.v1}.
+     *
+     * <p>A method the deployment did not configure is not in {@link #identityMethods} at all, so
+     * it reports as unknown rather than as a refusal -- the whole point of narrowing the binding.
+     * {@link IdentityImpl} still guards each method individually: a narrowed binding is what a
+     * client discovers, and the per-method guard is what actually holds if a caller reaches the
+     * method some other way.
+     */
+    private void serveIdentity(RpcTransport transport, String method, Map<String, Object> kwargs,
+                               Schema requestSchema, int parameterRows, Shm shm) throws Exception {
+        RpcMethodInfo info = identityMethods.get(method);
+        if (info == null) {
+            Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                    new MethodNotImplementedError(
+                            "Protocol '" + Identity.PROTOCOL_NAME + "' has no method '" + method
+                                    + "'. Available: " + identityMethods.keySet()),
+                    serverId);
+            transport.writer().flush();
+            return;
+        }
+        try {
+            validateParameterContract(method, requestSchema, parameterRows, info.paramsSchema());
+        } catch (RuntimeException contractError) {
+            Wire.writeErrorStream(transport.writer(), info.resultSchema(), contractError, serverId);
+            transport.writer().flush();
+            return;
+        }
+        serveUnary(transport, info, kwargs, shm, identity, Identity.PROTOCOL_NAME);
+        transport.writer().flush();
     }
 
     private void writeResult(IpcStreamWriter w, RpcMethodInfo info, Object result, Shm shm) throws Exception {
@@ -1045,16 +1155,28 @@ public final class RpcServer {
         // over an empty method set.
         Map<String, RpcMethodInfo> reflectionMethods = Map.of();
         String reflHash = Reflection.bindingHash(Reflection.PROTOCOL_NAME, reflectionMethods);
+        // Identity's hash is taken over its NARROWED method table, so a worker
+        // that only resolves credentials fingerprints differently from one that
+        // also mints grants. That difference is the discovery mechanism: a client
+        // reads the hash and knows the surface changed without fetching it.
+        String identityHash = identity == null
+                ? "" : Reflection.bindingHash(Identity.PROTOCOL_NAME, identityMethods);
 
         byte[] payload;
         if ("list_protocols".equals(method)) {
+            List<Reflection.Summary> hosted = new ArrayList<>();
+            hosted.add(new Reflection.Summary(protocolName(), protocolVersion, appHash));
+            hosted.add(new Reflection.Summary(Reflection.PROTOCOL_NAME, "", reflHash));
+            // After reflection, so identity appears in reflection's own output
+            // rather than having to be known a priori.
+            if (identity != null) {
+                hosted.add(new Reflection.Summary(Identity.PROTOCOL_NAME, "", identityHash));
+            }
             payload = Reflection.buildProtocolList(
                     serverId == null ? "" : serverId,
                     "",
                     Metadata.REQUEST_VERSION,
-                    List.of(
-                            new Reflection.Summary(protocolName(), protocolVersion, appHash),
-                            new Reflection.Summary(Reflection.PROTOCOL_NAME, "", reflHash)));
+                    hosted);
         } else if ("describe".equals(method)) {
             String requested = readProtocolArgument(kwargs);
             if (protocolName().equals(requested)) {
@@ -1063,13 +1185,16 @@ public final class RpcServer {
             } else if (Reflection.PROTOCOL_NAME.equals(requested)) {
                 payload = Reflection.buildServiceDescription(
                         Reflection.PROTOCOL_NAME, "", reflHash, reflectionMethods);
+            } else if (identity != null && Identity.PROTOCOL_NAME.equals(requested)) {
+                payload = Reflection.buildServiceDescription(
+                        Identity.PROTOCOL_NAME, "", identityHash, identityMethods);
             } else {
                 // Named, not silently empty: an empty description reads as
                 // "this protocol has no methods".
                 Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
                         new IllegalArgumentException(
-                                "This server does not host protocol '" + requested + "'. Hosted: ["
-                                        + protocolName() + ", " + Reflection.PROTOCOL_NAME + "]"),
+                                "This server does not host protocol '" + requested + "'. Hosted: "
+                                        + hostedProtocolNames()),
                         serverId);
                 transport.writer().flush();
                 return;
@@ -1087,6 +1212,15 @@ public final class RpcServer {
         // The framework's ordinary convention for a structured return: the
         // payload rides as serialized bytes in a single `result` binary column.
         writeReflectionResult(transport, payload);
+    }
+
+    /** The protocols this server routes, for a diagnostic that must name them. */
+    private String hostedProtocolNames() {
+        List<String> names = new ArrayList<>();
+        names.add(protocolName());
+        names.add(Reflection.PROTOCOL_NAME);
+        if (identity != null) names.add(Identity.PROTOCOL_NAME);
+        return names.toString();
     }
 
     /**
