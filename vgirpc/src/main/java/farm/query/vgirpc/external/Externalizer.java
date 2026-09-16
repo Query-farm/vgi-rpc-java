@@ -7,6 +7,7 @@ import com.github.luben.zstd.Zstd;
 import farm.query.vgirpc.AccessLogScope;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamWriter;
+import farm.query.vgirpc.wire.Wire;
 import farm.query.vgirpc.wire.Metadata;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
@@ -145,10 +146,14 @@ public final class Externalizer {
         AccessLogScope.countExternalized(uploadBody.length);
         URI url = config.storage().upload(uploadBody, contentEncoding);
 
-        // Build a zero-row pointer root with the same schema the payload declares.
-        VectorSchemaRoot pointer = VectorSchemaRoot.create(wireSchema, Allocators.root());
-        pointer.allocateNew();
-        pointer.setRowCount(0);
+        // Build a zero-row pointer root declaring the payload's schema. Via
+        // Wire.zeroRootFor, not VectorSchemaRoot.create: for a dictionary-encoded
+        // column the latter builds the *value* vector while the writer declares
+        // the *index* type, and the batch goes out with more buffers than its own
+        // schema accounts for. PyArrow ignores the surplus; Arrow Java refuses the
+        // batch outright, so the malformed pointer is invisible to every
+        // cross-language test and fatal to a Java client reading a Java server.
+        VectorSchemaRoot pointer = Wire.zeroRootFor(wireSchema);
 
         Map<String, String> pointerMeta = new LinkedHashMap<>();
         if (existingMeta != null) pointerMeta.putAll(existingMeta);

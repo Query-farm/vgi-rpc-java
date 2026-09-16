@@ -16,6 +16,7 @@ import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.Dictionary;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -85,9 +86,7 @@ public final class Wire {
      */
     public static void writeZeroBatch(IpcStreamWriter w, Schema schema,
                                       Map<String, String> customMetadata) throws IOException {
-        try (VectorSchemaRoot zero = VectorSchemaRoot.create(schema, Allocators.root())) {
-            zero.allocateNew();
-            zero.setRowCount(0);
+        try (VectorSchemaRoot zero = zeroRootFor(schema)) {
             // A dict-encoded (ENUM) field needs *some* dictionary registered for
             // Arrow to render even the schema message of this zero-row batch
             // (DictionaryUtility.toMessageFormat). Data batches carry their own
@@ -102,6 +101,73 @@ public final class Wire {
                 for (FieldVector v : owned) v.close();
             }
         }
+    }
+
+    /**
+     * Create an empty root whose vectors match what the IPC writer will
+     * <em>declare</em> for {@code schema}.
+     *
+     * <p>{@link VectorSchemaRoot#create} reads a field's declared type, and for
+     * a dictionary-encoded field that is the <em>value</em> type — so a
+     * {@code dictionary&lt;values=string, indices=int16&gt;} column becomes a
+     * {@code VarCharVector}, three buffers wide. The writer, meanwhile, puts the
+     * field on the wire through {@code DictionaryUtility.toMessageFormat}, which
+     * declares the <em>index</em> type: one node, two buffers. The batch then
+     * carries three buffers where its own schema says two.
+     *
+     * <p>Nothing catches it for a long time. PyArrow ignores the surplus buffer,
+     * so the reference client reads such a batch happily and every
+     * cross-language test passes; Arrow Java's {@code VectorLoader} refuses it
+     * outright ("not all nodes, buffers and variadicBufferCounts were
+     * consumed"), so the malformed frame is visible only to a Java client
+     * reading a Java server — a pairing nothing exercised until the conformance
+     * suite could be run with this port on both ends.
+     *
+     * <p>Mapping each dictionary-encoded field to its index type up front makes
+     * the vectors agree with the declaration. For a schema with no dictionaries
+     * the mapping is the identity and nothing changes.
+     *
+     * @param schema the schema the stream declares
+     * @return a zero-row root the caller must close
+     */
+    public static VectorSchemaRoot zeroRootFor(Schema schema) {
+        List<Field> fields = new ArrayList<>(schema.getFields().size());
+        boolean changed = false;
+        for (Field f : schema.getFields()) {
+            Field mapped = toIndexLayout(f);
+            changed |= mapped != f;
+            fields.add(mapped);
+        }
+        Schema layout = changed ? new Schema(fields, schema.getCustomMetadata()) : schema;
+        VectorSchemaRoot root = VectorSchemaRoot.create(layout, Allocators.root());
+        root.allocateNew();
+        root.setRowCount(0);
+        return root;
+    }
+
+    /**
+     * Replace a dictionary-encoded field's value type with its index type,
+     * keeping the encoding so the writer still declares the dictionary.
+     *
+     * <p>Children are dropped along with the value type, exactly as
+     * {@code DictionaryUtility.toMessageFormat} drops them: an encoded column's
+     * structure lives in the dictionary, not in the indices.
+     */
+    private static Field toIndexLayout(Field f) {
+        DictionaryEncoding enc = f.getDictionary();
+        if (enc != null) {
+            ArrowType indexType = enc.getIndexType() != null ? enc.getIndexType() : new ArrowType.Int(32, true);
+            return new Field(f.getName(), new FieldType(f.isNullable(), indexType, enc, f.getMetadata()), null);
+        }
+        if (f.getChildren().isEmpty()) return f;
+        List<Field> children = new ArrayList<>(f.getChildren().size());
+        boolean changed = false;
+        for (Field child : f.getChildren()) {
+            Field mapped = toIndexLayout(child);
+            changed |= mapped != child;
+            children.add(mapped);
+        }
+        return changed ? new Field(f.getName(), f.getFieldType(), children) : f;
     }
 
     /** Build empty dictionaries for every dict-encoded field in {@code schema}
