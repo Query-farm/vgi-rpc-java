@@ -52,7 +52,28 @@ else prefers the reference venv at `~/Development/vgi-rpc-python/.venv`, else fa
 sibling, which is an older tree without the multiservice routing work: running against it fails every
 HTTP test in a way that reads as a worker bug. Full pytest output is written to `/tmp/pytest_java.txt`.
 
-Before pushing: `./gradlew build` must pass, and `./run_tests.sh` must pass for the transports that apply to the change.
+Before pushing: `./gradlew build` must pass, and `./run_tests.sh` must pass for the transports that
+apply to the change.
+
+That pair is not the whole of CI. `.github/workflows/ci.yml` runs seven jobs, and three of the gates
+in them are invisible to the pair above:
+
+| CI gate | Local command |
+|---|---|
+| `test /` ubuntu+macos+windows, incl. `-PtestJdk=21` and `-PtestJdk=22` retargeting | `./gradlew build` covers only the toolchain-JDK lanes; add `./gradlew --rerun-tasks -PtestJdk=21 :vgirpc:test` and `-PtestJdk=22 :vgirpc:java22Test` (needs a JDK 22 installed) |
+| `storage integration` (rustfs + fake-gcs) | `./gradlew storageIntegrationTest` — deliberately outside `build`/`check`, needs Docker |
+| `native Iroh HTTP integration` | `scripts/run_iroh_integration.sh` — needs cargo and a vgi-rpc-rust checkout |
+| `conformance /` three transport lanes | `./run_tests.sh` (a superset: all seven transports) |
+| access-log validator (`launcher` lane) | `vgi-rpc-test --cmd "conformance-worker/build/install/conformance-worker/bin/conformance-worker --access-log /tmp/al.jsonl" --access-log /tmp/al.jsonl --require-request-data --timeout 30` |
+
+The Iroh lane is the one to remember, because it is the **only** gate where this port is the *client*
+and the Python reference is the server — the only place a request shape the reference does not serve
+can be caught. Nothing else sees it: the JUnit test assumes its way out when
+`VGI_IROH_HTTP_TEST_ENDPOINT` is unset, so `./gradlew build` reports green by not running it, and in
+the conformance suite Java is the server. That lane also pins its Python reference revision
+(`VGI_RPC_PYTHON_REV` in `ci.yml`) where the conformance lanes track the reference's main branch, so
+a change to the request shape must move that pin in the same commit. Namespacing the HTTP routes by
+protocol did not, and every call in the lane 404'd against a worker still routing `{prefix}/{method}`.
 
 ## Module layout (`settings.gradle.kts`)
 

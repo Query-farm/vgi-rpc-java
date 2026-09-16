@@ -13,6 +13,17 @@ env:
   # Exact source for the Rust HTTP bridge used by the native Kotlin/JVM Iroh
   # integration lane. Keep this pinned so Rust main cannot change Java CI.
   VGI_RPC_IROH_RUST_REV: 9e7dfb59686682be0ff4a46183988e2724416393
+  # Exact source for the Python reference *worker* that same lane calls into.
+  # Pinned for the same reason as the bridge, but unlike the bridge it is a
+  # party to the wire contract, so it is not a set-and-forget value: a change
+  # to the request shape this port emits must move this pin to a reference
+  # revision that speaks it, in the same commit. It did not when routes were
+  # namespaced by protocol -- the client began posting
+  # {prefix}/{protocol}/{method} while this worker still routed only
+  # {prefix}/{method}, and every call 404'd. The conformance lanes below track
+  # the reference's main branch and so cannot catch this: there Java is the
+  # server, and this is the one lane where Java is the client.
+  VGI_RPC_PYTHON_REV: 48d64e8a68c0d8dd61d6644d6cf3ced4fc61fbd0
 
 jobs:
   test:
@@ -182,7 +193,7 @@ jobs:
       - name: Install Python worker dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install 'vgi-rpc[http] @ git+https://github.com/Query-farm/vgi-rpc-python.git@365395a6144256ec163b17cf9b755b9b5f6a386c' \
+          python -m pip install "vgi-rpc[http] @ git+https://github.com/Query-farm/vgi-rpc-python.git@${VGI_RPC_PYTHON_REV}" \
             'httpx2==2.9.1' waitress
 
       - name: Build pinned Iroh bridge
