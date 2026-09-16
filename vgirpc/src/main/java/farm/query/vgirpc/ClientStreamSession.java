@@ -352,7 +352,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
         }
         LocationResolver.Resolved resolved;
         try {
-            resolved = locationResolver.resolve(pointerMeta);
+            resolved = locationResolver.resolve(pointerMeta, onLog);
         } catch (Exception fe) {
             throw new RpcError("ExternalLocationError",
                     "failed to resolve " + safeUrl + " (" + fe.getClass().getSimpleName() + ")", "");

@@ -79,6 +79,9 @@ _REF_HTTP_VALUED = frozenset({
     "--compression", "--max-fetch-bytes", "--max-decompressed-fetch-bytes", "--sticky-ttl",
     "--token-key", "--access-log", "--identity", "--cors-origin",
 })
+#: Flags the reference CLI accepts on its byte-stream transports, so they must
+#: not be translated into an HTTP variant.
+_REF_BYTESTREAM_EXTERNAL = frozenset({"--fake-storage", "--externalize-threshold"})
 #: Flags only the *strict* reference server accepts, and which select it.
 _REF_STRICT_VALUED = frozenset({"--max-response-bytes", "--max-externalized-response-bytes"})
 
@@ -128,6 +131,24 @@ def _worker(*args: str) -> list[str]:
         return [*_REF_CLI, "--unix", flags[flags.index("--unix") + 1], "--describe"]
     if "--tcp" in flags:
         return [*_REF_CLI, "--tcp", flags[flags.index("--tcp") + 1], "--describe"]
+    # External storage is not an HTTP flag. The reference CLI grew
+    # --fake-storage / --externalize-threshold for --pipe, --unix and --tcp in
+    # 84dbc08, which is what lets the byte-stream externalization group have a
+    # reference peer at all; translating them to an HTTP script instead spawns a
+    # server nobody ever reads from, and both ends block forever on a pipe that
+    # never carries a byte.
+    external = [f for f in _REF_BYTESTREAM_EXTERNAL if f in flags]
+    if external and "--http" not in flags:
+        out = [*_REF_CLI, "--pipe", "--describe"]
+        i = 0
+        while i < len(flags):
+            if flags[i] in _REF_BYTESTREAM_EXTERNAL:
+                out += [flags[i], flags[i + 1]]
+                i += 2
+            else:
+                pytest.skip(f"the reference byte-stream server has no equivalent of {flags[i]!r}")
+        return out
+
     # No flags at all is the pipe worker; everything else below is an HTTP
     # variant, including the modes the Java worker implies HTTP from (--identity
     # names a co-hosted protocol whose guards are all about an authenticated

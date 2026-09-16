@@ -199,12 +199,47 @@ public final class RpcConnection implements AutoCloseable {
                     drainQuietly(r);
                     throw error;
                 }
+                if (LocationResolver.isPointer(r.root().getRowCount(), md)) {
+                    try (LocationResolver.Resolved resolved = resolveHeaderPointer(md)) {
+                        byte[] external = Wire.writeOneBatch(
+                                resolved.root(), resolved.customMetadata(), resolved.dictionaries());
+                        drainQuietly(r);
+                        return external;
+                    }
+                }
                 byte[] framed = Wire.writeOneBatch(r.root(), md, r.dictionaryProvider());
                 // Consume the header stream's trailing EOS so the body stream
                 // that follows starts at a clean boundary.
                 drainQuietly(r);
                 return framed;
             }
+        }
+    }
+
+    /**
+     * Fetch a stream header that was externalized.
+     *
+     * <p>A header large enough to externalize arrives as a zero-row pointer
+     * batch, which {@code Wire.classify} calls DATA like any other — so a reader
+     * without this branch decodes the pointer *as* the header and hands back a
+     * record built from no rows ("Cannot deserialize RichHeader from empty
+     * RecordBatch"), or worse, silently empty fields. The unary and stream-body
+     * readers have always resolved pointers; the two header readers did not, and
+     * nothing noticed because this port's own server never externalizes a
+     * header.
+     */
+    private LocationResolver.Resolved resolveHeaderPointer(Map<String, String> md) {
+        String safeUrl = LocationResolver.redactUrl(md.get(farm.query.vgirpc.wire.Metadata.LOCATION));
+        if (locationResolver == null) {
+            throw new RpcError("ExternalLocationError",
+                    "stream header arrived externalized (" + farm.query.vgirpc.wire.Metadata.LOCATION
+                            + "=" + safeUrl + ") but this connection has no ExternalLocationConfig", "");
+        }
+        try {
+            return locationResolver.resolve(md, onLog);
+        } catch (Exception fe) {
+            throw new RpcError("ExternalLocationError",
+                    "failed to resolve " + safeUrl + " (" + fe.getClass().getSimpleName() + ")", "");
         }
     }
 
@@ -264,7 +299,7 @@ public final class RpcConnection implements AutoCloseable {
                     }
                     LocationResolver.Resolved resolved;
                     try {
-                        resolved = locationResolver.resolve(md);
+                        resolved = locationResolver.resolve(md, onLog);
                     } catch (Exception fe) {
                         throw new RpcError("ExternalLocationError",
                                 "failed to resolve " + safeUrl + " ("
@@ -410,6 +445,16 @@ public final class RpcConnection implements AutoCloseable {
                         RpcError error = Wire.errorFromMetadata(md);
                         drainQuietly(r);
                         throw error;
+                    }
+                    if (LocationResolver.isPointer(r.root().getRowCount(), md)) {
+                        try (LocationResolver.Resolved resolved = resolveHeaderPointer(md)) {
+                            Map<String, Object> external = Marshalling.decodeRow(
+                                    resolved.root(), resolved.dictionaries(), resolved.root().getSchema());
+                            ArrowSerializableRecord fetched = RecordCodec.fromRowMap(
+                                    (Class<? extends ArrowSerializableRecord>) headerType, external);
+                            drainQuietly(r);
+                            return fetched;
+                        }
                     }
                     Map<String, Object> row = Marshalling.decodeRow(r.root(), r.dictionaryProvider(), r.wireSchema());
                     ArrowSerializableRecord header = RecordCodec.fromRowMap(

@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc.external;
 
+import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.Metadata;
@@ -77,6 +78,28 @@ public final class LocationResolver {
      * and {@code vgi_rpc.location.sha256}; it may be null.
      */
     public Resolved resolve(Map<String, String> pointerMeta) throws Exception {
+        return resolve(pointerMeta, null);
+    }
+
+    /**
+     * Resolve a pointer batch, relaying any log batches the fetched object
+     * carries to {@code onLog}.
+     *
+     * <p>The object is a whole IPC stream, and a peer that externalizes a
+     * complete turn puts that turn's log batches in it beside the data batch --
+     * the Python reference does exactly this. A resolver with nowhere to send
+     * them drops them, and the loss is invisible to every assertion that only
+     * looks at data, which is why this overload exists rather than a
+     * {@code continue}.
+     *
+     * @param pointerMeta the pointer batch's custom metadata
+     * @param onLog sink for log batches found inside the object, or {@code null}
+     *     to discard them
+     * @return the fetched batch, its metadata and its dictionaries
+     * @throws Exception if the fetch or the decode fails
+     */
+    public Resolved resolve(Map<String, String> pointerMeta, java.util.function.Consumer<Message> onLog)
+            throws Exception {
         String url = pointerMeta.get(Metadata.LOCATION);
         if (url == null) throw new IllegalArgumentException("pointer batch missing vgi_rpc.location");
         String sha = pointerMeta.get(Metadata.LOCATION_SHA256);
@@ -86,7 +109,9 @@ public final class LocationResolver {
         } catch (IllegalArgumentException invalid) {
             throw new java.io.IOException("invalid external location URL: <redacted-url>");
         }
+        long startedNanos = System.nanoTime();
         byte[] body = fetcher.fetch(location, sha);
+        double elapsedMs = (System.nanoTime() - startedNanos) / 1_000_000.0;
 
         // Open the fetched stream, advance past any log/error batches, and take
         // the first data batch. We copy it into a caller-owned root because the
@@ -98,29 +123,7 @@ public final class LocationResolver {
                 VectorSchemaRoot root = r.root();
                 Wire.BatchKind kind = Wire.classify(root.getRowCount(), md);
                 if (kind == Wire.BatchKind.LOG) {
-                    // KNOWN GAP: a log batch inside an externalized object is
-                    // dropped here. This resolver has no sink to relay one to --
-                    // it takes no on-log callback -- so the batch is discarded
-                    // and the caller never learns the worker said anything.
-                    //
-                    // Against a Java peer it is unreachable, which is why it
-                    // survived: RpcServer.flushCollector externalizes per
-                    // collector entry and only `e.isData()` entries, so an object
-                    // this port produces holds exactly one data batch and the
-                    // turn's logs travel inline beside the pointer. Against the
-                    // Python reference it is reached on every logging call -- the
-                    // reference uploads the whole cycle, log batches and data
-                    // batch together, as one object. Measured, not inferred:
-                    // `produce_with_logs` and `exchange_with_logs` both lose
-                    // their logs over a byte-stream transport against a reference
-                    // peer.
-                    //
-                    // So this is a real defect, not an accepted trade, and the
-                    // fix is a relay channel rather than a continue. It is not
-                    // made here because the byte-stream half cannot be verified
-                    // end to end until a reference server that externalizes over
-                    // stdio exists; the HTTP client already resolves through
-                    // ExternalFetcher, which does relay.
+                    if (onLog != null) onLog.accept(Wire.messageFromMetadata(md));
                     continue;
                 }
                 if (kind == Wire.BatchKind.ERROR) throw Wire.errorFromMetadata(md);
@@ -129,6 +132,15 @@ public final class LocationResolver {
                 merged.remove(Metadata.LOCATION);
                 merged.remove(Metadata.LOCATION_SHA256);
                 if (md != null) merged.putAll(md);
+                // Stamped at resolve time, not copied from the pointer. A reader
+                // that only passes through what the writer happened to set
+                // reports nothing when the writer set nothing -- and this port's
+                // own Externalizer pre-stamps the source, so that gap passes by
+                // coincidence against a Java peer and yields empty provenance
+                // against every other. WIRE_PROTOCOL.md §12 requires both keys
+                // on a resolved batch: how long the fetch took, and where from.
+                merged.put(Metadata.LOCATION_FETCH, String.format(java.util.Locale.ROOT, "%.1f", elapsedMs));
+                merged.put(Metadata.LOCATION_SOURCE, url);
                 return new Resolved(copy.root(), merged, copy.dictionaries(), copy.owned());
             }
         }
