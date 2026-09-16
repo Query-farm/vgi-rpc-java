@@ -7,6 +7,8 @@
 #   ./run_tests.sh "echo_point"   # keyword filter (pytest -k)
 #   ./run_tests.sh --no-build …   # skip gradle rebuild
 #   ./run_tests.sh --coverage …   # attach JaCoCo to each worker + emit report
+#   ./run_tests.sh --client --python-server   # the Java CLIENT vs the Python reference
+#   ./run_tests.sh --client                   # the Java client vs this port's server (triage)
 #
 # Full output lands in /tmp/pytest_java.txt; the summary is printed here.
 # With --coverage, every spawned conformance worker runs under the JaCoCo agent
@@ -44,17 +46,35 @@ fi
 
 BUILD=1
 COVERAGE=0
+# Which half of this port is under test, and who serves. --client drives the
+# *Java client* through the JSONL conformance driver instead of driving the Java
+# worker; --python-server points that client at the Python reference, which is
+# the run that counts (a client validated against the server it ships with
+# proves only that the two halves of one port agree with each other).
+ROLE="${VGI_CONFORMANCE_ROLE:-server}"
+SERVER="${VGI_CONFORMANCE_SERVER:-java}"
 while [[ $# -gt 0 ]]; do
     case "${1:-}" in
         --no-build) BUILD=0; shift ;;
         --coverage) COVERAGE=1; shift ;;
+        --client) ROLE=client; shift ;;
+        --python-server) SERVER=python; shift ;;
         *) break ;;
     esac
 done
 FILTER="${1:-}"
+export VGI_CONFORMANCE_ROLE="$ROLE"
+export VGI_CONFORMANCE_SERVER="$SERVER"
 
 if [[ $BUILD -eq 1 ]]; then
     ./gradlew -q installDist || { echo "BUILD FAILED"; exit 1; }
+fi
+
+if [[ "$ROLE" == "client" ]]; then
+    # An installed distribution, never `gradlew run`: stdout is the driver's
+    # control channel and Gradle writes its progress there.
+    export VGI_CLIENT_DRIVER="${VGI_CLIENT_DRIVER:-$PWD/conformance-client-driver/build/install/conformance-client-driver/bin/conformance-client-driver}"
+    echo "=== client role: driver=$VGI_CLIENT_DRIVER server=$SERVER ==="
 fi
 
 # --- Coverage: front-load a wrapper that runs each worker under the JaCoCo

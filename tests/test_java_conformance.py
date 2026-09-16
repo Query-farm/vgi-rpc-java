@@ -36,6 +36,147 @@ JAVA_WORKER = os.environ.get(
     str(Path(__file__).parent.parent / "conformance-worker/build/install/conformance-worker/bin/conformance-worker"),
 )
 
+# Which half of this port is under test.
+#
+#   "server" (default) -- the Python reference client drives the Java worker.
+#   "client"  -- the *Java* client drives a server, reached through the JSONL
+#                conformance client driver (see tests/java_client_proxy.py and
+#                the reference's tools/cross-port/specs/CLIENT_DRIVER_PROTOCOL.md).
+#
+# The two roles share every test body; only the connection factory differs.
+ROLE = os.environ.get("VGI_CONFORMANCE_ROLE", "server")
+
+# Which implementation serves. Only meaningful in the client role, where it is
+# the whole point: a client validated against the server it ships with proves
+# the two halves of one port agree with each other, not that either agrees with
+# the protocol. The Rust client sent bare URL paths for weeks and passed its own
+# suite; against the Python reference the same client produced 730 failures.
+#
+# So `python` is the gate and `java` is triage -- the gap between the two runs
+# localises a bug to one side in one run.
+SERVER = os.environ.get("VGI_CONFORMANCE_SERVER", "java")
+
+# The Python reference checkout, for SERVER=python. The reference's HTTP server
+# variants live in its *repo* (tests/serve_conformance_*.py), not in the wheel,
+# so a cross-implementation client run needs a checkout rather than an install.
+_REF_REPO = Path(os.environ.get("VGI_RPC_PYTHON_REPO") or Path.home() / "Development" / "vgi-rpc-python")
+_REF_PY = os.environ.get("VGI_RPC_PYTHON") or sys.executable
+_REF_TESTS = Path(os.environ.get("VGI_RPC_PYTHON_TESTS") or _REF_REPO / "tests")
+
+# `-c` rather than the console script or `-m`: the reference may be installed
+# into the running interpreter without its `bin/` on PATH, and this form works
+# either way.
+_REF_CLI = [_REF_PY, "-c", "from vgi_rpc.conformance._cli import main; main()"]
+
+#: Flags the Java worker and the reference HTTP server spell identically.
+_REF_HTTP_PASSTHROUGH = frozenset({
+    "--http", "--no-compression", "--no-call-state-cache", "--sticky-auth",
+    "--fail-serve-start-once", "--reject-localhost-redirects",
+})
+#: Flags taking one value that both spell identically.
+_REF_HTTP_VALUED = frozenset({
+    "--host", "--port", "--fake-storage", "--externalize-threshold", "--max-request-bytes",
+    "--compression", "--max-fetch-bytes", "--max-decompressed-fetch-bytes", "--sticky-ttl",
+    "--token-key", "--access-log", "--identity", "--cors-origin",
+})
+#: Flags only the *strict* reference server accepts, and which select it.
+_REF_STRICT_VALUED = frozenset({"--max-response-bytes", "--max-externalized-response-bytes"})
+
+
+def _worker(*args: str) -> list[str]:
+    """Build the argv that starts the conformance SERVER with these flags.
+
+    Flags are written in the Java worker's spelling throughout the file, because
+    in the default (server) role that is exactly what runs. Under
+    ``SERVER=python`` they are translated to the reference's equivalents, which
+    are deliberately near-identical -- both sides grew them for the same shared
+    suite.
+
+    Raises:
+        Skipped: via ``pytest.skip`` when the reference exposes no equivalent of
+            a Java-only worker mode. Skipping is the honest answer: a silent
+            fallback to a *different* server configuration would report green
+            for a lane that tested something else.
+
+    """
+    if SERVER != "python":
+        return [JAVA_WORKER, *args]
+
+    flags = list(args)
+    if "--transport-kind-probe" in flags:
+        pytest.skip("the reference server hosts no transport-kind probe protocol")
+    if "--http-auth" in flags:
+        # A reject-all worker is its own script in the reference, and it binds a
+        # port given to it rather than choosing one.
+        return [_REF_PY, str(_REF_TESTS / "serve_conformance_http_auth.py"), "--port", str(_free_port())]
+    if "--http-proof" in flags:
+        proof = [_REF_PY, str(_REF_TESTS / "serve_conformance_http_proof.py"), "--port", str(_free_port())]
+        skip = {"--http-proof", "--proof-no-replay-cache"}
+        i = 0
+        while i < len(flags):
+            if flags[i] in skip:
+                i += 1
+                continue
+            proof += [flags[i], flags[i + 1]]
+            i += 2
+        return proof
+    if "--introspect" in flags:
+        pytest.skip("the reference HTTP server exposes no --introspect mode")
+
+    # Byte-stream transports: one CLI, three flags.
+    if "--unix" in flags:
+        return [*_REF_CLI, "--unix", flags[flags.index("--unix") + 1], "--describe"]
+    if "--tcp" in flags:
+        return [*_REF_CLI, "--tcp", flags[flags.index("--tcp") + 1], "--describe"]
+    # No flags at all is the pipe worker; everything else below is an HTTP
+    # variant, including the modes the Java worker implies HTTP from (--identity
+    # names a co-hosted protocol whose guards are all about an authenticated
+    # caller, so it only ships on the transport that carries one).
+    if not flags:
+        return [*_REF_CLI, "--pipe", "--describe"]
+
+    strict = "--strict" in flags or bool(set(flags) & _REF_STRICT_VALUED)
+    if "--http" not in flags and not strict:
+        flags = ["--http", *flags]
+    script = "serve_conformance_http_strict.py" if strict else "serve_conformance_http.py"
+    out = [_REF_PY, str(_REF_TESTS / script)]
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        if flag in ("--strict", "--http") and strict:
+            # The strict server is a separate script with no transport flag.
+            i += 1
+            continue
+        if flag in _REF_HTTP_PASSTHROUGH:
+            out.append(flag)
+            i += 1
+            continue
+        if flag in _REF_HTTP_VALUED or flag in _REF_STRICT_VALUED:
+            out += [flag, flags[i + 1]]
+            i += 2
+            continue
+        pytest.skip(f"the reference conformance server has no equivalent of {flag!r}")
+    return out
+
+
+def _free_port() -> int:
+    """Bind an ephemeral port, release it, and hand back the number."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+# Under the client role, route the HTTP feature tests -- external location,
+# sticky sessions, response caps, upload URLs -- through the Java client. They
+# import ``http_connect`` / ``http_capabilities`` / ``request_upload_urls``
+# *inside the test body*, so without this they quietly exercise the Python
+# client and prove nothing about the port under test.
+if ROLE == "client":
+    from java_client_proxy import DRIVER as CLIENT_DRIVER
+
+    CLIENT_DRIVER.install_http_overrides()
+
+
 # Size of the per-connection POSIX shm segment for the "subprocess_shm"
 # transport. Large enough that conformance batches ride the side-channel;
 # anything that overflows falls back to inline transfer (never an error).
@@ -57,7 +198,7 @@ class TransportKindProbeService(Protocol):
 
 @pytest.fixture(scope="session")
 def java_transport() -> Iterator[SubprocessTransport]:
-    transport = SubprocessTransport([JAVA_WORKER])
+    transport = SubprocessTransport(_worker())
     yield transport
     transport.close()
 
@@ -83,9 +224,20 @@ def conformance_describe() -> Iterator[Any]:
     server-side, so a single transport exercises ``Reflection``/``serveReflection``
     fully.
     """
+    if ROLE == "client":
+        # The driver relays an *already decoded* description (the one op that
+        # does), so this is the Java client's own reflection walk rather than
+        # the reference's -- which is the point of the client role.
+        proxy = CLIENT_DRIVER.connect("stdio", _worker())
+        try:
+            yield proxy.describe()
+        finally:
+            proxy.close()
+        return
+
     from vgi_rpc.introspect import introspect
 
-    transport = SubprocessTransport([JAVA_WORKER])
+    transport = SubprocessTransport(_worker())
     try:
         yield introspect(transport)
     finally:
@@ -105,7 +257,7 @@ def _wait_for_http(port: int, timeout: float = 10.0) -> None:
 
 @pytest.fixture(scope="session")
 def java_http_port() -> Iterator[int]:
-    proc = subprocess.Popen([JAVA_WORKER, "--http"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(_worker("--http"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         assert proc.stdout is not None
         line = proc.stdout.readline().decode().strip()
@@ -143,7 +295,7 @@ def _wait_for_unix(path: str, timeout: float = 10.0) -> None:
 @pytest.fixture(scope="session")
 def java_unix_path() -> Iterator[str]:
     path = _short_unix_path("conf")
-    proc = subprocess.Popen([JAVA_WORKER, "--unix", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(_worker("--unix", path), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         assert proc.stdout is not None
         line = proc.stdout.readline().decode().strip()
@@ -183,7 +335,7 @@ def java_tcp_addr() -> Iterator[tuple[str, int]]:
     # port 0 ⇒ the worker asks the OS for a free loopback port and reports it
     # back on the TCP:<host>:<port> discovery line.
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--tcp", "127.0.0.1:0"],
+        _worker("--tcp", "127.0.0.1:0"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -214,7 +366,7 @@ def conformance_resource_soak_target() -> Iterator[Any]:
     )
 
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--http"],
+        _worker("--http"),
         stdout=subprocess.PIPE,
         stderr=sys.stderr,
     )
@@ -249,7 +401,7 @@ def conformance_resource_soak_target() -> Iterator[Any]:
 def conformance_http_auth_port() -> Iterator[int]:
     """Spawn a reject-all HTTP worker, so every RPC POST returns 401."""
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--http-auth"],
+        _worker("--http-auth"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -293,7 +445,7 @@ def conformance_http_no_compression_port() -> Iterator[int]:
     "speaks no compression" from an absent header on a legacy server.
     """
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--http", "--no-compression"],
+        _worker("--http", "--no-compression"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -313,7 +465,7 @@ def conformance_http_no_compression_port() -> Iterator[int]:
 def conformance_http_small_request_cap_port() -> Iterator[int]:
     """Java worker with the shared suite's deliberately small request cap."""
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--http", "--max-request-bytes", "4096"],
+        _worker("--http", "--max-request-bytes", "4096"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -333,7 +485,7 @@ def conformance_http_small_request_cap_port() -> Iterator[int]:
 def conformance_http_serve_start_fail_once_port() -> Iterator[int]:
     """HTTP worker whose first lifecycle notification fails, then retries."""
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--http", "--fail-serve-start-once"],
+        _worker("--http", "--fail-serve-start-once"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -354,7 +506,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
     """Real Java worker probes for pipe, HTTP, Unix, and raw TCP."""
 
     def pipe_probe() -> str:
-        transport = SubprocessTransport([JAVA_WORKER, "--transport-kind-probe"])
+        transport = SubprocessTransport(_worker("--transport-kind-probe"))
         try:
             return str(_RpcProxy(TransportKindProbeService, transport, None).report_transport_kind())
         finally:
@@ -362,7 +514,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
 
     def http_probe() -> str:
         proc = subprocess.Popen(
-            [JAVA_WORKER, "--transport-kind-probe", "--http"],
+            _worker("--transport-kind-probe", "--http"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -380,7 +532,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
     def unix_probe() -> str:
         path = _short_unix_path("kind")
         proc = subprocess.Popen(
-            [JAVA_WORKER, "--transport-kind-probe", "--unix", path],
+            _worker("--transport-kind-probe", "--unix", path),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -395,7 +547,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
 
     def tcp_probe() -> str:
         proc = subprocess.Popen(
-            [JAVA_WORKER, "--transport-kind-probe", "--tcp", "127.0.0.1:0"],
+            _worker("--transport-kind-probe", "--tcp", "127.0.0.1:0"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -425,7 +577,7 @@ def conformance_transport_kind_probes() -> tuple[tuple[str, Callable[[], str]], 
 def conformance_http_strict_cap_port() -> Iterator[int]:
     """Spawn an HTTP worker with strict response caps (1 MiB) for cap-overshoot tests."""
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--http", "--strict"],
+        _worker("--http", "--strict"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -444,7 +596,7 @@ def conformance_http_strict_cap_port() -> Iterator[int]:
 def _start_http_worker(*extra_args: str) -> Iterator[int]:
     """Spawn a Java HTTP conformance worker and yield the port it reports."""
     proc = subprocess.Popen(
-        [JAVA_WORKER, *extra_args],
+        _worker(*extra_args),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -699,7 +851,7 @@ def conformance_fake_storage() -> Iterator[str]:
 def conformance_http_with_storage_port(conformance_fake_storage: str) -> Iterator[int]:
     """Spawn a Java HTTP worker wired to the fake-storage service (no compression)."""
     proc = subprocess.Popen(
-        [JAVA_WORKER, "--http", "--fake-storage", conformance_fake_storage],
+        _worker("--http", "--fake-storage", conformance_fake_storage),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -719,8 +871,7 @@ def conformance_http_with_storage_port(conformance_fake_storage: str) -> Iterato
 def conformance_http_external_security_port(conformance_fake_storage: str) -> Iterator[int]:
     """Spawn Java with per-hop URL policy and independent fetch caps."""
     proc = subprocess.Popen(
-        [
-            JAVA_WORKER,
+        _worker(
             "--http",
             "--fake-storage",
             conformance_fake_storage,
@@ -731,7 +882,7 @@ def conformance_http_external_security_port(conformance_fake_storage: str) -> It
             "--max-decompressed-fetch-bytes",
             "8192",
             "--reject-localhost-redirects",
-        ],
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -766,8 +917,7 @@ def conformance_http_externalized_cap_port(conformance_fake_storage: str) -> Ite
     exercise the same channel without tripping the cap.
     """
     proc = subprocess.Popen(
-        [
-            JAVA_WORKER,
+        _worker(
             "--http",
             "--fake-storage",
             conformance_fake_storage,
@@ -775,7 +925,7 @@ def conformance_http_externalized_cap_port(conformance_fake_storage: str) -> Ite
             str(64 * 1024),
             "--max-response-bytes",
             str(8 * 1024 * 1024),
-        ],
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -804,8 +954,7 @@ def conformance_http_externalize_always_port(conformance_fake_storage: str) -> I
     transmission for every protocol method.
     """
     proc = subprocess.Popen(
-        [
-            JAVA_WORKER,
+        _worker(
             "--http",
             "--fake-storage",
             conformance_fake_storage,
@@ -813,7 +962,7 @@ def conformance_http_externalize_always_port(conformance_fake_storage: str) -> I
             "1",
             "--max-request-bytes",
             "1048576",
-        ],
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -833,14 +982,13 @@ def conformance_http_externalize_always_port(conformance_fake_storage: str) -> I
 def conformance_http_with_zstd_storage_port(conformance_fake_storage: str) -> Iterator[int]:
     """Spawn a Java HTTP worker wired to fake-storage with zstd upload compression."""
     proc = subprocess.Popen(
-        [
-            JAVA_WORKER,
+        _worker(
             "--http",
             "--fake-storage",
             conformance_fake_storage,
             "--compression",
             "zstd",
-        ],
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -864,12 +1012,60 @@ ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
 # transport group — e.g. "pipe,subprocess,unix" for the launcher lanes vs
 # "http,http_externalize_always" for the HTTP lane. Unset = all (local default).
 _ALL_CONNS = ["pipe", "subprocess", "subprocess_shm", "http", "http_externalize_always", "unix", "tcp"]
+if ROLE == "client":
+    # The shared-memory side-channel is implemented on the Java *server* only;
+    # there is no client half to drive. Dropped rather than silently degraded to
+    # a pipe: a lane that quietly tested a different transport is worse than one
+    # that says it did not run.
+    _ALL_CONNS = [c for c in _ALL_CONNS if c != "subprocess_shm"]
 _CONN_SEL = os.environ.get("CONFORMANCE_TRANSPORTS")
 _CONN_PARAMS = (
     [c for c in _ALL_CONNS if c in {s.strip() for s in _CONN_SEL.split(",")}]
     if _CONN_SEL
     else _ALL_CONNS
 )
+
+
+def _client_conn(
+    param: str,
+    on_log: Callable[[Message], None] | None,
+    http_port: int | None,
+    unix_path: str | None,
+    tcp_addr: tuple[str, int] | None,
+    ext_port: int | None,
+) -> contextlib.AbstractContextManager[Any]:
+    """One connection driven by the *Java* client, through the JSONL driver."""
+    from vgi_rpc.external import ExternalLocationConfig
+
+    external_config = None
+    if param in ("pipe", "subprocess"):
+        transport: str = "stdio"
+        target: Any = _worker()
+    elif param == "http":
+        transport, target = "http", f"http://127.0.0.1:{http_port}"
+    elif param == "http_externalize_always":
+        transport, target = "http", f"http://127.0.0.1:{ext_port}"
+        # Presence is all that crosses the control boundary: the *client under
+        # test* resolves the pointer batch. Resolving it on this side would make
+        # the test pass without the client ever doing the work.
+        external_config = ExternalLocationConfig(url_validator=None)
+    elif param == "unix":
+        transport, target = "unix", unix_path
+    elif param == "tcp":
+        assert tcp_addr is not None
+        transport, target = "tcp", f"{tcp_addr[0]}:{tcp_addr[1]}"
+    else:
+        raise AssertionError(f"transport {param!r} has no client-role factory")
+
+    @contextlib.contextmanager
+    def _conn() -> Iterator[Any]:
+        proxy = CLIENT_DRIVER.connect(transport, target, on_log, external_config=external_config)
+        try:
+            yield proxy
+        finally:
+            proxy.close()
+
+    return _conn()
 
 
 @pytest.fixture(params=_CONN_PARAMS)
@@ -883,10 +1079,21 @@ def conformance_conn(
     def factory(
         on_log: Callable[[Message], None] | None = None,
     ) -> contextlib.AbstractContextManager[Any]:
+        if ROLE == "client":
+            return _client_conn(
+                request.param,
+                on_log,
+                java_http_port,
+                java_unix_path,
+                java_tcp_addr,
+                request.getfixturevalue("conformance_http_externalize_always_port")
+                if request.param == "http_externalize_always"
+                else None,
+            )
         if request.param == "pipe":
             @contextlib.contextmanager
             def _pipe_conn() -> Iterator[_RpcProxy]:
-                transport = SubprocessTransport([JAVA_WORKER])
+                transport = SubprocessTransport(_worker())
                 try:
                     yield _RpcProxy(ConformanceService, transport, on_log)
                 finally:
@@ -907,7 +1114,7 @@ def conformance_conn(
             @contextlib.contextmanager
             def _shm_conn() -> Iterator[_RpcProxy]:
                 segment = ShmSegment.create(SHM_SEGMENT_BYTES)
-                transport = ShmPipeTransport(SubprocessTransport([JAVA_WORKER]), segment)
+                transport = ShmPipeTransport(SubprocessTransport(_worker()), segment)
                 try:
                     yield _RpcProxy(ConformanceService, transport, on_log)
                 finally:
@@ -943,7 +1150,16 @@ def conformance_conn(
     return factory
 
 
-@pytest.fixture(params=["pipe", "subprocess", "subprocess_shm", "unix", "tcp"])
+# Deliberately NOT routed through the client driver in the client role. These
+# fixtures back the adversarial request-contract groups, which write a *malformed
+# framed request* straight onto the byte stream and assert the peer rejects it and
+# stays usable. That is a statement about a server, and it needs the raw transport
+# a driver-backed proxy does not have -- the shared suite says so itself, by
+# failing with "conformance_raw_conn supplied a non-raw transport".
+_RAW_CONNS = ["pipe", "subprocess", "subprocess_shm", "unix", "tcp"]
+
+
+@pytest.fixture(params=_RAW_CONNS)
 def conformance_raw_conn(
     request: pytest.FixtureRequest,
     java_transport: SubprocessTransport,
@@ -959,7 +1175,7 @@ def conformance_raw_conn(
 
             @contextlib.contextmanager
             def _pipe_conn() -> Iterator[_RpcProxy]:
-                transport = SubprocessTransport([JAVA_WORKER])
+                transport = SubprocessTransport(_worker())
                 try:
                     yield _RpcProxy(ConformanceService, transport, on_log)
                 finally:
@@ -978,7 +1194,7 @@ def conformance_raw_conn(
             @contextlib.contextmanager
             def _shm_conn() -> Iterator[_RpcProxy]:
                 segment = ShmSegment.create(SHM_SEGMENT_BYTES)
-                transport = ShmPipeTransport(SubprocessTransport([JAVA_WORKER]), segment)
+                transport = ShmPipeTransport(SubprocessTransport(_worker()), segment)
                 try:
                     yield _RpcProxy(ConformanceService, transport, on_log)
                 finally:
@@ -1001,6 +1217,17 @@ def conformance_raw_conn(
 from vgi_rpc.conformance._pytest_suite import *  # noqa: F401,F403,E402
 
 
+# These groups assert on *this port's worker* -- the records its access log
+# writes, and the shape of a continuation token its own server minted. They are
+# server-role tests that happen to live beside the shared suite, so they are
+# skipped when something else is serving: run against the reference they would
+# be asserting the reference's behaviour under this port's name, and the two
+# implementations are allowed to differ in what a worker logs by default.
+_JAVA_SERVER_ONLY = pytest.mark.skipif(
+    SERVER != "java", reason="asserts on the Java worker's own behaviour, not the wire contract"
+)
+
+
 @pytest.fixture(scope="session")
 def java_http_shared_key_ports() -> Iterator[tuple[int, int]]:
     """Two HTTP workers sharing one --token-key, so tokens minted by one
@@ -1012,7 +1239,7 @@ def java_http_shared_key_ports() -> Iterator[tuple[int, int]]:
     try:
         for _ in range(2):
             proc = subprocess.Popen(
-                [JAVA_WORKER, "--http", "--token-key", key],
+                _worker("--http", "--token-key", key),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -1030,6 +1257,7 @@ def java_http_shared_key_ports() -> Iterator[tuple[int, int]]:
             proc.wait(timeout=5)
 
 
+@_JAVA_SERVER_ONLY
 class TestContinuationOnlyResume:
     """Java worker mirror of the 0.20.0 ``_HttpProxy.resume_stream`` contract.
 
@@ -1082,6 +1310,7 @@ class TestContinuationOnlyResume:
             assert [ab.batch.column("value")[0].as_py() for ab in resumed] == [10, 20]
 
 
+@_JAVA_SERVER_ONLY
 class TestHttpStreamAccessLog:
     """Every HTTP turn of a stream call must produce an access-log record.
 
@@ -1265,6 +1494,7 @@ class TestHttpStreamAccessLog:
         assert rec["error_message"], "an error record must carry the server-side message"
 
 
+@_JAVA_SERVER_ONLY
 class TestHttpResponseCapAccessLog:
     """A response-cap overshoot must be logged as the failure it is.
 

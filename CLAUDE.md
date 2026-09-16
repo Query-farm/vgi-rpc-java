@@ -64,17 +64,29 @@ in them are invisible to the pair above:
 | `storage integration` (rustfs + fake-gcs) | `./gradlew storageIntegrationTest` — deliberately outside `build`/`check`, needs Docker |
 | `native Iroh HTTP integration` | `scripts/run_iroh_integration.sh` — needs cargo and a vgi-rpc-rust checkout |
 | `conformance /` three transport lanes | `./run_tests.sh` (a superset: all seven transports) |
+| `conformance / client vs python reference` | `./run_tests.sh --client --python-server` |
+| `conformance / client vs java server` | `./run_tests.sh --client` |
 | access-log validator (`launcher` lane) | `vgi-rpc-test --cmd "conformance-worker/build/install/conformance-worker/bin/conformance-worker --access-log /tmp/al.jsonl" --access-log /tmp/al.jsonl --require-request-data --timeout 30` |
 | cross-port drift (`launcher` lane) | from the reference checkout, with `VGI_RPC_REPOS` set to the directory holding both checkouts as siblings: `VGI_RPC_REPOS=~/Development python tools/cross-port/describe_diff.py --only java` and `… identity_consistency.py --only java --verbose` |
 
-The Iroh lane is the one to remember, because it is the **only** gate where this port is the *client*
-and the Python reference is the server — the only place a request shape the reference does not serve
-can be caught. Nothing else sees it: the JUnit test assumes its way out when
-`VGI_IROH_HTTP_TEST_ENDPOINT` is unset, so `./gradlew build` reports green by not running it, and in
-the conformance suite Java is the server. That lane also pins its Python reference revision
-(`VGI_RPC_PYTHON_REV` in `ci.yml`) where the conformance lanes track the reference's main branch, so
-a change to the request shape must move that pin in the same commit. Namespacing the HTTP routes by
-protocol did not, and every call in the lane 404'd against a worker still routing `{prefix}/{method}`.
+Two conformance lanes run this port as the **client**, through the JSONL client driver
+(`conformance-client-driver`, protocol spec in the reference's
+`tools/cross-port/specs/CLIENT_DRIVER_PROTOCOL.md`). `client vs python reference` is the gate:
+a client validated only against the server it ships with proves that the two halves of one port
+agree with each other, never that either agrees with the protocol — the Rust client sent bare URL
+paths and no routing key for weeks, passed its own suite on every test, and produced 730 failures
+the moment the peer was the strict Python reference. `client vs java server` is triage: same client,
+same tests, this port's own server, so the gap between the two lanes names the side at fault in one
+run instead of two. Both track the reference's `main` for the same reason the other conformance
+lanes do — here the reference is the yardstick.
+
+Before those lanes existed the Iroh lane was the *only* gate where this port was the client, which
+is why it is still worth remembering: the JUnit test assumes its way out when
+`VGI_IROH_HTTP_TEST_ENDPOINT` is unset, so `./gradlew build` reports green by not running it. That
+lane pins its Python reference revision (`VGI_RPC_PYTHON_REV` in `ci.yml`) where every conformance
+lane tracks the reference's main branch, so a change to the request shape must move that pin in the
+same commit. Namespacing the HTTP routes by protocol did not, and every call in the lane 404'd
+against a worker still routing `{prefix}/{method}`.
 
 `VGI_RPC_PYTHON_REV` is scoped to that one lane and must stay there. The cross-port drift checks run
 against the reference's `main`, deliberately: the reference is the yardstick they measure with, and a
@@ -94,6 +106,7 @@ ports described `vgi_rpc.Reflection.v1` as having zero methods with every suite 
 - **`vgirpc-gcs`** — Google Cloud Storage `ExternalStorage` backend.
 - **`conformance`** — the conformance service definition (`ConformanceService`, `AllTypes`, `Point`, `BoundingBox`, `RichHeader`, etc.) shared between the Java worker and the Python driver.
 - **`conformance-worker`** — runnable entry point (`Main`) that serves `ConformanceService` over pipe / unix / tcp / HTTP based on CLI args (`--unix <path>`, `--tcp [HOST:]PORT`, `--http`). Packaged via `installDist`.
+- **`conformance-client-driver`** — runnable entry point (`Main`) that exposes this port's *client* to the shared conformance suite over a newline-delimited JSON control protocol on stdin/stdout. Packaged via `installDist` and launched that way, never `gradlew run`: **stdout is the control channel**, and Gradle, SLF4J or a stray `println` writing there desynchronises every later response from its request. The driver is a relay and must stay one — it never defaults the routing key or the method name, never guesses a stream kind from a method name, and never resolves an external pointer itself; each of those would turn a client defect into a passing run.
 - **`benchmark`** + **`benchmark-worker`** — equivalent pair for the benchmark service.
 
 ## Core modules inside `vgirpc`

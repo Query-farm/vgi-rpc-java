@@ -282,6 +282,34 @@ jobs:
             transports: subprocess_shm
           - name: http
             transports: http,http_externalize_always
+          # --- client role -------------------------------------------------
+          # The two lanes below drive this port's *client* through the JSONL
+          # conformance client driver instead of driving its server.
+          #
+          # The first is the gate. A client validated only against the server it
+          # ships with proves that the two halves of one port agree with each
+          # other, never that either agrees with the protocol: the Rust client
+          # sent bare URL paths and no routing key for weeks, passed its own
+          # suite on every test, and produced 730 failures the moment the peer
+          # was the strict Python reference. A permissive server cannot validate
+          # a client.
+          #
+          # Deliberately NOT pinned to VGI_RPC_PYTHON_REV. That variable exists
+          # for the Iroh lane, where this port is the client of a *pinned* peer
+          # and the revision is party to the wire contract. Here the reference is
+          # the yardstick, and a pinned yardstick is how a lane rots for days
+          # while reporting green.
+          - name: client vs python reference
+            role: client
+            server: python
+            transports: pipe,unix,tcp,http,http_externalize_always
+          # The second is triage, not a gate: same client, same tests, against
+          # this port's own server. When the two lanes disagree the gap names the
+          # side at fault in one run instead of two.
+          - name: client vs java server
+            role: client
+            server: java
+            transports: pipe,unix,tcp,http,http_externalize_always
     steps:
       - uses: actions/checkout@v4
 
@@ -341,6 +369,14 @@ jobs:
       - name: Build conformance worker
         run: ./gradlew --no-daemon :conformance-worker:installDist
 
+      # The client driver is launched as an *installed distribution*, never
+      # `gradlew run`: stdout is the driver's control channel, and Gradle writes
+      # its progress there. A single line of progress output desynchronises
+      # every later response from its request.
+      - name: Build conformance client driver
+        if: matrix.role == 'client'
+        run: ./gradlew --no-daemon :conformance-client-driver:installDist
+
       # Cross-port drift. Every step below compares this port to the reference
       # over the wire, which is exactly the comparison that cannot see a port
       # drifting in what it *says about itself*: four ports described
@@ -395,6 +431,10 @@ jobs:
       - name: Run conformance suite (${{ matrix.transports }})
         env:
           CONFORMANCE_TRANSPORTS: ${{ matrix.transports }}
+          VGI_CONFORMANCE_ROLE: ${{ matrix.role || 'server' }}
+          VGI_CONFORMANCE_SERVER: ${{ matrix.server || 'java' }}
+          VGI_RPC_PYTHON_REPO: ${{ env.VGI_RPC_REPOS }}/vgi-rpc-python
+          VGI_CLIENT_DRIVER: conformance-client-driver/build/install/conformance-client-driver/bin/conformance-client-driver
         run: python -m pytest tests/test_java_conformance.py -p no:cacheprovider -q --timeout=120
 
       # The suite above proves the wire; this proves the access-log record, which
