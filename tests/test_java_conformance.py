@@ -180,6 +180,24 @@ def _worker(*args: str) -> list[str]:
     return out
 
 
+def _loopback_only_validator(url: str) -> None:
+    """Permit the fake storage's loopback URLs and nothing else.
+
+    The fixtures' fake storage vends ``http://127.0.0.1`` URLs, which the
+    default HTTPS-only policy refuses — but ``url_validator=None`` switches the
+    policy off entirely, which is strictly more than is needed and reads, in a
+    fixture other ports copy, like a general permission rather than a local one.
+    The check that matters here is the one that stops an allowed public URL
+    redirecting a reader into a loopback service; narrowing to loopback keeps it
+    engaged while still passing every URL the backend can produce.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ("127.0.0.1", "::1", "localhost"):
+        raise ValueError(f"external URL {url!r} is not a loopback fixture URL")
+
+
 def _free_port() -> int:
     """Bind an ephemeral port, release it, and hand back the number."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -1061,7 +1079,7 @@ def conformance_bytestream_external_target(conformance_fake_storage: str) -> Ite
 
     @contextlib.contextmanager
     def _connect(on_log: Callable[[Message], None] | None = None) -> Iterator[Any]:
-        external = ExternalLocationConfig(url_validator=None)
+        external = ExternalLocationConfig(url_validator=_loopback_only_validator)
         if ROLE == "client":
             proxy = CLIENT_DRIVER.connect("stdio", argv, on_log, external_config=external)
             try:
@@ -1126,7 +1144,7 @@ def _client_conn(
         # Presence is all that crosses the control boundary: the *client under
         # test* resolves the pointer batch. Resolving it on this side would make
         # the test pass without the client ever doing the work.
-        external_config = ExternalLocationConfig(url_validator=None)
+        external_config = ExternalLocationConfig(url_validator=_loopback_only_validator)
     elif param == "unix":
         transport, target = "unix", unix_path
     elif param == "tcp":
@@ -1216,7 +1234,7 @@ def conformance_conn(
                 on_log=on_log,
                 # Server uses http://127.0.0.1 download URLs from the
                 # in-process fake storage; disable the HTTPS-only validator.
-                external_location=ExternalLocationConfig(url_validator=None),
+                external_location=ExternalLocationConfig(url_validator=_loopback_only_validator),
             )
         elif request.param == "unix":
             return unix_connect(ConformanceService, java_unix_path, on_log=on_log)
