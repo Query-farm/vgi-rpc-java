@@ -273,6 +273,11 @@ jobs:
             # reference driver installed. Running it on all three would just
             # repeat the same check.
             access_log: true
+            # Same reasoning for the cross-port drift checks: describe_diff
+            # spawns the worker on stdio and talks to it over a pipe, which is
+            # this lane's transport, and this lane already has the reference
+            # checkout and its conformance extras.
+            cross_port: true
           - name: launcher + shm
             transports: subprocess_shm
           - name: http
@@ -300,11 +305,27 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: gradle-${{ runner.os }}-
 
+      # The cross-port tools resolve a port as <repos>/vgi-rpc-<name>, so the
+      # reference is cloned as a *sibling* of this checkout rather than into
+      # RUNNER_TEMP, and VGI_RPC_REPOS names the directory holding both.
+      # $GITHUB_WORKSPACE is .../work/vgi-rpc-java/vgi-rpc-java, so its parent
+      # already holds this repo under exactly the name the tools look for — no
+      # copy and no symlink, which keeps Gradle running in the real workspace.
+      - name: Locate the sibling checkout root
+        run: echo "VGI_RPC_REPOS=$(dirname "$GITHUB_WORKSPACE")" >> "$GITHUB_ENV"
+
       # The Java worker tracks the *unreleased* Python reference (0.19.0+ on
       # main), which is ahead of PyPI's latest — so install vgi_rpc from source
       # off the default branch rather than `pip install vgi-rpc`.
-      - name: Clone vgi-rpc-python reference
-        run: git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git "$RUNNER_TEMP/vgi-rpc-python"
+      #
+      # Deliberately unpinned, and it must stay that way: VGI_RPC_PYTHON_REV
+      # exists for the Iroh lane, where this port is the client and a pin is
+      # part of the wire contract. Here the reference is the yardstick, and a
+      # pinned yardstick is how that lane rotted for eleven days while
+      # reporting green. A reference change that breaks this port should turn
+      # this port red the same day.
+      - name: Clone vgi-rpc-python reference (main, deliberately unpinned)
+        run: git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git "$VGI_RPC_REPOS/vgi-rpc-python"
 
       - name: Install Python dependencies
         run: |
@@ -314,11 +335,62 @@ jobs:
           # PyArrow as if it were IPC ("negative continuation token"). Keep
           # the known-good reference client until that upstream regression is
           # fixed; this does not change the Java server's zstd contract.
-          pip install "${RUNNER_TEMP}/vgi-rpc-python[http,cli,external,conformance,oauth,mtls]" \
+          pip install "$VGI_RPC_REPOS/vgi-rpc-python[http,cli,external,conformance,oauth,mtls]" \
             'httpx2==2.9.1' pytest pytest-timeout
 
       - name: Build conformance worker
         run: ./gradlew --no-daemon :conformance-worker:installDist
+
+      # Cross-port drift. Every step below compares this port to the reference
+      # over the wire, which is exactly the comparison that cannot see a port
+      # drifting in what it *says about itself*: four ports described
+      # vgi_rpc.Reflection.v1 as having zero methods, and six logged six
+      # different wrong protocol_hash values, while every one of their
+      # conformance suites was green. The tools live in the reference because
+      # the comparison is between implementations, not inside one; --only java
+      # is the form that works from a single repo's CI, and it still pulls
+      # python in as the reference rather than letting this port agree with
+      # itself.
+      #
+      # Placed before the suite deliberately. It costs seconds, and when a
+      # description has drifted its output is a two-line hash diff naming the
+      # field that differs — a better first answer than a thousand red test
+      # results, and the answer the suite has demonstrably failed to give (the
+      # zero-method reflection bug ran green through every port's suite).
+      #
+      # describe_diff asks the worker, over reflection, for every protocol it
+      # hosts and compares the canonical protocol_hash of each against the
+      # reference's. It builds the worker itself — the same installDist as the
+      # step above, so a no-op here — because it must run the *installed
+      # distribution*: `gradlew run` would write Gradle's progress to stdout,
+      # which is the stream the worker speaks Arrow IPC on. It exits non-zero
+      # on drift, on a hash that agrees over descriptions that do not, and on a
+      # port it could not reach at all, because "not checked" must not look
+      # like "checked and agrees".
+      - name: Cross-port protocol description drift
+        if: matrix.cross_port
+        run: |
+          cd "$VGI_RPC_REPOS/vgi-rpc-python"
+          python tools/cross-port/describe_diff.py --only java
+
+      # identity_consistency covers what the hash cannot: the order the guards
+      # run in, the size of the window a rate limiter admits, whether an
+      # allowlist can be reached by omission, whether a transient failure is
+      # distinguishable from a definitive one. Six ports can agree on the
+      # digest to the last byte and disagree about all of it.
+      #
+      # It is a grep over source, so it is weak by construction — it proves a
+      # value is written, not that it is used, and the port's own
+      # TokenIntrospection tests are what establish behaviour. It finds
+      # identity files by content, so an empty matrix would mean it found no
+      # files rather than that this port is clean: --verbose makes it name the
+      # files it read, so a run that silently stopped matching is visible in
+      # the log instead of passing as a row of blanks.
+      - name: Cross-port identity invariant drift
+        if: matrix.cross_port
+        run: |
+          cd "$VGI_RPC_REPOS/vgi-rpc-python"
+          python tools/cross-port/identity_consistency.py --only java --verbose
 
       - name: Run conformance suite (${{ matrix.transports }})
         env:

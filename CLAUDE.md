@@ -65,6 +65,7 @@ in them are invisible to the pair above:
 | `native Iroh HTTP integration` | `scripts/run_iroh_integration.sh` — needs cargo and a vgi-rpc-rust checkout |
 | `conformance /` three transport lanes | `./run_tests.sh` (a superset: all seven transports) |
 | access-log validator (`launcher` lane) | `vgi-rpc-test --cmd "conformance-worker/build/install/conformance-worker/bin/conformance-worker --access-log /tmp/al.jsonl" --access-log /tmp/al.jsonl --require-request-data --timeout 30` |
+| cross-port drift (`launcher` lane) | from the reference checkout, with `VGI_RPC_REPOS` set to the directory holding both checkouts as siblings: `VGI_RPC_REPOS=~/Development python tools/cross-port/describe_diff.py --only java` and `… identity_consistency.py --only java --verbose` |
 
 The Iroh lane is the one to remember, because it is the **only** gate where this port is the *client*
 and the Python reference is the server — the only place a request shape the reference does not serve
@@ -74,6 +75,16 @@ the conformance suite Java is the server. That lane also pins its Python referen
 (`VGI_RPC_PYTHON_REV` in `ci.yml`) where the conformance lanes track the reference's main branch, so
 a change to the request shape must move that pin in the same commit. Namespacing the HTTP routes by
 protocol did not, and every call in the lane 404'd against a worker still routing `{prefix}/{method}`.
+
+`VGI_RPC_PYTHON_REV` is scoped to that one lane and must stay there. The cross-port drift checks run
+against the reference's `main`, deliberately: the reference is the yardstick they measure with, and a
+pinned yardstick measures nothing — a pin is how the Iroh lane reported green for eleven days against
+an eleven-day-stale reference. The two are opposite requirements on purpose. A pin belongs where this
+port is the *client* and the pinned revision is a party to the wire contract; tracking `main` belongs
+where the reference is the thing being compared to, so a reference change that breaks this port turns
+this port red the same day. They also catch different things: the conformance suite compares this port
+to the reference over the wire, and cannot see a port drifting in what it *says about itself* — four
+ports described `vgi_rpc.Reflection.v1` as having zero methods with every suite green.
 
 ## Module layout (`settings.gradle.kts`)
 
