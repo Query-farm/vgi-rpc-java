@@ -1004,6 +1004,63 @@ def conformance_http_with_zstd_storage_port(conformance_fake_storage: str) -> It
         proc.wait(timeout=5)
 
 
+@pytest.fixture(scope="session")
+def conformance_bytestream_external_target(conformance_fake_storage: str) -> Iterator[Any]:
+    """A pipe connection with externalization wired on both ends.
+
+    External-location pointers are not an HTTP feature: every transport that
+    carries record batches carries pointer batches, and the shared suite's
+    other external groups need a raw HTTP driver to place a pointer on an
+    inbound route — which leaves the byte-stream half of a port's one pointer
+    resolver unexercised. Two ports shipped the same two defects on their HTTP
+    path and then found both still latent behind the byte-stream one.
+
+    ``--externalize-threshold 1`` is the reference setting and is load-bearing:
+    the group asserts an upload happened on every test, so a threshold that
+    left this suite's small batches inline would fail the group rather than
+    pass it vacuously.
+
+    The client half differs by role and nothing else does. In the server role
+    it is the reference proxy with an ``ExternalLocationConfig``; in the client
+    role it is this port's own client, reached through the driver, because
+    resolving the pointer on the Python side would prove nothing about the
+    client under test. The fixture's storage vends ``http://127.0.0.1`` URLs,
+    so the HTTPS-only validator comes off — a property of the fixture, not a
+    relaxation of the resolver, which still does the fetching either way.
+    """
+    from vgi_rpc.conformance._external_bytestream_pytest import ByteStreamExternalTarget
+    from vgi_rpc.external import ExternalLocationConfig
+
+    argv = _worker("--fake-storage", conformance_fake_storage, "--externalize-threshold", "1")
+
+    def _uploaded_objects() -> int:
+        response = httpx.get(f"{conformance_fake_storage}/_stats", timeout=10.0)
+        response.raise_for_status()
+        return int(response.json()["object_count"])
+
+    @contextlib.contextmanager
+    def _connect(on_log: Callable[[Message], None] | None = None) -> Iterator[Any]:
+        external = ExternalLocationConfig(url_validator=None)
+        if ROLE == "client":
+            proxy = CLIENT_DRIVER.connect("stdio", argv, on_log, external_config=external)
+            try:
+                yield proxy
+            finally:
+                proxy.close()
+            return
+        transport = SubprocessTransport(argv)
+        try:
+            yield _RpcProxy(ConformanceService, transport, on_log, external_config=external)
+        finally:
+            transport.close()
+
+    yield ByteStreamExternalTarget(
+        name=f"java-pipe-{'client' if ROLE == 'client' else 'server'}",
+        connect=_connect,
+        uploaded_objects=_uploaded_objects,
+    )
+
+
 ConnFactory = Callable[..., contextlib.AbstractContextManager[Any]]
 
 

@@ -271,11 +271,11 @@ public final class RpcConnection implements AutoCloseable {
                                         + fe.getClass().getSimpleName() + ")", "");
                     }
                     try {
-                        T out = projection.apply(resolved.root(), resolved.customMetadata(), null);
+                        T out = projection.apply(resolved.root(), resolved.customMetadata(), resolved.dictionaries());
                         drainQuietly(r);
                         return out;
                     } finally {
-                        resolved.root().close();
+                        resolved.close();
                     }
                 }
                 T out = projection.apply(root, md, r.dictionaryProvider());

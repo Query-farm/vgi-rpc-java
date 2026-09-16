@@ -7,11 +7,19 @@ import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.dictionary.Dictionary;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
+import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.util.TransferPair;
 
 import java.io.ByteArrayInputStream;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -89,35 +97,164 @@ public final class LocationResolver {
                 if (md == null) throw new java.io.IOException("external stream contained no data batch");
                 VectorSchemaRoot root = r.root();
                 Wire.BatchKind kind = Wire.classify(root.getRowCount(), md);
-                if (kind == Wire.BatchKind.LOG) continue;          // external-stream logs are advisory
+                if (kind == Wire.BatchKind.LOG) {
+                    // KNOWN GAP: a log batch inside an externalized object is
+                    // dropped here. This resolver has no sink to relay one to --
+                    // it takes no on-log callback -- so the batch is discarded
+                    // and the caller never learns the worker said anything.
+                    //
+                    // Against a Java peer it is unreachable, which is why it
+                    // survived: RpcServer.flushCollector externalizes per
+                    // collector entry and only `e.isData()` entries, so an object
+                    // this port produces holds exactly one data batch and the
+                    // turn's logs travel inline beside the pointer. Against the
+                    // Python reference it is reached on every logging call -- the
+                    // reference uploads the whole cycle, log batches and data
+                    // batch together, as one object. Measured, not inferred:
+                    // `produce_with_logs` and `exchange_with_logs` both lose
+                    // their logs over a byte-stream transport against a reference
+                    // peer.
+                    //
+                    // So this is a real defect, not an accepted trade, and the
+                    // fix is a relay channel rather than a continue. It is not
+                    // made here because the byte-stream half cannot be verified
+                    // end to end until a reference server that externalizes over
+                    // stdio exists; the HTTP client already resolves through
+                    // ExternalFetcher, which does relay.
+                    continue;
+                }
                 if (kind == Wire.BatchKind.ERROR) throw Wire.errorFromMetadata(md);
-                VectorSchemaRoot copy = copyRoot(root);
+                Copy copy = copyRoot(root, r.dictionaryProvider());
                 Map<String, String> merged = new LinkedHashMap<>(pointerMeta);
                 merged.remove(Metadata.LOCATION);
                 merged.remove(Metadata.LOCATION_SHA256);
                 if (md != null) merged.putAll(md);
-                return new Resolved(copy, merged);
+                return new Resolved(copy.root(), merged, copy.dictionaries(), copy.owned());
             }
         }
     }
 
-    private static VectorSchemaRoot copyRoot(VectorSchemaRoot src) {
-        VectorSchemaRoot dst = VectorSchemaRoot.create(src.getSchema(), Allocators.root());
-        dst.allocateNew();
+    /** A copied batch and the dictionary vectors it refers to, all caller-owned. */
+    private record Copy(VectorSchemaRoot root, DictionaryProvider dictionaries, List<FieldVector> owned) {}
+
+    /**
+     * Copy a batch out of the reader that owns it, dictionaries included.
+     *
+     * <p>Two things here are easy to get wrong and were.
+     *
+     * <p>The copy is made through each source vector's own
+     * {@link org.apache.arrow.vector.util.TransferPair}, not by creating a root
+     * from the schema and copying cell by cell. A dictionary-encoded column is
+     * stored as indices, but its <em>field</em> declares the value type, so
+     * {@code VectorSchemaRoot.create} builds a {@code VarCharVector} where the
+     * source holds a {@code SmallIntVector} and the copy is nonsense. Asking the
+     * source vector for its own transfer pair cannot make that mistake.
+     *
+     * <p>The dictionaries are copied too. They travel beside a batch and never
+     * inside it, so a root handed on without them is not a batch that has lost
+     * an optimisation — it is a batch that cannot be written or read at all
+     * ("Could not find dictionary with ID 0"), and the failure lands on whoever
+     * touches it next, a layer away from the fetch that dropped them. Nothing in
+     * the shared suite externalized over a byte-stream transport until
+     * {@code TestExternalByteStream} landed, so this half stayed latent while the
+     * same defect was being fixed on the HTTP path.
+     */
+    private static Copy copyRoot(VectorSchemaRoot src, DictionaryProvider source) {
         int rows = src.getRowCount();
-        for (int c = 0; c < src.getSchema().getFields().size(); c++) {
-            org.apache.arrow.vector.FieldVector sv = src.getVector(c);
-            org.apache.arrow.vector.FieldVector dv = dst.getVector(c);
-            for (int r = 0; r < rows; r++) dv.copyFromSafe(r, r, sv);
+        List<FieldVector> owned = new ArrayList<>();
+        List<FieldVector> columns = new ArrayList<>(src.getFieldVectors().size());
+        for (FieldVector sv : src.getFieldVectors()) {
+            TransferPair tp = sv.getTransferPair(Allocators.root());
+            tp.splitAndTransfer(0, rows);
+            FieldVector copied = (FieldVector) tp.getTo();
+            columns.add(copied);
+            owned.add(copied);
         }
+        VectorSchemaRoot dst = new VectorSchemaRoot(columns);
         dst.setRowCount(rows);
-        return dst;
+
+        DictionaryProvider.MapDictionaryProvider dictionaries = null;
+        if (source != null) {
+            dictionaries = copyDictionaries(src.getSchema().getFields(), source, owned, null);
+        }
+        return new Copy(dst, dictionaries, owned);
+    }
+
+    /**
+     * Copy every dictionary the given fields refer to, at any depth.
+     *
+     * <p>Recursive, and that is the point: a dictionary-encoded column can sit
+     * inside a list or a struct — {@code List<item: int16[dictionary: 0]>} is an
+     * encoded enum array — and a top-level-only scan finds nothing for it while
+     * the schema still declares the encoding. The batch is then written against
+     * a provider that has no entry for the id it names, which fails as "Could
+     * not find dictionary with ID 0" at the writer rather than at the fetch.
+     *
+     * @param fields the fields to walk
+     * @param source the provider owning the originals
+     * @param owned collects every copied vector for the caller to release
+     * @param into the provider being built, or {@code null} to create one lazily
+     * @return the provider, or {@code null} when no field was encoded
+     */
+    private static DictionaryProvider.MapDictionaryProvider copyDictionaries(
+            List<Field> fields, DictionaryProvider source, List<FieldVector> owned,
+            DictionaryProvider.MapDictionaryProvider into) {
+        for (Field f : fields) {
+            DictionaryEncoding enc = f.getDictionary();
+            if (enc != null) {
+                Dictionary d = source.lookup(enc.getId());
+                if (d != null) {
+                    TransferPair tp = d.getVector().getTransferPair(Allocators.root());
+                    tp.splitAndTransfer(0, d.getVector().getValueCount());
+                    FieldVector copiedDict = (FieldVector) tp.getTo();
+                    owned.add(copiedDict);
+                    if (into == null) into = new DictionaryProvider.MapDictionaryProvider();
+                    into.put(new Dictionary(copiedDict, enc));
+                }
+            }
+            if (!f.getChildren().isEmpty()) {
+                into = copyDictionaries(f.getChildren(), source, owned, into);
+            }
+        }
+        return into;
     }
 
     /**
      * The outcome of resolving an external-location pointer batch: the fetched,
-     * materialised {@link VectorSchemaRoot} and the custom metadata that should
-     * accompany it downstream.
+     * materialised batch, the metadata that should accompany it downstream, and
+     * the dictionaries its encoded columns refer to.
+     *
+     * <p>Everything here is caller-owned. {@link #close()} releases the batch
+     * <em>and</em> the dictionary copies; closing only {@link #root()} leaks the
+     * latter, which is why every call site uses {@code close()}.
+     *
+     * @param root the fetched batch
+     * @param customMetadata the pointer's metadata minus the location keys,
+     *     overlaid with the externalized batch's own — what the batch would have
+     *     carried had it been sent inline
+     * @param dictionaries dictionaries for encoded columns, or {@code null}
+     * @param owned every vector this result allocated, closed by {@link #close()}
      */
-    public record Resolved(VectorSchemaRoot root, Map<String, String> customMetadata) {}
+    public record Resolved(VectorSchemaRoot root, Map<String, String> customMetadata,
+                           DictionaryProvider dictionaries, List<FieldVector> owned)
+            implements AutoCloseable {
+
+        @Override
+        public void close() {
+            try {
+                root.close();
+            } finally {
+                if (owned != null) {
+                    for (FieldVector v : owned) {
+                        try {
+                            v.close();
+                        } catch (RuntimeException ignore) {
+                            // Best-effort: one vector failing to release must not
+                            // strand the rest.
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -359,10 +359,14 @@ public final class Wire {
                 } catch (Exception e) {
                     throw new IOException("failed to resolve externalized request", e);
                 }
-                try (VectorSchemaRoot resolvedRoot = resolved.root()) {
+                // close() rather than root().close(): the resolver copies the
+                // batch's dictionaries out of the reader that owned them, and
+                // releasing only the root strands those copies.
+                try (LocationResolver.Resolved owned = resolved) {
+                    VectorSchemaRoot resolvedRoot = owned.root();
                     kwargs = resolvedRoot.getRowCount() == 0
                             ? new LinkedHashMap<>()
-                            : Marshalling.decodeRow(resolvedRoot, null, resolvedRoot.getSchema());
+                            : Marshalling.decodeRow(resolvedRoot, owned.dictionaries(), resolvedRoot.getSchema());
                 }
             } else if (root.getRowCount() == 0) {
                 kwargs = new LinkedHashMap<>();

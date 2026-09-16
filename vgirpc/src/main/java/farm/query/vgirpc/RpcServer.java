@@ -571,7 +571,11 @@ public final class RpcServer {
             // If the outer batch is a shm or external-location pointer, resolve the
             // inner batch and decode kwargs from it. Dispatch metadata still comes
             // from the (merged) outer batch metadata.
-            VectorSchemaRoot resolvedParams = null;
+            // The whole Resolved, not just its root. The external resolver
+            // copies the batch's dictionaries out of the reader that owned
+            // them, so releasing only the root strands those copies; both
+            // resolvers' results close the same way, so one handle covers them.
+            AutoCloseable resolvedParams = null;
             try {
                 if (shm != null && ShmResolver.isPointer(paramsRoot.getRowCount(), meta)) {
                     try {
@@ -579,7 +583,7 @@ public final class RpcServer {
                         shm.inShmBytes += Long.parseLong(meta.get(Metadata.SHM_LENGTH));
                         ShmResolver.Resolved res = ShmResolver.resolve(shm, paramsRoot, meta);
                         resolvedParams = res.root();
-                        paramsRoot = resolvedParams;
+                        paramsRoot = res.root();
                         meta = res.customMetadata();
                     } catch (Exception shmExc) {
                         Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, shmExc, serverId);
@@ -589,8 +593,8 @@ public final class RpcServer {
                 } else if (locationResolver != null && LocationResolver.isPointer(paramsRoot.getRowCount(), meta)) {
                     try {
                         LocationResolver.Resolved res = locationResolver.resolve(meta);
-                        resolvedParams = res.root();
-                        paramsRoot = resolvedParams;
+                        resolvedParams = res;
+                        paramsRoot = res.root();
                     } catch (Exception fetchExc) {
                         Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, fetchExc, serverId);
                         transport.writer().flush();
@@ -807,7 +811,14 @@ public final class RpcServer {
                 }
                 transport.writer().flush();
             } finally {
-                if (resolvedParams != null) resolvedParams.close();
+                if (resolvedParams != null) {
+                    try {
+                        resolvedParams.close();
+                    } catch (Exception ignore) {
+                        // Best-effort release; a failure here must not mask the
+                        // outcome of the call itself.
+                    }
+                }
             }
         } catch (EndOfStream e) {
             throw e;
@@ -1128,8 +1139,15 @@ public final class RpcServer {
                 }
                 return;
             }
+            // `schema`, not null. It happens to be a no-op today -- both of
+            // encodeRowForWire's branches preserve the declared fields, so the
+            // root's schema already equals this one -- but nothing asserts that,
+            // and an encoder that normalised nullability, or any new unary result
+            // path that builds its own root, would reintroduce exactly the
+            // declared-schema mismatch fixed on the streaming path below. Saying
+            // it turns an invariant into a statement.
             Externalizer.Pointer ptr = Externalizer.maybeExternalize(
-                    root, null, externalConfig, null, encoded.provider());
+                    root, null, externalConfig, schema, encoded.provider());
             if (ptr != null) {
                 try (VectorSchemaRoot pr = ptr.root()) {
                     w.writeBatch(pr, ptr.customMetadata(), encoded.provider());
@@ -1244,7 +1262,7 @@ public final class RpcServer {
                                     StreamState state, CallContext ctx, Schema outputSchema, Schema inputSchema,
                                     boolean isProducer, Map<String, String> meta, Shm shm) throws IOException {
         VectorSchemaRoot inputRoot = inputReader.root();
-        VectorSchemaRoot resolvedRoot = null;
+        AutoCloseable resolvedRoot = null;
         Map<String, String> effectiveMeta = meta;
 
         boolean inboundViaShm = shm != null && ShmResolver.isPointer(inputRoot.getRowCount(), meta);
@@ -1256,7 +1274,7 @@ public final class RpcServer {
                 ShmResolver.Resolved res = ShmResolver.resolve(shm, inputRoot, meta);
                 shm.resolveNs += System.nanoTime() - tr0;
                 resolvedRoot = res.root();
-                inputRoot = resolvedRoot;
+                inputRoot = res.root();
                 effectiveMeta = res.customMetadata();
             } catch (Exception shmExc) {
                 Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(shmExc, serverId));
@@ -1266,8 +1284,8 @@ public final class RpcServer {
         } else if (locationResolver != null && LocationResolver.isPointer(inputRoot.getRowCount(), meta)) {
             try {
                 LocationResolver.Resolved res = locationResolver.resolve(meta);
-                resolvedRoot = res.root();
-                inputRoot = resolvedRoot;
+                resolvedRoot = res;
+                inputRoot = res.root();
                 effectiveMeta = res.customMetadata();
             } catch (Exception fetchExc) {
                 Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(fetchExc, serverId));
@@ -1309,7 +1327,13 @@ public final class RpcServer {
         transport.writer().flush();
         if (shm != null) shm.emitNs += System.nanoTime() - te0;
         if (castRoot != null) castRoot.close();
-        if (resolvedRoot != null) resolvedRoot.close();
+        if (resolvedRoot != null) {
+            try {
+                resolvedRoot.close();
+            } catch (Exception ignore) {
+                // Best-effort release.
+            }
+        }
         return !out.finished();
     }
 
@@ -1367,8 +1391,17 @@ public final class RpcServer {
                 }
                 if (e.isData() && externalConfig != null && externalConfig.storage() != null) {
                     try {
+                        // The stream's declared output schema, not the collector
+                        // root's. They differ in nullability -- a not-null field
+                        // declared by the protocol is built nullable in the
+                        // collector -- and the externalized object has to declare
+                        // what inline delivery would, or a resolver that checks
+                        // the payload against the stream it arrived on rejects it
+                        // ("expected value: double not null, got value: double").
+                        // The HTTP path always passed the declared schema, which
+                        // is why only the byte-stream transports carried this.
                         Externalizer.Pointer ptr = Externalizer.maybeExternalize(
-                                e.root(), e.customMetadata(), externalConfig, null, effective);
+                                e.root(), e.customMetadata(), externalConfig, out.outputSchema(), effective);
                         if (ptr != null) {
                             try (VectorSchemaRoot pr = ptr.root()) {
                                 writer.writeBatch(pr, ptr.customMetadata(), effective);

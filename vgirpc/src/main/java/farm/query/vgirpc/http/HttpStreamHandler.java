@@ -335,7 +335,7 @@ public final class HttpStreamHandler {
                         ? Marshalling.decodeRow(root, null, root.getSchema())
                         : Marshalling.decodeRow(root, r.dictionaryProvider(), r.wireSchema()));
         } finally {
-            if (resolved != null) resolved.root().close();
+            if (resolved != null) resolved.close();
         }
 
         OutputCollectorSink sink = new OutputCollectorSink();
@@ -505,7 +505,7 @@ public final class HttpStreamHandler {
             }
         }
         } finally {
-            if (resolved != null) resolved.root().close();
+            if (resolved != null) resolved.close();
             closeDictionaries(inputDicts);
         }
     }

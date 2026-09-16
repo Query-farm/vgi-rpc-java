@@ -83,7 +83,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
      * ("valid until the next call — copy what you must keep"), instead of
      * making the caller remember which kind of batch it just received.
      */
-    private VectorSchemaRoot resolvedRoot;
+    private LocationResolver.Resolved resolvedBatch;
 
     /**
      * Create a client streaming session with no external-location resolution.
@@ -358,15 +358,18 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
                     "failed to resolve " + safeUrl + " (" + fe.getClass().getSimpleName() + ")", "");
         }
         // Held for release on the next read / close — see the resolvedRoot field.
-        resolvedRoot = resolved.root();
-        return new AnnotatedBatch(resolvedRoot, resolved.customMetadata());
+        resolvedBatch = resolved;
+        // The dictionaries travel with the batch: an encoded column handed on
+        // without them cannot be written or read at all.
+        return new AnnotatedBatch(resolved.root(), resolved.customMetadata(),
+                resolved.dictionaries(), null);
     }
 
     /** Free the previous resolved batch's caller-facing root, if any. */
     private void releaseResolvedRoot() {
-        if (resolvedRoot == null) return;
-        try { resolvedRoot.close(); } catch (Exception ignore) { /* best-effort */ }
-        resolvedRoot = null;
+        if (resolvedBatch == null) return;
+        try { resolvedBatch.close(); } catch (Exception ignore) { /* best-effort */ }
+        resolvedBatch = null;
     }
 
     private void drainOutput() {
