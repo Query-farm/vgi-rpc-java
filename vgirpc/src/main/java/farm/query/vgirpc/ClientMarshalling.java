@@ -138,6 +138,65 @@ public final class ClientMarshalling {
     }
 
     /**
+     * Write a request IPC stream for a method named by string rather than by a
+     * service interface, carrying a caller-supplied batch and metadata verbatim.
+     *
+     * <p>The untyped counterpart of
+     * {@link #writeRequest(OutputStream, RpcMethodInfo, Method, Object[], String, String)},
+     * and the same bytes: {@code vgi_rpc.method}, the request version, the
+     * routing key and the protocol version are stamped identically, so a call
+     * made this way is indistinguishable on the wire from the typed one.
+     *
+     * <p>{@code extraMetadata} is layered <em>over</em> the framework keys, not
+     * under them: a caller relaying somebody else's request already holds that
+     * request's metadata map, and silently substituting this connection's
+     * routing key for the one the caller was given would make the relay lie
+     * about what it was asked to send.
+     *
+     * @param out destination for the framed request; not closed by this method
+     * @param method the RPC method name to stamp
+     * @param params the request batch; its own schema is what the stream declares
+     * @param dictionaries dictionaries for encoded params fields, or {@code null}
+     * @param extraMetadata additional Arrow custom metadata, layered last; may be {@code null}
+     * @param protocol the routing key to stamp; {@code null} or blank omits the key
+     * @param protocolVersion the version to stamp; {@code null} or blank omits the key
+     * @throws IOException if {@code out} fails
+     */
+    public static void writeRawRequest(OutputStream out, String method, VectorSchemaRoot params,
+                                       org.apache.arrow.vector.dictionary.DictionaryProvider dictionaries,
+                                       Map<String, String> extraMetadata,
+                                       String protocol, String protocolVersion) throws IOException {
+        Map<String, String> meta = rawRequestMetadata(method, extraMetadata, protocol, protocolVersion);
+        try (IpcStreamWriter w = new IpcStreamWriter(out)) {
+            w.writeSchema(params.getSchema());
+            if (dictionaries != null) w.writeBatch(params, meta, dictionaries);
+            else w.writeBatch(params, meta);
+        }
+    }
+
+    /**
+     * Build the metadata map an untyped request carries.
+     *
+     * @param method the RPC method name
+     * @param extraMetadata additional metadata, layered last; may be {@code null}
+     * @param protocol the routing key; {@code null} or blank omits the key
+     * @param protocolVersion the protocol version; {@code null} or blank omits the key
+     * @return a fresh mutable metadata map
+     */
+    public static Map<String, String> rawRequestMetadata(String method, Map<String, String> extraMetadata,
+                                                         String protocol, String protocolVersion) {
+        Map<String, String> meta = Wire.requestMetadata(method);
+        if (protocol != null && !protocol.isBlank()) {
+            meta.put(farm.query.vgirpc.wire.Metadata.PROTOCOL, protocol);
+        }
+        if (protocolVersion != null && !protocolVersion.isBlank()) {
+            meta.put(farm.query.vgirpc.wire.Metadata.PROTOCOL_VERSION_KEY, protocolVersion);
+        }
+        if (extraMetadata != null) meta.putAll(extraMetadata);
+        return meta;
+    }
+
+    /**
      * Bind invocation arguments to their declared parameter names.
      *
      * <p>{@link CallContext} parameters are framework-injected on the server and

@@ -347,6 +347,54 @@ public final class Wire {
     }
 
     /**
+     * Frame one batch and its custom metadata as a complete Arrow IPC
+     * <em>stream</em>: schema message, exactly one {@code RecordBatch}, then
+     * end-of-stream.
+     *
+     * <p>The unit the untyped client surface ({@link farm.query.vgirpc.RawStream},
+     * {@code RpcConnection.callUnaryRaw}) hands back, and the unit a caller
+     * relaying batches between two peers needs. Deliberately a whole stream
+     * rather than a bare batch message: a bare message cannot be read without
+     * the schema that preceded it, so it is not self-describing and cannot
+     * cross a process boundary on its own.</p>
+     *
+     * @param root the batch to frame
+     * @param customMetadata the batch's Arrow custom metadata, or {@code null}
+     * @param dictionaries dictionaries for encoded fields, or {@code null}
+     * @return the framed one-batch IPC stream
+     * @throws IOException on a write failure
+     */
+    public static byte[] writeOneBatch(VectorSchemaRoot root, Map<String, String> customMetadata,
+                                       DictionaryProvider dictionaries) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        try (IpcStreamWriter w = new IpcStreamWriter(buf)) {
+            w.writeSchema(root.getSchema());
+            if (dictionaries != null) w.writeBatch(root, customMetadata, dictionaries);
+            else w.writeBatch(root, customMetadata);
+        }
+        return buf.toByteArray();
+    }
+
+    /**
+     * Frame an empty (zero-row) batch of {@code schema} carrying
+     * {@code customMetadata} as a complete one-batch IPC stream.
+     *
+     * @param schema the schema to declare
+     * @param customMetadata the batch's Arrow custom metadata, or {@code null}
+     * @return the framed one-batch IPC stream
+     * @throws IOException on a write failure
+     */
+    public static byte[] writeOneEmptyBatch(Schema schema, Map<String, String> customMetadata)
+            throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        try (IpcStreamWriter w = new IpcStreamWriter(buf)) {
+            w.writeSchema(schema);
+            writeZeroBatch(w, schema, customMetadata);
+        }
+        return buf.toByteArray();
+    }
+
+    /**
      * Build a complete IPC stream carrying a single error batch — the wire shape
      * an intermediary returns to deny or abort a call in-band. The client decodes
      * it back into a raised exception.

@@ -141,9 +141,27 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
      */
     @Override
     public AnnotatedBatch tick() {
+        return tick(null);
+    }
+
+    /**
+     * Send a tick carrying per-tick Arrow custom metadata, and return the next
+     * data batch from the producer.
+     *
+     * <p>The tick batch is still zero-row — it carries no data, only the
+     * metadata a caller wants the worker to see for this turn (a trace
+     * context, a deadline, a cursor of the caller's own). The returned batch's
+     * root is owned by the reader and reused on the next call.</p>
+     *
+     * @param customMetadata metadata to stamp on the tick batch, or {@code null}
+     * @return the next output {@link AnnotatedBatch}
+     * @throws NoSuchElementException when the producer has finished
+     * @throws RpcError on transport failure or if the server reported an error
+     */
+    public AnnotatedBatch tick(Map<String, String> customMetadata) {
         ensureNotClosed();
         try {
-            writeTickOrBatch(null, null, null);
+            writeTickOrBatch(null, customMetadata, null);
             return readNextDataBatch();
         } catch (NoSuchElementException e) {
             close();
