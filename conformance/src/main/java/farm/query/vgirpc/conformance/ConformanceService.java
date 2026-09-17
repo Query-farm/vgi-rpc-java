@@ -167,6 +167,7 @@ public interface ConformanceService {
     RpcStream<? extends ProducerState> produce_empty();
     RpcStream<? extends ProducerState> produce_single();
     RpcStream<? extends ProducerState> produce_large_batches(long rows_per_batch, long batch_count);
+    RpcStream<? extends ProducerState> produce_annotated_batches(long count, long rows_per_batch);
     RpcStream<? extends ProducerState> produce_with_logs(long count);
     RpcStream<? extends ProducerState> produce_error_mid_stream(long emit_before_error);
     RpcStream<? extends ProducerState> produce_error_on_init();

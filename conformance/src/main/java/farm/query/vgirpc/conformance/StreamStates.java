@@ -21,7 +21,9 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /** RpcStream-state implementations used by the conformance service. */
 final class StreamStates {
@@ -43,6 +45,12 @@ final class StreamStates {
     static final Schema TICK_METADATA_SCHEMA = new Schema(List.of(
             i64("index"),
             new Field("seen", FieldType.notNullable(new ArrowType.Utf8()), null)));
+
+    /** Single <em>nullable</em> int64 column {@code value} — the annotated producer's output.
+     *  Nullable rather than not-null to match the reference field-for-field: the
+     *  protocol hash covers nullability, so a not-null column here would drift. */
+    static final Schema ANNOTATED_SCHEMA = new Schema(List.of(
+            new Field("value", FieldType.nullable(new ArrowType.Int(64, true)), null)));
 
     /** Single int64 column {@code value} — used by the sticky session streams. */
     static final Schema COUNTER_SINGLE_SCHEMA = new Schema(List.of(i64("value")));
@@ -181,6 +189,55 @@ final class StreamStates {
         @Override public void produce(OutputCollector out, CallContext ctx) {
             if (current >= batchCount) { out.finish(); return; }
             out.emit(counterRows(current * rowsPerBatch, rowsPerBatch));
+            current++;
+        }
+    }
+
+    /** Constant emit label, deliberately non-ASCII: a port that round-trips batch
+     *  metadata through a latin-1 or C-string path fails here rather than in
+     *  someone's production data. */
+    static final String ANNOTATED_EMIT_LABEL = "\u00fcn\u00efcode-\u03bb";
+
+    /** Emits {@code count} batches of {@code rowsPerBatch} rows, each carrying
+     *  distinct per-emit custom metadata.
+     *
+     *  <p>Pins the one place per-batch metadata and externalization meet. Two
+     *  sibling ports shipped opposite defects there: one refused to externalize
+     *  any batch carrying metadata (treating "has metadata" as a proxy for "is a
+     *  control batch"), the other externalized and then <em>replaced</em> the
+     *  result's metadata, erasing {@code vgi_rpc.location}. This port is immune by
+     *  construction — {@link OutputCollector.Entry#isData()} classifies the entry
+     *  explicitly instead of inferring it from metadata presence, and the metadata
+     *  rides the payload into the externalizer rather than being stamped onto the
+     *  pointer afterwards. Keep it that way: any code that makes metadata
+     *  <em>presence</em> load-bearing reintroduces one of the two defects.
+     *
+     *  <p>{@code batch_index} varies per batch and the suite checks which batch
+     *  carried which value, so a port that caches the first turn's metadata and
+     *  reuses it fails rather than passing on the constant label alone. */
+    static final class AnnotatedProducer extends ProducerState {
+        final long count;
+        final long rowsPerBatch;
+        long current;
+        AnnotatedProducer(long count, long rowsPerBatch) {
+            this.count = count;
+            this.rowsPerBatch = rowsPerBatch;
+        }
+        @Override public void produce(OutputCollector out, CallContext ctx) {
+            if (current >= count) { out.finish(); return; }
+            long base = current * 1_000_000L;
+            VectorSchemaRoot root = VectorSchemaRoot.create(ANNOTATED_SCHEMA, Allocators.root());
+            root.allocateNew();
+            BigIntVector values = (BigIntVector) root.getVector(0);
+            for (int i = 0; i < rowsPerBatch; i++) {
+                values.setSafe(i, base + i);
+            }
+            root.setRowCount((int) rowsPerBatch);
+            Map<String, String> md = new LinkedHashMap<>();
+            md.put("conformance.batch_index", Long.toString(current));
+            md.put("conformance.batch_total", Long.toString(count));
+            md.put("conformance.emit_label", ANNOTATED_EMIT_LABEL);
+            out.emit(root, md);
             current++;
         }
     }

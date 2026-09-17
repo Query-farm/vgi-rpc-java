@@ -156,6 +156,10 @@ public final class ConformanceServiceImpl implements ConformanceService {
     @Override public RpcStream<StreamStates.Large> produce_large_batches(long rpb, long bc) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.Large(rpb, bc));
     }
+    @Override public RpcStream<StreamStates.AnnotatedProducer> produce_annotated_batches(long count, long rows_per_batch) {
+        return RpcStream.producer(StreamStates.ANNOTATED_SCHEMA,
+                new StreamStates.AnnotatedProducer(count, rows_per_batch));
+    }
     @Override public RpcStream<StreamStates.LoggingProducer> produce_with_logs(long count) {
         return RpcStream.producer(StreamStates.COUNTER_SCHEMA, new StreamStates.LoggingProducer(count));
     }
