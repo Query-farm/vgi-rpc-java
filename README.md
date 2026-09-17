@@ -43,11 +43,11 @@ Artifacts are published to Maven Central under the `farm.query` group.
 
 ```kotlin
 dependencies {
-    implementation("farm.query:vgirpc:0.25.1")          // core: protocol, transports, HTTP, schema
-    implementation("farm.query:vgirpc-iroh:0.25.1")     // optional: official native Iroh binding
-    implementation("farm.query:vgirpc-oauth:0.25.1")    // optional: JWT / OAuth / PKCE auth
-    implementation("farm.query:vgirpc-s3:0.25.1")       // optional: S3 external storage
-    implementation("farm.query:vgirpc-gcs:0.25.1")      // optional: GCS external storage
+    implementation("farm.query:vgirpc:0.25.2")          // core: protocol, transports, HTTP, schema
+    implementation("farm.query:vgirpc-iroh:0.25.2")     // optional: official native Iroh binding
+    implementation("farm.query:vgirpc-oauth:0.25.2")    // optional: JWT / OAuth / PKCE auth
+    implementation("farm.query:vgirpc-s3:0.25.2")       // optional: S3 external storage
+    implementation("farm.query:vgirpc-gcs:0.25.2")      // optional: GCS external storage
 }
 ```
 
@@ -57,7 +57,7 @@ dependencies {
 <dependency>
   <groupId>farm.query</groupId>
   <artifactId>vgirpc</artifactId>
-  <version>0.25.1</version>
+  <version>0.25.2</version>
 </dependency>
 ```
 
@@ -186,6 +186,11 @@ A request naming a protocol this server does not host is refused with `ProtocolN
 (`protocol_not_supported`), distinct from `protocol_not_specified` for a request that named none
 and from `method_not_implemented` for a hosted protocol missing the method. A client probing for
 an optional protocol depends on telling those apart.
+
+The same answer comes back from `vgi_rpc.Reflection.v1`'s `describe`, which asks the same question
+with the name as an argument rather than as a routing key. Both check the name against the grammar
+*before* the lookup, so a name that cannot be a protocol name is refused without being echoed back
+in the message.
 
 ## Wire compatibility
 

@@ -38,6 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -210,6 +211,71 @@ final class ReflectionSelfDescriptionTest {
         assertTrue(advertised.containsKey(Reflection.PROTOCOL_NAME),
                 "reflection appears in its own output: self-description is not special-cased");
         assertEquals(REFLECTION_CANONICAL_HASH, advertised.get(Reflection.PROTOCOL_NAME));
+    }
+
+    @Test
+    void describingAProtocolThisServerDoesNotHostIsProtocolNotSupported() throws Exception {
+        // The same question raw dispatch answers, asked through reflection instead: "do you
+        // host this?". It used to be answered with a different error class here --
+        // IllegalArgumentException, which arrives with no error_kind at all -- so a client
+        // could not handle "not hosted" uniformly across the two surfaces. Reflection is
+        // exactly the surface a mismatched client reaches for to find out WHAT mismatched,
+        // so it is the worst one on which to answer in a shape nothing can pattern-match.
+        RpcServer srv = new RpcServer(Ledger.class, new LedgerImpl(), "srv-refl");
+        RpcError e = assertThrows(RpcError.class,
+                () -> call(srv, "describe", utf8("protocol"), Map.of("protocol", "other.v1")));
+        assertEquals(ProtocolNotSupportedError.ERROR_KIND, e.errorKind(),
+                "reflection and raw dispatch must give a client the same answer to the same "
+                        + "question: " + e.getMessage());
+        assertTrue(e.getMessage().contains("does not host protocol 'other.v1'"), e.getMessage());
+        assertTrue(e.getMessage().contains(Reflection.PROTOCOL_NAME),
+                "the refusal names what IS hosted, or the client has to ask again: "
+                        + e.getMessage());
+    }
+
+    @Test
+    void describingAnUnnameableProtocolDoesNotEchoIt() throws Exception {
+        // The grammar is checked BEFORE the lookup, so a request-supplied string never reaches
+        // an error message, a log field or a metric label. Raw dispatch was hardened this way;
+        // leaving reflection echoing the same class of string makes that hardening decorative,
+        // since reflection takes the name as an ordinary argument from the same callers.
+        RpcServer srv = new RpcServer(Ledger.class, new LedgerImpl(), "srv-refl");
+        String hostile = "<script>alert(1)</script>";
+        RpcError e = assertThrows(RpcError.class,
+                () -> call(srv, "describe", utf8("protocol"), Map.of("protocol", hostile)));
+        assertEquals(ProtocolNotSupportedError.ERROR_KIND, e.errorKind(), e.getMessage());
+        assertTrue(e.getMessage().contains("is not a protocol name"), e.getMessage());
+        assertFalse(e.getMessage().contains(hostile),
+                "an unvalidated request string must not be repeated back: " + e.getMessage());
+    }
+
+    @Test
+    void describingIsStillExemptFromTheVersionGate() throws Exception {
+        // The refusal above must not become a reason to refuse callers reflection exists to
+        // serve. A version-mismatched client calls describe to learn what it mismatched on;
+        // the tightening is about WHICH error a genuinely unhosted name gets, not about
+        // refusing more.
+        RpcServer srv = new RpcServer(Ledger.class, new LedgerImpl(), "srv-refl");
+        srv.setProtocolVersion("9.9.9");
+        Map<String, Object> row = call(srv, "describe", utf8("protocol"),
+                Map.of("protocol", "Ledger"));
+        Description desc = readDescription((byte[]) row.get("result"));
+        assertEquals("Ledger", desc.protocol);
+        assertEquals(List.of("echo"), desc.methods.stream().map(m -> m.name).toList());
+    }
+
+    @Test
+    void listProtocolsTakesNoNameAndSoHasNothingToEcho() throws Exception {
+        // The sibling check. `describe` is reflection's only name-taking method -- the surface
+        // is two methods wide and list_protocols takes no arguments at all -- so there is no
+        // second place on this protocol for an unvalidated string to arrive.
+        assertEquals(List.of(), Reflection.methodTable().get("list_protocols")
+                .paramsSchema().getFields());
+        RpcServer srv = new RpcServer(Ledger.class, new LedgerImpl(), "srv-refl");
+        Map<String, String> advertised = readProtocolList(
+                (byte[]) call(srv, "list_protocols", new Schema(List.of()), Map.of()).get("result"));
+        assertTrue(advertised.containsKey("Ledger"));
+        assertTrue(advertised.containsKey(Reflection.PROTOCOL_NAME));
     }
 
     @Test

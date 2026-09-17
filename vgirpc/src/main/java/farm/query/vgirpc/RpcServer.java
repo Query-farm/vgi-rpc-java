@@ -770,13 +770,8 @@ public final class RpcServer {
                 // without being echoed, so a request-supplied string never reaches an error
                 // message, a log field or a metric label.
                 if (!protocolName().equals(requestProtocol)) {
-                    ProtocolNotSupportedError refusal = ProtocolNames.isValid(requestProtocol)
-                            ? new ProtocolNotSupportedError(
-                                    "This server does not host protocol '" + requestProtocol
-                                            + "'. Hosted: " + hostedProtocolNames() + ".")
-                            : new ProtocolNotSupportedError(
-                                    "The 'vgi_rpc.protocol' routing key is not a protocol name. "
-                                            + "Hosted: " + hostedProtocolNames() + ".");
+                    ProtocolNotSupportedError refusal = protocolNotHosted(
+                            requestProtocol, "The 'vgi_rpc.protocol' routing key");
                     Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, refusal, serverId);
                     transport.writer().flush();
                     return;
@@ -1521,10 +1516,21 @@ public final class RpcServer {
             } else {
                 // Named, not silently empty: an empty description reads as
                 // "this protocol has no methods".
+                //
+                // And refused with the SAME error raw dispatch gives the same question. This
+                // used to throw IllegalArgumentException, which carries no error_kind at all,
+                // so a client asking "do you host X?" got one shape when it addressed X
+                // directly and another when it asked reflection -- on the one surface a
+                // mismatched client reaches for precisely to find out what mismatched. The
+                // grammar is checked before the lookup for the same reason it is there: the
+                // name is request-supplied, and an unnameable one is never echoed into a
+                // message, a log field or a metric label.
+                //
+                // Only the error changes. Reflection stays exempt from the application
+                // protocol's version gate -- this is the call that diagnoses a version
+                // mismatch, so it must keep answering the clients it exists to serve.
                 Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
-                        new IllegalArgumentException(
-                                "This server does not host protocol '" + requested + "'. Hosted: "
-                                        + hostedProtocolNames()),
+                        protocolNotHosted(requested, "The 'protocol' argument to describe"),
                         serverId);
                 transport.writer().flush();
                 return;
@@ -1542,6 +1548,37 @@ public final class RpcServer {
         // The framework's ordinary convention for a structured return: the
         // payload rides as serialized bytes in a single `result` binary column.
         writeReflectionResult(transport, payload);
+    }
+
+    /**
+     * Refuse a protocol name this server does not host, without echoing an unnameable one.
+     *
+     * <p>Shared by raw dispatch (where the name arrives as the {@code vgi_rpc.protocol} routing
+     * key) and by reflection's {@code describe} (where it arrives as an ordinary argument), so the
+     * two cannot answer the same question differently. They did: dispatch answered the specified
+     * {@code ProtocolNotSupportedError} and checked the grammar first, while describe threw
+     * {@code IllegalArgumentException} and echoed whatever it was given. The conformance suite was
+     * green either way, which is how the divergence survived a commit whose whole subject was this
+     * refusal.
+     *
+     * <p>The grammar is checked <em>before</em> the lookup: a candidate that cannot be a protocol
+     * name at all is refused without being repeated, so a request-supplied string never reaches an
+     * error message, a log field or a metric label. Both branches are the same error kind --
+     * "unnameable" and "not here" are one answer to the caller ("you cannot reach that protocol
+     * through this server"), and splitting them would make a client parse prose to find out.
+     *
+     * @param requested the name as received, request-supplied and not yet validated
+     * @param carrier how to name the field it arrived in, for the branch that cannot quote it
+     * @return the refusal to write back
+     */
+    private ProtocolNotSupportedError protocolNotHosted(String requested, String carrier) {
+        return ProtocolNames.isValid(requested)
+                ? new ProtocolNotSupportedError(
+                        "This server does not host protocol '" + requested + "'. Hosted: "
+                                + hostedProtocolNames() + ".")
+                : new ProtocolNotSupportedError(
+                        carrier + " is not a protocol name. Hosted: "
+                                + hostedProtocolNames() + ".");
     }
 
     /** The protocols this server routes, for a diagnostic that must name them. */
