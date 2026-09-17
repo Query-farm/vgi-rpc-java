@@ -5,6 +5,7 @@ package farm.query.vgirpc.identity;
 
 import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.AuthScope;
+import farm.query.vgirpc.ProtocolNotSupportedError;
 import farm.query.vgirpc.Reflection;
 import farm.query.vgirpc.RpcError;
 import farm.query.vgirpc.RpcMethodInfo;
@@ -199,9 +200,16 @@ final class IdentityServerWiringTest {
         RpcError err = assertThrows(RpcError.class, () ->
                 call(bare, caller("proxy"), Identity.PROTOCOL_NAME, "introspect_token",
                         new LinkedHashMap<>(Map.of("token", "good"))));
-        // It falls through to the application method table, which has never
-        // heard of it -- the protocol is absent in every sense.
-        assertTrue(err.getMessage().contains("introspect_token"), err.getMessage());
+        // The protocol is absent in every sense -- so the answer is "this server does not host
+        // that protocol", not "that protocol has no such method". A proxy probing for a
+        // credential oracle depends on the difference: the second reads as "the oracle is here,
+        // configured differently", and would have it retry against a worker that has none.
+        //
+        // This used to fall through to the application method table and report an unknown
+        // METHOD, because raw dispatch accepted any routing key it was given. That was the same
+        // leniency that let a client address this worker by any name at all.
+        assertEquals(ProtocolNotSupportedError.ERROR_KIND, err.errorKind(), err.getMessage());
+        assertTrue(err.getMessage().contains(Identity.PROTOCOL_NAME), err.getMessage());
     }
 
     @Test

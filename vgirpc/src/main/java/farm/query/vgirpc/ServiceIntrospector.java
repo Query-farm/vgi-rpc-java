@@ -25,6 +25,9 @@ public final class ServiceIntrospector {
 
     private static final Map<Class<?>, Map<String, RpcMethodInfo>> CACHE = new ConcurrentHashMap<>();
 
+    /** Resolved wire names. Memoised because dispatch asks for one several times per call. */
+    private static final Map<Class<?>, String> NAME_CACHE = new ConcurrentHashMap<>();
+
     private ServiceIntrospector() {}
 
     /**
@@ -42,16 +45,49 @@ public final class ServiceIntrospector {
     /**
      * The wire name of the protocol a service interface defines -- its routing key.
      *
-     * <p>The interface's simple name, matching the reference, which uses the Protocol class name
-     * when it declares no explicit {@code protocol_name}. Read from one place because the server
+     * <p>{@link farm.query.vgirpc.schema.ProtocolName} when the interface declares one, else the
+     * interface's simple name -- matching the reference, which uses the Protocol class name when
+     * it declares no explicit {@code protocol_name}. Read from one place because the server
      * advertises it and the client stamps it on every request: derived separately on each side,
      * they would drift, and a drifted routing key fails as a 404 rather than as a type error.
      *
+     * <p>The declaration is read from the interface's <em>own</em> annotations, never an
+     * inherited one, mirroring the reference's {@code vars(protocol)} lookup. An interface that
+     * extends a declared protocol and stays silent gets its own simple name rather than quietly
+     * answering to its parent's routing key.
+     *
      * @param serviceInterface the service interface
      * @return the protocol name carried in {@code vgi_rpc.protocol} and in the HTTP path
+     * @throws IllegalArgumentException if a declared name is malformed, over-long, or claims the
+     *     framework-reserved {@code vgi_rpc.} prefix
      */
     public static String protocolName(Class<?> serviceInterface) {
-        return serviceInterface.getSimpleName();
+        return NAME_CACHE.computeIfAbsent(serviceInterface, ServiceIntrospector::resolveProtocolName);
+    }
+
+    private static String resolveProtocolName(Class<?> serviceInterface) {
+        farm.query.vgirpc.schema.ProtocolName declared =
+                serviceInterface.getDeclaredAnnotation(farm.query.vgirpc.schema.ProtocolName.class);
+        if (declared == null) return serviceInterface.getSimpleName();
+        String name = declared.value();
+        // Thrown at introspection time -- which is worker construction, since RpcServer describes
+        // its interface in its constructor -- rather than on the first request. A name that
+        // cannot be routed makes every call fail; failing to start says so once, at the point
+        // where the declaration is.
+        if (!ProtocolNames.isValid(name)) {
+            throw new IllegalArgumentException(
+                    "@ProtocolName on " + serviceInterface.getName() + " is not a protocol name: "
+                            + "expected [A-Za-z_][A-Za-z0-9_.]* of at most "
+                            + ProtocolNames.MAX_BYTES + " UTF-8 bytes.");
+        }
+        if (ProtocolNames.isReserved(name)) {
+            throw new IllegalArgumentException(
+                    "@ProtocolName on " + serviceInterface.getName() + " claims the reserved '"
+                            + ProtocolNames.RESERVED_PREFIX + "' prefix, which is for protocols "
+                            + "the framework defines. An application protocol that claimed it "
+                            + "could shadow " + Reflection.PROTOCOL_NAME + ".");
+        }
+        return name;
     }
 
     /**

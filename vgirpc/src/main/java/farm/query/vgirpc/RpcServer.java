@@ -64,7 +64,9 @@ public final class RpcServer {
      */
     public static final String RETIRED_DESCRIBE_METHOD = "__describe__";
 
-    private final Class<?> serviceInterface;
+    /** Resolved once, in the constructor: an unroutable @ProtocolName must refuse to start the
+     *  worker rather than fail every request, and dispatch asks for the name several times a call. */
+    private final String protocolName;
     private final Object impl;
     private final String serverId;
     private final Map<String, RpcMethodInfo> methods;
@@ -104,7 +106,7 @@ public final class RpcServer {
      * @param serverId stable identifier echoed in response metadata
      */
     public RpcServer(Class<?> serviceInterface, Object impl, String serverId) {
-        this.serviceInterface = serviceInterface;
+        this.protocolName = ServiceIntrospector.protocolName(serviceInterface);
         this.impl = impl;
         this.serverId = serverId;
         this.methods = new LinkedHashMap<>(ServiceIntrospector.describe(serviceInterface));
@@ -367,11 +369,12 @@ public final class RpcServer {
      */
     public String serverId() { return serverId; }
     /**
-     * The protocol name advertised in {@code __describe__}.
+     * This server's application-protocol wire name -- its routing key, and its HTTP path segment.
      *
-     * @return the service interface's simple name
+     * @return the interface's declared {@link farm.query.vgirpc.schema.ProtocolName}, else its
+     *     simple name
      */
-    public String protocolName() { return ServiceIntrospector.protocolName(serviceInterface); }
+    public String protocolName() { return protocolName; }
     /**
      * Introspected method table for the service interface.
      *
@@ -719,39 +722,62 @@ public final class RpcServer {
                     serveTransportOptions(transport);
                     return;
                 }
+                // A reserved name this server does not offer, answered before routing is
+                // considered at all -- reserved names are owned by no protocol, so the answer
+                // cannot depend on which one the caller named, or on whether it named one. It is
+                // "no such method", not a routing complaint: the caller did nothing wrong with
+                // routing, and a client probing for optional introspection needs the capability
+                // answer. The one exception is __describe__, which is retired rather than merely
+                // absent -- see reservedMethodRefusal, and note that it is exactly the path a
+                // confused client reaches for, so answering it "this server does not host that
+                // protocol" would send the diagnosis in the wrong direction.
+                if (method.startsWith("__") && method.endsWith("__")) {
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                            reservedMethodRefusal(method),
+                            serverId);
+                    transport.writer().flush();
+                    return;
+                }
                 // Required, with no single-protocol exemption -- and checked only now, after the
-                // reserved server-level built-ins above. Those belong to no protocol, and
-                // __describe__ in particular is the diagnostic path a confused client reaches
-                // for, so demanding a routing key first would remove the tool exactly when it is
-                // needed. An application call that named nothing is refused: an intermediary
-                // that rebuilds a request and drops the field must be told, not landed silently
-                // on whichever protocol happens to be first.
-                //
-                // The name is NOT required to equal protocolName(). This port hosts exactly one
-                // application protocol, so there is nothing to mis-route to, and peers whose
-                // Protocol class name differs from the Java interface's simple name (the
-                // conformance suite's transport-kind probe among them) would otherwise be
-                // refused over a naming difference that costs nothing here.
+                // reserved server-level built-ins above. An application call that named nothing
+                // is refused: an intermediary that rebuilds a request and drops the field must be
+                // told, not landed silently on whichever protocol happens to be first.
                 if (requestProtocol == null) {
-                    if (method.startsWith("__") && method.endsWith("__")) {
-                        // A reserved name this server does not offer. The answer is "no such
-                        // method", not "you failed to name a protocol": the caller did nothing
-                        // wrong with routing, and a client probing for optional introspection
-                        // needs the capability answer rather than a routing complaint. The one
-                        // exception is __describe__, which is retired rather than merely absent
-                        // -- see reservedMethodRefusal.
-                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
-                                reservedMethodRefusal(method),
-                                serverId);
-                        transport.writer().flush();
-                        return;
-                    }
                     Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
                             new ProtocolNotSpecifiedError(
                                     "Request carries no 'vgi_rpc.protocol' routing key. Every "
                                             + "request must name the protocol it addresses. This "
                                             + "server hosts: " + hostedProtocolNames() + "."),
                             serverId);
+                    transport.writer().flush();
+                    return;
+                }
+                // ...and the name must be one this server actually hosts. Reflection and identity
+                // returned above, so the only binding left to match is the application protocol.
+                //
+                // This used to accept any non-empty string, justified as "this port hosts exactly
+                // one application protocol, so there is nothing to mis-route to". That was wrong
+                // twice over. It is not one protocol -- vgi_rpc.Reflection.v1 is registered
+                // unconditionally, and identity conditionally -- and accepting a name the server
+                // does not host is precisely the confused-deputy behaviour the routing key exists
+                // to prevent: an intermediary that rewrites the key, or a client addressing a
+                // protocol this worker does not speak, was answered as though it had reached the
+                // right one. WIRE_PROTOCOL.md 3.1 specifies three distinct answers, and a client
+                // probing for an optional protocol depends on telling "you do not speak this"
+                // (here) from "you speak it but lack this method" (below).
+                //
+                // The grammar is checked before the lookup, and a name that fails it is refused
+                // without being echoed, so a request-supplied string never reaches an error
+                // message, a log field or a metric label.
+                if (!protocolName().equals(requestProtocol)) {
+                    ProtocolNotSupportedError refusal = ProtocolNames.isValid(requestProtocol)
+                            ? new ProtocolNotSupportedError(
+                                    "This server does not host protocol '" + requestProtocol
+                                            + "'. Hosted: " + hostedProtocolNames() + ".")
+                            : new ProtocolNotSupportedError(
+                                    "The 'vgi_rpc.protocol' routing key is not a protocol name. "
+                                            + "Hosted: " + hostedProtocolNames() + ".");
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, refusal, serverId);
                     transport.writer().flush();
                     return;
                 }

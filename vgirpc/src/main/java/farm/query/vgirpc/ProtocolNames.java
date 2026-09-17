@@ -24,6 +24,29 @@ public final class ProtocolNames {
     public static final int MAX_BYTES = 255;
 
     /**
+     * The prefix reserved for protocols the framework itself defines ({@code vgi_rpc.Reflection.v1},
+     * {@code vgi_rpc.Identity.v1}).
+     *
+     * <p>An application protocol that claimed it could shadow one of those and make it unroutable
+     * on the server that hosts both -- reflection in particular, which is the one endpoint a
+     * confused client reaches for to find out what went wrong.
+     */
+    public static final String RESERVED_PREFIX = "vgi_rpc.";
+
+    /**
+     * Whether {@code name} claims the framework-reserved prefix.
+     *
+     * <p>Not part of {@link #isValid}: the framework's own names are valid and must stay routable,
+     * so this is a separate question asked only where an <em>application</em> declares a name.
+     *
+     * @param name the candidate, already known to match the grammar
+     * @return whether it is under {@link #RESERVED_PREFIX}
+     */
+    public static boolean isReserved(String name) {
+        return name != null && name.startsWith(RESERVED_PREFIX);
+    }
+
+    /**
      * Whether {@code name} can be a protocol name at all.
      *
      * <p>Deliberately a predicate rather than a thrower: every caller here answers an unroutable

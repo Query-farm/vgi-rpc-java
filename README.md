@@ -43,11 +43,11 @@ Artifacts are published to Maven Central under the `farm.query` group.
 
 ```kotlin
 dependencies {
-    implementation("farm.query:vgirpc:0.25.0")          // core: protocol, transports, HTTP, schema
-    implementation("farm.query:vgirpc-iroh:0.25.0")     // optional: official native Iroh binding
-    implementation("farm.query:vgirpc-oauth:0.25.0")    // optional: JWT / OAuth / PKCE auth
-    implementation("farm.query:vgirpc-s3:0.25.0")       // optional: S3 external storage
-    implementation("farm.query:vgirpc-gcs:0.25.0")      // optional: GCS external storage
+    implementation("farm.query:vgirpc:0.25.1")          // core: protocol, transports, HTTP, schema
+    implementation("farm.query:vgirpc-iroh:0.25.1")     // optional: official native Iroh binding
+    implementation("farm.query:vgirpc-oauth:0.25.1")    // optional: JWT / OAuth / PKCE auth
+    implementation("farm.query:vgirpc-s3:0.25.1")       // optional: S3 external storage
+    implementation("farm.query:vgirpc-gcs:0.25.1")      // optional: GCS external storage
 }
 ```
 
@@ -57,7 +57,7 @@ dependencies {
 <dependency>
   <groupId>farm.query</groupId>
   <artifactId>vgirpc</artifactId>
-  <version>0.25.0</version>
+  <version>0.25.1</version>
 </dependency>
 ```
 
@@ -160,6 +160,32 @@ start or download a helper executable.
 
 - **Unary** — request batch in, one result (or error) batch out.
 - **Streaming** — a `RpcStream<S extends StreamState>` whose state's `process(input, out, ctx)` runs once per tick, in two flavours: **producer** (server emits a sequence of output batches) and **exchange** (lockstep input batch → output batch).
+
+## Protocol names
+
+A service's **wire name** is its routing key: it rides every request as `vgi_rpc.protocol`, and
+over HTTP it is also the protocol path segment. By default it is the interface's simple name.
+Declare it explicitly when the name is a cross-implementation contract:
+
+```java
+@ProtocolName("orders.v2")
+@ProtocolVersion("2.0.0")
+public interface OrderService { ... }
+```
+
+Put the major version in the name. An incompatible major then becomes a *different* protocol and
+an unroutable request 404s — an answer every proxy and load balancer understands without an Arrow
+parser — and `orders.v1` and `orders.v2` can be served side by side while clients migrate. A Java
+simple name cannot express that shape at all, since no Java identifier contains a dot.
+
+The declaration is read from the interface's **own** annotations. An interface that extends a
+declared protocol and does not redeclare gets its own simple name rather than silently answering
+to its parent's routing key.
+
+A request naming a protocol this server does not host is refused with `ProtocolNotSupportedError`
+(`protocol_not_supported`), distinct from `protocol_not_specified` for a request that named none
+and from `method_not_implemented` for a hosted protocol missing the method. A client probing for
+an optional protocol depends on telling those apart.
 
 ## Wire compatibility
 
