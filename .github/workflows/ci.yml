@@ -410,14 +410,14 @@ jobs:
           python tools/cross-port/describe_diff.py --only java
 
       # identity_consistency covers what the hash cannot: the order the guards
-      # run in, the size of the window a rate limiter admits, whether an
-      # allowlist can be reached by omission, whether a transient failure is
-      # distinguishable from a definitive one. Six ports can agree on the
-      # digest to the last byte and disagree about all of it.
+      # run in, whether an allowlist can be reached by omission, whether a
+      # transient failure is distinguishable from a definitive one, and that no
+      # introspection rate limiter survives. Six ports can agree on the digest
+      # to the last byte and disagree about all of it.
       #
       # It is a grep over source, so it is weak by construction — it proves a
       # value is written, not that it is used, and the port's own
-      # TokenIntrospection tests are what establish behaviour. It finds
+      # IdentityProtocolTest is what establishes behaviour. It finds
       # identity files by content, so an empty matrix would mean it found no
       # files rather than that this port is clean: --verbose makes it name the
       # files it read, so a run that silently stopped matching is visible in

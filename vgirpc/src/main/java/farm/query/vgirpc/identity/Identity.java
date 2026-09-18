@@ -24,13 +24,23 @@ import java.util.List;
  * thing being protected, which the asker then acts on using credentials the worker does not hold
  * -- storage credentials, entitlement lookups, policy-tier selection. "Trust it as much as you
  * trust the worker" is the wrong frame: it must be trusted <em>more</em>. So every rejection is
- * uniform, the caller must be on an allowlist with no permissive default, a JWS-shaped subject
- * never reaches the resolver, and the whole thing is rate limited.
+ * uniform, the caller must be on an allowlist with no permissive default, and a JWS-shaped
+ * subject never reaches the resolver.
+ *
+ * <p>It is deliberately <strong>not rate limited</strong>. The allowlist is the control: the only
+ * callers are trusted askers, in practice a proxy. A per-caller limit there bounds only guessing,
+ * which is hopeless against a random credential at any rate, and not the real harm of a leaked
+ * introspector credential -- resolving a <em>stolen</em> credential to its owner takes one call.
+ * What it did do was harm: the asker calls on behalf of everyone who presents a bearer, so a
+ * per-caller budget is one budget for every user's login, drainable by unauthenticated junk
+ * credentials. Throttling untrusted traffic belongs where it arrives -- at the asker, per client
+ * -- and a throttled answer is never {@code introspection_refused}, which a caller may cache as
+ * definitive.
  *
  * <p>{@code issue_grant} mints a credential for the <em>calling</em> user, so it is not an oracle
- * about anybody else. It therefore needs no allowlist and no rate limit, and its rejections are
- * deliberately <em>actionable</em>: a console that cannot tell "your login is too old" from "no"
- * cannot know to re-prompt.
+ * about anybody else. It therefore needs no allowlist, and its rejections are deliberately
+ * <em>actionable</em>: a console that cannot tell "your login is too old" from "no" cannot know
+ * to re-prompt.
  *
  * <p>Method and parameter names are snake_case, and their declaration order is fixed. The
  * framework binds arguments by parameter name and derives the protocol hash from the schema, so
@@ -87,9 +97,9 @@ public interface Identity {
      *     before reaching the resolver, because routing one onward would hand a third party a
      *     token the asker may itself have rejected
      * @param ctx the calling context; the caller's own authenticated identity is what the
-     *     allowlist and the rate limiter are keyed on
+     *     allowlist is keyed on
      * @return the resolved identity
-     * @throws IntrospectionRefusedError when the caller may not introspect, or asks too often
+     * @throws IntrospectionRefusedError when the caller may not introspect
      * @throws TokenUnresolvedError when the credential does not resolve
      * @throws IdentityUnavailableError when the answer is not knowable
      */

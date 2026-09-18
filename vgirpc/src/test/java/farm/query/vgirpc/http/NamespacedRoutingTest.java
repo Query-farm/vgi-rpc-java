@@ -48,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -318,6 +319,41 @@ final class NamespacedRoutingTest {
     void getOnANonRouteIs404WhileGetOnARouteIs405() throws Exception {
         assertEquals(404, get("/NoSuchService/echo").statusCode());
         assertEquals(405, get("/EchoService/echo").statusCode());
+    }
+
+    /**
+     * The pre-0.46 {@code __introspect_token__} JSON route is retired, not merely unadvertised.
+     *
+     * <p>{@code IDENTITY_V1_SPEC.md} §8: a port MUST NOT serve it. This server is configured
+     * exactly the way the old route used to answer -- a resolver, and the calling principal on
+     * the introspector allowlist -- and the body names a credential that resolves. The answer is
+     * the reserved-method refusal every other unimplemented reserved name gets, the principal
+     * appears nowhere in it, and {@code /health} advertises no {@code VGI-Token-Introspection}.
+     * {@code vgi_rpc.Identity.v1} is the only introspection surface: two surfaces meant two sets
+     * of guards to keep identical, and the second had already kept a rate limiter the protocol
+     * dropped.
+     */
+    @Test
+    void theRetiredIntrospectTokenRouteIsNotServed() throws Exception {
+        HttpResponse<byte[]> resp;
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
+            resp = client.send(HttpRequest.newBuilder(URI.create(base + "/__introspect_token__"))
+                    .timeout(Duration.ofSeconds(20))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("{\"token\": \"good\"}"))
+                    .build(), HttpResponse.BodyHandlers.ofByteArray());
+        }
+        assertEquals(404, resp.statusCode());
+        RpcError err = errorOf(resp);
+        assertEquals("method_not_implemented", err.errorKind());
+        assertTrue(err.getMessage().contains("__introspect_token__"), err.getMessage());
+        assertFalse(new String(resp.body(), java.nio.charset.StandardCharsets.ISO_8859_1).contains("bob"),
+                "the retired route resolved the credential");
+
+        HttpResponse<byte[]> health = get("/health");
+        assertEquals(200, health.statusCode());
+        assertTrue(health.headers().firstValue("VGI-Token-Introspection").isEmpty(),
+                "/health still advertises the retired route");
     }
 
     // --- helpers -------------------------------------------------------------

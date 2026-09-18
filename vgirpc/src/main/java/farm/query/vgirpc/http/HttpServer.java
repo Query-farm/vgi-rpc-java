@@ -97,9 +97,12 @@ import java.util.concurrent.TimeoutException;
  *   stream (params). Response body is one Arrow IPC stream (result or error).</li>
  *   <li>{@code POST /vgi/{method}/init} and {@code /exchange} — streaming
  *   endpoints.</li>
- *   <li>{@code POST /vgi/__introspect_token__} — opaque credential to principal;
- *   refuses definitively unless {@link TokenIntrospection} is configured.</li>
  * </ul>
+ *
+ * <p>There is no {@code __introspect_token__} route. Credential introspection is
+ * the {@code vgi_rpc.Identity.v1} protocol (see {@link farm.query.vgirpc.identity.Identity}),
+ * reached like any other protocol; the retired JSON route now answers as an
+ * unimplemented reserved method.
  */
 public final class HttpServer {
 
@@ -238,10 +241,6 @@ public final class HttpServer {
      *  advertisement, so none of the three can disagree. Empty = never
      *  compress, and accept no compressed request bodies. */
     private final List<String> supportedEncodings;
-    /** The token-introspection endpoint, or {@code null} when no resolver was
-     *  configured. Null is the load-bearing state: no worker grows a
-     *  credential-to-identity oracle by upgrading a dependency. */
-    private final TokenIntrospection introspection;
     /** Browser access policy, or {@code null} when no origin was configured —
      *  CORS is opt-in, and off means not one {@code Access-Control-*} header. */
     private final CorsPolicy cors;
@@ -321,11 +320,6 @@ public final class HttpServer {
             this.sessionTokenKey = null;
             this.sessionRegistry = null;
         }
-        // Built before the CORS policy: corsExposeHeaders() reads this field, and
-        // the advertise/expose pair has to agree.
-        this.introspection = config.introspectResolver() == null ? null
-                : new TokenIntrospection(config.introspectResolver(), config.introspectPrincipals(),
-                        config.introspectTtlSeconds(), config.introspectRateLimitPerSecond());
         this.cors = config.corsOrigins().isEmpty()
                 ? null
                 : new CorsPolicy(config.corsOrigins(), config.corsMaxAgeSeconds(), corsExposeHeaders());
@@ -490,27 +484,6 @@ public final class HttpServer {
      *                         header. Default
      *                         {@value #DEFAULT_CORS_MAX_AGE_SECONDS}s. Ignored
      *                         when {@code corsOrigins} is empty.
-     * @param introspectResolver enables {@code POST {prefix}/__introspect_token__}.
-     *                         This is the on/off switch: {@code null} (the
-     *                         default) leaves the endpoint refusing definitively
-     *                         and holding no resolver, so no worker grows a
-     *                         credential-to-identity oracle by upgrading a
-     *                         dependency. See {@link TokenIntrospection}.
-     * @param introspectPrincipals principals permitted to introspect. Required
-     *                         whenever {@code introspectResolver} is set, with
-     *                         <em>no permissive default</em>: authentication and
-     *                         introspection are different capabilities, and a
-     *                         deployment where any valid credential may introspect
-     *                         lets any user resolve any other user's credential to
-     *                         its owner.
-     * @param introspectTtlSeconds cache lifetime reported to the asker when a
-     *                         {@link TokenIdentity} names none. Default
-     *                         {@value TokenIntrospection#DEFAULT_TTL_SECONDS}s.
-     * @param introspectRateLimitPerSecond introspection requests allowed per
-     *                         caller per second (default
-     *                         {@value TokenIntrospection#DEFAULT_RATE_LIMIT_PER_SECOND}).
-     *                         Bounds, rather than closes, the oracle an
-     *                         allowlisted-but-compromised caller still has.
      */
     public record Config(
             String host,
@@ -541,10 +514,6 @@ public final class HttpServer {
             LandingInfo landingInfo,
             List<String> corsOrigins,
             long corsMaxAgeSeconds,
-            TokenResolver introspectResolver,
-            List<String> introspectPrincipals,
-            long introspectTtlSeconds,
-            int introspectRateLimitPerSecond,
             List<PeerIdentityProvider> peerIdentityProviders,
             PeerAuthenticationPolicy peerAuthenticationPolicy,
             String peerServiceName,
@@ -553,63 +522,6 @@ public final class HttpServer {
             long hostingMaxRequestBytes,
             long hostingMaxResponseBytes,
             long preferredResponseBytes) {
-
-        /** Source-compatible constructor for the initial peer-identity configuration shape. */
-        public Config(
-                String host, int port, String prefix, byte[] tokenKey, long tokenTtlSeconds,
-                Authenticator authenticator, List<HttpPreHandler> preHandlers,
-                long maxRequestBytes, long maxResponseBytes, long idleTimeoutMs, int zstdLevel,
-                List<String> supportedEncodings, TlsConfig tls, boolean advertiseMaxRequestBytes,
-                UploadUrlProvider uploadUrlProvider, Long maxUploadBytes,
-                long advertisedMaxResponseBytes, long advertisedMaxExternalizedResponseBytes,
-                boolean proxyProofRequired, List<String> proxyAuthHeaders,
-                int callStateCacheMaxEntries, boolean stickyEnabled, long stickyDefaultTtlSeconds,
-                Map<String, String> stickyEchoHeaders, boolean exposeTestDrainAdmin,
-                LandingInfo landingInfo, List<String> corsOrigins, long corsMaxAgeSeconds,
-                TokenResolver introspectResolver, List<String> introspectPrincipals,
-                long introspectTtlSeconds, int introspectRateLimitPerSecond,
-                List<PeerIdentityProvider> peerIdentityProviders,
-                PeerAuthenticationPolicy peerAuthenticationPolicy, String peerServiceName,
-                long peerResolutionTimeoutMs) {
-            this(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator, preHandlers,
-                    maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, supportedEncodings,
-                    tls, advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
-                    advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
-                    proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries, stickyEnabled,
-                    stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin, landingInfo,
-                    corsOrigins, corsMaxAgeSeconds, introspectResolver, introspectPrincipals,
-                    introspectTtlSeconds, introspectRateLimitPerSecond, peerIdentityProviders,
-                    peerAuthenticationPolicy, peerServiceName, peerResolutionTimeoutMs, 64,
-                    0, 0, 0);
-        }
-
-        /**
-         * Source- and binary-compatible constructor from before peer identity
-         * providers were added. New fields take their disabled defaults.
-         */
-        public Config(
-                String host, int port, String prefix, byte[] tokenKey, long tokenTtlSeconds,
-                Authenticator authenticator, List<HttpPreHandler> preHandlers,
-                long maxRequestBytes, long maxResponseBytes, long idleTimeoutMs, int zstdLevel,
-                List<String> supportedEncodings, TlsConfig tls, boolean advertiseMaxRequestBytes,
-                UploadUrlProvider uploadUrlProvider, Long maxUploadBytes,
-                long advertisedMaxResponseBytes, long advertisedMaxExternalizedResponseBytes,
-                boolean proxyProofRequired, List<String> proxyAuthHeaders,
-                int callStateCacheMaxEntries, boolean stickyEnabled, long stickyDefaultTtlSeconds,
-                Map<String, String> stickyEchoHeaders, boolean exposeTestDrainAdmin,
-                LandingInfo landingInfo, List<String> corsOrigins, long corsMaxAgeSeconds,
-                TokenResolver introspectResolver, List<String> introspectPrincipals,
-                long introspectTtlSeconds, int introspectRateLimitPerSecond) {
-            this(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator, preHandlers,
-                    maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel, supportedEncodings,
-                    tls, advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
-                    advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
-                    proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries, stickyEnabled,
-                    stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin, landingInfo,
-                    corsOrigins, corsMaxAgeSeconds, introspectResolver, introspectPrincipals,
-                    introspectTtlSeconds, introspectRateLimitPerSecond,
-                    List.of(), null, null, 5_000, 64, 0, 0, 0);
-        }
 
         /** 1 hour. */
         public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
@@ -680,7 +592,6 @@ public final class HttpServer {
             proxyAuthHeaders = proxyAuthHeaders != null ? List.copyOf(proxyAuthHeaders) : List.of();
             stickyEchoHeaders = stickyEchoHeaders != null ? Map.copyOf(stickyEchoHeaders) : Map.of();
             corsOrigins = corsOrigins != null ? List.copyOf(corsOrigins) : List.of();
-            introspectPrincipals = introspectPrincipals != null ? List.copyOf(introspectPrincipals) : List.of();
             peerIdentityProviders = peerIdentityProviders != null ? List.copyOf(peerIdentityProviders) : List.of();
             supportedEncodings = supportedEncodings != null
                     ? normalizeEncodings(supportedEncodings)
@@ -722,20 +633,6 @@ public final class HttpServer {
                 throw new IllegalArgumentException("stickyDefaultTtlSeconds must be > 0 when sticky is enabled");
             }
             if (corsMaxAgeSeconds < 0) throw new IllegalArgumentException("corsMaxAgeSeconds must be >= 0");
-            // Validated at construction rather than at the first proxy preflight:
-            // a credential-to-identity oracle is not something to discover is
-            // misconfigured in production.
-            if (introspectResolver != null) {
-                TokenIntrospection.normalizeIntrospectors(introspectPrincipals);
-            } else if (!introspectPrincipals.isEmpty()) {
-                throw new IllegalArgumentException(
-                        "introspectPrincipals was given without introspectResolver; the endpoint stays "
-                                + "disabled, so the allowlist would have no effect. Pass both or neither.");
-            }
-            if (introspectTtlSeconds < 0) throw new IllegalArgumentException("introspectTtlSeconds must be >= 0");
-            if (introspectRateLimitPerSecond < 0) {
-                throw new IllegalArgumentException("introspectRateLimitPerSecond must be >= 0");
-            }
             if (peerResolutionTimeoutMs <= 0) {
                 throw new IllegalArgumentException("peerResolutionTimeoutMs must be > 0");
             }
@@ -807,10 +704,6 @@ public final class HttpServer {
             private LandingInfo landingInfo;
             private List<String> corsOrigins = List.of();
             private long corsMaxAgeSeconds = DEFAULT_CORS_MAX_AGE_SECONDS;
-            private TokenResolver introspectResolver;
-            private List<String> introspectPrincipals = List.of();
-            private long introspectTtlSeconds = TokenIntrospection.DEFAULT_TTL_SECONDS;
-            private int introspectRateLimitPerSecond = TokenIntrospection.DEFAULT_RATE_LIMIT_PER_SECOND;
             private List<PeerIdentityProvider> peerIdentityProviders = List.of();
             private PeerAuthenticationPolicy peerAuthenticationPolicy;
             private String peerServiceName;
@@ -1130,62 +1023,6 @@ public final class HttpServer {
             public Builder corsMaxAgeSeconds(long v) { this.corsMaxAgeSeconds = v; return this; }
 
             /**
-             * Enable {@code POST {prefix}/__introspect_token__}, which resolves an
-             * opaque bearer credential to a principal for a reverse proxy that
-             * must know the caller's identity before it can authorize.
-             *
-             * <p>Off unless called. A disabled worker still answers the path
-             * definitively ({@code 404 not_enabled}) while holding no resolver and
-             * looking nothing up — a caller that reads anything else as transient
-             * would otherwise retry forever against a worker that will never
-             * support the feature.
-             *
-             * <p>The resolver takes the credential and nothing else, deliberately:
-             * see {@link TokenResolver} for the four ways replaying it through this
-             * server's own {@link Authenticator} breaks. It never returns claims;
-             * see {@link TokenIdentity}.
-             *
-             * @param resolver resolves the subject credential; {@code null} disables
-             *        the endpoint (the default)
-             * @param principals principals permitted to introspect. Must name at
-             *        least one — there is no permissive default, because
-             *        "any authenticated caller" is exactly the configuration that
-             *        turns this endpoint into an open oracle
-             * @return this builder
-             */
-            public Builder tokenIntrospection(TokenResolver resolver, List<String> principals) {
-                this.introspectResolver = resolver;
-                this.introspectPrincipals = principals != null ? principals : List.of();
-                return this;
-            }
-            /**
-             * Cache lifetime reported to the asker when a {@link TokenIdentity}
-             * names none.
-             *
-             * <p>Treat it as an authorization window: for any path the asker serves
-             * without re-presenting the credential, that is exactly what it is.
-             *
-             * @param v the TTL in seconds (default
-             *        {@value TokenIntrospection#DEFAULT_TTL_SECONDS})
-             * @return this builder
-             */
-            public Builder introspectTtlSeconds(long v) { this.introspectTtlSeconds = v; return this; }
-            /**
-             * Introspection requests allowed per caller per second.
-             *
-             * <p>Bounds, rather than closes, the oracle an allowlisted caller whose
-             * own credential leaked still has — a ceiling on how fast an attacker
-             * converts guesses into answers.
-             *
-             * @param v the per-second ceiling (default
-             *        {@value TokenIntrospection#DEFAULT_RATE_LIMIT_PER_SECOND})
-             * @return this builder
-             */
-            public Builder introspectRateLimitPerSecond(int v) {
-                this.introspectRateLimitPerSecond = v; return this;
-            }
-
-            /**
              * Build the immutable config.
              *
              * @return the validated {@link Config}
@@ -1202,8 +1039,6 @@ public final class HttpServer {
                         proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries,
                         stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
                         landingInfo, corsOrigins, corsMaxAgeSeconds,
-                        introspectResolver, introspectPrincipals,
-                        introspectTtlSeconds, introspectRateLimitPerSecond,
                         peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
                         peerResolutionTimeoutMs, peerProviderConcurrency,
                         hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes);
@@ -1227,8 +1062,6 @@ public final class HttpServer {
                     proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries,
                     stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
                     p, corsOrigins, corsMaxAgeSeconds,
-                    introspectResolver, introspectPrincipals,
-                    introspectTtlSeconds, introspectRateLimitPerSecond,
                     peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
                     peerResolutionTimeoutMs, peerProviderConcurrency,
                     hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes);
@@ -1423,10 +1256,6 @@ public final class HttpServer {
             }
             if (exposeTestDrainAdmin && StickyHeaders.TEST_DRAIN_PATH.equals(rest)) {
                 handleTestDrain(req, resp, true);
-                return;
-            }
-            if (TokenIntrospection.ENDPOINT.equals(rest)) {
-                handleIntrospect(req, resp);
                 return;
             }
             if (UPLOAD_URL_METHOD.equals(rest) || (UPLOAD_URL_METHOD + "/init").equals(rest)) {
@@ -1632,10 +1461,6 @@ public final class HttpServer {
         if (proxyProofRequired) {
             resp.setHeader(ProxyProof.PROOF_REQUIRED_HEADER, "true");
         }
-        // Absent, never "false", when disabled: a proxy preflights on presence.
-        if (introspection != null) {
-            resp.setHeader(TokenIntrospection.ENABLED_HEADER, "true");
-        }
         if (stickyEnabled) {
             resp.setHeader(StickyHeaders.STICKY_ENABLED, "true");
             resp.setHeader(StickyHeaders.STICKY_TTL, Long.toString(stickyDefaultTtlSeconds));
@@ -1681,7 +1506,6 @@ public final class HttpServer {
             if (maxUploadBytes != null) expose.add(MAX_UPLOAD_BYTES_HEADER);
         }
         if (proxyProofRequired) expose.add(ProxyProof.PROOF_REQUIRED_HEADER);
-        if (introspection != null) expose.add(TokenIntrospection.ENABLED_HEADER);
         if (!proxyHint.isEmpty()) expose.add(HttpHeaders.VGI_AUTH_PROXY_REQUIRED);
         if (stickyEnabled) {
             expose.add(StickyHeaders.STICKY_ENABLED);
@@ -2238,31 +2062,6 @@ public final class HttpServer {
         }
         sessionRegistry.setDraining(drain);
         resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
-    }
-
-    /**
-     * {@code POST {prefix}/__introspect_token__}: resolve an opaque credential
-     * to a principal, or say definitively that this worker will not.
-     *
-     * <p>An {@link AuthException} from the caller's own authenticator collapses
-     * onto the same 403 a non-allowlisted caller gets. Distinguishing "your
-     * credential is bad" from "your credential is fine but you may not
-     * introspect" would tell an unauthorized caller which of the two it is, and
-     * both are equally final. An {@link AuthUnavailableException} is not caught
-     * here — it is not a rejection, and the servlet boundary renders it as 503.
-     */
-    private void handleIntrospect(HttpServletRequest req, HttpServletResponse resp) throws IOException {
-        if (introspection == null) {
-            TokenIntrospection.writeNotEnabled(resp);
-            return;
-        }
-        AuthContext auth;
-        try {
-            auth = authenticateIdentity(req).auth();
-        } catch (AuthException e) {
-            auth = AuthContext.ANONYMOUS;
-        }
-        introspection.handle(req, resp, auth);
     }
 
     /**

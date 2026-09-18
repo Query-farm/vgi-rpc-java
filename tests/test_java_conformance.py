@@ -123,8 +123,6 @@ def _worker(*args: str) -> list[str]:
             proof += [flags[i], flags[i + 1]]
             i += 2
         return proof
-    if "--introspect" in flags:
-        pytest.skip("the reference HTTP server exposes no --introspect mode")
 
     # Byte-stream transports: one CLI, three flags.
     if "--unix" in flags:
@@ -711,19 +709,6 @@ def conformance_http_capped_access_log(
         yield port, log_path
     finally:
         next(gen, None)
-
-
-@pytest.fixture(scope="session")
-def conformance_http_introspect_port() -> Iterator[int]:
-    """Spawn an HTTP worker with token introspection enabled.
-
-    Backs the shared ``TestTokenIntrospection`` group. It needs its own worker
-    because the endpoint resolves nothing unless explicitly enabled -- which
-    ``TestTokenIntrospectionOffMode`` asserts against the default one. The
-    worker is configured with the exact introspector / subject / JWS-trap
-    constants the shared suite posts; anything else reads as "did not resolve".
-    """
-    yield from _start_http_worker("--http", "--introspect")
 
 
 @pytest.fixture(scope="session")

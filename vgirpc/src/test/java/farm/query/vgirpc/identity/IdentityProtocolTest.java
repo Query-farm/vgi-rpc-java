@@ -298,18 +298,6 @@ final class IdentityProtocolTest {
             }
         }
 
-        /** The rate limit is also ahead of the subject: same reason, same order. */
-        @Test
-        void theRateLimitPrecedesEveryLookAtTheSubject() {
-            IdentityImpl impl = IdentityImpl.builder()
-                    .resolveToken(RESOLVER).introspectPrincipals("proxy")
-                    .introspectRateLimit(1).build();
-            assertEquals("bob", impl.introspect_token("good", ctx(auth("proxy"))).principal());
-            IntrospectionRefusedError err = assertThrows(IntrospectionRefusedError.class,
-                    () -> impl.introspect_token("aaa.bbb.ccc", ctx(auth("proxy"))));
-            assertTrue(err.getMessage().contains("rate limit"), err.getMessage());
-        }
-
         /**
          * The cap actually fires on the dispatch path -- not merely in the guard.
          *
@@ -422,18 +410,67 @@ final class IdentityProtocolTest {
                     new IdentityUnavailableError("store is down", 30, null).retryAfterSeconds());
         }
 
-        /** Bounds, rather than closes, the oracle an allowlisted caller still has. */
+        /**
+         * The allowlisted caller is answered however often it asks.
+         *
+         * <p>The caller is the asker -- a proxy -- introspecting on behalf of every client that
+         * presents a bearer, so a per-caller limit was one budget for every user's login,
+         * drainable by unauthenticated junk credentials. And it refused with
+         * {@code introspection_refused}, the kind a caller may cache as definitive.
+         */
         @Test
-        void rateLimited() {
-            IdentityImpl impl = IdentityImpl.builder()
-                    .resolveToken(RESOLVER).introspectPrincipals("proxy")
-                    .introspectRateLimit(2).build();
+        void introspectionIsNotRateLimited() {
+            IdentityImpl impl = resolving();
             CallContext c = ctx(auth("proxy"));
-            assertEquals("bob", impl.introspect_token("good", c).principal());
-            assertEquals("bob", impl.introspect_token("good", c).principal());
-            IntrospectionRefusedError err = assertThrows(IntrospectionRefusedError.class,
-                    () -> impl.introspect_token("good", c));
-            assertTrue(err.getMessage().contains("rate limit"), err.getMessage());
+            for (int i = 0; i < 500; i++) {
+                assertEquals("bob", impl.introspect_token("good", c).principal());
+            }
+        }
+
+        /**
+         * Nor is a concurrent burst -- the shape that used to trip the limiter in production.
+         *
+         * <p>Sixty calls from twelve threads land well inside one second, three times the retired
+         * default of twenty per caller per second. Mirrors the shared suite's
+         * {@code TestIntrospectionIsNotThrottled}.
+         */
+        @Test
+        void aConcurrentBurstFromTheIntrospectorIsAnsweredInFull() throws Exception {
+            IdentityImpl impl = resolving();
+            CallContext c = ctx(auth("proxy"));
+            java.util.concurrent.ExecutorService pool =
+                    java.util.concurrent.Executors.newFixedThreadPool(12);
+            try {
+                List<java.util.concurrent.Future<String>> outcomes = new ArrayList<>();
+                for (int i = 0; i < 60; i++) {
+                    outcomes.add(pool.submit(() -> {
+                        try {
+                            return impl.introspect_token("good", c).principal();
+                        } catch (RuntimeException e) {
+                            return e.getClass().getSimpleName() + ": " + e.getMessage();
+                        }
+                    }));
+                }
+                for (java.util.concurrent.Future<String> f : outcomes) {
+                    assertEquals("bob", f.get());
+                }
+            } finally {
+                pool.shutdownNow();
+            }
+        }
+
+        /**
+         * The option is gone, not ignored: this port has no published caller that passes it.
+         *
+         * <p>The reference keeps its keyword as a deprecated no-op for one release only because a
+         * published vgi-python passes it; the spec says a port without one removes it outright.
+         */
+        @Test
+        void thereIsNoRateLimitToConfigure() {
+            for (Method m : IdentityImpl.Builder.class.getMethods()) {
+                assertFalse(m.getName().toLowerCase(java.util.Locale.ROOT).contains("ratelimit"),
+                        "IdentityImpl.Builder still offers " + m);
+            }
         }
 
         /** There is no permissive default, so it cannot be reached by omission. */
@@ -466,7 +503,7 @@ final class IdentityProtocolTest {
 
     // --- issuance ----------------------------------------------------------
 
-    /** Issuance is always about the caller, so it needs neither allowlist nor limit. */
+    /** Issuance is always about the caller, so it needs no allowlist. */
     @Nested
     final class IssuanceIsNotAnOracle {
 
@@ -865,84 +902,6 @@ final class IdentityProtocolTest {
 
         private String escape(String s) {
             return "\"" + s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "\"";
-        }
-    }
-
-    // --- the limiter -------------------------------------------------------
-
-    /** Fixed-window, because the state is one integer rather than an aged float. */
-    @Nested
-    final class Limiter {
-
-        /** Within a window. */
-        @Test
-        void admitsUpToTheLimit() {
-            RateLimiter limiter = new RateLimiter(3);
-            assertEquals(List.of(true, true, true, false),
-                    List.of(limiter.allow("a", 100.0), limiter.allow("a", 100.0),
-                            limiter.allow("a", 100.0), limiter.allow("a", 100.0)));
-        }
-
-        /** A new window resets the count. */
-        @Test
-        void windowRolls() {
-            RateLimiter limiter = new RateLimiter(1);
-            assertTrue(limiter.allow("a", 100.0));
-            assertFalse(limiter.allow("a", 100.5));
-            assertTrue(limiter.allow("a", 101.5));
-        }
-
-        /** One caller exhausting its budget must not refuse another. */
-        @Test
-        void callersAreIndependent() {
-            RateLimiter limiter = new RateLimiter(1);
-            assertTrue(limiter.allow("a", 100.0));
-            assertTrue(limiter.allow("b", 100.0));
-            assertFalse(limiter.allow("a", 100.0));
-        }
-
-        /**
-         * Whole-map reset rather than per-key ageing, so an attacker cannot grow the map.
-         *
-         * <p>Per-key ageing would let a caller cycling keys grow the map without bound between
-         * sweeps.
-         */
-        @Test
-        void cyclingKeysCannotGrowTheMap() {
-            RateLimiter limiter = new RateLimiter(1);
-            for (int i = 0; i < 1000; i++) limiter.allow("k" + i, 100.0);
-            limiter.allow("fresh", 200.0);
-            assertEquals(1, limiter.trackedKeys());
-        }
-
-        /**
-         * A limiter that can be beaten by racing it is not a limiter.
-         *
-         * <p>A worker serves concurrent requests from a pool, so two threads reading the same
-         * count and both admitting is not a hypothetical.
-         */
-        @Test
-        void isSafeUnderConcurrency() throws Exception {
-            int threads = 8;
-            int perThread = 250;
-            RateLimiter limiter = new RateLimiter(threads * perThread * 2);
-            List<Thread> workers = new ArrayList<>();
-            java.util.concurrent.atomic.AtomicInteger admitted =
-                    new java.util.concurrent.atomic.AtomicInteger();
-            for (int t = 0; t < threads; t++) {
-                Thread th = new Thread(() -> {
-                    for (int i = 0; i < perThread; i++) {
-                        if (limiter.allow("shared", 100.0)) admitted.incrementAndGet();
-                    }
-                });
-                workers.add(th);
-                th.start();
-            }
-            for (Thread th : workers) th.join();
-            // Every request fits under the ceiling, so a correct limiter admits
-            // all of them -- and a lost update would show up as a short count.
-            assertEquals(threads * perThread, admitted.get());
-            assertEquals(1, limiter.trackedKeys());
         }
     }
 }

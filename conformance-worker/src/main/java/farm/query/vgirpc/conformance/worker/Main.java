@@ -14,11 +14,9 @@ import farm.query.vgirpc.external.ExternalLocationConfig;
 import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.http.AuthFailure;
 import farm.query.vgirpc.http.AuthReason;
-import farm.query.vgirpc.http.AuthUnavailableException;
 import farm.query.vgirpc.http.Authenticator;
 import farm.query.vgirpc.http.HttpPreHandler;
 import farm.query.vgirpc.http.HttpServer;
-import farm.query.vgirpc.http.TokenIdentity;
 import farm.query.vgirpc.identity.GrantRefusedError;
 import farm.query.vgirpc.identity.IdentityImpl;
 import farm.query.vgirpc.identity.IdentityUnavailableError;
@@ -46,7 +44,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class Main {
@@ -121,10 +118,6 @@ public final class Main {
         // "off by default" property is itself a conformance contract
         // (TestCorsOffMode), and only --cors-origin opts a worker out of it.
         List<String> corsOrigins = new ArrayList<>();
-        // Token introspection is off unless asked for -- that "absent by default"
-        // property is itself a conformance contract (TestTokenIntrospectionOffMode),
-        // which runs against the plain worker.
-        boolean introspect = false;
         // vgi_rpc.Identity.v1 is off unless asked for -- "a worker that configured no hook
         // hosts no identity protocol at all" is itself a conformance contract
         // (TestIdentityAbsentByDefault), and it is asserted against the *plain* worker, so
@@ -210,9 +203,6 @@ public final class Main {
                 case "--no-call-state-cache" -> callStateCache = false;
                 // Implies HTTP, like --http-auth and --http-proof; repeatable.
                 case "--cors-origin" -> { mode = "http"; corsOrigins.add(c.requireValue(a)); }
-                // Implies HTTP, and implies principal-header auth below so the
-                // introspector allowlist has something to check.
-                case "--introspect" -> { mode = "http"; introspect = true; }
                 // Implies HTTP: Identity's guards all read an authenticated caller, and HTTP is
                 // the only transport that carries one. Implies principal-header auth below.
                 case "--identity" -> { mode = "http"; identityMode = c.requireValue(a); }
@@ -240,7 +230,6 @@ public final class Main {
         }
         // Applied after the loop so flag order does not matter, and only when no
         // stronger mode was selected.
-        if (introspect && authenticator == null) authenticator = principalHeaderAuthenticator();
         if (!"off".equals(identityMode)) {
             server.setIdentity(conformanceIdentity(identityMode));
             if (authenticator == null) authenticator = principalHeaderAuthenticator();
@@ -308,7 +297,7 @@ public final class Main {
                     stickyEnabled, stickyTtl, responseCompression,
                     // Only require mode denies, so only require mode advertises.
                     httpProof && "require".equals(proofMode),
-                    callStateCache, corsOrigins, introspect);
+                    callStateCache, corsOrigins);
             case "unix" -> serveUnix(server, Path.of(unixPath), (long) (unixIdleTimeoutSeconds * 1000));
             case "tcp" -> serveTcp(server, tcpHost, tcpPort);
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
@@ -442,53 +431,22 @@ public final class Main {
     /** Carries the {@code auth_time} claim, verbatim and unparsed. See above. */
     private static final String CONFORMANCE_AUTH_TIME_HEADER = "X-Conformance-Auth-Time";
 
-    // Fixed values the shared TestTokenIntrospection group is written against:
-    // it posts the subject credential and asserts the principal, so a port
-    // supplying the conformance_http_introspect_port fixture must configure
-    // exactly these.
+    // Fixed values the shared identity group (IDENTITY_CONFORMANCE_FIXTURE.md) is
+    // written against: it introspects as this principal and asserts the subject's
+    // principal and token name, so a port must configure exactly these.
     private static final String CONFORMANCE_INTROSPECTOR = "conformance-introspector";
-    private static final String CONFORMANCE_SUBJECT_TOKEN = "conformance-opaque-subject-token";
     private static final String CONFORMANCE_SUBJECT_PRINCIPAL = "subject@conformance.example";
     private static final String CONFORMANCE_SUBJECT_TOKEN_NAME = "conformance-subject";
     private static final long CONFORMANCE_SUBJECT_TTL = 300;
     /**
-     * A JWS-shaped credential the resolver <em>would</em> resolve.
-     *
-     * <p>Deliberately resolvable: against an unknown JWS a port with no shape
-     * guard rejects it as unknown and passes the test for the wrong reason. Made
-     * resolvable, the guard is the only thing that can produce a rejection — a
-     * port missing it answers 200 and fails.
-     */
-    private static final String CONFORMANCE_JWS_TRAP_TOKEN =
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
-    /**
      * The credential whose resolution is <em>unknowable</em> rather than unknown.
      *
-     * <p>The shared suite posts it to check that a backing-store outage surfaces
-     * as a transient 503 and not as this endpoint's own definitive 404 — which a
-     * caller may negative-cache, so a briefly unreachable store would be
-     * remembered as a bad credential for the cache's lifetime.
+     * <p>The shared suite sends it to check that a backing-store outage surfaces as the transient
+     * {@code identity_unavailable} and not as the definitive {@code token_unresolved} -- which a
+     * caller may negative-cache, so a briefly unreachable store would be remembered as a bad
+     * credential for the cache's lifetime.
      */
     private static final String CONFORMANCE_UNAVAILABLE_TOKEN = "conformance-unavailable-token";
-
-    /**
-     * Resolve the fixed credentials the shared tests post.
-     *
-     * <p>Three answers, deliberately: an identity, {@code Optional.empty()} for
-     * "does not resolve", and {@link AuthUnavailableException} for "I could not
-     * find out". The third is not a flavour of the second — an empty result
-     * becomes the definitive 404 a caller may negative-cache.
-     */
-    private static Optional<TokenIdentity> resolveConformanceToken(String token) {
-        if (CONFORMANCE_UNAVAILABLE_TOKEN.equals(token)) {
-            throw new AuthUnavailableException("conformance: mapping store unreachable");
-        }
-        if (CONFORMANCE_SUBJECT_TOKEN.equals(token) || CONFORMANCE_JWS_TRAP_TOKEN.equals(token)) {
-            return Optional.of(new TokenIdentity(
-                    CONFORMANCE_SUBJECT_PRINCIPAL, CONFORMANCE_SUBJECT_TOKEN_NAME, CONFORMANCE_SUBJECT_TTL));
-        }
-        return Optional.empty();
-    }
 
     // -----------------------------------------------------------------------
     // vgi_rpc.Identity.v1 -- the pinned deployment policy
@@ -544,14 +502,10 @@ public final class Main {
     private static final String IDENTITY_TOKEN_PADDED_PROBE = "  conformance-padded-probe  ";
     private static final String IDENTITY_TOKEN_PADDED_NAME = "conformance-padded";
 
-    /**
-     * Introspections admitted per caller per second.
-     *
-     * <p>Deliberately far above the default 20. Nearly every case in the shared group is an
-     * introspection, so a production-tuned limiter would fire mid-group and every resulting
-     * failure would read as the wrong guard. The limiter is covered port-locally instead.
-     */
-    private static final int IDENTITY_RATE_LIMIT = 100_000;
+    // There is no introspection rate limit to configure: introspection is not rate limited
+    // (IDENTITY_V1_SPEC.md §4, "No rate limiter"), and the shared group's
+    // TestIntrospectionIsNotThrottled asserts it. This fixture used to set 100,000 so a
+    // production-tuned limiter could not fire mid-group.
 
     /** How recently a caller must have authenticated to mint -- the documented default. */
     private static final double IDENTITY_MAX_AUTH_AGE = 900.0;
@@ -654,7 +608,6 @@ public final class Main {
         IdentityImpl.Builder b = IdentityImpl.builder()
                 .resolveToken(Main::identityResolveToken)
                 .introspectPrincipals(CONFORMANCE_INTROSPECTOR)
-                .introspectRateLimit(IDENTITY_RATE_LIMIT)
                 .maxAuthAge(IDENTITY_MAX_AUTH_AGE);
         switch (mode) {
             case "both" -> b.mintGrant(Main::identityMintGrant);
@@ -755,8 +708,7 @@ public final class Main {
                                    boolean responseCompression,
                                    boolean proxyProofRequired,
                                    boolean callStateCache,
-                                   List<String> corsOrigins,
-                                   boolean introspect) throws Exception {
+                                   List<String> corsOrigins) throws Exception {
         HttpServer.Config.Builder cb = HttpServer.Config.builder()
                 .tokenKey(tokenKey)
                 .tokenTtlSeconds(tokenTtl)
@@ -765,10 +717,6 @@ public final class Main {
                 .proxyProofRequired(proxyProofRequired);
         if (!callStateCache) cb.callStateCacheMaxEntries(0);
         if (!corsOrigins.isEmpty()) cb.corsOrigins(corsOrigins);
-        if (introspect) {
-            cb.tokenIntrospection(Main::resolveConformanceToken, List.of(CONFORMANCE_INTROSPECTOR))
-              .introspectTtlSeconds(CONFORMANCE_SUBJECT_TTL);
-        }
         // Empty producible set ⇒ present-but-empty VGI-Supported-Encodings and
         // no compression, whatever the client asks for. null would mean "unset"
         // and fall back to the default set, so the empty list is load-bearing.

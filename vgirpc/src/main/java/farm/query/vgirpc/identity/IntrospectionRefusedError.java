@@ -6,7 +6,12 @@ package farm.query.vgirpc.identity;
 import farm.query.vgirpc.HasErrorKind;
 
 /**
- * The caller may not introspect.
+ * The caller may not introspect -- it is not on the allowlist (or this worker resolves nothing).
+ *
+ * <p><strong>Never a throttle.</strong> This kind is definitive and a caller may cache it, so a
+ * throttled introspection reported as it would negative-cache valid credentials -- which is how a
+ * per-caller rate limit used to lock users out. Introspection is not rate limited; a deployment
+ * that throttles it anyway must answer with {@link IdentityUnavailableError}, which is transient.
  *
  * <p>Definitive: a caller may cache this. Authentication is not the same capability as
  * introspection -- a deployment where any valid credential may introspect lets any user test

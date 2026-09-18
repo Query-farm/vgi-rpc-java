@@ -21,9 +21,9 @@ import java.util.regex.Pattern;
 /**
  * Applies this protocol's guards, then delegates to worker-supplied hooks.
  *
- * <p>The framework owns the guards and owns none of the policy. It decides who may ask, how
- * often, and what shape of credential is refused outright; the worker decides what a credential
- * resolves to and whether a grant is minted. That split is deliberate -- the guards are the part
+ * <p>The framework owns the guards and owns none of the policy. It decides who may ask and what
+ * shape of credential is refused outright; the worker decides what a credential resolves to and
+ * whether a grant is minted. That split is deliberate -- the guards are the part
  * that is identical in every deployment and catastrophic to get wrong, and the policy is the
  * part that is different in every deployment and cannot be guessed.
  *
@@ -48,16 +48,12 @@ public final class IdentityImpl implements Identity {
     private static final Pattern JWS_SHAPED =
             Pattern.compile("^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*$");
 
-    /** Introspections admitted per caller per second when the deployment names no limit. */
-    public static final int DEFAULT_INTROSPECT_RATE_LIMIT = 20;
-
     /** How recently a caller must have authenticated to mint a grant, in seconds. */
     public static final double DEFAULT_MAX_AUTH_AGE_SECONDS = 900.0;
 
     private final TokenResolveHook resolveToken;
     private final GrantMintHook mintGrant;
     private final Set<String> principals;
-    private final RateLimiter limiter;
     private final double maxAuthAge;
 
     private IdentityImpl(Builder b) {
@@ -70,7 +66,6 @@ public final class IdentityImpl implements Identity {
         this.principals = b.resolveToken != null
                 ? normalisePrincipals(b.introspectPrincipals)
                 : Set.of();
-        this.limiter = new RateLimiter(b.introspectRateLimit);
     }
 
     /**
@@ -87,7 +82,6 @@ public final class IdentityImpl implements Identity {
         private TokenResolveHook resolveToken;
         private GrantMintHook mintGrant;
         private Collection<String> introspectPrincipals;
-        private int introspectRateLimit = DEFAULT_INTROSPECT_RATE_LIMIT;
         private double maxAuthAge = DEFAULT_MAX_AUTH_AGE_SECONDS;
 
         private Builder() {}
@@ -146,17 +140,6 @@ public final class IdentityImpl implements Identity {
         }
 
         /**
-         * Introspections admitted per caller per second.
-         *
-         * @param perSecond the ceiling
-         * @return this builder
-         */
-        public Builder introspectRateLimit(int perSecond) {
-            this.introspectRateLimit = perSecond;
-            return this;
-        }
-
-        /**
          * How recently a caller must have authenticated to mint a grant.
          *
          * @param seconds the ceiling on {@code now - auth_time}
@@ -201,15 +184,15 @@ public final class IdentityImpl implements Identity {
             throw new IntrospectionRefusedError("this worker does not resolve credentials");
         }
 
-        // ORDER IS LOAD-BEARING, and the order is: authorization, then rate
-        // limit, then anything that touches the subject credential. An
-        // unauthorized caller must learn nothing about that credential --
-        // including how long looking at it took, which is what a length check or
-        // a regex match ahead of this would leak. Do not reorder for tidiness.
-        String caller = checkIntrospector(ctx == null ? null : ctx.auth(), principals);
-        if (!limiter.allow(caller)) {
-            throw new IntrospectionRefusedError("introspection rate limit exceeded");
-        }
+        // ORDER IS LOAD-BEARING, and the order is: authorization, then anything
+        // that touches the subject credential. An unauthorized caller must learn
+        // nothing about that credential -- including how long looking at it
+        // took, which is what a length check or a regex match ahead of this
+        // would leak. Do not reorder for tidiness.
+        //
+        // There is deliberately no rate limit here: see Identity's class doc.
+        // The allowlist is the control.
+        checkIntrospector(ctx == null ? null : ctx.auth(), principals);
         rejectJwsShaped(token);
 
         TokenIdentity identity = resolveToken.resolve(token);
