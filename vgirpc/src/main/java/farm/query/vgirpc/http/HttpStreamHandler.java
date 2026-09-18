@@ -309,6 +309,10 @@ public final class HttpStreamHandler {
         Map<String, String> requestMeta;
         LocationResolver.Resolved resolved = null;
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(requestBody), Allocators.root())) {
+            // The request batch's own metadata, pointer or not: dispatch metadata
+            // (method, request version) is read off the batch the client sent, as
+            // the reference and this port's raw transports do, and so is the first
+            // tick's. A resolved pointer contributes only the parameters.
             Map<String, String> meta = r.readNextBatch();
             if (meta == null) return errorStream(new RuntimeException("empty request"));
             VectorSchemaRoot root = r.root();
@@ -317,7 +321,6 @@ public final class HttpStreamHandler {
                 try {
                     resolved = resolver.resolve(meta);
                     root = resolved.root();
-                    meta = resolved.customMetadata();
                 } catch (Exception e) {
                     return errorStream(e);
                 }
@@ -328,7 +331,11 @@ public final class HttpStreamHandler {
                 return errorStream(new ClassCastException(
                         "Method name mismatch: URL has '" + method + "' but metadata has '" + urlMethod + "'"));
             }
-            requestMeta = Map.copyOf(meta);
+            // Less the stream tokens, as on every continuation (see
+            // turnInputMetadata). An honest client has not been issued any yet,
+            // so this guards against a crafted /init rather than changing what a
+            // real one sees.
+            requestMeta = Map.copyOf(turnInputMetadata(meta));
             kwargs = root.getRowCount() == 0
                     ? new LinkedHashMap<>()
                     : (resolved != null
@@ -440,19 +447,25 @@ public final class HttpStreamHandler {
         try {
         try (VectorSchemaRoot ownedInput = req.inputRoot()) {
             VectorSchemaRoot actualInput = ownedInput;
-            Map<String, String> requestMeta = req.meta();
+            // Two different things ride this request, and a pointer pulls them
+            // apart. The batch the client sent addresses the turn -- the cursor,
+            // the call token, the cancel marker are read off it and nowhere else.
+            // The input is what the method is handed: that same batch inline, or
+            // for a pointer the batch it points at, whose metadata is the fetched
+            // batch's plus the reader's provenance and never the pointer's (§12).
+            Map<String, String> wireMeta = req.meta();
+            Map<String, String> inputMeta = wireMeta;
             LocationResolver resolver = rpc.locationResolver();
-            if (resolver != null && LocationResolver.isPointer(ownedInput.getRowCount(), requestMeta)) {
+            if (resolver != null && LocationResolver.isPointer(ownedInput.getRowCount(), wireMeta)) {
                 try {
-                    resolved = resolver.resolve(requestMeta);
+                    resolved = resolver.resolve(wireMeta);
                     actualInput = resolved.root();
-                    requestMeta = resolved.customMetadata();
+                    inputMeta = resolved.fetchedMetadata();
                 } catch (Exception e) {
                     return errorStream(e);
                 }
             }
-            ExchangeRequest effectiveRequest = new ExchangeRequest(requestMeta, actualInput, inputDicts);
-            String tokenB64 = requestMeta.get(Metadata.STREAM_STATE);
+            String tokenB64 = wireMeta.get(Metadata.STREAM_STATE);
             if (tokenB64 == null) {
                 return errorStream(new RuntimeException("Missing state token in exchange request"));
             }
@@ -471,7 +484,7 @@ public final class HttpStreamHandler {
             }
             CallToken call;
             try {
-                call = resolveCall(token, req.meta().get(Metadata.CALL_STATE), auth, cacheIdentity,
+                call = resolveCall(token, wireMeta.get(Metadata.CALL_STATE), auth, cacheIdentity,
                         protocol);
             } catch (Exception e) {
                 return errorStream(e);
@@ -491,8 +504,9 @@ public final class HttpStreamHandler {
                     long boundLimit = Math.min(responseLimitBytes, call.responseLimitBytes());
                     Long boundPreferred = preferredResponseBytes == null ? null
                             : Math.min(preferredResponseBytes, boundLimit);
-                    byte[] response = runExchange(protocol, method, effectiveRequest, actualInput,
-                            token, call, auth, inputDicts, turn, boundLimit, boundPreferred);
+                    byte[] response = runExchange(protocol, method,
+                            wireMeta.containsKey(Metadata.CANCEL), turnInputMetadata(inputMeta),
+                            actualInput, token, call, auth, inputDicts, turn, boundLimit, boundPreferred);
                     if (response.length > boundLimit) {
                         return errorStream(new farm.query.vgirpc.ResponseTooLargeError(
                                 method, response.length, boundLimit));
@@ -510,8 +524,15 @@ public final class HttpStreamHandler {
         }
     }
 
-    /** The body of {@code /exchange}, wrapped by {@link #handleExchange}'s telemetry. */
-    private byte[] runExchange(String protocol, String method, ExchangeRequest req,
+    /**
+     * The body of {@code /exchange}, wrapped by {@link #handleExchange}'s telemetry.
+     *
+     * @param cancel whether the request carried the cancel marker
+     * @param inputMeta the input's metadata as {@code process()} is to see it,
+     *     already stripped by {@link #turnInputMetadata}
+     */
+    private byte[] runExchange(String protocol, String method, boolean cancel,
+                                Map<String, String> inputMeta,
                                 VectorSchemaRoot ownedInput,
                                 StateToken token, CallToken call, AuthContext auth,
                                 DictionaryProvider inputDicts, StreamTurn turn,
@@ -536,7 +557,7 @@ public final class HttpStreamHandler {
         OutputCollectorSink sink = new OutputCollectorSink();
         CallContext ctx = buildCallContext(method, sink, responseLimitBytes, preferredResponseBytes);
 
-        if (req.meta().containsKey(Metadata.CANCEL)) {
+        if (cancel) {
             onTurn(turn, i -> i.cancelled = true);
             return handleCancel(outputSchema, state, ctx, sink);
         }
@@ -556,7 +577,10 @@ public final class HttpStreamHandler {
                     responseLimitBytes == Long.MAX_VALUE ? null : responseLimitBytes,
                     preferredResponseBytes);
             try {
-                state.process(new AnnotatedBatch(actualInput, req.meta()), collector, ctx);
+                // The input's own metadata, per turn, as the pipe transport hands
+                // it over: an exchange input's validators and filter deltas, a
+                // producer tick's. The tokens that addressed the turn are not in it.
+                state.process(new AnnotatedBatch(actualInput, inputMeta), collector, ctx);
                 if (!collector.finished()) collector.validate();
             } catch (Throwable t) {
                 // Carries whatever the turn logged before it failed. Those lines
@@ -576,6 +600,43 @@ public final class HttpStreamHandler {
 
     /** Parsed exchange-request body: metadata (including the state token) plus the (owned) input batch. */
     private record ExchangeRequest(Map<String, String> meta, VectorSchemaRoot inputRoot, DictionaryProvider inputDicts) {}
+
+    /**
+     * What one HTTP stream turn hands {@code process()} as its input's metadata:
+     * the batch's own, less the transport's bookkeeping.
+     *
+     * <p>That metadata is application data, per input. VGI hangs per-input state
+     * on it -- {@code vgi.cache.if_none_match} / {@code if_modified_since} on
+     * every exchange input, {@code vgi_pushdown_filters} deltas on every tick --
+     * and the pipe transport delivers it with the batch it rode in on.
+     *
+     * <p>The cursor ({@code vgi_rpc.stream_state#b64}), the call token
+     * ({@code vgi_rpc.call_state#b64}) and the cancel marker are stripped, as the
+     * reference does (WIRE_PROTOCOL.md, "Stream exchange (HTTP)"). They address
+     * the turn rather than describe the input: the pipe transport keeps that state
+     * in the connection and never puts it on a batch, so handing it over is a
+     * transport-parity break, and the cursor is a sealed token application code
+     * has no business reading. Every other key passes through, {@code vgi_rpc.*}
+     * included, again as the reference does.
+     *
+     * @param metadata the input batch's metadata; for a resolved pointer, the
+     *     fetched batch's ({@link LocationResolver.Resolved#fetchedMetadata()})
+     * @return a copy without the bookkeeping keys, or {@code metadata} itself
+     *     when it carries none
+     */
+    private static Map<String, String> turnInputMetadata(Map<String, String> metadata) {
+        if (metadata == null) return Map.of();
+        if (!metadata.containsKey(Metadata.STREAM_STATE)
+                && !metadata.containsKey(Metadata.CALL_STATE)
+                && !metadata.containsKey(Metadata.CANCEL)) {
+            return metadata;
+        }
+        Map<String, String> stripped = new LinkedHashMap<>(metadata);
+        stripped.remove(Metadata.STREAM_STATE);
+        stripped.remove(Metadata.CALL_STATE);
+        stripped.remove(Metadata.CANCEL);
+        return stripped;
+    }
 
     private static ExchangeRequest parseExchangeRequest(byte[] body) throws IOException {
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(body), Allocators.root())) {

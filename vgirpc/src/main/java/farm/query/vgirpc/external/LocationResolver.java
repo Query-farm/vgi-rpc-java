@@ -30,8 +30,8 @@ import java.util.Map;
  * {@code vgi_rpc.location}. On resolution the fetcher downloads the IPC bytes
  * from the URL, opens them as an Arrow stream, discards any log/error batches
  * (log dispatch is the caller's responsibility), and returns the (single) data
- * batch as a fresh {@link VectorSchemaRoot} plus metadata with the location
- * key stripped.</p>
+ * batch as a fresh {@link VectorSchemaRoot} plus its metadata (see
+ * {@link Resolved} for which view a server hands application code).</p>
  */
 public final class LocationResolver {
 
@@ -73,9 +73,9 @@ public final class LocationResolver {
 
     /**
      * Resolve a pointer batch to its underlying data batch. Ownership of the
-     * returned root transfers to the caller (must close). {@code metaOut} is
-     * populated with the merged custom metadata minus {@code vgi_rpc.location}
-     * and {@code vgi_rpc.location.sha256}; it may be null.
+     * returned batch transfers to the caller (must close). See {@link Resolved}
+     * for the two views of its metadata, and which one a server hands
+     * application code.
      */
     public Resolved resolve(Map<String, String> pointerMeta) throws Exception {
         return resolve(pointerMeta, null);
@@ -128,10 +128,10 @@ public final class LocationResolver {
                 }
                 if (kind == Wire.BatchKind.ERROR) throw Wire.errorFromMetadata(md);
                 Copy copy = copyRoot(root, r.dictionaryProvider());
-                Map<String, String> merged = new LinkedHashMap<>(pointerMeta);
-                merged.remove(Metadata.LOCATION);
-                merged.remove(Metadata.LOCATION_SHA256);
-                if (md != null) merged.putAll(md);
+                // What §12 says a resolved batch carries: the fetched batch's own
+                // metadata, never the pointer's, plus the reader's provenance.
+                Map<String, String> fetched = new LinkedHashMap<>();
+                if (md != null) fetched.putAll(md);
                 // Stamped at resolve time, not copied from the pointer. A reader
                 // that only passes through what the writer happened to set
                 // reports nothing when the writer set nothing -- and this port's
@@ -139,9 +139,15 @@ public final class LocationResolver {
                 // coincidence against a Java peer and yields empty provenance
                 // against every other. WIRE_PROTOCOL.md §12 requires both keys
                 // on a resolved batch: how long the fetch took, and where from.
-                merged.put(Metadata.LOCATION_FETCH, String.format(java.util.Locale.ROOT, "%.1f", elapsedMs));
-                merged.put(Metadata.LOCATION_SOURCE, url);
-                return new Resolved(copy.root(), merged, copy.dictionaries(), copy.owned());
+                // Put last, so the reader's stamp wins: a payload cannot choose
+                // its own provenance.
+                fetched.put(Metadata.LOCATION_FETCH, String.format(java.util.Locale.ROOT, "%.1f", elapsedMs));
+                fetched.put(Metadata.LOCATION_SOURCE, url);
+                Map<String, String> merged = new LinkedHashMap<>(pointerMeta);
+                merged.remove(Metadata.LOCATION);
+                merged.remove(Metadata.LOCATION_SHA256);
+                merged.putAll(fetched);
+                return new Resolved(copy.root(), merged, copy.dictionaries(), copy.owned(), fetched);
             }
         }
     }
@@ -233,8 +239,19 @@ public final class LocationResolver {
 
     /**
      * The outcome of resolving an external-location pointer batch: the fetched,
-     * materialised batch, the metadata that should accompany it downstream, and
-     * the dictionaries its encoded columns refer to.
+     * materialised batch, two views of its metadata, and the dictionaries its
+     * encoded columns refer to.
+     *
+     * <p>The two views differ in whether the <em>pointer's</em> keys survive, and
+     * a server must use {@link #fetchedMetadata()}. A resolved input reaches
+     * application code -- an exchange method reads per-input validators and
+     * filter deltas off it -- and WIRE_PROTOCOL.md §12 defines what it carries:
+     * the fetched batch's metadata plus the reader's provenance stamp, never the
+     * pointer's. Merging the pointer in hands a method keys the client put only
+     * on the envelope (over HTTP, the stream's cursor and call token), and lets
+     * a pointer-only key stand in for one the payload does not carry.
+     * {@link #customMetadata()} is the client-side view this port's readers of
+     * <em>responses</em> were built on, and they still use it.
      *
      * <p>Everything here is caller-owned. {@link #close()} releases the batch
      * <em>and</em> the dictionary copies; closing only {@link #root()} leaks the
@@ -242,13 +259,18 @@ public final class LocationResolver {
      *
      * @param root the fetched batch
      * @param customMetadata the pointer's metadata minus the location keys,
-     *     overlaid with the externalized batch's own — what the batch would have
-     *     carried had it been sent inline
+     *     overlaid with {@code fetchedMetadata}
      * @param dictionaries dictionaries for encoded columns, or {@code null}
      * @param owned every vector this result allocated, closed by {@link #close()}
+     * @param fetchedMetadata the fetched batch's own metadata plus the reader's
+     *     {@code vgi_rpc.location.source} / {@code vgi_rpc.location.fetch_ms}
+     *     stamp, and nothing from the pointer -- what the reference's
+     *     {@code resolve_external_location} returns, and what a server hands a
+     *     stream method as a resolved input's metadata
      */
     public record Resolved(VectorSchemaRoot root, Map<String, String> customMetadata,
-                           DictionaryProvider dictionaries, List<FieldVector> owned)
+                           DictionaryProvider dictionaries, List<FieldVector> owned,
+                           Map<String, String> fetchedMetadata)
             implements AutoCloseable {
 
         @Override

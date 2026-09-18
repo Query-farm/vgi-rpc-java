@@ -1307,7 +1307,10 @@ public final class RpcServer {
                 LocationResolver.Resolved res = locationResolver.resolve(meta);
                 resolvedRoot = res;
                 inputRoot = res.root();
-                effectiveMeta = res.customMetadata();
+                // The fetched batch's metadata plus the reader's provenance, never
+                // the pointer's (§12): this is what process() reads the input's
+                // per-batch metadata from, as the reference's tick loop does.
+                effectiveMeta = res.fetchedMetadata();
             } catch (Exception fetchExc) {
                 Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(fetchExc, serverId));
                 transport.writer().flush();
