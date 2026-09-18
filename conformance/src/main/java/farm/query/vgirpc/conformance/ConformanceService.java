@@ -189,6 +189,8 @@ public interface ConformanceService {
     RpcStream<? extends ExchangeState> exchange_with_logs();
     RpcStream<? extends ExchangeState> exchange_error_on_nth(long fail_on);
     RpcStream<? extends ExchangeState> exchange_zero_columns();
+    /** Report the custom metadata each exchange input batch was handed with. */
+    RpcStream<? extends ExchangeState> exchange_input_metadata();
     RpcStream<? extends ExchangeState> exchange_error_on_init();
     RpcStream<? extends ExchangeState> exchange_oversized(long rows_per_batch);
 

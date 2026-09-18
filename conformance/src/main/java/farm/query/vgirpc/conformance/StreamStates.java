@@ -21,9 +21,11 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeSet;
 
 /** RpcStream-state implementations used by the conformance service. */
 final class StreamStates {
@@ -58,6 +60,14 @@ final class StreamStates {
     static final Schema SESSION_COUNTER_BY_SCHEMA = new Schema(List.of(i64("by")));
 
     static final Schema EMPTY_SCHEMA = new Schema(List.of());
+
+    /** {@code exchange_input_metadata} input: one nullable float64 {@code value}. */
+    static final Schema INPUT_METADATA_INPUT_SCHEMA = new Schema(List.of(new Field(
+            "value", FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)), null)));
+    /** {@code exchange_input_metadata} output: nullable utf8 {@code seen} and {@code keys}. */
+    static final Schema INPUT_METADATA_OUTPUT_SCHEMA = new Schema(List.of(
+            new Field("seen", FieldType.nullable(new ArrowType.Utf8()), null),
+            new Field("keys", FieldType.nullable(new ArrowType.Utf8()), null)));
 
     /** Sticky-session state object: a mutable counter shared across requests. */
     static final class StickyCounter implements AutoCloseable {
@@ -343,6 +353,30 @@ final class StreamStates {
         }
         root.setRowCount(rows);
         return root;
+    }
+
+    /** The application key {@link InputMetadata} reports the value of. */
+    static final String INPUT_METADATA_KEY = "vgi.conformance.input";
+
+    /**
+     * Reports, per input, the metadata {@code exchange} was handed: {@code seen} is the
+     * value of {@link #INPUT_METADATA_KEY} (empty when absent) and {@code keys} every key
+     * present, sorted and comma-joined (empty when there is none). Together they check
+     * both halves of the rule: the application's own metadata arrives, and the HTTP
+     * transport's bookkeeping (the cursor, the call token) does not.
+     */
+    static final class InputMetadata extends ExchangeState {
+        @Override public void exchange(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
+            Map<String, String> md = input.customMetadata();
+            String seen = md.getOrDefault(INPUT_METADATA_KEY, "");
+            String keys = String.join(",", new TreeSet<>(md.keySet()));
+            VectorSchemaRoot root = VectorSchemaRoot.create(INPUT_METADATA_OUTPUT_SCHEMA, Allocators.root());
+            root.allocateNew();
+            ((VarCharVector) root.getVector("seen")).setSafe(0, seen.getBytes(StandardCharsets.UTF_8));
+            ((VarCharVector) root.getVector("keys")).setSafe(0, keys.getBytes(StandardCharsets.UTF_8));
+            root.setRowCount(1);
+            out.emit(root);
+        }
     }
 
     static final class ZeroColumns extends ExchangeState {

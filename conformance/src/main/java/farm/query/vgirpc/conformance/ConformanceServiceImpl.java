@@ -228,6 +228,10 @@ public final class ConformanceServiceImpl implements ConformanceService {
         return RpcStream.exchange(StreamStates.EMPTY_SCHEMA, StreamStates.EMPTY_SCHEMA,
                 new StreamStates.ZeroColumns());
     }
+    @Override public RpcStream<StreamStates.InputMetadata> exchange_input_metadata() {
+        return RpcStream.exchange(StreamStates.INPUT_METADATA_INPUT_SCHEMA,
+                StreamStates.INPUT_METADATA_OUTPUT_SCHEMA, new StreamStates.InputMetadata());
+    }
     @Override public RpcStream<? extends ExchangeState> exchange_error_on_init() {
         throw new RuntimeException("intentional exchange init error");
     }
