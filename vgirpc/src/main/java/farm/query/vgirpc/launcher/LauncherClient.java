@@ -3,9 +3,13 @@
 
 package farm.query.vgirpc.launcher;
 
+import farm.query.vgirpc.transport.UnixSocketTransport;
+
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
+import java.net.ConnectException;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.SocketChannel;
@@ -27,14 +31,22 @@ import java.util.concurrent.TimeUnit;
  * docs/launcher-protocol.md}'s <i>Lifecycle in one paragraph</i>.
  *
  * <p>Returns a plain socket path — this class does not open a connection itself.
- * Callers connect exactly as they would to any other {@code unix://} location (see
- * this package's own javadoc).
+ * Callers connect exactly as they would to any other {@code unix://} location, ideally
+ * with {@link UnixSocketTransport#connect(Path, java.time.Duration)}, which waits out a
+ * busy worker's full accept queue instead of failing (see this package's own javadoc).
  */
 public final class LauncherClient {
 
     private LauncherClient() {}
 
     private static final long DISCOVERY_NOISE_CAP_BYTES = 1_048_576; // 1 MiB, matching the protocol doc
+
+    /**
+     * Pauses between re-probes of a refused socket, in milliseconds — see {@link #probe}. A socket
+     * left by a dead worker costs this once (350 ms), before it is replaced. The same values as
+     * the Python ({@code _PROBE_REFUSED_BACKOFF_S}) and C++ ({@code ProbeAlive}) launchers.
+     */
+    private static final long[] PROBE_REFUSED_BACKOFF_MS = {50, 100, 200};
 
     /**
      * Ensure a worker is running and return its absolute socket path.
@@ -100,18 +112,56 @@ public final class LauncherClient {
         Files.deleteIfExists(path);
     }
 
-    /** True iff a worker is currently accepting connections at {@code path}. Connects then immediately
-     *  closes — this is a liveness probe only, never the connection the caller actually uses. AF_UNIX
-     *  {@code connect()} is local and effectively instantaneous (unlike a network socket), so — matching
-     *  the Python reference's own probe — this is a plain blocking connect rather than a
-     *  selector-mediated timeout; a genuinely hung peer here would be a kernel-level anomaly, not a
-     *  realistic failure mode this client needs to defend against. */
-    private static boolean probe(Path path) {
-        try (SocketChannel channel = SocketChannel.open(StandardProtocolFamily.UNIX)) {
-            channel.connect(UnixDomainSocketAddress.of(path));
-            return true;
-        } catch (IOException e) {
-            return false;
+    /**
+     * True iff a worker is listening at {@code path}. Connects then immediately closes — a
+     * liveness probe only, never the connection the caller actually uses.
+     *
+     * <p><strong>A listener whose accept queue is full is alive, only busy</strong> — and a false
+     * "dead" here is destructive, because {@link #launch} then unlinks the socket out from under
+     * the live worker and spawns a duplicate, orphaning the original and racing clients onto a
+     * vanished path (a 32-process Python test run produced 64 workers for 2 commands). So:
+     *
+     * <ul>
+     *   <li>The connect is <em>non-blocking</em>. A blocking one behaves differently by thread
+     *   (measured on Linux, JDK 21 and 25): on a platform thread it waits for a queue slot with no
+     *   bound — while this process holds the launcher lock — and on a virtual thread the JDK makes
+     *   the socket non-blocking and it fails at once. One behaviour, on every thread.</li>
+     *   <li>Connected (or still connecting) is alive.</li>
+     *   <li>Linux reports a full queue as {@code EAGAIN}, which is alive — see
+     *   {@link UnixSocketTransport#isAcceptQueueFull} for how that is told apart without reading a
+     *   localised error message.</li>
+     *   <li>macOS reports a full queue as {@code ECONNREFUSED}, the same as an unbound socket, so a
+     *   refusal is re-probed after 50, 100 and 200 ms before it is believed.</li>
+     *   <li>Anything else (absent, not reachable) is dead.</li>
+     * </ul>
+     *
+     * <p>This asks "is anything listening", not "is it responsive": a connect lands in the queue
+     * of a worker that never accepts, so a successful one never proved that either. Mirrors
+     * {@code vgi_rpc.launcher._probe} and the vgi extension's {@code ProbeAlive}.
+     *
+     * @throws InterruptedIOException if interrupted between re-probes — never read as "dead",
+     *     which would unlink a socket that may be live
+     */
+    static boolean probe(Path path) throws InterruptedIOException {
+        UnixDomainSocketAddress address = UnixDomainSocketAddress.of(path);
+        for (int attempt = 0; ; attempt++) {
+            if (attempt > 0) {
+                try {
+                    Thread.sleep(PROBE_REFUSED_BACKOFF_MS[attempt - 1]);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new InterruptedIOException("interrupted probing " + path);
+                }
+            }
+            try (SocketChannel channel = SocketChannel.open(StandardProtocolFamily.UNIX)) {
+                channel.configureBlocking(false);
+                channel.connect(address); // true: connected; false: in progress — a listener either way
+                return true;
+            } catch (ConnectException refused) {
+                if (attempt == PROBE_REFUSED_BACKOFF_MS.length) return false;
+            } catch (IOException e) {
+                return UnixSocketTransport.isAcceptQueueFull(e, path);
+            }
         }
     }
 

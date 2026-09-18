@@ -15,9 +15,17 @@
  *
  * <p>{@link farm.query.vgirpc.launcher.LauncherClient#launch} resolves (spawning if
  * needed) and returns the worker's socket path — callers then connect to it exactly
- * like any other {@code unix://} location (e.g. via {@code UnixDomainSocketAddress}
- * + {@code SocketChannel}, as {@code UnixSocketTransport}'s own client side does).
- * This package does not implement a byte-stream transport itself.
+ * like any other {@code unix://} location, ideally with {@link
+ * farm.query.vgirpc.transport.UnixSocketTransport#connect(java.nio.file.Path,
+ * java.time.Duration)}. This package does not implement a byte-stream transport itself.
+ *
+ * <p><b>A busy worker is not a dead one.</b> Under a burst of connections a launched
+ * worker's accept queue fills, and Linux then fails a non-blocking connect with
+ * {@code EAGAIN}. The launcher's liveness probe counts that as alive (and re-probes a
+ * refusal briefly, since macOS reports a full queue as {@code ECONNREFUSED}), so it never
+ * unlinks a live worker's socket and spawns a duplicate; {@code UnixSocketTransport.connect}
+ * waits for a queue slot until its timeout rather than failing. See {@code
+ * docs/launcher-protocol.md} in the {@code vgi} repo, which requires both.
  *
  * <p>The {@code flock(2)} lock (and the process's effective UID, needed for
  * state-directory naming parity with the Python/C++ launchers) require the

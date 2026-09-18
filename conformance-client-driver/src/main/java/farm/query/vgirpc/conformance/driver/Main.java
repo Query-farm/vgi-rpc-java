@@ -31,9 +31,6 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
-import java.net.StandardProtocolFamily;
-import java.net.UnixDomainSocketAddress;
-import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -77,6 +74,8 @@ public final class Main {
 
     /** Default POSIX shared-memory segment size, matching the reference shim. */
     private static final int DEFAULT_SHM_SIZE = 4 * 1024 * 1024;
+    /** How long a {@code unix} connect waits out a busy worker's full accept queue. */
+    private static final java.time.Duration UNIX_CONNECT_TIMEOUT = java.time.Duration.ofSeconds(10);
 
     /** The real stdout, captured before {@link System#out} is redirected to stderr. */
     private final PrintStream control;
@@ -201,9 +200,8 @@ public final class Main {
                     if (target == null || !target.isTextual()) {
                         return refusal("unix target must be a path string");
                     }
-                    SocketChannel channel = SocketChannel.open(StandardProtocolFamily.UNIX);
-                    channel.connect(UnixDomainSocketAddress.of(Path.of(target.asText())));
-                    transport = new UnixSocketTransport(channel);
+                    // Waits out a busy worker's full accept queue rather than failing on it.
+                    transport = UnixSocketTransport.connect(Path.of(target.asText()), UNIX_CONNECT_TIMEOUT);
                     byteStream = new RpcConnection(transport, logs::add, externalConfig(request));
                 }
                 case "tcp" -> {
