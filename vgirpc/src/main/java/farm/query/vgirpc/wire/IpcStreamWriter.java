@@ -138,6 +138,10 @@ public final class IpcStreamWriter implements AutoCloseable {
      */
     public void writeBatch(VectorSchemaRoot root, Map<String, String> customMetadata,
                             DictionaryProvider provider) throws IOException {
+        // Workaround for apache/arrow-java#1308: correct union type ids on the
+        // emitted schema (no-op unless a union field is affected). Remove with
+        // UnionTypeIdWorkaround once the upstream fix lands.
+        root = UnionTypeIdWorkaround.canonicalize(root);
         ensureSchemaAndDictsStarted(root, provider);
         VectorUnloader unloader = unloaderFor(root);
         try (ArrowRecordBatch batch = unloader.getRecordBatch()) {
