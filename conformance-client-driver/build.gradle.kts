@@ -7,7 +7,7 @@ dependencies {
     // The control channel is newline-delimited JSON. Jackson is already on the
     // library's own classpath; naming it here keeps this module's use of it
     // explicit rather than inherited by accident.
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.18.2")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.21.0")
     // SLF4J backend, pinned to stderr below. vgirpc ships none, and the default
     // NOP binder would swallow a real diagnostic.
     runtimeOnly("org.slf4j:slf4j-simple:2.0.16")
@@ -21,6 +21,7 @@ application {
     // explicitly because it is load-bearing here rather than cosmetic.
     applicationDefaultJvmArgs = listOf(
         "--add-opens=java.base/java.nio=ALL-UNNAMED",
+        "-Dio.netty.noUnsafe=false",
         "-Dorg.slf4j.simpleLogger.logFile=System.err",
         "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
     )

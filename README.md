@@ -102,7 +102,7 @@ import farm.query.vgirpc.transport.SubprocessTransport;
 import java.util.List;
 
 var transport = new SubprocessTransport(List.of(
-        "java", "--add-opens=java.base/java.nio=ALL-UNNAMED",
+        "java", "--add-opens=java.base/java.nio=ALL-UNNAMED", "-Dio.netty.noUnsafe=false",
         "-cp", "worker.jar", "CalculatorWorker"));
 try (RpcConnection conn = new RpcConnection(transport)) {
     Calculator calc = conn.proxy(Calculator.class);
@@ -111,8 +111,9 @@ try (RpcConnection conn = new RpcConnection(transport)) {
 }
 ```
 
-> **Two things to get right:**
+> **Three things to get right:**
 > - **Run with `--add-opens=java.base/java.nio=ALL-UNNAMED`** on every JVM that touches the library (both the worker and the client above) — Apache Arrow accesses `java.nio` internals and throws on startup without it. Notice it's passed both to the client JVM and, in the `SubprocessTransport` command, to the spawned worker.
+> - **On Java 25+, also pass `-Dio.netty.noUnsafe=false`.** Arrow allocates through Netty 4.2, which switches `sun.misc.Unsafe` off by default on Java 25+, and Arrow's allocator cannot start without it ([apache/arrow-java#728](https://github.com/apache/arrow-java/issues/728)). The library sets this default itself when it is the first thing in the process to touch Arrow, but a JVM that allocates Arrow memory some other way first needs the flag. It is harmless on Java 21–24.
 > - **Compile services with `-parameters`** — the framework binds call arguments by parameter name (matching the Python reference's keyword-argument wire semantics).
 
 ## Modules

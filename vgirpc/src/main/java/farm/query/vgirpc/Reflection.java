@@ -3,6 +3,7 @@ package farm.query.vgirpc;
 import farm.query.vgirpc.hash.ProtocolHash;
 import farm.query.vgirpc.schema.ArrowSerializableRecord;
 import farm.query.vgirpc.schema.SchemaDerivation;
+import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.hash.ProtocolHash.HashMethod;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -12,7 +13,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
@@ -305,7 +305,7 @@ public final class Reflection {
             String serverId, String serverVersion, String requestVersion, List<Summary> protocols)
             throws IOException {
         Schema schema = protocolListSchema();
-        try (BufferAllocator allocator = new RootAllocator();
+        try (BufferAllocator allocator = Allocators.root().newChildAllocator("reflection", 0, Long.MAX_VALUE);
                 VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
             setUtf8(root, "server_id", serverId);
             setUtf8(root, "server_version", serverVersion);
@@ -341,7 +341,7 @@ public final class Reflection {
             String protocol, String version, String hash, Map<String, RpcMethodInfo> methods)
             throws IOException {
         Schema schema = serviceDescriptionSchema();
-        try (BufferAllocator allocator = new RootAllocator();
+        try (BufferAllocator allocator = Allocators.root().newChildAllocator("reflection", 0, Long.MAX_VALUE);
                 VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
             setUtf8(root, "protocol", protocol);
             setUtf8(root, "protocol_version", version);

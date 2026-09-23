@@ -9,6 +9,9 @@ val testcontainersVersion = "1.21.4"
 dependencies {
     api(project(":vgirpc"))
     implementation(platform("software.amazon.awssdk:bom:$awsSdkVersion"))
+    // Arrow 19 pulls netty-common/netty-buffer 4.2; the AWS SDK pulls the rest of Netty
+    // at 4.1. Mixing Netty minors is unsupported, so pin every module to Arrow's.
+    implementation(platform("io.netty:netty-bom:4.2.9.Final"))
     implementation("software.amazon.awssdk:s3")
     implementation("software.amazon.awssdk:s3-transfer-manager")
     implementation("software.amazon.awssdk:regions")

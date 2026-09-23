@@ -13,6 +13,7 @@ application {
     mainClass.set("farm.query.vgirpc.benchmark.worker.Main")
     applicationDefaultJvmArgs = listOf(
         "--add-opens=java.base/java.nio=ALL-UNNAMED",
+        "-Dio.netty.noUnsafe=false",
         "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
     )
 }

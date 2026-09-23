@@ -73,6 +73,9 @@ subprojects {
         // FFM (shm_open/mmap) needs native access without warnings.
         jvmArgs(
             "--add-opens=java.base/java.nio=ALL-UNNAMED",
+            // Arrow 19 allocates through Netty 4.2, which disables sun.misc.Unsafe
+            // on Java 25+ unless told otherwise (apache/arrow-java#728).
+            "-Dio.netty.noUnsafe=false",
             "--enable-native-access=ALL-UNNAMED",
         )
     }

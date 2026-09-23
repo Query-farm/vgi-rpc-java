@@ -17,7 +17,7 @@ When the Python and Java implementations disagree, **Python is the reference**. 
 # Compile only
 ./gradlew compileJava
 
-# JUnit tests (Arrow memory needs --add-opens java.base/java.nio — already set in root build.gradle.kts)
+# JUnit tests (Arrow memory needs --add-opens java.base/java.nio, and -Dio.netty.noUnsafe=false on JDK 25+ — both already set in root build.gradle.kts)
 ./gradlew test
 
 # Single module
@@ -163,7 +163,7 @@ Package root: `farm.query.vgirpc`
 
 ## Testing
 
-- **JUnit 5** for Java-side unit tests (`*Test.java` under `src/test/java`). Arrow memory needs `--add-opens=java.base/java.nio=ALL-UNNAMED` — already wired in the root `build.gradle.kts`.
+- **JUnit 5** for Java-side unit tests (`*Test.java` under `src/test/java`). Arrow memory needs `--add-opens=java.base/java.nio=ALL-UNNAMED` — already wired in the root `build.gradle.kts`. So is `-Dio.netty.noUnsafe=false`: Arrow 19 allocates through Netty 4.2, which disables `sun.misc.Unsafe` by default on Java 25+ (the toolchain JDK) and leaves `NettyAllocationManager` unable to initialise (apache/arrow-java#728). `Allocators` sets the same default when it is Arrow's first touch in a process, which is why main code allocates from `Allocators.root()` rather than a fresh `RootAllocator` — a stray one that runs first gets no default. Every `applicationDefaultJvmArgs` passes the flag too. `vgirpc-s3` pins `netty-bom` to Arrow's Netty, because the AWS SDK otherwise brings the rest of Netty at 4.1.
 - **Conformance** is driven from Python via `tests/test_java_conformance.py` and the other `tests/test_java_*.py` files. These spawn the Java worker (built via `./gradlew installDist`) over the transport under test. The `./run_tests.sh` / `./inspect.sh` entry points stay at the repo root.
 - The conformance driver expects `conformance-worker` to print `PORT:<port>` on stdout when launched with `--http` (auto-port selection, matches the Python reference).
 

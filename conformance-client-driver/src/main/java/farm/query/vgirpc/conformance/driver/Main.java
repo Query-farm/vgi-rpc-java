@@ -236,7 +236,7 @@ public final class Main {
         HttpRpcConnection.Builder builder = HttpRpcConnection.builder(url).onLog(logs::add);
         JsonNode headers = request.get("headers");
         if (headers != null && headers.isObject()) {
-            headers.fields().forEachRemaining(entry -> {
+            headers.properties().forEach(entry -> {
                 if (entry.getValue().isTextual()) builder.header(entry.getKey(), entry.getValue().asText());
             });
         }

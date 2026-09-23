@@ -29,7 +29,11 @@ public final class Allocators {
     /** @return the shared process-wide root {@link BufferAllocator}. */
     public static BufferAllocator root() { return ROOT; }
 
+    /** Netty's switch for {@code sun.misc.Unsafe}; see {@link #defaultNettyToUnsafe()}. */
+    static final String NETTY_NO_UNSAFE_PROPERTY = "io.netty.noUnsafe";
+
     private static BufferAllocator buildRoot() {
+        defaultNettyToUnsafe();
         long limit = parseLimit();
         // Pooled, non-zeroing allocator for large buffers is ON by default: it
         // removes the ~35% of worker CPU the JDK spends zeroing fresh direct
@@ -40,6 +44,30 @@ public final class Allocators {
             return VgiPooledAllocators.create(limit, PooledDirectAllocator.FACTORY);
         }
         return new RootAllocator(limit);
+    }
+
+    /**
+     * Arrow 19 allocates through Netty 4.2, which turns {@code sun.misc.Unsafe}
+     * off by default on Java 25+ unless {@code io.netty.noUnsafe} or
+     * {@code --sun-misc-unsafe-memory-access} is set explicitly. Arrow's
+     * {@code NettyAllocationManager} cannot run without it: its static
+     * initializer calls {@code memoryAddress()} and every allocator in the
+     * process then fails with an opaque {@code ExceptionInInitializerError}
+     * (apache/arrow-java#728). Upstream's answer is a JVM flag; setting the
+     * same property here, before this class first touches Arrow, means a
+     * worker or client that forgot the flag still starts. An explicit choice
+     * by the operator — either property — is left alone.
+     *
+     * <p>Netty reads the property once, in {@code PlatformDependent0}'s static
+     * initializer, so this only helps when nothing in the process loaded Netty
+     * or an Arrow allocator first. Launchers should still pass
+     * {@code -Dio.netty.noUnsafe=false}.</p>
+     */
+    private static void defaultNettyToUnsafe() {
+        if (System.getProperty(NETTY_NO_UNSAFE_PROPERTY) == null
+                && System.getProperty("sun.misc.unsafe.memory.access") == null) {
+            System.setProperty(NETTY_NO_UNSAFE_PROPERTY, "false");
+        }
     }
 
     private static long parseLimit() {

@@ -4,7 +4,7 @@ plugins {
 
 dependencies {
     implementation(project(":vgirpc"))
-    implementation("com.fasterxml.jackson.core:jackson-databind:2.18.2")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.21.0")
     runtimeOnly("org.slf4j:slf4j-simple:2.0.16")
 
     testImplementation(platform("org.junit:junit-bom:5.11.3"))
@@ -16,6 +16,7 @@ application {
     mainClass.set("farm.query.vgirpc.tailnet.Main")
     applicationDefaultJvmArgs = listOf(
         "--add-opens=java.base/java.nio=ALL-UNNAMED",
+        "-Dio.netty.noUnsafe=false",
         "-Dorg.slf4j.simpleLogger.defaultLogLevel=warn",
     )
 }

@@ -3,9 +3,9 @@ plugins {
     `java-test-fixtures`
 }
 
-val arrowVersion = "18.1.0"
+val arrowVersion = "19.0.0"
 val jettyVersion = "12.0.16"
-val jacksonVersion = "2.18.2"
+val jacksonVersion = "2.21.0"
 val slf4jVersion = "2.0.16"
 
 dependencies {
