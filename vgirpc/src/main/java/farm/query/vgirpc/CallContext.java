@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc;
 
+import farm.query.vgirpc.external.ExternalRef;
 import farm.query.vgirpc.http.SessionRegistry;
 import farm.query.vgirpc.http.SessionScope;
 import farm.query.vgirpc.identity.PeerEvidenceSet;
@@ -11,6 +12,7 @@ import farm.query.vgirpc.log.Message;
 
 import java.util.Collections;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Consumer;
 
 /**
@@ -31,6 +33,9 @@ public final class CallContext {
     private final TransportKind kind;
     private final Long responseLimitBytes;
     private final Long preferredResponseBytes;
+    /** Set by the unary dispatcher; only then may the method answer with a ref. */
+    private boolean externalRefAllowed;
+    private ExternalRef externalRef;
 
     /**
      * Create a per-request context. Constructed by the framework at dispatch
@@ -244,6 +249,54 @@ public final class CallContext {
      * @param m the message to serialize as a zero-row log batch on the response stream
      */
     public void emitClientLog(Message m) { emitClientLog.accept(m); }
+
+    // --- Pre-published results (unary only) ------------------------------
+
+    /**
+     * Answer this unary call with a pre-published {@link ExternalRef} instead
+     * of the method's return value.
+     *
+     * <p>The dispatcher then writes the ExternalLocation pointer batch for the
+     * ref directly — {@code vgi_rpc.location}, plus
+     * {@code vgi_rpc.location.sha256} only when the ref carries a digest — and
+     * ignores whatever the method returns: no result value is built or
+     * validated (a {@code null} for a non-nullable result is fine), nothing is
+     * serialised or uploaded, the inline and shared-memory routes are never
+     * taken, and it happens whether or not the server has external storage
+     * configured and regardless of the externalisation threshold. Nothing is
+     * charged to {@code max_externalized_response_bytes}. A method that throws
+     * after calling this still answers with its error.</p>
+     *
+     * <pre>{@code
+     * public String catalog(CallContext ctx) {     // implements MyService.catalog
+     *     ctx.respondWithExternalRef(cachedRef());   // e.g. from Externalizer.publishExternal
+     *     return null;                               // ignored
+     * }
+     * }</pre>
+     *
+     * <p>Unary methods with a result only; a later call replaces an earlier
+     * ref.</p>
+     *
+     * @param ref the published reference
+     * @throws NullPointerException if {@code ref} is {@code null}
+     * @throws IllegalStateException if this context does not belong to a unary
+     *     call (stream methods cannot answer with a ref)
+     */
+    public void respondWithExternalRef(ExternalRef ref) {
+        Objects.requireNonNull(ref, "ref");
+        if (!externalRefAllowed) {
+            throw new IllegalStateException(
+                    "respondWithExternalRef is only supported for unary methods (method '"
+                            + methodName + "')");
+        }
+        this.externalRef = ref;
+    }
+
+    /** Enable {@link #respondWithExternalRef}; called by the unary dispatcher. */
+    void allowExternalRef() { this.externalRefAllowed = true; }
+
+    /** The ref this call answered with, or {@code null} for an ordinary result. */
+    ExternalRef externalRef() { return externalRef; }
 
     // --- Sticky-session API (HTTP-only) ---------------------------------
     //

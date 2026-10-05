@@ -137,7 +137,7 @@ Package root: `farm.query.vgirpc`
 - **`http/auth/`** — shared authenticator implementations (bearer, mTLS/XFCC). JWT/OAuth lives in the `vgirpc-oauth` module to keep core deps lean.
 - **`marshal/`** — `Marshalling` (row↔VectorSchemaRoot, type casting, parameter adaptation), `RecordCodec` (Java record ↔ row map).
 - **`schema/`** — `SchemaDerivation` (Java type → Arrow schema), `ArrowSerializableRecord`, `ArrowField`, `ArrowFieldType`, `Nullable`, `EnumDictionaryRegistry`, `StreamHeader`.
-- **`external/`** — `ExternalStorage`, `ExternalLocationConfig`, `Externalizer` (large batch → pointer batch), `LocationResolver`, `ExternalFetcher`.
+- **`external/`** — `ExternalStorage`, `ExternalLocationConfig`, `Externalizer` (large batch → pointer batch; `publishExternal` publishes a unary result once and returns an `ExternalRef`), `ExternalRef` (pre-published result: a unary method answers with it via `CallContext.respondWithExternalRef`, and `RpcServer.writeExternalRef` writes its pointer directly — no build/validate/upload, never inline or shm, not charged to the externalized-response budget; the per-call externalizer and `publishExternal` share `serializeSingleBatch`/`uploadIpcBytes`), `LocationResolver`, `ExternalFetcher`.
 - **`shm/`** — `ShmSegment` for zero-copy batch transfer between co-located processes.
 - **`log/`** — `Level`, `Message`. Log messages are serialized as zero-row batches with `vgi_rpc.log_level` / `vgi_rpc.log_message` / `vgi_rpc.log_extra` metadata.
 

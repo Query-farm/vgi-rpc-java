@@ -36,6 +36,20 @@ public interface ConformanceService {
     byte[] echo_bytes(byte[] data);
     byte[] oversized_unary(long target_bytes);
 
+    /**
+     * Return {@code value} through a pre-published {@code ExternalRef} (publish once, reuse).
+     *
+     * <p>Requires the worker's external storage ({@code --fake-storage}). The worker keeps
+     * a per-process cache keyed by {@code (value, include_sha256)}; on a miss it builds the
+     * result batch {@code {result: [value]}}, publishes it with the worker's configured
+     * compression (and a digest only when {@code include_sha256}) and caches the ref. Every
+     * call answers with the cached ref, so the response is always a pointer batch --
+     * regardless of the externalisation threshold -- and repeated calls name the same URL
+     * without uploading again. Without storage the call fails with
+     * "published_string requires external storage".</p>
+     */
+    String published_string(String value, boolean include_sha256, CallContext ctx);
+
     @ArrowField(ArrowFieldType.LARGE_UTF8)
     String echo_large_string(@ArrowField(ArrowFieldType.LARGE_UTF8) String value);
 

@@ -7,6 +7,11 @@ import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.ExchangeState;
 import farm.query.vgirpc.ProducerState;
 import farm.query.vgirpc.RpcStream;
+import farm.query.vgirpc.ServiceIntrospector;
+import farm.query.vgirpc.external.ExternalLocationConfig;
+import farm.query.vgirpc.external.ExternalRef;
+import farm.query.vgirpc.external.ExternalStorage;
+import farm.query.vgirpc.external.Externalizer;
 import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.wire.Allocators;
@@ -18,12 +23,65 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayOutputStream;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 public final class ConformanceServiceImpl implements ConformanceService {
+
+    /** The worker's external storage, for {@code published_string}; {@code null} when none. */
+    private final ExternalStorage externalStorage;
+    /** The worker's configured upload compression; {@code null} uploads raw. */
+    private final ExternalLocationConfig.Compression externalCompression;
+    /** Publish-once cache for {@code published_string}, keyed by (value, include_sha256). */
+    private final Map<PublishedKey, ExternalRef> published = new HashMap<>();
+
+    private record PublishedKey(String value, boolean includeSha256) {}
+
+    /** An implementation with no external storage ({@code published_string} raises). */
+    public ConformanceServiceImpl() {
+        this(null, null);
+    }
+
+    /**
+     * An implementation that publishes {@code published_string} results through the
+     * worker's own storage.
+     *
+     * @param externalStorage the worker's external storage backend, or {@code null}
+     * @param externalCompression the worker's configured compression for externalised
+     *     data, applied when {@code published_string} publishes; {@code null} uploads raw
+     */
+    public ConformanceServiceImpl(ExternalStorage externalStorage,
+                                  ExternalLocationConfig.Compression externalCompression) {
+        this.externalStorage = externalStorage;
+        this.externalCompression = externalCompression;
+    }
+
+    @Override public String published_string(String value, boolean include_sha256, CallContext ctx) {
+        ExternalStorage storage = externalStorage;
+        if (storage == null) throw new RuntimeException("published_string requires external storage");
+        ExternalRef ref;
+        synchronized (published) {
+            PublishedKey key = new PublishedKey(value, include_sha256);
+            ref = published.get(key);
+            if (ref == null) {
+                Schema schema = ServiceIntrospector.describe(ConformanceService.class)
+                        .get("published_string").resultSchema();
+                try {
+                    ref = Externalizer.publishExternal(schema, value, storage, externalCompression, include_sha256);
+                } catch (RuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new RuntimeException("published_string: publish failed: " + e.getMessage(), e);
+                }
+                published.put(key, ref);
+            }
+        }
+        ctx.respondWithExternalRef(ref);
+        return null;  // ignored: the call answers with the ref's pointer
+    }
 
     @Override public String echo_string(String value) { return value; }
     @Override public byte[] echo_bytes(byte[] data) { return data; }

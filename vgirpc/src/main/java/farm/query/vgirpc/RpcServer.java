@@ -4,6 +4,7 @@
 package farm.query.vgirpc;
 
 import farm.query.vgirpc.external.ExternalLocationConfig;
+import farm.query.vgirpc.external.ExternalRef;
 import farm.query.vgirpc.external.Externalizer;
 import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.http.SessionScope;
@@ -1094,10 +1095,16 @@ public final class RpcServer {
             CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
                     serverId, info.name(), proto, "", transportKind, scope.peerEvidence());
             sink.bind(w, schema);
+            ctx.allowExternalRef();
             try {
                 Object[] callArgs = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
                 Object result = info.reflectMethod().invoke(target, callArgs);
-                writeResult(w, info, result, shm);
+                ExternalRef ref = ctx.externalRef();
+                if (ref != null) {
+                    writeExternalRef(w, info, ref);
+                } else {
+                    writeResult(w, info, result, shm);
+                }
             } catch (Throwable t) {
                 Throwable inner = unwrap(t);
                 Wire.writeZeroBatch(w, schema, Wire.errorMetadata(inner, serverId));
@@ -1135,6 +1142,30 @@ public final class RpcServer {
         }
         serveUnary(transport, info, kwargs, shm, identity, Identity.PROTOCOL_NAME);
         transport.writer().flush();
+    }
+
+    /**
+     * Write the pointer batch for a pre-published {@link ExternalRef} result.
+     *
+     * <p>Called instead of {@link #writeResult} when the method answered via
+     * {@link CallContext#respondWithExternalRef}: nothing is built, validated,
+     * serialised or uploaded, and the shared-memory and inline routes are never
+     * taken -- a ref always goes as a pointer, whatever the external config or
+     * threshold. It bypasses {@link Externalizer}, so it is never charged to the
+     * externalised-response budget; the HTTP wire cap still sees the (tiny)
+     * pointer like any other body. Every transport's unary call lands here, HTTP
+     * included (via {@link #serveOne}).
+     */
+    private void writeExternalRef(IpcStreamWriter w, RpcMethodInfo info, ExternalRef ref) throws IOException {
+        Schema schema = info.resultSchema();
+        if (schema.getFields().isEmpty()) {
+            throw new IllegalStateException("method '" + info.name()
+                    + "' has no result; it cannot answer with an ExternalRef");
+        }
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Write result batch: method={}, route=external_ref", info.name());
+        }
+        Wire.writeZeroBatch(w, schema, ref.pointerMetadata());
     }
 
     private void writeResult(IpcStreamWriter w, RpcMethodInfo info, Object result, Shm shm) throws Exception {

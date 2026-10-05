@@ -5,6 +5,7 @@ package farm.query.vgirpc.external;
 
 import com.github.luben.zstd.Zstd;
 import farm.query.vgirpc.AccessLogScope;
+import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Wire;
@@ -22,6 +23,7 @@ import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Server-side helper that externalises data batches above the configured
@@ -31,6 +33,10 @@ import java.util.Map;
  *
  * <p>Never externalises zero-row batches (logs, errors, finish markers) —
  * these are tiny and carry semantic metadata that must travel inline.</p>
+ *
+ * <p>{@link #publishExternal} is the publish-once counterpart: it uploads a
+ * unary result through the same serialise/hash/compress/upload path and
+ * returns an {@link ExternalRef} a method can hand back on every later call.</p>
  */
 public final class Externalizer {
 
@@ -103,48 +109,11 @@ public final class Externalizer {
 
         Schema wireSchema = declaredSchema != null ? declaredSchema : root.getSchema();
 
-        // Serialise the whole batch as a standalone IPC stream (schema + batch + EOS)
-        // matching the wire format the fetcher consumes.
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        try (IpcStreamWriter w = new IpcStreamWriter(bos)) {
-            if (wireSchema.equals(root.getSchema())) {
-                w.writeBatch(root, existingMeta, dictionaryProvider);
-            } else {
-                // Declare the enclosing stream's schema and write the root's
-                // buffers unchanged — byte-for-byte what inline delivery emits.
-                w.writeSchema(wireSchema);
-                VectorUnloader unloader = new VectorUnloader(root, true, NoCompressionCodec.INSTANCE, true);
-                try (ArrowRecordBatch rb = unloader.getRecordBatch()) {
-                    w.writeBatch(rb, existingMeta);
-                }
-            }
-            w.writeEos();
-        }
-        byte[] body = bos.toByteArray();
-        // SHA-256 is computed over the *raw* (pre-compression) IPC bytes so
-        // both sides can verify the payload after the fetcher transparently
-        // decompresses on download — matches the Python reference.
-        byte[] sha256 = MessageDigest.getInstance("SHA-256").digest(body);
-
-        String contentEncoding = null;
-        byte[] uploadBody = body;
-        ExternalLocationConfig.Compression comp = config.compression();
-        if (comp != null && "zstd".equalsIgnoreCase(comp.algorithm())) {
-            uploadBody = Zstd.compress(body, comp.level());
-            contentEncoding = "zstd";
-        }
-
-        // Pre-flight the operator cap BEFORE the upload. Enforcing it afterwards
-        // would still have spent the egress: bytes already in external storage
-        // cannot be un-uploaded, which is exactly why this cap — unlike the wire
-        // cap — has no soft-for-producers escape. Throws on overshoot.
-        ExternalResponseBudget.reserve(uploadBody.length);
-        // Counted here rather than at the call sites: this is the one place every
-        // externalised payload passes through, so a new upload path cannot drift
-        // from the total. These bytes never appear in the HTTP body — only the
-        // pointer batch below does — so nothing at the transport can see them.
-        AccessLogScope.countExternalized(uploadBody.length);
-        URI url = config.storage().upload(uploadBody, contentEncoding);
+        byte[] body = serializeSingleBatch(root, existingMeta, wireSchema, dictionaryProvider);
+        // The per-call path charges the response: the cap pre-flight and the
+        // access-log egress counter both run between compression and upload.
+        Uploaded up = uploadIpcBytes(body, config.storage(), config.compression(), true);
+        URI url = up.url();
 
         // Build a zero-row pointer root declaring the payload's schema. Via
         // Wire.zeroRootFor, not VectorSchemaRoot.create: for a dictionary-encoded
@@ -158,9 +127,208 @@ public final class Externalizer {
         Map<String, String> pointerMeta = new LinkedHashMap<>();
         if (existingMeta != null) pointerMeta.putAll(existingMeta);
         pointerMeta.put(Metadata.LOCATION, url.toString());
-        pointerMeta.put(Metadata.LOCATION_SHA256, HexFormat.of().formatHex(sha256));
+        pointerMeta.put(Metadata.LOCATION_SHA256, up.sha256());
         pointerMeta.put(Metadata.LOCATION_SOURCE, "external");
 
         return new Pointer(pointer, pointerMeta);
+    }
+
+    // ------------------------------------------------------------------
+    // Pre-published references
+    // ------------------------------------------------------------------
+
+    /**
+     * Publish a unary result batch once and return a reusable reference.
+     *
+     * <p>Serialises {@code batch} exactly as the per-call externaliser does (a
+     * standalone IPC stream of its schema plus this one batch), hashes the raw
+     * bytes, compresses when {@code compression} is given (same codec and
+     * {@code Content-Encoding} handling), and calls
+     * {@link ExternalStorage#upload} once. Cache the returned
+     * {@link ExternalRef} and answer later calls with
+     * {@link farm.query.vgirpc.CallContext#respondWithExternalRef(ExternalRef)};
+     * the server writes the pointer directly.</p>
+     *
+     * <p>Unlike {@link #maybeExternalize}, this is not a per-response upload:
+     * it is neither charged to the calling request's
+     * {@code max_externalized_response_bytes} budget nor counted as that
+     * request's externalised egress.</p>
+     *
+     * @param batch the 1-row result batch, built against the method's result
+     *     schema (see {@link #publishExternal(Schema, Object, ExternalStorage,
+     *     ExternalLocationConfig.Compression, boolean)} to build it from a value)
+     * @param storage storage backend to upload to
+     * @param compression compression applied before upload (pass the server's
+     *     {@link ExternalLocationConfig#compression()} to match it), or
+     *     {@code null} to upload raw
+     * @param includeSha256 when {@code false} the ref carries no digest, so
+     *     clients skip the content check
+     * @return a ref naming the uploaded object
+     * @throws IllegalArgumentException if {@code batch} does not have exactly one row
+     * @throws Exception if serialisation or the upload fails
+     */
+    public static ExternalRef publishExternal(VectorSchemaRoot batch,
+                                              ExternalStorage storage,
+                                              ExternalLocationConfig.Compression compression,
+                                              boolean includeSha256) throws Exception {
+        return publishExternal(batch, null, storage, compression, includeSha256);
+    }
+
+    /**
+     * {@link #publishExternal(VectorSchemaRoot, ExternalStorage,
+     * ExternalLocationConfig.Compression, boolean)} with a digest.
+     *
+     * @param batch the 1-row result batch
+     * @param storage storage backend to upload to
+     * @param compression compression applied before upload, or {@code null}
+     * @return a ref naming the uploaded object, carrying its SHA-256
+     * @throws Exception if serialisation or the upload fails
+     */
+    public static ExternalRef publishExternal(VectorSchemaRoot batch,
+                                              ExternalStorage storage,
+                                              ExternalLocationConfig.Compression compression)
+            throws Exception {
+        return publishExternal(batch, null, storage, compression, true);
+    }
+
+    /**
+     * Dictionary-aware variant of {@link #publishExternal(VectorSchemaRoot,
+     * ExternalStorage, ExternalLocationConfig.Compression, boolean)} for a
+     * batch with dictionary-encoded (enum) columns.
+     *
+     * @param batch the 1-row result batch
+     * @param dictionaryProvider dictionaries for encoded columns, or {@code null}
+     * @param storage storage backend to upload to
+     * @param compression compression applied before upload, or {@code null}
+     * @param includeSha256 whether the ref carries the digest
+     * @return a ref naming the uploaded object
+     * @throws Exception if serialisation or the upload fails
+     */
+    public static ExternalRef publishExternal(VectorSchemaRoot batch,
+                                              DictionaryProvider dictionaryProvider,
+                                              ExternalStorage storage,
+                                              ExternalLocationConfig.Compression compression,
+                                              boolean includeSha256) throws Exception {
+        Objects.requireNonNull(batch, "batch");
+        Objects.requireNonNull(storage, "storage");
+        if (batch.getRowCount() != 1) {
+            throw new IllegalArgumentException(
+                    "publishExternal expects a 1-row result batch, got " + batch.getRowCount() + " rows");
+        }
+        byte[] body = serializeSingleBatch(batch, null, batch.getSchema(), dictionaryProvider);
+        Uploaded up = uploadIpcBytes(body, storage, compression, false);
+        return new ExternalRef(up.url().toString(), includeSha256 ? up.sha256() : null);
+    }
+
+    /**
+     * Build the result batch {@code {result: [value]}} against
+     * {@code resultSchema} and publish it.
+     *
+     * <p>Obtain the schema from the service interface, e.g.
+     * {@code ServiceIntrospector.describe(MyService.class).get("catalog").resultSchema()}.
+     * {@code value} is marshalled the way the unary dispatcher marshals a
+     * returned value.</p>
+     *
+     * @param resultSchema the method's single-column result schema
+     * @param value the result value
+     * @param storage storage backend to upload to
+     * @param compression compression applied before upload, or {@code null}
+     * @param includeSha256 whether the ref carries the digest
+     * @return a ref naming the uploaded object
+     * @throws IllegalArgumentException if {@code resultSchema} does not have exactly one field
+     * @throws Exception if marshalling, serialisation or the upload fails
+     */
+    public static ExternalRef publishExternal(Schema resultSchema,
+                                              Object value,
+                                              ExternalStorage storage,
+                                              ExternalLocationConfig.Compression compression,
+                                              boolean includeSha256) throws Exception {
+        Objects.requireNonNull(resultSchema, "resultSchema");
+        if (resultSchema.getFields().size() != 1) {
+            throw new IllegalArgumentException(
+                    "publishExternal needs a single-column result schema, got " + resultSchema);
+        }
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put(resultSchema.getFields().get(0).getName(), value);
+        try (Marshalling.EncodedRow encoded =
+                     Marshalling.encodeRowForWire(resultSchema, row, Allocators.root())) {
+            return publishExternal(encoded.root(), encoded.provider(), storage, compression, includeSha256);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Shared serialise / hash / compress / upload
+    // ------------------------------------------------------------------
+
+    /** Result of {@link #uploadIpcBytes}. */
+    private record Uploaded(URI url, String sha256) {}
+
+    /**
+     * Serialise {@code root} as a complete standalone IPC stream (schema +
+     * one batch + EOS) declaring {@code wireSchema}, matching the wire format
+     * the fetcher consumes.
+     */
+    private static byte[] serializeSingleBatch(VectorSchemaRoot root,
+                                               Map<String, String> meta,
+                                               Schema wireSchema,
+                                               DictionaryProvider dictionaryProvider) throws Exception {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (IpcStreamWriter w = new IpcStreamWriter(bos)) {
+            if (wireSchema.equals(root.getSchema())) {
+                w.writeBatch(root, meta, dictionaryProvider);
+            } else {
+                // Declare the enclosing stream's schema and write the root's
+                // buffers unchanged — byte-for-byte what inline delivery emits.
+                w.writeSchema(wireSchema);
+                VectorUnloader unloader = new VectorUnloader(root, true, NoCompressionCodec.INSTANCE, true);
+                try (ArrowRecordBatch rb = unloader.getRecordBatch()) {
+                    w.writeBatch(rb, meta);
+                }
+            }
+            w.writeEos();
+        }
+        return bos.toByteArray();
+    }
+
+    /**
+     * Hash, optionally compress, and upload one serialised IPC stream — the
+     * single choke point shared by every server-side externalisation path
+     * (per-call batches and {@link #publishExternal}), so the bytes a pointer
+     * names are always produced the same way.
+     *
+     * @param chargeResponse {@code true} for a per-response upload: pre-flight
+     *     the {@link ExternalResponseBudget} and count the bytes as the
+     *     request's externalised egress before uploading
+     */
+    private static Uploaded uploadIpcBytes(byte[] body,
+                                           ExternalStorage storage,
+                                           ExternalLocationConfig.Compression comp,
+                                           boolean chargeResponse) throws Exception {
+        // SHA-256 is computed over the *raw* (pre-compression) IPC bytes so
+        // both sides can verify the payload after the fetcher transparently
+        // decompresses on download — matches the Python reference.
+        byte[] sha256 = MessageDigest.getInstance("SHA-256").digest(body);
+
+        String contentEncoding = null;
+        byte[] uploadBody = body;
+        if (comp != null && "zstd".equalsIgnoreCase(comp.algorithm())) {
+            uploadBody = Zstd.compress(body, comp.level());
+            contentEncoding = "zstd";
+        }
+
+        if (chargeResponse) {
+            // Pre-flight the operator cap BEFORE the upload. Enforcing it afterwards
+            // would still have spent the egress: bytes already in external storage
+            // cannot be un-uploaded, which is exactly why this cap — unlike the wire
+            // cap — has no soft-for-producers escape. Throws on overshoot.
+            ExternalResponseBudget.reserve(uploadBody.length);
+            // Counted here rather than at the call sites: this is the one place every
+            // externalised payload passes through, so a new upload path cannot drift
+            // from the total. These bytes never appear in the HTTP body — only the
+            // pointer batch does — so nothing at the transport can see them.
+            AccessLogScope.countExternalized(uploadBody.length);
+        }
+        URI url = storage.upload(uploadBody, contentEncoding);
+        return new Uploaded(url, HexFormat.of().formatHex(sha256));
     }
 }

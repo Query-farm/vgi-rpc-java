@@ -30,6 +30,7 @@ This is a port of the Python reference implementation, [`vgi-rpc`](https://githu
 - **Runtime introspection** — the `vgi_rpc.Reflection.v1` protocol (`list_protocols`, then `describe`) for dynamic service discovery, with a canonical protocol hash every port agrees on. The old `__describe__` RPC is retired; a request for it is refused with a message naming its replacement.
 - **Shared-memory transport** — zero-copy batch transfer between co-located processes (auto-negotiated on JDK 22+ via a multi-release overlay; transparent pipe fallback otherwise).
 - **Large-batch externalization** — oversized batches transparently spilled to S3 (`vgirpc-s3`) or GCS (`vgirpc-gcs`).
+- **Pre-published results** — a unary method can answer with an `ExternalRef` to an object published once, so a large, rarely-changing result is never re-serialized or re-uploaded per call.
 
 ## Requirements
 
@@ -161,6 +162,52 @@ start or download a helper executable.
 
 - **Unary** — request batch in, one result (or error) batch out.
 - **Streaming** — a `RpcStream<S extends StreamState>` whose state's `process(input, out, ctx)` runs once per tick, in two flavours: **producer** (server emits a sequence of output batches) and **exchange** (lockstep input batch → output batch).
+
+## Pre-published results (`ExternalRef`)
+
+Some unary results are large and change rarely (a worker's whole catalog, say). Rather than letting
+the externalizer serialize and upload them on every call, publish the result once with
+`Externalizer.publishExternal` and answer later calls with the cached reference:
+
+```java
+public interface CatalogService {
+    String catalog(CallContext ctx);   // CallContext is off-wire
+}
+
+final class CatalogImpl implements CatalogService {
+    private volatile ExternalRef ref;
+
+    @Override public String catalog(CallContext ctx) {
+        ExternalRef r = ref;
+        if (r == null) {
+            Schema schema = ServiceIntrospector.describe(CatalogService.class).get("catalog").resultSchema();
+            // Builds {result: [value]}, serializes it exactly like the per-call externalizer,
+            // hashes the raw bytes, compresses (zstd here) and uploads once.
+            r = ref = Externalizer.publishExternal(schema, buildCatalog(), storage,
+                    ExternalLocationConfig.Compression.zstd(), /* includeSha256 */ true);
+        }
+        ctx.respondWithExternalRef(r);
+        return null;   // ignored once a ref is set
+    }
+}
+```
+
+`ctx.respondWithExternalRef(ref)` makes the dispatcher write the ExternalLocation pointer batch
+(`vgi_rpc.location`, plus `vgi_rpc.location.sha256` only when the ref has a digest) directly: the
+returned value is ignored and not validated, nothing is serialized or uploaded, the inline and
+shared-memory routes are never taken, and this holds whether or not the server has external
+storage configured and regardless of the externalization threshold. A ref is not charged to
+`max_externalized_response_bytes`. It works on every transport (pipe, unix, TCP, HTTP); clients
+resolve it like any other pointer and need no change. Unary methods with a result only — a stream
+method's context refuses the call.
+
+`publishExternal` also takes a ready-built 1-row `VectorSchemaRoot`. A ref built with
+`includeSha256 = false` (or `ExternalRef.of(url)` for an object published out of band) carries no
+digest, so clients skip the content check — use that for an object rewritten in place. You own the
+ref's cache and the object's lifecycle: a long-lived ref must not point at an object under the
+short-TTL lifecycle rule used for per-call uploads, a pre-signed URL expires (re-sign or rebuild the
+ref before then), and a ref must only be returned to callers who are all entitled to the same
+content.
 
 ## Protocol names
 

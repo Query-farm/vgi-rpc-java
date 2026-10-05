@@ -211,34 +211,8 @@ public final class Main {
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
         }
-        RpcServer server;
-        if (transportKindProbe) {
-            server = new RpcServer(TransportKindProbeService.class, new TransportKindProbeServiceImpl());
-        } else {
-            server = new RpcServer(ConformanceService.class, new ConformanceServiceImpl());
-            // Match the Python reference's ConformanceService.protocol_version so the
-            // describe conformance suite sees the same MAJOR.MINOR.PATCH label.
-            server.setProtocolVersion("2.0.0");
-        }
-        if (failServeStartOnce) {
-            AtomicBoolean first = new AtomicBoolean(true);
-            server.setServeStartHook(kind -> {
-                if (first.compareAndSet(true, false)) {
-                    throw new IllegalStateException("conformance injected on_serve_start failure");
-                }
-            });
-        }
-        // Applied after the loop so flag order does not matter, and only when no
-        // stronger mode was selected.
-        if (!"off".equals(identityMode)) {
-            server.setIdentity(conformanceIdentity(identityMode));
-            if (authenticator == null) authenticator = principalHeaderAuthenticator();
-        }
-        if (httpProof) {
-            authenticator = buildProofGate(
-                    proofMode, proofOriginId, proofSecrets, proofSkew, proofReplayCache, authenticator);
-        }
         FakeStorage fakeStorage = null;
+        ExternalLocationConfig externalCfg = null;
         if (fakeStorageUrl != null) {
             fakeStorage = new FakeStorage(fakeStorageUrl);
             ExternalLocationConfig.Builder cfgB = ExternalLocationConfig.builder()
@@ -264,11 +238,42 @@ public final class Main {
                 System.err.println("unknown --compression value: " + compression);
                 System.exit(2);
             }
-            ExternalLocationConfig cfg = cfgB.build();
-            server.setExternalConfig(cfg);
+            externalCfg = cfgB.build();
+        }
+        RpcServer server;
+        if (transportKindProbe) {
+            server = new RpcServer(TransportKindProbeService.class, new TransportKindProbeServiceImpl());
+        } else {
+            // published_string publishes through the worker's own storage + compression.
+            server = new RpcServer(ConformanceService.class, new ConformanceServiceImpl(
+                    fakeStorage, externalCfg != null ? externalCfg.compression() : null));
+            // Match the Python reference's ConformanceService.protocol_version so the
+            // describe conformance suite sees the same MAJOR.MINOR.PATCH label.
+            server.setProtocolVersion("2.0.0");
+        }
+        if (externalCfg != null) {
+            server.setExternalConfig(externalCfg);
             // Also wire the resolver so the server can transparently pull pointer
             // batches that clients upload via the __upload_url__ flow.
-            server.setLocationResolver(new LocationResolver(cfg));
+            server.setLocationResolver(new LocationResolver(externalCfg));
+        }
+        if (failServeStartOnce) {
+            AtomicBoolean first = new AtomicBoolean(true);
+            server.setServeStartHook(kind -> {
+                if (first.compareAndSet(true, false)) {
+                    throw new IllegalStateException("conformance injected on_serve_start failure");
+                }
+            });
+        }
+        // Applied after the loop so flag order does not matter, and only when no
+        // stronger mode was selected.
+        if (!"off".equals(identityMode)) {
+            server.setIdentity(conformanceIdentity(identityMode));
+            if (authenticator == null) authenticator = principalHeaderAuthenticator();
+        }
+        if (httpProof) {
+            authenticator = buildProofGate(
+                    proofMode, proofOriginId, proofSecrets, proofSkew, proofReplayCache, authenticator);
         }
         if (accessLogPath != null) {
             OutputStream accessLogOut = new FileOutputStream(accessLogPath, true);
