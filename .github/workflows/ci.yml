@@ -193,8 +193,13 @@ jobs:
       - name: Install Python worker dependencies
         run: |
           python -m pip install --upgrade pip
+          # Same httpx2 pin as the conformance lane: 2.12.0 stopped decoding a
+          # standard zstd Content-Encoding while still advertising zstd, and
+          # 2.13.1 fixed it. vgi-rpc 0.47.2+ requires httpx2>=2.12, so 2.9.1
+          # only installed here because VGI_RPC_PYTHON_REV predates that floor
+          # and would stop resolving as soon as the pin moved forward.
           python -m pip install "vgi-rpc[http] @ git+https://github.com/Query-farm/vgi-rpc-python.git@${VGI_RPC_PYTHON_REV}" \
-            'httpx2==2.9.1' waitress
+            'httpx2==2.13.1' waitress
 
       - name: Build pinned Iroh bridge
         working-directory: .ci/vgi-rpc-rust
