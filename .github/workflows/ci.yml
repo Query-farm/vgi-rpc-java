@@ -445,7 +445,7 @@ jobs:
           VGI_CLIENT_DRIVER: conformance-client-driver/build/install/conformance-client-driver/bin/conformance-client-driver
         run: python -m pytest tests/test_java_conformance.py -p no:cacheprovider -q --timeout=120
 
-      # The multi-protocol hosting / error-model groups skip *loudly* when the
+      # The multi-protocol hosting / error-model / grant groups skip *loudly* when the
       # runner provides no `conformance_protocol_connector`, and a skip there
       # reads as a pass in the totals above. This re-runs exactly those groups
       # and fails on any skip, so "not run" cannot look like "passed".
@@ -460,7 +460,7 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest tests/test_java_conformance.py -p no:cacheprovider -q --timeout=120 -rs \
-            -k "Secondary or RoutingByPair or ErrorModel or TracebackPolicy or VersionMismatchCode or UnclassifiedErrorsAreUnknown or UnavailableCarriesARetryHint or ErrorKindsReachTheWire" \
+            -k "Secondary or RoutingByPair or ErrorModel or TracebackPolicy or VersionMismatchCode or UnclassifiedErrorsAreUnknown or UnavailableCarriesARetryHint or ErrorKindsReachTheWire or SealedGrant or GrantPrefixRouting or ResolveTokenBearer" \
             | tee /tmp/new-groups.txt
           if grep -q '^SKIPPED' /tmp/new-groups.txt; then
             echo "::error::a multi-protocol / error-model group skipped; see SKIPPED lines above"

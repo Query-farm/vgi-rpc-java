@@ -10,6 +10,9 @@ import farm.query.vgirpc.conformance.ConformanceService;
 import farm.query.vgirpc.conformance.ConformanceServiceImpl;
 import farm.query.vgirpc.conformance.Secondary;
 import farm.query.vgirpc.conformance.SecondaryImpl;
+import farm.query.vgirpc.conformance.Whoami;
+import farm.query.vgirpc.conformance.WhoamiImpl;
+import farm.query.vgirpc.identity.GrantKeys;
 import farm.query.vgirpc.conformance.TransportKindProbeService;
 import farm.query.vgirpc.conformance.TransportKindProbeServiceImpl;
 import farm.query.vgirpc.external.ExternalLocationConfig;
@@ -125,6 +128,7 @@ public final class Main {
         // (TestIdentityAbsentByDefault), and it is asserted against the *plain* worker, so
         // this flag must never default to anything but off.
         String identityMode = "off";
+        List<String> grantKeyArgs = new ArrayList<>();
         boolean transportKindProbe = false;
         boolean failServeStartOnce = false;
         ArgCursor c = new ArgCursor(args);
@@ -208,6 +212,8 @@ public final class Main {
                 // Implies HTTP: Identity's guards all read an authenticated caller, and HTTP is
                 // the only transport that carries one. Implies principal-header auth below.
                 case "--identity" -> { mode = "http"; identityMode = c.requireValue(a); }
+                // Repeatable, first mints (IDENTITY_V1_SPEC.md §9.1); overrides VGI_RPC_GRANT_KEYS.
+                case "--grant-key" -> grantKeyArgs.add(c.requireValue(a));
                 case "--transport-kind-probe" -> transportKindProbe = true;
                 case "--fail-serve-start-once" -> failServeStartOnce = true;
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
@@ -273,6 +279,21 @@ public final class Main {
         }
         // Applied after the loop so flag order does not matter, and only when no
         // stronger mode was selected.
+        if (!grantKeyArgs.isEmpty()) {
+            GrantKeys fromEnv = GrantKeys.fromEnv();
+            String ttl = System.getenv(GrantKeys.MAX_TTL_ENV);
+            server.setGrantKeys(GrantKeys.parse(grantKeyArgs,
+                    System.getenv().getOrDefault(GrantKeys.AUDIENCE_ENV, ""),
+                    ttl == null || ttl.isBlank() ? GrantKeys.DEFAULT_MAX_TTL_SECONDS : Long.parseLong(ttl.strip())));
+            if (fromEnv != null) System.err.println("--grant-key overrides " + GrantKeys.KEYS_ENV);
+        }
+        if ("grants".equals(identityMode)) {
+            // IDENTITY_CONFORMANCE_FIXTURE.md §10: the fixture keys, no mint hook (the framework
+            // mints sealed grants), and the Whoami probe, so a test can read back how a bearer
+            // was authenticated.
+            server.setGrantKeys(conformanceGrantKeys());
+            server.addProtocol(Whoami.class, new WhoamiImpl());
+        }
         if (!"off".equals(identityMode)) {
             server.setIdentity(conformanceIdentity(identityMode));
             if (authenticator == null) authenticator = principalHeaderAuthenticator();
@@ -429,6 +450,13 @@ public final class Main {
         return request -> {
             String principal = request.getHeader("X-Conformance-Principal");
             if (principal == null || principal.isEmpty()) {
+                // A bearer without a principal header is not this authenticator's credential:
+                // "not mine", so the identity bearer authenticators the server appends (sealed
+                // grants, resolveToken) are reached. Neither header means anonymous.
+                String authorization = request.getHeader("Authorization");
+                if (authorization != null && !authorization.isEmpty()) {
+                    throw new farm.query.vgirpc.http.InvalidCredentials("no conformance principal header");
+                }
                 return AuthContext.ANONYMOUS;
             }
             String authTime = request.getHeader(CONFORMANCE_AUTH_TIME_HEADER);
@@ -642,6 +670,19 @@ public final class Main {
      * @param mode {@code both} or {@code introspect-only}
      * @return the configured implementation
      */
+    /** The grant worker's keys: current {@code 0x10..0x2f} mints, previous {@code 0x30..0x4f}
+     *  verifies; audience {@code "conformance"}; max TTL 3600. Published fixture keys -- the suite
+     *  mints with them -- and never to be used anywhere else. */
+    private static GrantKeys conformanceGrantKeys() {
+        byte[] current = new byte[32];
+        byte[] previous = new byte[32];
+        for (int i = 0; i < 32; i++) {
+            current[i] = (byte) (0x10 + i);
+            previous[i] = (byte) (0x30 + i);
+        }
+        return new GrantKeys(List.of(current, previous), "conformance", 3600);
+    }
+
     private static IdentityImpl conformanceIdentity(String mode) {
         IdentityImpl.Builder b = IdentityImpl.builder()
                 .resolveToken(Main::identityResolveToken)
@@ -650,9 +691,10 @@ public final class Main {
         switch (mode) {
             case "both" -> b.mintGrant(Main::identityMintGrant);
             case "introspect-only" -> { }
+            case "grants" -> b.grantKeys(conformanceGrantKeys());
             default -> {
                 System.err.println("unknown --identity value: " + mode
-                        + " (expected off, both, or introspect-only)");
+                        + " (expected off, both, introspect-only, or grants)");
                 System.exit(2);
             }
         }

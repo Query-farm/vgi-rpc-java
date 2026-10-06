@@ -55,10 +55,15 @@ public final class IdentityImpl implements Identity {
     private final GrantMintHook mintGrant;
     private final Set<String> principals;
     private final double maxAuthAge;
+    private final GrantKeys grantKeys;
 
     private IdentityImpl(Builder b) {
         this.resolveToken = b.resolveToken;
-        this.mintGrant = b.mintGrant;
+        this.grantKeys = b.grantKeys;
+        // Grant keys and no hook of the worker's own: the framework mints sealed grants itself
+        // (IDENTITY_V1_SPEC.md §9.1), and an HTTP server hosting this identity accepts them back.
+        this.mintGrant = b.mintGrant != null ? b.mintGrant
+                : b.grantKeys != null ? SealedGrants.minter(b.grantKeys) : null;
         this.maxAuthAge = b.maxAuthAge;
         // Validated at construction, not at first call: a worker that would
         // refuse every introspection should fail to start rather than serve
@@ -83,6 +88,7 @@ public final class IdentityImpl implements Identity {
         private GrantMintHook mintGrant;
         private Collection<String> introspectPrincipals;
         private double maxAuthAge = DEFAULT_MAX_AUTH_AGE_SECONDS;
+        private GrantKeys grantKeys;
 
         private Builder() {}
 
@@ -151,6 +157,21 @@ public final class IdentityImpl implements Identity {
         }
 
         /**
+         * Sealed-grant configuration (IDENTITY_V1_SPEC.md §9).
+         *
+         * <p>When given and {@link #mintGrant} is not, the framework mints sealed grants itself;
+         * an HTTP server hosting this identity then also accepts them back as bearer credentials.
+         * {@code null} changes nothing.
+         *
+         * @param keys the deployment's grant keys, or {@code null}
+         * @return this builder
+         */
+        public Builder grantKeys(GrantKeys keys) {
+            this.grantKeys = keys;
+            return this;
+        }
+
+        /**
          * Build the implementation.
          *
          * @return the configured implementation
@@ -160,6 +181,20 @@ public final class IdentityImpl implements Identity {
             return new IdentityImpl(this);
         }
     }
+
+    /**
+     * The sealed-grant configuration, when this deployment has one.
+     *
+     * @return the keys, or {@code null}
+     */
+    public GrantKeys grantKeys() { return grantKeys; }
+
+    /**
+     * The worker's {@code resolveToken}, which an HTTP server also consults for bearers.
+     *
+     * @return the hook, or {@code null}
+     */
+    public TokenResolveHook resolveTokenHook() { return resolveToken; }
 
     /**
      * The methods this deployment can actually answer.

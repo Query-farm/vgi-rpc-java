@@ -110,6 +110,10 @@ public final class RpcServer {
     private ExternalLocationConfig externalConfig;
     private DispatchHook dispatchHook;
     private IdentityImpl identity;
+    /** Sealed-grant keys from {@code VGI_RPC_GRANT_KEYS} or {@link #setGrantKeys}; {@code null} = off. */
+    private farm.query.vgirpc.identity.GrantKeys configuredGrantKeys;
+    /** Whether {@link #identity} was installed by this server for grants, not by the deployment. */
+    private boolean autoIdentity;
     private Map<String, RpcMethodInfo> identityMethods = Map.of();
     private String protocolVersion = "";
     private final Object transportLock = new Object();
@@ -145,6 +149,10 @@ public final class RpcServer {
         this.methods = new LinkedHashMap<>(ServiceIntrospector.describe(serviceInterface));
         bindings.put(protocolName, new Binding(protocolName, impl,
                 Collections.unmodifiableMap(this.methods), ""));
+        // Read at construction, so a malformed key refuses to start the worker rather than
+        // failing the first mint. Unset means grants are off and nothing changes.
+        this.configuredGrantKeys = farm.query.vgirpc.identity.GrantKeys.fromEnv();
+        if (configuredGrantKeys != null) setIdentity(null);
     }
 
     /**
@@ -336,15 +344,60 @@ public final class RpcServer {
      *
      * <p>Passing an implementation that offers no method registers nothing at all.
      *
-     * @param impl the guard-applying implementation, or {@code null} to host nothing
+     * <p>With sealed-grant keys configured ({@link #setGrantKeys} or {@code VGI_RPC_GRANT_KEYS}),
+     * {@code null} installs the framework's own identity, which hosts {@code issue_grant} and mints
+     * sealed grants; an implementation passed instead must carry the same keys.
+     *
+     * @param impl the guard-applying implementation, or {@code null} to host nothing (or only the
+     *     sealed-grant minter, when grant keys are configured)
+     * @throws IllegalArgumentException grant keys are configured and {@code impl} carries none
      */
     public void setIdentity(IdentityImpl impl) {
+        boolean auto = impl == null && configuredGrantKeys != null;
+        if (auto) {
+            // Grants on and no other identity hooks: the framework mints and accepts its own,
+            // and hosts issue_grant alone.
+            impl = IdentityImpl.builder().grantKeys(configuredGrantKeys).build();
+        } else if (impl != null && configuredGrantKeys != null && impl.grantKeys() == null) {
+            throw new IllegalArgumentException("grant keys were configured (setGrantKeys or "
+                    + farm.query.vgirpc.identity.GrantKeys.KEYS_ENV + ") and an IdentityImpl was "
+                    + "passed without them. Build it with IdentityImpl.builder().grantKeys(...) so "
+                    + "the minter and the verifier use the same keys.");
+        }
+        autoIdentity = auto;
         Map<String, RpcMethodInfo> narrowed = impl == null ? Map.of() : identityMethods(impl);
         this.identity = narrowed.isEmpty() ? null : impl;
         this.identityMethods = narrowed;
         // The narrowed table is part of identity's fingerprint -- that is the whole point of
         // narrowing it -- so a memoised digest from before this call is stale.
         bindingHashes.remove(Identity.PROTOCOL_NAME);
+    }
+
+    /**
+     * Configure sealed grants (IDENTITY_V1_SPEC.md §9), overriding {@code VGI_RPC_GRANT_KEYS}.
+     *
+     * <p>With keys, the framework mints sealed grants through {@code issue_grant} (unless the
+     * hosted {@link IdentityImpl} supplies its own {@code mintGrant}) and an HTTP server accepts
+     * them back as bearer credentials. {@code null} turns grants off regardless of the
+     * environment. Call before {@link #setIdentity}; an identity passed afterwards must carry the
+     * same keys.
+     *
+     * @param keys the deployment's grant keys, or {@code null} for none
+     */
+    public void setGrantKeys(farm.query.vgirpc.identity.GrantKeys keys) {
+        this.configuredGrantKeys = keys;
+        // Only the identity this server installed for grants is replaced; one the deployment
+        // passed is left alone (and setIdentity checks the keys when it is passed again).
+        if (identity == null || autoIdentity) setIdentity(null);
+    }
+
+    /**
+     * The sealed-grant keys in effect -- the hosted identity's.
+     *
+     * @return the keys, or {@code null} when grants are off
+     */
+    public farm.query.vgirpc.identity.GrantKeys grantKeys() {
+        return identity == null ? null : identity.grantKeys();
     }
 
     /**

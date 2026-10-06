@@ -196,6 +196,8 @@ public final class HttpServer {
     private final RpcServer rpc;
     private final HttpStreamHandler streamHandler;
     private final Authenticator authenticator;
+    /** The deployment's own authenticator, before the identity bearers were appended. */
+    private final Authenticator deploymentAuthenticator;
     private final List<PeerIdentityProvider> peerIdentityProviders;
     private final PeerAuthenticationPolicy peerAuthenticationPolicy;
     private final String peerServiceName;
@@ -267,7 +269,9 @@ public final class HttpServer {
         this.rpc = rpc;
         this.streamHandler = new HttpStreamHandler(rpc, config.tokenKey(),
                 config.tokenTtlSeconds(), Long.MAX_VALUE, config.callStateCacheMaxEntries());
-        this.authenticator = config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
+        this.deploymentAuthenticator =
+                config.authenticator() != null ? config.authenticator() : Authenticator.ANONYMOUS;
+        this.authenticator = withIdentityBearers(rpc, config, deploymentAuthenticator);
         this.peerIdentityProviders = config.peerIdentityProviders();
         this.peerAuthenticationPolicy = config.peerAuthenticationPolicy();
         this.peerServiceName = config.peerServiceName();
@@ -1438,6 +1442,33 @@ public final class HttpServer {
         return segment.length() > 4 && segment.startsWith("__") && segment.endsWith("__");
     }
 
+    /**
+     * Append the identity bearer authenticators (WIRE_PROTOCOL.md §16) when the server hosts
+     * {@code vgi_rpc.Identity.v1} with sealed grants or a {@code resolveToken} hook.
+     *
+     * <p>Order: the deployment's own authenticator, then sealed grants, then
+     * {@code resolveToken}. A deployment that composes them itself wraps its authenticator in
+     * {@link IdentityBearer#explicit}, and one whose authenticator depends on proxy-injected
+     * evidence must: appending alternatives with OR semantics beside a proxy-proof gate or mTLS
+     * headers would let a grant or a resolved token bypass that requirement, so this refuses to
+     * start instead.
+     */
+    private static Authenticator withIdentityBearers(RpcServer rpc, Config config, Authenticator deployment) {
+        if (deployment instanceof IdentityBearer.Explicit) return deployment;
+        farm.query.vgirpc.identity.IdentityImpl identity = rpc.identity();
+        if (identity == null || (identity.grantKeys() == null && identity.resolveTokenHook() == null)) {
+            return deployment;
+        }
+        if (config.proxyProofRequired() || !config.proxyAuthHeaders().isEmpty()) {
+            throw new IllegalArgumentException("this server's authenticator depends on proxy-injected "
+                    + "evidence, and accepting sealed grants or resolveToken bearers would be an OR "
+                    + "beside it that bypasses that requirement. Compose it yourself -- the gate "
+                    + "around IdentityBearer.compose(inner, grantKeys, resolveToken) -- and pass it "
+                    + "wrapped in IdentityBearer.explicit(...).");
+        }
+        return IdentityBearer.compose(deployment, identity.grantKeys(), identity.resolveTokenHook());
+    }
+
     /** Set capability-advertisement headers on every response. */
     private void applyCapabilityHeaders(HttpServletRequest req, HttpServletResponse resp) {
         long requestLimit = configuredRequestLimit();
@@ -2241,7 +2272,7 @@ public final class HttpServer {
     /** Whether an interactive authenticator (e.g. OAuth/PKCE) is active. Surfaced
      *  as the {@code oauth} flag of {@code describe.json}. */
     private boolean oauthActive() {
-        return authenticator != Authenticator.ANONYMOUS;
+        return deploymentAuthenticator != Authenticator.ANONYMOUS;
     }
 
     private byte[] readBody(HttpServletRequest req) throws IOException {
