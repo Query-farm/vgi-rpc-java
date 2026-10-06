@@ -260,6 +260,9 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         rec.put("error_type", errorType);
 
         if (!errorMessage.isEmpty()) rec.put("error_message", errorMessage);
+        // The code is what an operator alerts on ("page on UNAVAILABLE"); absent on success,
+        // which the schema forbids it on.
+        if (failure != null) rec.put("error_code", farm.query.vgirpc.errors.ErrorModel.codeOf(failure).name());
         if (!serverVersion.isEmpty()) rec.put("server_version", serverVersion);
         if (info.protocolVersion != null && !info.protocolVersion.isEmpty()) {
             rec.put("protocol_version", info.protocolVersion);
@@ -387,6 +390,7 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         rec.put("status", "error");
         rec.put("error_type", f.type());
         rec.put("error_message", f.message());
+        rec.put("error_code", farm.query.vgirpc.errors.ErrorModel.codeOf(late).name());
         // Rebuilt from the record's own fields rather than re-plumbed from
         // DispatchInfo; `message` is the same two values plus the status, and
         // leaving it saying "ok" is how a human reader gets told the opposite

@@ -4,9 +4,9 @@
 package farm.query.vgirpc.wire;
 
 import farm.query.vgirpc.CallOutcome;
-import farm.query.vgirpc.HasErrorKind;
 import farm.query.vgirpc.RpcError;
 import farm.query.vgirpc.VersionError;
+import farm.query.vgirpc.errors.ErrorModel;
 import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.log.Message;
@@ -69,12 +69,26 @@ public final class Wire {
         return name;
     }
 
-    /** Build a complete error stream (schema + zero-row error batch + EOS). */
+    /**
+     * Build a complete error stream (schema + zero-row error batch + EOS).
+     *
+     * <p>{@code includeTraceback} is required rather than defaulted, so no call site inherits a
+     * choice by forgetting to make one. Servers pass {@code RpcServer.includeTracebacks()} --
+     * on by default, one switch for every transport.
+     *
+     * @param out where the stream is written
+     * @param schema the stream schema
+     * @param t the exception to encode
+     * @param serverId server id to stamp on the batch, or {@code null}
+     * @param includeTraceback whether the batch carries the remote traceback
+     * @throws IOException on a write failure
+     */
     public static void writeErrorStream(OutputStream out, Schema schema,
-                                         Throwable t, String serverId) throws IOException {
+                                         Throwable t, String serverId, boolean includeTraceback)
+            throws IOException {
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(schema);
-            writeZeroBatch(w, schema, errorMetadata(t, serverId));
+            writeZeroBatch(w, schema, errorMetadata(t, serverId, includeTraceback));
         }
     }
 
@@ -216,21 +230,31 @@ public final class Wire {
      *
      * @param t the exception being serialized
      * @param serverId server id to stamp on the batch, or {@code null}
+     * @param includeTraceback whether {@code log_extra} carries the traceback; required so no
+     *     call site inherits a default by forgetting to decide
      * @return the batch's custom metadata
      */
-    public static Map<String, String> errorMetadata(Throwable t, String serverId) {
+    public static Map<String, String> errorMetadata(Throwable t, String serverId,
+                                                    boolean includeTraceback) {
         CallOutcome.recordError(t);
-        Message msg = Message.fromException(t);
+        Message msg = Message.fromException(t, includeTraceback);
         Map<String, String> md = msg.addToMetadata(null);
         if (serverId != null) md.put(Metadata.SERVER_ID, serverId);
-        // errorKind() is documented to return null when no category applies —
-        // which every server-thrown RpcError built without one does. A null
-        // value reaches the flatbuffer key/value writer as a null string and
-        // throws there, so the error batch is never written and the caller
-        // waits on a response that will not come: the wrong error, reported as
-        // a hang.
-        if (t instanceof HasErrorKind hk && hk.errorKind() != null) {
-            md.put(Metadata.ERROR_KIND, hk.errorKind());
+        // The three layers of the error model ride as top-level keys (canonical) and are
+        // mirrored in log_extra by Message.fromException. Read from the same message so the two
+        // cannot disagree: the code always, the kind when declared, the details only when they
+        // pass the catalog rules and the 4 KiB cap -- dropped whole otherwise, never trimmed.
+        //
+        // A null kind must never reach the flatbuffer key/value writer: it throws there, the
+        // error batch is never written, and the caller waits on a response that will not come.
+        Map<String, Object> extra = msg.extra();
+        md.put(Metadata.ERROR_CODE, String.valueOf(extra.get("error_code")));
+        if (extra.get("error_kind") instanceof String kind) {
+            md.put(Metadata.ERROR_KIND, kind);
+        }
+        if (extra.get("error_details") instanceof List<?>) {
+            String encoded = ErrorModel.encode(ErrorModel.objectsOf(extra.get("error_details")));
+            if (encoded != null) md.put(Metadata.ERROR_DETAILS, encoded);
         }
         return md;
     }
@@ -247,16 +271,30 @@ public final class Wire {
         return Level.EXCEPTION.name().equals(level) ? BatchKind.ERROR : BatchKind.LOG;
     }
 
-    /** Construct an {@link RpcError} from an EXCEPTION-level batch's metadata. */
+    /**
+     * Construct an {@link RpcError} from an EXCEPTION-level batch's metadata.
+     *
+     * <p>The single client decode point: every path -- unary, stream init, stream exchange, an
+     * externalized error, pipe or HTTP -- funnels through here, which is why the error model is
+     * read nowhere else. The top-level keys are canonical and read first; the {@code log_extra}
+     * mirror is the fallback, so a server or intermediary that set only one still classifies.
+     * A missing code stays {@code ""} -- "the server sent none" is a different answer from
+     * {@code "UNKNOWN"}.
+     *
+     * @param meta the EXCEPTION batch's custom metadata
+     * @return the reconstructed error
+     */
     public static RpcError errorFromMetadata(Map<String, String> meta) {
         String text = meta.get(Metadata.LOG_MESSAGE);
         String extraJson = meta.get(Metadata.LOG_EXTRA);
         String exType = "RpcError";
         String tb = "";
+        Map<String, Object> extra = Map.of();
         if (extraJson != null) {
             try {
                 @SuppressWarnings("unchecked")
-                Map<String, Object> extra = JSON.readValue(extraJson, Map.class);
+                Map<String, Object> parsed = JSON.readValue(extraJson, Map.class);
+                if (parsed != null) extra = parsed;
                 Object t = extra.get("exception_type");
                 if (t != null) exType = t.toString();
                 Object trace = extra.get("traceback");
@@ -267,7 +305,14 @@ public final class Wire {
         // callers can pattern-match without parsing message text — parity
         // with the Python client's RpcError.error_kind attribute.
         String kind = meta.get(Metadata.ERROR_KIND);
-        return new RpcError(exType, text != null ? text : "", tb, "", kind);
+        if (kind == null && extra.get("error_kind") instanceof String k) kind = k;
+        String code = meta.get(Metadata.ERROR_CODE);
+        if (code == null) code = extra.get("error_code") instanceof String c ? c : "";
+        String rawDetails = meta.get(Metadata.ERROR_DETAILS);
+        List<Map<String, Object>> details = rawDetails != null
+                ? ErrorModel.decode(rawDetails)
+                : ErrorModel.objectsOf(extra.get("error_details"));
+        return new RpcError(exType, text != null ? text : "", tb, "", kind, code, details);
     }
 
     /** Construct a {@link Message} from non-exception log-batch metadata. */
@@ -476,8 +521,27 @@ public final class Wire {
      * @throws IOException on a write failure
      */
     public static byte[] buildErrorStream(Throwable t, Schema schema, String serverId) throws IOException {
+        return buildErrorStream(t, schema, serverId, false);
+    }
+
+    /**
+     * Build a complete IPC stream carrying a single error batch, choosing whether it carries the
+     * traceback. {@link #buildErrorStream(Throwable, Schema, String)} omits it: an intermediary
+     * answering on behalf of a worker is not that worker's operator, so it says nothing about the
+     * worker's internals unless asked.
+     *
+     * @param t the exception to encode; its type and message reach the client
+     * @param schema the stream schema, or {@code null} for an empty schema
+     * @param serverId optional server id to stamp on the error batch
+     * @param includeTraceback whether to carry the traceback
+     * @return the error IPC stream bytes
+     * @throws IOException on a write failure
+     */
+    public static byte[] buildErrorStream(Throwable t, Schema schema, String serverId,
+                                          boolean includeTraceback) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
-        writeErrorStream(buf, schema != null ? schema : new Schema(List.of()), t, serverId);
+        writeErrorStream(buf, schema != null ? schema : new Schema(List.of()), t, serverId,
+                includeTraceback);
         return buf.toByteArray();
     }
 

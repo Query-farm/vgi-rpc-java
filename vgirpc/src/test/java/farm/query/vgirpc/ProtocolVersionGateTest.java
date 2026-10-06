@@ -36,9 +36,10 @@ final class ProtocolVersionGateTest {
 
     /** The gate is private; drive it directly so the cases below stay unit-sized. */
     private static String check(RpcServer server, String clientVersion) throws Exception {
-        Method m = RpcServer.class.getDeclaredMethod("checkProtocolVersion", String.class);
+        Method m = RpcServer.class.getDeclaredMethod(
+                "checkProtocolVersion", String.class, String.class, String.class);
         m.setAccessible(true);
-        Object err = m.invoke(server, clientVersion);
+        Object err = m.invoke(null, server.protocolName(), server.protocolVersion(), clientVersion);
         return err == null ? null : ((ProtocolVersionError) err).getMessage();
     }
 

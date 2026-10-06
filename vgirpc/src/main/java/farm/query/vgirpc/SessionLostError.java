@@ -10,7 +10,7 @@ package farm.query.vgirpc;
  * stable {@code "session_lost"} error_kind on the wire so clients can
  * pattern-match without parsing message strings.
  */
-public class SessionLostError extends RuntimeException implements HasErrorKind {
+public class SessionLostError extends RuntimeException implements HasErrorKind, farm.query.vgirpc.errors.HasErrorCode {
     /** Stable error category emitted via the {@code vgi_rpc.error_kind} metadata key. */
     public static final String ERROR_KIND = "session_lost";
 
@@ -27,4 +27,10 @@ public class SessionLostError extends RuntimeException implements HasErrorKind {
     public SessionLostError(String message, Throwable cause) { super(message, cause); }
 
     @Override public String errorKind() { return ERROR_KIND; }
+
+    /** {@code ABORTED}, fixed where this kind is defined (WIRE_PROTOCOL.md §8). */
+    @Override
+    public farm.query.vgirpc.errors.Code errorCode() {
+        return farm.query.vgirpc.errors.Code.ABORTED;
+    }
 }

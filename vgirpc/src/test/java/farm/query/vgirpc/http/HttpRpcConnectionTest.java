@@ -516,7 +516,10 @@ final class HttpRpcConnectionTest {
     void anUnroutableUrlFailsAsAnRpcErrorNotAnIoException() throws Exception {
         try (HttpRpcConnection bad = HttpRpcConnection.builder(endpoint() + "/nope").build()) {
             RpcError err = assertThrows(RpcError.class, () -> bad.proxy(DemoService.class).ping(1L));
-            assertEquals("HttpError", err.errorType(), err.getMessage());
+            // The 404 carries the same EXCEPTION batch raw dispatch answers with, so the client
+            // learns *why* the route did not resolve, classified, rather than a bare status.
+            assertEquals("protocol_not_supported", err.errorKind(), err.getMessage());
+            assertEquals("UNIMPLEMENTED", err.errorCode(), err.getMessage());
         }
     }
 

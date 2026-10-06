@@ -21,7 +21,9 @@ import farm.query.vgirpc.HasErrorKind;
  * turning a thirty-second blip into a fleet-wide re-login. It mirrors
  * {@code AuthUnavailableException}, which stays outside that hierarchy for the same reason.
  */
-public final class IdentityUnavailableError extends RuntimeException implements HasErrorKind {
+public final class IdentityUnavailableError extends RuntimeException
+        implements HasErrorKind, farm.query.vgirpc.errors.HasErrorCode,
+                   farm.query.vgirpc.errors.HasErrorDetails {
 
     /** The stable wire category for a transient identity-lookup failure. */
     public static final String ERROR_KIND = "identity_unavailable";
@@ -76,5 +78,23 @@ public final class IdentityUnavailableError extends RuntimeException implements 
     @Override
     public String errorKind() {
         return ERROR_KIND;
+    }
+
+    /** {@code UNAVAILABLE}: transient, and retryable. */
+    @Override
+    public farm.query.vgirpc.errors.Code errorCode() {
+        return farm.query.vgirpc.errors.Code.UNAVAILABLE;
+    }
+
+    /**
+     * The retry hint, as the {@code RetryInfo} this kind MUST carry (WIRE_PROTOCOL.md §16).
+     *
+     * <p>{@link #retryAfterSeconds()} existed in every port and reached the wire in none, so a
+     * caller could tell the answer was transient but not when to ask again.
+     */
+    @Override
+    public java.util.List<java.util.Map<String, Object>> errorDetails() {
+        return java.util.List.of(
+                new farm.query.vgirpc.errors.ErrorDetail.RetryInfo(retryAfterSeconds).toJson());
     }
 }

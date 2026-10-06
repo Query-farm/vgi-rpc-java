@@ -22,7 +22,7 @@ import farm.query.vgirpc.HasErrorKind;
  * not an {@link IllegalArgumentException}: refusing the caller and failing to resolve the
  * subject are different answers and a caller branches on the difference.
  */
-public final class IntrospectionRefusedError extends SecurityException implements HasErrorKind {
+public final class IntrospectionRefusedError extends SecurityException implements HasErrorKind, farm.query.vgirpc.errors.HasErrorCode {
 
     /** The stable wire category for this refusal. */
     public static final String ERROR_KIND = "introspection_refused";
@@ -39,5 +39,11 @@ public final class IntrospectionRefusedError extends SecurityException implement
     @Override
     public String errorKind() {
         return ERROR_KIND;
+    }
+
+    /** {@code PERMISSION_DENIED}, fixed where this kind is defined (WIRE_PROTOCOL.md §8). */
+    @Override
+    public farm.query.vgirpc.errors.Code errorCode() {
+        return farm.query.vgirpc.errors.Code.PERMISSION_DENIED;
     }
 }

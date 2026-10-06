@@ -16,7 +16,7 @@ package farm.query.vgirpc;
  * server does not host that" are different problems with different fixes, and a client
  * capability-probing a fleet depends on telling them apart.
  */
-public class ProtocolNotSpecifiedError extends RuntimeException implements HasErrorKind {
+public class ProtocolNotSpecifiedError extends RuntimeException implements HasErrorKind, farm.query.vgirpc.errors.HasErrorCode {
     /** Stable error category emitted via the {@code vgi_rpc.error_kind} metadata key. */
     public static final String ERROR_KIND = "protocol_not_specified";
 
@@ -25,4 +25,10 @@ public class ProtocolNotSpecifiedError extends RuntimeException implements HasEr
     public ProtocolNotSpecifiedError(String message) { super(message); }
 
     @Override public String errorKind() { return ERROR_KIND; }
+
+    /** {@code INVALID_ARGUMENT}, fixed where this kind is defined (WIRE_PROTOCOL.md §8). */
+    @Override
+    public farm.query.vgirpc.errors.Code errorCode() {
+        return farm.query.vgirpc.errors.Code.INVALID_ARGUMENT;
+    }
 }

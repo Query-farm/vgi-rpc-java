@@ -13,7 +13,7 @@ import farm.query.vgirpc.HasErrorKind;
  * learns to re-prompt. A console that cannot tell "your login is too old" from "no" cannot know
  * to send the user back to the identity provider.
  */
-public final class StaleAuthError extends SecurityException implements HasErrorKind {
+public final class StaleAuthError extends SecurityException implements HasErrorKind, farm.query.vgirpc.errors.HasErrorCode {
 
     /** The stable wire category for a caller whose authentication is too old or unverifiable. */
     public static final String ERROR_KIND = "stale_auth";
@@ -30,5 +30,11 @@ public final class StaleAuthError extends SecurityException implements HasErrorK
     @Override
     public String errorKind() {
         return ERROR_KIND;
+    }
+
+    /** {@code UNAUTHENTICATED}, fixed where this kind is defined (WIRE_PROTOCOL.md §8). */
+    @Override
+    public farm.query.vgirpc.errors.Code errorCode() {
+        return farm.query.vgirpc.errors.Code.UNAUTHENTICATED;
     }
 }

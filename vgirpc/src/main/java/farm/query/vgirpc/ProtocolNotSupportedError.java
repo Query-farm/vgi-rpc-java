@@ -12,7 +12,7 @@ package farm.query.vgirpc;
  * disagreement case is the Content-Length/Transfer-Encoding shape: left unchecked, the edge
  * applies policy to one protocol while the worker dispatches another.
  */
-public class ProtocolNotSupportedError extends RuntimeException implements HasErrorKind {
+public class ProtocolNotSupportedError extends RuntimeException implements HasErrorKind, farm.query.vgirpc.errors.HasErrorCode {
     /** Stable error category emitted via the {@code vgi_rpc.error_kind} metadata key. */
     public static final String ERROR_KIND = "protocol_not_supported";
 
@@ -21,4 +21,10 @@ public class ProtocolNotSupportedError extends RuntimeException implements HasEr
     public ProtocolNotSupportedError(String message) { super(message); }
 
     @Override public String errorKind() { return ERROR_KIND; }
+
+    /** {@code UNIMPLEMENTED}, fixed where this kind is defined (WIRE_PROTOCOL.md §8). */
+    @Override
+    public farm.query.vgirpc.errors.Code errorCode() {
+        return farm.query.vgirpc.errors.Code.UNIMPLEMENTED;
+    }
 }

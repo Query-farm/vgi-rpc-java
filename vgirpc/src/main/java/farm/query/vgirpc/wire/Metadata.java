@@ -69,4 +69,13 @@ public final class Metadata {
      *  (e.g. "session_lost", "server_draining", "method_not_implemented")
      *  so clients can pattern-match without substring-searching message text. */
     public static final String ERROR_KIND = "vgi_rpc.error_kind";
+
+    /** Canonical error code on EXCEPTION batches: the <em>name</em> of one of gRPC's sixteen
+     *  non-OK codes ({@code UNAVAILABLE}, ...). Closed set; emitted on every EXCEPTION batch.
+     *  WIRE_PROTOCOL.md §8. */
+    public static final String ERROR_CODE = "vgi_rpc.error_code";
+
+    /** Typed error details on EXCEPTION batches: a JSON array of objects naming their
+     *  {@code @type}. At most 4 KiB; omitted whole when larger. WIRE_PROTOCOL.md §8. */
+    public static final String ERROR_DETAILS = "vgi_rpc.error_details";
 }

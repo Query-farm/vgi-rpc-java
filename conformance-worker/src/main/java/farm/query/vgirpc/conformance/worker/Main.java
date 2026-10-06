@@ -8,6 +8,8 @@ import farm.query.vgirpc.AuthContext;
 import farm.query.vgirpc.RpcServer;
 import farm.query.vgirpc.conformance.ConformanceService;
 import farm.query.vgirpc.conformance.ConformanceServiceImpl;
+import farm.query.vgirpc.conformance.Secondary;
+import farm.query.vgirpc.conformance.SecondaryImpl;
 import farm.query.vgirpc.conformance.TransportKindProbeService;
 import farm.query.vgirpc.conformance.TransportKindProbeServiceImpl;
 import farm.query.vgirpc.external.ExternalLocationConfig;
@@ -250,6 +252,10 @@ public final class Main {
             // Match the Python reference's ConformanceService.protocol_version so the
             // describe conformance suite sees the same MAJOR.MINOR.PATCH label.
             server.setProtocolVersion("2.0.0");
+            // The second application protocol every conformance worker hosts, registered through
+            // the public hosting API rather than special-cased, after the primary so reflection
+            // lists it second -- on every transport this worker serves.
+            server.addProtocol(Secondary.class, new SecondaryImpl());
         }
         if (externalCfg != null) {
             server.setExternalConfig(externalCfg);
@@ -453,6 +459,24 @@ public final class Main {
      */
     private static final String CONFORMANCE_UNAVAILABLE_TOKEN = "conformance-unavailable-token";
 
+    /** Retry hint {@link #CONFORMANCE_UNAVAILABLE_TOKEN} carries -- pinned, not each port's default. */
+    private static final int CONFORMANCE_UNAVAILABLE_RETRY_AFTER = 5;
+
+    /**
+     * The credential the resolver answers by raising the <em>transport-auth</em> unavailable error
+     * ({@code AuthUnavailableException}), not the identity one. The framework must translate it to
+     * {@code identity_unavailable} and keep its retry hint (WIRE_PROTOCOL.md §16); raising the
+     * identity error here instead would make the test pass while the rule stays unimplemented.
+     */
+    private static final String CONFORMANCE_AUTH_UNAVAILABLE_TOKEN = "conformance-auth-unavailable-token";
+
+    /** The purpose the minter answers with the same transport-auth error. */
+    private static final String IDENTITY_AUTH_UNAVAILABLE_PURPOSE = "conformance-auth-unavailable";
+
+    /** Retry hint the transport-auth error carries: 7 is no port's default, so a translation that
+     *  substitutes its own hint is caught. */
+    private static final int AUTH_UNAVAILABLE_RETRY_AFTER = 7;
+
     // -----------------------------------------------------------------------
     // vgi_rpc.Identity.v1 -- the pinned deployment policy
     //
@@ -549,7 +573,12 @@ public final class Main {
      */
     private static farm.query.vgirpc.identity.TokenIdentity identityResolveToken(String token) {
         if (CONFORMANCE_UNAVAILABLE_TOKEN.equals(token)) {
-            throw new IdentityUnavailableError("conformance: mapping store unreachable");
+            throw new IdentityUnavailableError("conformance: mapping store unreachable",
+                    CONFORMANCE_UNAVAILABLE_RETRY_AFTER, null);
+        }
+        if (CONFORMANCE_AUTH_UNAVAILABLE_TOKEN.equals(token)) {
+            throw new farm.query.vgirpc.http.AuthUnavailableException(
+                    "conformance: authority unreachable", AUTH_UNAVAILABLE_RETRY_AFTER, null);
         }
         if (IDENTITY_TOKEN_UNKNOWN.equals(token)) {
             return null;
@@ -587,6 +616,10 @@ public final class Main {
      */
     private static IssuedGrant identityMintGrant(String principal, String purpose,
                                                  List<String> scopes, long ttlSeconds) {
+        if (IDENTITY_AUTH_UNAVAILABLE_PURPOSE.equals(purpose)) {
+            throw new farm.query.vgirpc.http.AuthUnavailableException(
+                    "conformance: grant store unreachable", AUTH_UNAVAILABLE_RETRY_AFTER, null);
+        }
         if (IDENTITY_REFUSED_PURPOSE.equals(purpose)) {
             throw new GrantRefusedError("conformance: this purpose is refused");
         }

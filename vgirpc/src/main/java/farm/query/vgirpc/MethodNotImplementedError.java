@@ -9,7 +9,7 @@ package farm.query.vgirpc;
  * error_kind on the wire so capability-detecting clients pattern-match
  * cleanly across older / partial server implementations.
  */
-public class MethodNotImplementedError extends RuntimeException implements HasErrorKind {
+public class MethodNotImplementedError extends RuntimeException implements HasErrorKind, farm.query.vgirpc.errors.HasErrorCode {
     /** Stable error category emitted via the {@code vgi_rpc.error_kind} metadata key. */
     public static final String ERROR_KIND = "method_not_implemented";
 
@@ -18,4 +18,10 @@ public class MethodNotImplementedError extends RuntimeException implements HasEr
     public MethodNotImplementedError(String message) { super(message); }
 
     @Override public String errorKind() { return ERROR_KIND; }
+
+    /** {@code UNIMPLEMENTED}, fixed where this kind is defined (WIRE_PROTOCOL.md §8). */
+    @Override
+    public farm.query.vgirpc.errors.Code errorCode() {
+        return farm.query.vgirpc.errors.Code.UNIMPLEMENTED;
+    }
 }

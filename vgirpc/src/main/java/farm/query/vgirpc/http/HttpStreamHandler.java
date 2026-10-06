@@ -137,6 +137,9 @@ public final class HttpStreamHandler {
             throw new IllegalArgumentException("maxResponseBytes must be > 0, got " + maxResponseBytes);
         }
         this.rpc = rpc;
+        // The state-type table below is seeded from the hosted protocols, so the set is fixed
+        // from here on -- the same moment the HTTP transport starts existing.
+        rpc.sealProtocols();
         if (tokenKey != null) {
             this.tokenKey = tokenKey.clone();
         } else {
@@ -156,19 +159,27 @@ public final class HttpStreamHandler {
      * methods fall back to init-time learning.
      */
     private void seedStateTypes() {
-        Class<?> implClass = rpc.implementation().getClass();
-        for (RpcMethodInfo info : rpc.methods().values()) {
-            if (info.methodType() != MethodType.STREAM) continue;
-            Method implMethod;
-            try {
-                implMethod = implClass.getMethod(
-                        info.reflectMethod().getName(), info.reflectMethod().getParameterTypes());
-            } catch (NoSuchMethodException e) {
-                continue;
+        for (RpcServer.ApplicationProtocol app : rpc.applicationProtocols()) {
+            Class<?> implClass = app.implementation().getClass();
+            for (RpcMethodInfo info : app.methods().values()) {
+                if (info.methodType() != MethodType.STREAM) continue;
+                Method implMethod;
+                try {
+                    implMethod = implClass.getMethod(
+                            info.reflectMethod().getName(), info.reflectMethod().getParameterTypes());
+                } catch (NoSuchMethodException e) {
+                    continue;
+                }
+                Class<? extends StreamState> cls = concreteStateArg(implMethod.getGenericReturnType());
+                if (cls != null) stateTypes.put(stateKey(app.name(), info.name()), cls);
             }
-            Class<? extends StreamState> cls = concreteStateArg(implMethod.getGenericReturnType());
-            if (cls != null) stateTypes.put(info.name(), cls);
         }
+    }
+
+    /** State types are keyed by the pair (protocol, method): two hosted protocols may declare
+     *  the same stream method name with different state classes. */
+    private static String stateKey(String protocol, String method) {
+        return protocol + "\u0000" + method;
     }
 
     /** The concrete {@link StreamState} type argument of an {@code RpcStream<X>} return, or null. */
@@ -297,7 +308,8 @@ public final class HttpStreamHandler {
      */
     public byte[] handleInit(String protocol, String method, byte[] requestBody,
                              long responseLimitBytes, Long preferredResponseBytes) throws Exception {
-        RpcMethodInfo info = rpc.methods().get(method);
+        RpcServer.ApplicationProtocol app = rpc.applicationProtocol(protocol);
+        RpcMethodInfo info = app == null ? null : app.methods().get(method);
         if (info == null) return errorStream(new IllegalArgumentException("Unknown method: " + method));
 
         Map<String, Object> kwargs;
@@ -331,6 +343,13 @@ public final class HttpStreamHandler {
                 return errorStream(new ClassCastException(
                         "Method name mismatch: URL has '" + method + "' but metadata has '" + urlMethod + "'"));
             }
+            // Application-protocol-version gate, against the binding the path resolved to --
+            // the same gate raw and unary dispatch apply. Stream /init dispatches here rather than
+            // through RpcServer.serveOne, so it is wired in independently; only /init is gated,
+            // since a continuation was admitted when its stream opened.
+            farm.query.vgirpc.ProtocolVersionError pve =
+                    rpc.gateVersion(protocol, meta.get(Metadata.PROTOCOL_VERSION_KEY));
+            if (pve != null) return errorStream(pve);
             // Less the stream tokens, as on every continuation (see
             // turnInputMetadata). An honest client has not been issued any yet,
             // so this guards against a crafted /init rather than changing what a
@@ -346,7 +365,8 @@ public final class HttpStreamHandler {
         }
 
         OutputCollectorSink sink = new OutputCollectorSink();
-        CallContext ctx = buildCallContext(method, sink, responseLimitBytes, preferredResponseBytes);
+        CallContext ctx = buildCallContext(protocol, method, sink, responseLimitBytes,
+                preferredResponseBytes);
 
         // Minted here rather than inside mintInitTokens so the init record
         // carries it even when the producer finishes in one turn and no
@@ -360,7 +380,7 @@ public final class HttpStreamHandler {
             // discrete body, has to re-frame the batch.
             onTurn(turn, i -> i.requestData = requestBody);
             try {
-                return runInit(protocol, method, info, kwargs, requestMeta, ctx, sink, streamId, turn,
+                return runInit(protocol, app.implementation(), method, info, kwargs, requestMeta, ctx, sink, streamId, turn,
                         responseLimitBytes, preferredResponseBytes);
             } catch (Throwable t) {
                 if (turn != null) turn.thrown = t;
@@ -370,7 +390,7 @@ public final class HttpStreamHandler {
     }
 
     /** The body of {@code /init}, wrapped by {@link #handleInit}'s telemetry. */
-    private byte[] runInit(String protocol, String method, RpcMethodInfo info,
+    private byte[] runInit(String protocol, Object target, String method, RpcMethodInfo info,
                             Map<String, Object> kwargs,
                             Map<String, String> requestMeta, CallContext ctx,
                             OutputCollectorSink sink, String streamId, StreamTurn turn,
@@ -378,14 +398,14 @@ public final class HttpStreamHandler {
         RpcStream<?> streamResult;
         try {
             Object[] args = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
-            streamResult = (RpcStream<?>) info.reflectMethod().invoke(rpc.implementation(), args);
+            streamResult = (RpcStream<?>) info.reflectMethod().invoke(target, args);
         } catch (InvocationTargetException ie) {
             return errorStream(ie.getCause() != null ? ie.getCause() : ie, sink);
         } catch (Throwable t) {
             return errorStream(t, sink);
         }
         // Record the concrete state class for this method so /exchange can rehydrate.
-        stateTypes.put(method, streamResult.state().getClass());
+        stateTypes.put(stateKey(protocol, method), streamResult.state().getClass());
 
         BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         if (streamResult.header() != null) {
@@ -432,8 +452,13 @@ public final class HttpStreamHandler {
     public byte[] handleExchange(String protocol, String method, byte[] requestBody,
                                  long responseLimitBytes, Long preferredResponseBytes)
             throws Exception {
-        RpcMethodInfo info = rpc.methods().get(method);
-        if (info == null) return errorStream(new IllegalArgumentException("Unknown method: " + method));
+        // An unhosted protocol is not refused here: the route layer never forwards one, and for
+        // a continuation the AEAD associated data is the guard that matters -- tokens minted under
+        // another protocol fail to open below, whatever this lookup says.
+        RpcServer.ApplicationProtocol app = rpc.applicationProtocol(protocol);
+        if (app != null && !app.methods().containsKey(method)) {
+            return errorStream(new IllegalArgumentException("Unknown method: " + method));
+        }
 
         ExchangeRequest req;
         try {
@@ -537,7 +562,7 @@ public final class HttpStreamHandler {
                                 StateToken token, CallToken call, AuthContext auth,
                                 DictionaryProvider inputDicts, StreamTurn turn,
                                 long responseLimitBytes, Long preferredResponseBytes) throws Exception {
-        Class<? extends StreamState> stateCls = stateTypes.get(method);
+        Class<? extends StreamState> stateCls = stateTypes.get(stateKey(protocol, method));
         if (stateCls == null) {
             return errorStream(new IllegalStateException(
                     "Cannot resolve state type for method '" + method + "'"));
@@ -555,7 +580,8 @@ public final class HttpStreamHandler {
         // after the first turn is worst on exactly the long streams whose
         // progress logs are the only in-band diagnostic a caller has.
         OutputCollectorSink sink = new OutputCollectorSink();
-        CallContext ctx = buildCallContext(method, sink, responseLimitBytes, preferredResponseBytes);
+        CallContext ctx = buildCallContext(protocol, method, sink, responseLimitBytes,
+                preferredResponseBytes);
 
         if (cancel) {
             onTurn(turn, i -> i.cancelled = true);
@@ -791,11 +817,11 @@ public final class HttpStreamHandler {
                 new String(call.pack(tokenKey, auth, protocol), StandardCharsets.US_ASCII));
     }
 
-    private CallContext buildCallContext(String method, Consumer<Message> sink,
+    private CallContext buildCallContext(String protocol, String method, Consumer<Message> sink,
                                          long responseLimitBytes, Long preferredResponseBytes) {
         AuthScope.Scope scope = AuthScope.current();
         return new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                rpc.serverId(), method, rpc.protocolName(), "", TransportKind.HTTP, scope.peerEvidence(),
+                rpc.serverId(), method, protocol, "", TransportKind.HTTP, scope.peerEvidence(),
                 responseLimitBytes == Long.MAX_VALUE ? null : responseLimitBytes,
                 preferredResponseBytes);
     }
@@ -826,7 +852,7 @@ public final class HttpStreamHandler {
                 state.process(new AnnotatedBatch(tickInput, requestMeta), coll, ctx);
             } catch (Throwable t) {
                 error = true;
-                Wire.writeZeroBatch(w, outputSchema, Wire.errorMetadata(t, rpc.serverId()));
+                Wire.writeZeroBatch(w, outputSchema, Wire.errorMetadata(t, rpc.serverId(), rpc.includeTracebacks()));
                 // The exception goes *into* the response, behind the stream
                 // header the client is already committed to reading, instead of
                 // replacing it. That makes this the one error the transport must
@@ -893,7 +919,7 @@ public final class HttpStreamHandler {
         // Error streams are zero-row metadata, well under the cap; use unbounded so we never lose
         // the error message itself if a different code path tripped maxResponseBytes earlier.
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        Wire.writeErrorStream(out, RpcStream.EMPTY_SCHEMA, t, rpc.serverId());
+        Wire.writeErrorStream(out, RpcStream.EMPTY_SCHEMA, t, rpc.serverId(), rpc.includeTracebacks());
         return out.toByteArray();
     }
 
@@ -909,7 +935,7 @@ public final class HttpStreamHandler {
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(RpcStream.EMPTY_SCHEMA);
             sink.bind(w, RpcStream.EMPTY_SCHEMA);
-            Wire.writeZeroBatch(w, RpcStream.EMPTY_SCHEMA, Wire.errorMetadata(t, rpc.serverId()));
+            Wire.writeZeroBatch(w, RpcStream.EMPTY_SCHEMA, Wire.errorMetadata(t, rpc.serverId(), rpc.includeTracebacks()));
         } finally {
             sink.detach();
         }

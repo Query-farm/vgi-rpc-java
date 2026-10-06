@@ -33,14 +33,14 @@ final class ErrorMetadataTest {
     @Test
     void nullErrorKindIsOmittedRatherThanWritten() {
         Map<String, String> md = Wire.errorMetadata(
-                new RpcError("ValueError", "boom", ""), "server-1");
+                new RpcError("ValueError", "boom", ""), "server-1", true);
         assertFalse(md.containsKey(Metadata.ERROR_KIND));
         assertEquals("server-1", md.get(Metadata.SERVER_ID));
     }
 
     @Test
     void declaredErrorKindIsCarried() {
-        Map<String, String> md = Wire.errorMetadata(new SessionLostError("gone"), "server-1");
+        Map<String, String> md = Wire.errorMetadata(new SessionLostError("gone"), "server-1", true);
         assertEquals(SessionLostError.ERROR_KIND, md.get(Metadata.ERROR_KIND));
     }
 
@@ -51,7 +51,7 @@ final class ErrorMetadataTest {
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(RESULT);
             Wire.writeZeroBatch(w, RESULT,
-                    Wire.errorMetadata(new RpcError("ValueError", "boom", ""), "server-1"));
+                    Wire.errorMetadata(new RpcError("ValueError", "boom", ""), "server-1", true));
         }
         assertTrue(out.size() > 0);
     }

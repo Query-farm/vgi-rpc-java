@@ -12,7 +12,7 @@ import farm.query.vgirpc.HasErrorKind;
  * because reporting which would confirm that a guessed credential exists. The message is
  * therefore always {@code "unresolved"} -- there is nothing else it may say.
  */
-public final class TokenUnresolvedError extends IllegalArgumentException implements HasErrorKind {
+public final class TokenUnresolvedError extends IllegalArgumentException implements HasErrorKind, farm.query.vgirpc.errors.HasErrorCode {
 
     /** The stable wire category for a credential that did not resolve. */
     public static final String ERROR_KIND = "token_unresolved";
@@ -30,5 +30,11 @@ public final class TokenUnresolvedError extends IllegalArgumentException impleme
     @Override
     public String errorKind() {
         return ERROR_KIND;
+    }
+
+    /** {@code NOT_FOUND}, fixed where this kind is defined (WIRE_PROTOCOL.md §8). */
+    @Override
+    public farm.query.vgirpc.errors.Code errorCode() {
+        return farm.query.vgirpc.errors.Code.NOT_FOUND;
     }
 }

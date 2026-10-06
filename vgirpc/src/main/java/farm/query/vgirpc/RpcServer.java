@@ -71,6 +71,38 @@ public final class RpcServer {
     private final Object impl;
     private final String serverId;
     private final Map<String, RpcMethodInfo> methods;
+
+    /**
+     * One hosted application protocol: its routing key, implementation and method table.
+     *
+     * @param name the wire name -- routing key and HTTP path segment
+     * @param implementation the object calls are dispatched to
+     * @param methods the method table, in declaration order
+     * @param declaredVersion the {@code @ProtocolVersion} label, or {@code ""}; the primary's
+     *     version is whatever {@link #setProtocolVersion} set instead
+     */
+    private record Binding(String name, Object implementation, Map<String, RpcMethodInfo> methods,
+                           String declaredVersion) {}
+
+    /**
+     * A hosted application protocol, as transports and reflection see it.
+     *
+     * @param name the wire name -- routing key and HTTP path segment
+     * @param protocolVersion the version label its gate enforces, or {@code ""} for none
+     * @param implementation the object calls are dispatched to
+     * @param methods the method table, in declaration order
+     */
+    public record ApplicationProtocol(String name, String protocolVersion, Object implementation,
+                                      Map<String, RpcMethodInfo> methods) {}
+
+    /** Every hosted application protocol, primary first, in registration order. Framework
+     *  protocols ({@code vgi_rpc.*}) are not in it. Fixed once serving begins. */
+    private final Map<String, Binding> bindings = new LinkedHashMap<>();
+    /** Set when the first transport starts; after it the registered set may not change, so
+     *  reflection output and every protocol hash are stable for the life of the process. */
+    private volatile boolean protocolsSealed;
+    /** Included by default on every transport. See {@link #setIncludeTracebacks}. */
+    private volatile boolean includeTracebacks = true;
     /** Canonical digests, keyed by protocol name. Memoised: computing one serialises every
      *  method's schemas and canonicalises the JSON, and an access record needs one per dispatch. */
     private final Map<String, String> bindingHashes = new ConcurrentHashMap<>();
@@ -107,10 +139,149 @@ public final class RpcServer {
      * @param serverId stable identifier echoed in response metadata
      */
     public RpcServer(Class<?> serviceInterface, Object impl, String serverId) {
-        this.protocolName = ServiceIntrospector.protocolName(serviceInterface);
+        this.protocolName = applicationProtocolName(serviceInterface);
         this.impl = impl;
         this.serverId = serverId;
         this.methods = new LinkedHashMap<>(ServiceIntrospector.describe(serviceInterface));
+        bindings.put(protocolName, new Binding(protocolName, impl,
+                Collections.unmodifiableMap(this.methods), ""));
+    }
+
+    /**
+     * Host an additional application protocol beside the primary.
+     *
+     * <p>Any number may be added, each routed, versioned, gated and hashed independently: a call
+     * is dispatched by the pair (protocol, method), so two protocols may declare the same method
+     * name. The set is fixed for the server's life -- it may be computed from configuration when
+     * the server is built, but once a transport starts serving this throws -- so reflection output
+     * and every {@code protocol_hash} are stable for the life of the process. The same set is
+     * hosted on every transport the server is offered on (WIRE_PROTOCOL.md §3.1).
+     *
+     * <p>The protocol's version label is the interface's {@code @ProtocolVersion}, or none. The
+     * reserved {@code vgi_rpc.} prefix is refused however the name was derived, and a name already
+     * hosted is refused rather than replaced.
+     *
+     * @param serviceInterface the protocol's interface, introspected for its method table
+     * @param implementation the object its calls are dispatched to; must implement the interface
+     * @return this server, for chaining
+     * @throws IllegalArgumentException if the name is unroutable, reserved or already hosted, or
+     *     the implementation does not implement the interface
+     * @throws IllegalStateException if the server has already started serving
+     */
+    public synchronized RpcServer addProtocol(Class<?> serviceInterface, Object implementation) {
+        if (protocolsSealed) {
+            throw new IllegalStateException("addProtocol(" + serviceInterface.getName() + ") after "
+                    + "serving began: the hosted protocol set is fixed for the server's life, so "
+                    + "reflection output and protocol hashes stay stable. Register every protocol "
+                    + "before the first transport starts.");
+        }
+        if (implementation == null || !serviceInterface.isInstance(implementation)) {
+            throw new IllegalArgumentException("the implementation registered for "
+                    + serviceInterface.getName() + " does not implement it");
+        }
+        String name = applicationProtocolName(serviceInterface);
+        if (bindings.containsKey(name)) {
+            throw new IllegalArgumentException("protocol '" + name + "' is already hosted by this "
+                    + "server; a second registration under one name is refused, not last-writer-wins.");
+        }
+        bindings.put(name, new Binding(name, implementation,
+                ServiceIntrospector.describe(serviceInterface),
+                ServiceIntrospector.protocolVersion(serviceInterface)));
+        return this;
+    }
+
+    /**
+     * The wire name of an application protocol, refused if it is unroutable or reserved.
+     *
+     * <p>{@link ServiceIntrospector#protocolName} already refuses a reserved
+     * {@code @ProtocolName}; this re-checks the <em>resolved</em> name whichever way it was
+     * derived, because the rule is about every registered name, not about one way of declaring
+     * it. A port that checked only declared names let a derived one shadow
+     * {@code vgi_rpc.Reflection.v1}.
+     */
+    private static String applicationProtocolName(Class<?> serviceInterface) {
+        String name = ServiceIntrospector.protocolName(serviceInterface);
+        if (!ProtocolNames.isValid(name)) {
+            throw new IllegalArgumentException("protocol name '" + name + "' derived from "
+                    + serviceInterface.getName() + " is not routable: expected "
+                    + "[A-Za-z_][A-Za-z0-9_.]* of at most " + ProtocolNames.MAX_BYTES + " UTF-8 bytes.");
+        }
+        if (ProtocolNames.isReserved(name)) {
+            throw new IllegalArgumentException("protocol name '" + name + "' derived from "
+                    + serviceInterface.getName() + " claims the reserved '"
+                    + ProtocolNames.RESERVED_PREFIX + "' prefix, which is for protocols the "
+                    + "framework defines. An application protocol that claimed it could shadow "
+                    + Reflection.PROTOCOL_NAME + ".");
+        }
+        return name;
+    }
+
+    /**
+     * Fix the hosted protocol set. Transports call this when they start; after it,
+     * {@link #addProtocol} throws. Idempotent.
+     */
+    public void sealProtocols() {
+        protocolsSealed = true;
+    }
+
+    /**
+     * Every hosted application protocol, primary first, in registration order.
+     *
+     * @return the protocols; framework protocols ({@code vgi_rpc.*}) are not included
+     */
+    public synchronized List<ApplicationProtocol> applicationProtocols() {
+        List<ApplicationProtocol> out = new ArrayList<>();
+        for (Binding b : bindings.values()) out.add(publicView(b));
+        return List.copyOf(out);
+    }
+
+    /**
+     * The hosted application protocol named {@code name}, or {@code null}.
+     *
+     * @param name a routing key
+     * @return the protocol, or {@code null} when this server does not host it
+     */
+    public ApplicationProtocol applicationProtocol(String name) {
+        Binding b = binding(name);
+        return b == null ? null : publicView(b);
+    }
+
+    private synchronized Binding binding(String name) {
+        return name == null ? null : bindings.get(name);
+    }
+
+    private ApplicationProtocol publicView(Binding b) {
+        return new ApplicationProtocol(b.name(), versionOf(b), b.implementation(), b.methods());
+    }
+
+    /** The version a binding's gate enforces: the primary's is {@link #setProtocolVersion}'s. */
+    private String versionOf(Binding b) {
+        return b.name().equals(protocolName) ? protocolVersion : b.declaredVersion();
+    }
+
+    /**
+     * Decide whether EXCEPTION batches carry the remote traceback ({@code log_extra.traceback},
+     * {@code frames}, {@code cause}).
+     *
+     * <p>Included by default, on every transport: the DuckDB extension puts the remote traceback
+     * into the user-visible error, so omitting it hides the chained cause from the person who
+     * has to act on it. This one switch turns it off on <em>all</em> transports -- there is no
+     * per-transport default. The exception type, message, code, kind and details are sent
+     * either way. See WIRE_PROTOCOL.md §8.
+     *
+     * @param include {@code false} to omit tracebacks everywhere
+     */
+    public void setIncludeTracebacks(boolean include) { this.includeTracebacks = include; }
+
+    /**
+     * Whether EXCEPTION batches this server writes carry the remote traceback.
+     *
+     * @return {@code true} unless {@link #setIncludeTracebacks} turned them off
+     */
+    public boolean includeTracebacks() { return includeTracebacks; }
+
+    private boolean tracebacks() {
+        return includeTracebacks;
     }
 
     /**
@@ -360,6 +531,10 @@ public final class RpcServer {
                     bindingHash(Identity.PROTOCOL_NAME, identityMethods),
                     "");
         }
+        Binding b = binding(protocol);
+        if (b != null && !b.name().equals(protocolName)) {
+            return new ProtocolIdentity(b.name(), bindingHash(b.name(), b.methods()), versionOf(b));
+        }
         return new ProtocolIdentity(protocolName(), protocolHash(), protocolVersion);
     }
 
@@ -429,6 +604,7 @@ public final class RpcServer {
      * @param transport the transport whose request/response streams are served
      */
     public void serve(RpcTransport transport) {
+        sealProtocols();
         notifyRawTransport(transport);
         // One shared-memory session per connection: lazily attaches when the
         // client advertises a segment, and is munmap'd/closed when the loop
@@ -445,7 +621,7 @@ public final class RpcServer {
                     LOG.warn("recoverable serve error: {}", t.toString(), t);
                     t.printStackTrace(System.err);
                     try {
-                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, t, serverId);
+                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, t, serverId, tracebacks());
                         transport.writer().flush();
                     } catch (Exception ignore) {
                         // If we can't even write back, the transport is dead — exit.
@@ -490,6 +666,7 @@ public final class RpcServer {
      * @param transport the transport whose next request stream is read and answered
      */
     public void serveOne(RpcTransport transport) {
+        sealProtocols();
         notifyRawTransport(transport);
         serveCall(transport, null, null);
     }
@@ -509,6 +686,7 @@ public final class RpcServer {
      * @param routedProtocol the protocol the transport resolved from the request path
      */
     public void serveOne(RpcTransport transport, String routedProtocol) {
+        sealProtocols();
         notifyRawTransport(transport);
         serveCall(transport, null, routedProtocol);
     }
@@ -541,7 +719,7 @@ public final class RpcServer {
                 // next call's schema, and the connection dies one call later —
                 // looking exactly like the wedge this branch exists to avoid.
                 try { reader.drain(); } catch (IOException ignore) { /* best-effort */ }
-                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, oversized, serverId);
+                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, oversized, serverId, tracebacks());
                 transport.writer().flush();
                 return;
             } catch (RuntimeException malformed) {
@@ -551,7 +729,7 @@ public final class RpcServer {
                 // consumed. Drain its EOS marker, return a typed error for
                 // this call, and preserve the persistent connection.
                 try { reader.drain(); } catch (Exception ignore) { /* best-effort */ }
-                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, malformed, serverId);
+                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, malformed, serverId, tracebacks());
                 transport.writer().flush();
                 return;
             } catch (IOException ioe) {
@@ -568,7 +746,7 @@ public final class RpcServer {
                 requestSchema = reader.wireSchema();
             } catch (IOException schemaExc) {
                 try { reader.drain(); } catch (IOException ignore) { /* best-effort */ }
-                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, schemaExc, serverId);
+                Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, schemaExc, serverId, tracebacks());
                 transport.writer().flush();
                 return;
             }
@@ -590,7 +768,7 @@ public final class RpcServer {
                         paramsRoot = res.root();
                         meta = res.customMetadata();
                     } catch (Exception shmExc) {
-                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, shmExc, serverId);
+                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, shmExc, serverId, tracebacks());
                         transport.writer().flush();
                         return;
                     }
@@ -600,7 +778,7 @@ public final class RpcServer {
                         resolvedParams = res;
                         paramsRoot = res.root();
                     } catch (Exception fetchExc) {
-                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, fetchExc, serverId);
+                        Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, fetchExc, serverId, tracebacks());
                         transport.writer().flush();
                         return;
                     }
@@ -612,7 +790,7 @@ public final class RpcServer {
                     // loudly rather than silently decoding the 0-row pointer as empty.
                     Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
                             new IOException("received shm pointer batch but no segment is attached "
-                                    + "(transport negotiation mismatch)"), serverId);
+                                    + "(transport negotiation mismatch)"), serverId, tracebacks());
                     transport.writer().flush();
                     return;
                 }
@@ -629,7 +807,7 @@ public final class RpcServer {
                                 : Marshalling.decodeRow(paramsRoot, reader.dictionaryProvider(), reader.wireSchema()));
                 } catch (Exception decodeExc) {
                     try { reader.drain(); } catch (IOException ignore) {}
-                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, decodeExc, serverId);
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, decodeExc, serverId, tracebacks());
                     transport.writer().flush();
                     return;
                 }
@@ -647,7 +825,7 @@ public final class RpcServer {
                     Wire.validateRequestVersion(meta);
                     method = Wire.requireMethodName(meta);
                 } catch (RuntimeException pe) {
-                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, pe, serverId);
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, pe, serverId, tracebacks());
                     transport.writer().flush();
                     return;
                 }
@@ -671,7 +849,7 @@ public final class RpcServer {
                                                 + routedProtocol + "' but the Arrow IPC "
                                                 + "custom_metadata 'vgi_rpc.protocol' says '"
                                                 + requestProtocol + "'. These must agree."),
-                                serverId);
+                                serverId, tracebacks());
                         transport.writer().flush();
                         return;
                     }
@@ -735,7 +913,7 @@ public final class RpcServer {
                 if (method.startsWith("__") && method.endsWith("__")) {
                     Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
                             reservedMethodRefusal(method),
-                            serverId);
+                            serverId, tracebacks());
                     transport.writer().flush();
                     return;
                 }
@@ -749,7 +927,7 @@ public final class RpcServer {
                                     "Request carries no 'vgi_rpc.protocol' routing key. Every "
                                             + "request must name the protocol it addresses. This "
                                             + "server hosts: " + hostedProtocolNames() + "."),
-                            serverId);
+                            serverId, tracebacks());
                     transport.writer().flush();
                     return;
                 }
@@ -770,35 +948,44 @@ public final class RpcServer {
                 // The grammar is checked before the lookup, and a name that fails it is refused
                 // without being echoed, so a request-supplied string never reaches an error
                 // message, a log field or a metric label.
-                if (!protocolName().equals(requestProtocol)) {
+                // Dispatch is by the pair (protocol, method): every hosted application protocol is
+                // its own binding, so two of them may declare the same method name and each call
+                // reaches the one it named.
+                Binding binding = ProtocolNames.isValid(requestProtocol) ? binding(requestProtocol) : null;
+                if (binding == null) {
                     ProtocolNotSupportedError refusal = protocolNotHosted(
                             requestProtocol, "The 'vgi_rpc.protocol' routing key");
-                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, refusal, serverId);
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, refusal, serverId, tracebacks());
                     transport.writer().flush();
                     return;
                 }
-                RpcMethodInfo info = methods.get(method);
+                RpcMethodInfo info = binding.methods().get(method);
                 if (info == null) {
+                    // Protocol hosted, method absent: the documented capability-probe signal,
+                    // distinct from "protocol not hosted" above.
                     Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
-                            new IllegalArgumentException("Unknown method: '" + method + "'. Available: " + methods.keySet()),
-                            serverId);
+                            new MethodNotImplementedError("Protocol '" + binding.name()
+                                    + "' has no method '" + method + "'. Available: "
+                                    + binding.methods().keySet()),
+                            serverId, tracebacks());
                     transport.writer().flush();
                     return;
                 }
-                // Application-protocol-version gate. Fires only when the
-                // operator declared a version via setProtocolVersion (empty =
-                // opt out). Placed after method resolution so an unknown method
+                // Application-protocol-version gate, against the binding that owns the method --
+                // never the primary's version for every call: a secondary that declares no
+                // version is not gated at all. Fires only when that binding declares a version
+                // (empty = opt out). Placed after method resolution so an unknown method
                 // still reports as unknown, and after the reflection /
                 // transport-options short-circuits above — those are the
                 // diagnostic paths a MISMATCHED client uses to discover what the
                 // server expects, so gating them would hide the answer.
-                if (!protocolVersion.isEmpty()) {
-                    ProtocolVersionError pve =
-                            checkProtocolVersion(meta.get(farm.query.vgirpc.wire.Metadata.PROTOCOL_VERSION_KEY));
+                {
+                    ProtocolVersionError pve = gateVersion(binding.name(),
+                            meta.get(farm.query.vgirpc.wire.Metadata.PROTOCOL_VERSION_KEY));
                     if (pve != null) {
                         Schema errorSchema = info.methodType() == MethodType.UNARY
                                 ? info.resultSchema() : RpcStream.EMPTY_SCHEMA;
-                        Wire.writeErrorStream(transport.writer(), errorSchema, pve, serverId);
+                        Wire.writeErrorStream(transport.writer(), errorSchema, pve, serverId, tracebacks());
                         transport.writer().flush();
                         return;
                     }
@@ -809,7 +996,7 @@ public final class RpcServer {
                 } catch (RuntimeException contractError) {
                     Schema errorSchema = info.methodType() == MethodType.UNARY
                             ? info.resultSchema() : RpcStream.EMPTY_SCHEMA;
-                    Wire.writeErrorStream(transport.writer(), errorSchema, contractError, serverId);
+                    Wire.writeErrorStream(transport.writer(), errorSchema, contractError, serverId, tracebacks());
                     transport.writer().flush();
                     return;
                 }
@@ -822,9 +1009,10 @@ public final class RpcServer {
                         requestProtocol, requestDataSnapshot)) {
                     try {
                         if (info.methodType() == MethodType.UNARY) {
-                            serveUnary(transport, info, kwargs, shm);
+                            serveUnary(transport, info, kwargs, shm,
+                                    binding.implementation(), binding.name());
                         } else {
-                            serveStream(transport, info, kwargs, shm);
+                            serveStream(transport, info, kwargs, shm, binding);
                         }
                     } catch (Throwable t) {
                         if (d != null) d.failed(t);
@@ -1004,7 +1192,8 @@ public final class RpcServer {
      * @param clientVersion the version the client declared, or {@code null} when it declared none
      * @return the error to return to the caller, or {@code null} when the versions are compatible
      */
-    private ProtocolVersionError checkProtocolVersion(String clientVersion) {
+    private static ProtocolVersionError checkProtocolVersion(String protocol, String protocolVersion,
+                                                             String clientVersion) {
         String head = "VGI client/worker protocol_version mismatch.\n"
                 + "  Client: " + (clientVersion == null ? "<not declared>" : clientVersion) + "\n"
                 + "  Server: " + protocolVersion + "\n"
@@ -1013,14 +1202,15 @@ public final class RpcServer {
             return new ProtocolVersionError(head
                     + "the client did not send a vgi_rpc.protocol_version metadata key. "
                     + "This is either a vgi-rpc framework bug or a non-VGI client "
-                    + "connecting to a VGI worker.");
+                    + "connecting to a VGI worker.", protocol, "", protocolVersion);
         }
         int[] client = parseSemver(clientVersion);
         int[] server = parseSemver(protocolVersion);
         if (client == null || server == null) {
             return new ProtocolVersionError(head
                     + "client sent a malformed protocol_version. "
-                    + "Expected canonical semver MAJOR.MINOR.PATCH.");
+                    + "Expected canonical semver MAJOR.MINOR.PATCH.",
+                    protocol, clientVersion, protocolVersion);
         }
         if (client[0] == server[0] && client[1] == server[1]) {
             return null;
@@ -1030,7 +1220,29 @@ public final class RpcServer {
                 ? "client is too old; upgrade the VGI extension/client to a version "
                         + "supporting protocol_version " + protocolVersion + "."
                 : "server is too old; upgrade the VGI worker to a version "
-                        + "supporting protocol_version " + clientVersion + "."));
+                        + "supporting protocol_version " + clientVersion + "."),
+                protocol, clientVersion, protocolVersion);
+    }
+
+    /**
+     * Gate a call against the declared {@code protocol_version} of the application protocol that
+     * owns it -- the binding's own version, never the primary's for every call.
+     *
+     * <p>Shared by raw dispatch and transports that dispatch outside {@link #serveOne} (the HTTP
+     * stream {@code /init} route), so the two cannot disagree. A no-op for a protocol that declares
+     * no version, and for one this server does not host as an application protocol (reflection
+     * and identity are exempt: they are how a mismatched client diagnoses the mismatch).
+     *
+     * @param protocol the routing key the call resolved to
+     * @param clientVersion the request's {@code vgi_rpc.protocol_version}, or {@code null}
+     * @return the refusal to write back, or {@code null} when the call may proceed
+     */
+    public ProtocolVersionError gateVersion(String protocol, String clientVersion) {
+        Binding b = binding(protocol);
+        if (b == null) return null;
+        String version = versionOf(b);
+        if (version.isEmpty()) return null;
+        return checkProtocolVersion(b.name(), version, clientVersion);
     }
 
     /** {@code MAJOR.MINOR.PATCH} as three ints, or {@code null} when not canonical semver. */
@@ -1071,11 +1283,6 @@ public final class RpcServer {
         }
     }
 
-    private void serveUnary(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs,
-                            Shm shm) throws Exception {
-        serveUnary(transport, info, kwargs, shm, impl, protocolName());
-    }
-
     /**
      * Serve one unary call against {@code target}, reported as belonging to {@code proto}.
      *
@@ -1107,7 +1314,7 @@ public final class RpcServer {
                 }
             } catch (Throwable t) {
                 Throwable inner = unwrap(t);
-                Wire.writeZeroBatch(w, schema, Wire.errorMetadata(inner, serverId));
+                Wire.writeZeroBatch(w, schema, Wire.errorMetadata(inner, serverId, tracebacks()));
             }
         }
     }
@@ -1129,14 +1336,14 @@ public final class RpcServer {
                     new MethodNotImplementedError(
                             "Protocol '" + Identity.PROTOCOL_NAME + "' has no method '" + method
                                     + "'. Available: " + identityMethods.keySet()),
-                    serverId);
+                    serverId, tracebacks());
             transport.writer().flush();
             return;
         }
         try {
             validateParameterContract(method, requestSchema, parameterRows, info.paramsSchema());
         } catch (RuntimeException contractError) {
-            Wire.writeErrorStream(transport.writer(), info.resultSchema(), contractError, serverId);
+            Wire.writeErrorStream(transport.writer(), info.resultSchema(), contractError, serverId, tracebacks());
             transport.writer().flush();
             return;
         }
@@ -1221,13 +1428,13 @@ public final class RpcServer {
     }
 
     private void serveStream(RpcTransport transport, RpcMethodInfo info, Map<String, Object> kwargs,
-                             Shm shm) throws Exception {
+                             Shm shm, Binding binding) throws Exception {
         ClientLogSink sink = new ClientLogSink(serverId);
         AuthScope.Scope scope = AuthScope.current();
         CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
-                serverId, info.name(), protocolName(), "", transportKind, scope.peerEvidence());
+                serverId, info.name(), binding.name(), "", transportKind, scope.peerEvidence());
 
-        RpcStream<?> stream = runStreamInit(info, kwargs, ctx, transport);
+        RpcStream<?> stream = runStreamInit(info, kwargs, ctx, transport, binding.implementation());
         if (stream == null) return;  // init failed; error already reported + input drained
 
         if (stream.header() != null) {
@@ -1261,13 +1468,13 @@ public final class RpcServer {
      * callers should early-exit in that case.
      */
     private RpcStream<?> runStreamInit(RpcMethodInfo info, Map<String, Object> kwargs, CallContext ctx,
-                                        RpcTransport transport) throws IOException {
+                                        RpcTransport transport, Object target) throws IOException {
         try {
             Object[] args = ParameterBinder.bind(info.reflectMethod(), kwargs, ctx);
-            return (RpcStream<?>) info.reflectMethod().invoke(impl, args);
+            return (RpcStream<?>) info.reflectMethod().invoke(target, args);
         } catch (Throwable t) {
             Throwable initException = unwrap(t);
-            Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, initException, serverId);
+            Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA, initException, serverId, tracebacks());
             transport.writer().flush();
             // Drain the client's input IPC stream so subsequent requests aren't misparsed.
             try (IpcStreamReader inputReader = new IpcStreamReader(transport.reader(), Allocators.root())) {
@@ -1329,7 +1536,7 @@ public final class RpcServer {
                 inputRoot = res.root();
                 effectiveMeta = res.customMetadata();
             } catch (Exception shmExc) {
-                Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(shmExc, serverId));
+                Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(shmExc, serverId, tracebacks()));
                 transport.writer().flush();
                 return false;
             }
@@ -1343,7 +1550,7 @@ public final class RpcServer {
                 // per-batch metadata from, as the reference's tick loop does.
                 effectiveMeta = res.fetchedMetadata();
             } catch (Exception fetchExc) {
-                Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(fetchExc, serverId));
+                Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(fetchExc, serverId, tracebacks()));
                 transport.writer().flush();
                 return false;
             }
@@ -1360,7 +1567,7 @@ public final class RpcServer {
                 inputRoot = castRoot;
             } catch (Exception castExc) {
                 Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(
-                        new ClassCastException(castExc.getMessage()), serverId));
+                        new ClassCastException(castExc.getMessage()), serverId, tracebacks()));
                 transport.writer().flush();
                 return false;
             }
@@ -1372,7 +1579,7 @@ public final class RpcServer {
         try {
             state.process(new AnnotatedBatch(inputRoot, effectiveMeta), out, ctx);
         } catch (Throwable t) {
-            Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(unwrap(t), serverId));
+            Wire.writeZeroBatch(outputWriter, outputSchema, Wire.errorMetadata(unwrap(t), serverId, tracebacks()));
             transport.writer().flush();
             return false;
         }
@@ -1506,7 +1713,6 @@ public final class RpcServer {
      */
     private void serveReflection(
             RpcTransport transport, String method, Map<String, Object> kwargs) throws IOException {
-        String appHash = Reflection.bindingHash(protocolName(), methods);
         // Reflection describes itself with its own two methods in the table.
         // They are answered here rather than registered by an application, but
         // that is a statement about who implements them, not about whether they
@@ -1524,7 +1730,12 @@ public final class RpcServer {
         byte[] payload;
         if ("list_protocols".equals(method)) {
             List<Reflection.Summary> hosted = new ArrayList<>();
-            hosted.add(new Reflection.Summary(protocolName(), protocolVersion, appHash));
+            // Every application protocol, primary first, in registration order -- the order a
+            // client relies on after filtering the reserved prefix out.
+            for (ApplicationProtocol app : applicationProtocols()) {
+                hosted.add(new Reflection.Summary(app.name(), app.protocolVersion(),
+                        bindingHash(app.name(), app.methods())));
+            }
             hosted.add(new Reflection.Summary(Reflection.PROTOCOL_NAME, "", reflHash));
             // After reflection, so identity appears in reflection's own output
             // rather than having to be known a priori.
@@ -1538,9 +1749,10 @@ public final class RpcServer {
                     hosted);
         } else if ("describe".equals(method)) {
             String requested = readProtocolArgument(kwargs);
-            if (protocolName().equals(requested)) {
-                payload = Reflection.buildServiceDescription(
-                        protocolName(), protocolVersion, appHash, methods);
+            ApplicationProtocol app = ProtocolNames.isValid(requested) ? applicationProtocol(requested) : null;
+            if (app != null) {
+                payload = Reflection.buildServiceDescription(app.name(), app.protocolVersion(),
+                        bindingHash(app.name(), app.methods()), app.methods());
             } else if (Reflection.PROTOCOL_NAME.equals(requested)) {
                 payload = Reflection.buildServiceDescription(
                         Reflection.PROTOCOL_NAME, "", reflHash, reflectionMethods);
@@ -1565,7 +1777,7 @@ public final class RpcServer {
                 // mismatch, so it must keep answering the clients it exists to serve.
                 Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
                         protocolNotHosted(requested, "The 'protocol' argument to describe"),
-                        serverId);
+                        serverId, tracebacks());
                 transport.writer().flush();
                 return;
             }
@@ -1574,7 +1786,7 @@ public final class RpcServer {
                     new IllegalArgumentException(
                             "Protocol '" + Reflection.PROTOCOL_NAME + "' has no method '" + method
                                     + "'. Available: [describe, list_protocols]"),
-                    serverId);
+                    serverId, tracebacks());
             transport.writer().flush();
             return;
         }
@@ -1618,7 +1830,7 @@ public final class RpcServer {
     /** The protocols this server routes, for a diagnostic that must name them. */
     private String hostedProtocolNames() {
         List<String> names = new ArrayList<>();
-        names.add(protocolName());
+        for (ApplicationProtocol app : applicationProtocols()) names.add(app.name());
         names.add(Reflection.PROTOCOL_NAME);
         if (identity != null) names.add(Identity.PROTOCOL_NAME);
         return names.toString();

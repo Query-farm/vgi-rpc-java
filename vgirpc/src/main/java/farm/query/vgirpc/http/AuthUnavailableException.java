@@ -26,8 +26,14 @@ package farm.query.vgirpc.http;
  *
  * <p>Raise it for transport failures, timeouts, and 5xx from a remote authority.
  * Never for a credential the authority actually answered about.
+ *
+ * <p>Raised from an identity hook ({@code TokenResolveHook} / {@code GrantMintHook}) it is
+ * translated by {@link farm.query.vgirpc.identity.IdentityImpl} to {@code identity_unavailable}
+ * carrying the same retry hint (WIRE_PROTOCOL.md §16), on every transport: a hook calling the same
+ * store an authenticator calls raises what the authenticator raises.
  */
-public final class AuthUnavailableException extends RuntimeException {
+public final class AuthUnavailableException extends RuntimeException
+        implements farm.query.vgirpc.errors.HasErrorCode, farm.query.vgirpc.errors.HasErrorDetails {
 
     private static final long serialVersionUID = 1L;
 
@@ -74,4 +80,17 @@ public final class AuthUnavailableException extends RuntimeException {
      * @return the retry hint, always {@code >= 1}
      */
     public int retryAfterSeconds() { return retryAfterSeconds; }
+
+    /** {@code UNAVAILABLE}; the retry hint rides as {@code RetryInfo}. */
+    @Override
+    public farm.query.vgirpc.errors.Code errorCode() {
+        return farm.query.vgirpc.errors.Code.UNAVAILABLE;
+    }
+
+    /** The retry hint, as the one detail this error carries. */
+    @Override
+    public java.util.List<java.util.Map<String, Object>> errorDetails() {
+        return java.util.List.of(
+                new farm.query.vgirpc.errors.ErrorDetail.RetryInfo(retryAfterSeconds).toJson());
+    }
 }

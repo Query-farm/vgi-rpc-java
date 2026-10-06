@@ -195,7 +195,12 @@ public final class IdentityImpl implements Identity {
         checkIntrospector(ctx == null ? null : ctx.auth(), principals);
         rejectJwsShaped(token);
 
-        TokenIdentity identity = resolveToken.resolve(token);
+        TokenIdentity identity;
+        try {
+            identity = resolveToken.resolve(token);
+        } catch (farm.query.vgirpc.http.AuthUnavailableException e) {
+            throw unavailable(e);
+        }
         if (identity == null) {
             // Uniform with malformed and expired: reporting which would confirm
             // that a guessed credential exists.
@@ -216,7 +221,25 @@ public final class IdentityImpl implements Identity {
         // closed by construction rather than by a check that could be forgotten
         // in one of seven ports.
         String principal = auth == null || auth.principal() == null ? "" : auth.principal();
-        return mintGrant.mint(principal, purpose, scopes == null ? List.of() : scopes, ttl_seconds);
+        try {
+            return mintGrant.mint(principal, purpose, scopes == null ? List.of() : scopes, ttl_seconds);
+        } catch (farm.query.vgirpc.http.AuthUnavailableException e) {
+            throw unavailable(e);
+        }
+    }
+
+    /**
+     * Translate the transport-auth "could not find out" into {@code identity_unavailable}.
+     *
+     * <p>A hook calling the same backing store an authenticator does raises the error an
+     * authenticator raises when that store is down. Left untranslated it reached the wire
+     * unclassified -- no kind -- so a caller could no longer tell an outage from a refusal, the one
+     * distinction this protocol's error kinds exist to carry (WIRE_PROTOCOL.md §16). The retry hint
+     * is kept, never replaced with a default: the store that is down is the one that knows how
+     * long.
+     */
+    private static IdentityUnavailableError unavailable(farm.query.vgirpc.http.AuthUnavailableException e) {
+        return new IdentityUnavailableError(e.getMessage(), e.retryAfterSeconds(), e);
     }
 
     // -----------------------------------------------------------------------

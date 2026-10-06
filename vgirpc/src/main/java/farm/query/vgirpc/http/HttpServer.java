@@ -1295,9 +1295,17 @@ public final class HttpServer {
             if (binding == null) {
                 // Not hosted here, or not a protocol name at all: a routing failure, and 404 is
                 // the answer every proxy, WAF and load balancer understands without an Arrow
-                // parser. Checked before the grammar is echoed anywhere, so a request-supplied
-                // segment never reaches an error message, a log field or a metric label.
-                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+                // parser. The body is still the EXCEPTION batch an RPC client reads, so the
+                // caller gets protocol_not_supported / UNIMPLEMENTED rather than a bare status --
+                // the same answer raw dispatch gives. The grammar is checked before the segment
+                // is echoed, so an unnameable one never reaches a message, a log field or a
+                // metric label; and the hosted set is not listed, since this is answered before
+                // authentication.
+                writeArrowError(req, resp, HttpServletResponse.SC_NOT_FOUND,
+                        new farm.query.vgirpc.ProtocolNotSupportedError(
+                                ProtocolNames.isValid(protocolSegment)
+                                        ? "This server does not host protocol '" + protocolSegment + "'."
+                                        : "The request path does not name a protocol."));
                 return;
             }
             boolean stream = tail.endsWith("/init") || tail.endsWith("/exchange");
@@ -1404,8 +1412,11 @@ public final class HttpServer {
      */
     private RouteBinding resolveBinding(String protocol) {
         if (!ProtocolNames.isValid(protocol)) return null;
-        if (rpc.protocolName().equals(protocol)) {
-            return new RouteBinding(protocol, rpc.methods(), rpc.methods().keySet());
+        // Every hosted application protocol, not just the primary: the same set is hosted on
+        // every transport, so a protocol reachable over stdio is reachable here too.
+        RpcServer.ApplicationProtocol app = rpc.applicationProtocol(protocol);
+        if (app != null) {
+            return new RouteBinding(protocol, app.methods(), app.methods().keySet());
         }
         if (Reflection.PROTOCOL_NAME.equals(protocol)) {
             // The names come from reflection's own method table -- the same one it describes
@@ -1671,7 +1682,7 @@ public final class HttpServer {
             } catch (IOException ioe) {
                 // Fall through: an empty (or partial) IPC body is a server error
                 resp.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
-                Wire.writeErrorStream(out, UPLOAD_URL_SCHEMA, ioe, rpc.serverId());
+                Wire.writeErrorStream(out, UPLOAD_URL_SCHEMA, ioe, rpc.serverId(), rpc.includeTracebacks());
                 writeArrowResponse(req, resp, out.toByteArray());
                 return;
             }
@@ -2009,7 +2020,7 @@ public final class HttpServer {
     private void writeSessionLostResponse(HttpServletRequest req, HttpServletResponse resp,
                                            SessionLostError e) throws IOException {
         ByteArrayOutputStream errOut = new ByteArrayOutputStream();
-        Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, e, rpc.serverId());
+        Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, e, rpc.serverId(), rpc.includeTracebacks());
         resp.setStatus(HttpServletResponse.SC_OK);
         resp.setHeader(RPC_ERROR_HEADER, "true");
         writeArrowResponse(req, resp, errOut.toByteArray());
@@ -2114,7 +2125,7 @@ public final class HttpServer {
     private void writeCapError(HttpServletRequest req, HttpServletResponse resp,
                                Throwable overshoot) throws IOException {
         ByteArrayOutputStream errOut = new ByteArrayOutputStream();
-        Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, overshoot, rpc.serverId());
+        Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, overshoot, rpc.serverId(), rpc.includeTracebacks());
         resp.setStatus(HttpServletResponse.SC_OK);
         resp.setHeader(RPC_ERROR_HEADER, "true");
         writeArrowResponse(req, resp, errOut.toByteArray());
@@ -2443,7 +2454,7 @@ public final class HttpServer {
     private void writeArrowError(HttpServletRequest req, HttpServletResponse resp, int status,
                                  Throwable error) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        Wire.writeErrorStream(out, RpcStream.EMPTY_SCHEMA, error, rpc.serverId());
+        Wire.writeErrorStream(out, RpcStream.EMPTY_SCHEMA, error, rpc.serverId(), rpc.includeTracebacks());
         resp.setStatus(status);
         writeArrowResponse(req, resp, out.toByteArray());
     }
@@ -2750,7 +2761,7 @@ public final class HttpServer {
                 if (System.getenv("VGI_STREAM_DEBUG") != null) e.printStackTrace();
                 // Serialise an error stream so the client can read it uniformly.
                 ByteArrayOutputStream errOut = new ByteArrayOutputStream();
-                Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, e, rpc.serverId());
+                Wire.writeErrorStream(errOut, RpcStream.EMPTY_SCHEMA, e, rpc.serverId(), rpc.includeTracebacks());
                 out = errOut.toByteArray();
                 resp.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
             }

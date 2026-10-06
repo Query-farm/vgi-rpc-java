@@ -204,6 +204,61 @@ class HttpStreamHandlerResumeTest {
         assertEquals(List.of(1L), same.values());
     }
 
+    /** Same request as {@link #initRequest}, stamping {@code vgi_rpc.protocol_version}. */
+    private static byte[] versionedInitRequest(RpcServer server, String method, Map<String, Object> kwargs,
+                                               String version) throws Exception {
+        Schema params = server.methods().get(method).paramsSchema();
+        Map<String, String> md = new java.util.LinkedHashMap<>(Wire.requestMetadata(method));
+        if (version != null) md.put(Metadata.PROTOCOL_VERSION_KEY, version);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (IpcStreamWriter w = new IpcStreamWriter(out);
+             VectorSchemaRoot root = Marshalling.encodeRow(params, kwargs, Allocators.root())) {
+            w.writeSchema(params);
+            w.writeBatch(root, md);
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * Stream {@code /init} is gated against the owning binding's declared version, exactly as
+     * unary and raw dispatch are. It used not to be: HTTP streams dispatch outside
+     * {@code RpcServer.serveOne}, so a mismatched client could open a stream the same server
+     * would refuse a unary call from.
+     */
+    @Test
+    void streamInitIsVersionGated() throws Exception {
+        RpcServer server = new RpcServer(CounterService.class, new CounterServiceImpl());
+        server.setProtocolVersion("2.0.0");
+        HttpStreamHandler handler = new HttpStreamHandler(server, KEY, 0, Long.MAX_VALUE);
+
+        byte[] stale = handler.handleInit("CounterService", "count_to",
+                versionedInitRequest(server, "count_to", Map.of("limit", 2L), "1.0.0"), Long.MAX_VALUE, null);
+        Map<String, String> md = firstErrorMetadata(stale);
+        assertNotNull(md, "a 1.0.0 client must be refused by a 2.0.0 binding");
+        assertEquals("protocol_version_mismatch", md.get(Metadata.ERROR_KIND));
+        assertEquals("FAILED_PRECONDITION", md.get(Metadata.ERROR_CODE));
+        assertTrue(md.get(Metadata.ERROR_DETAILS).contains("\"subject\":\"CounterService\""),
+                md.get(Metadata.ERROR_DETAILS));
+
+        assertNotNull(firstErrorMetadata(handler.handleInit("CounterService", "count_to",
+                versionedInitRequest(server, "count_to", Map.of("limit", 2L), null), Long.MAX_VALUE, null)),
+                "a client declaring no version is refused too, as on the unary path");
+        Turn ok = readTurn(handler.handleInit("CounterService", "count_to",
+                versionedInitRequest(server, "count_to", Map.of("limit", 2L), "2.0.7"), Long.MAX_VALUE, null));
+        assertNull(ok.error(), "a patch difference is compatible");
+    }
+
+    /** The EXCEPTION batch's metadata, or {@code null} when the response carries none. */
+    private static Map<String, String> firstErrorMetadata(byte[] response) throws Exception {
+        try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(response), Allocators.root())) {
+            Map<String, String> md;
+            while ((md = r.readNextBatch()) != null) {
+                if ("EXCEPTION".equals(md.get(Metadata.LOG_LEVEL))) return md;
+            }
+        }
+        return null;
+    }
+
     @Test
     void wildcardImplStillLearnsFromInit() throws Exception {
         RpcServer server = new RpcServer(CounterService.class, new WildcardImpl());

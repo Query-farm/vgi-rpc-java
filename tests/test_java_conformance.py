@@ -1114,6 +1114,7 @@ def _client_conn(
     unix_path: str | None,
     tcp_addr: tuple[str, int] | None,
     ext_port: int | None,
+    service: type | None = None,
 ) -> contextlib.AbstractContextManager[Any]:
     """One connection driven by the *Java* client, through the JSONL driver."""
     from vgi_rpc.external import ExternalLocationConfig
@@ -1138,9 +1139,16 @@ def _client_conn(
     else:
         raise AssertionError(f"transport {param!r} has no client-role factory")
 
+    if service is None:
+        driver = CLIENT_DRIVER
+    else:
+        from java_client_proxy import driver_for
+
+        driver = driver_for(service)
+
     @contextlib.contextmanager
     def _conn() -> Iterator[Any]:
-        proxy = CLIENT_DRIVER.connect(transport, target, on_log, external_config=external_config)
+        proxy = driver.connect(transport, target, on_log, external_config=external_config)
         try:
             yield proxy
         finally:
@@ -1229,6 +1237,92 @@ def conformance_conn(
         raise ValueError(request.param)
 
     return factory
+
+
+@pytest.fixture(scope="session")
+def conformance_protocol_connector(
+    request: pytest.FixtureRequest,
+) -> Callable[..., contextlib.AbstractContextManager[Any]]:
+    """Connect a proxy bound to *any* protocol to the worker a ``conformance_conn`` id reaches.
+
+    The runner contract of the reference's ``MULTI_PROTOCOL_HOSTING.md`` §4: the SAME worker the
+    transport reaches, routing on *protocol*'s wire name, so one test can hold a primary and a
+    secondary proxy and show one method name resolving to two bindings. Server role uses the
+    reference client; client role drives the Java client through the JSONL driver bound to
+    *protocol*.
+    """
+
+    def connect(
+        transport: str,
+        protocol: type,
+        on_log: Callable[[Message], None] | None = None,
+    ) -> contextlib.AbstractContextManager[Any]:
+        if ROLE == "client":
+            return _client_conn(
+                transport,
+                on_log,
+                request.getfixturevalue("java_http_port") if transport == "http" else None,
+                request.getfixturevalue("java_unix_path") if transport == "unix" else None,
+                request.getfixturevalue("java_tcp_addr") if transport == "tcp" else None,
+                request.getfixturevalue("conformance_http_externalize_always_port")
+                if transport == "http_externalize_always"
+                else None,
+                service=protocol,
+            )
+        if transport == "pipe":
+
+            @contextlib.contextmanager
+            def _pipe_conn() -> Iterator[_RpcProxy]:
+                t = SubprocessTransport(_worker())
+                try:
+                    yield _RpcProxy(protocol, t, on_log)
+                finally:
+                    t.close()
+
+            return _pipe_conn()
+        if transport == "subprocess":
+            shared: SubprocessTransport = request.getfixturevalue("java_transport")
+
+            @contextlib.contextmanager
+            def _shared_subproc() -> Iterator[_RpcProxy]:
+                yield _RpcProxy(protocol, shared, on_log)
+
+            return _shared_subproc()
+        if transport == "subprocess_shm":
+
+            @contextlib.contextmanager
+            def _shm_conn() -> Iterator[_RpcProxy]:
+                segment = ShmSegment.create(SHM_SEGMENT_BYTES)
+                t = ShmPipeTransport(SubprocessTransport(_worker()), segment)
+                try:
+                    yield _RpcProxy(protocol, t, on_log)
+                finally:
+                    t.close()
+                    segment.close()
+                    segment.unlink()
+
+            return _shm_conn()
+        if transport == "http":
+            port: int = request.getfixturevalue("java_http_port")
+            return http_connect(protocol, f"http://127.0.0.1:{port}", on_log=on_log)
+        if transport == "http_externalize_always":
+            from vgi_rpc.external import ExternalLocationConfig
+
+            ext_port: int = request.getfixturevalue("conformance_http_externalize_always_port")
+            return http_connect(
+                protocol,
+                f"http://127.0.0.1:{ext_port}",
+                on_log=on_log,
+                external_location=ExternalLocationConfig(url_validator=_loopback_only_validator),
+            )
+        if transport == "unix":
+            return unix_connect(protocol, request.getfixturevalue("java_unix_path"), on_log=on_log)
+        if transport == "tcp":
+            host, tcp_port = request.getfixturevalue("java_tcp_addr")
+            return tcp_connect(protocol, host, tcp_port, on_log=on_log)
+        raise ValueError(f"no conformance transport named {transport!r}")
+
+    return connect
 
 
 # Deliberately NOT routed through the client driver in the client role. These

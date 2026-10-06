@@ -26,3 +26,12 @@ _DEFAULT_DRIVER = str(
 )
 
 DRIVER = ClientDriver.from_env(default=[_DEFAULT_DRIVER])
+
+
+def driver_for(service: type) -> ClientDriver:
+    """The same driver executable, bound to another protocol's surface.
+
+    The driver's ``connect`` op carries the routing key, so one executable serves every
+    protocol; only the Python-side method table differs.
+    """
+    return ClientDriver.from_env(default=[_DEFAULT_DRIVER], service=service)

@@ -33,7 +33,7 @@ final class OutputCollectorTest {
             RpcError error = assertThrows(RpcError.class, () -> out.emit(second));
             assertEquals("ProtocolError", error.errorType());
             assertEquals("ProtocolError",
-                    Wire.errorFromMetadata(Wire.errorMetadata(error, "test")).errorType());
+                    Wire.errorFromMetadata(Wire.errorMetadata(error, "test", true)).errorType());
 
             out.clientLog(Level.INFO, "after data");
             assertEquals(2, out.entries().size(), "one data batch plus one control batch");

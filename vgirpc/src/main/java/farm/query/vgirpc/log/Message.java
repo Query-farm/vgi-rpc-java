@@ -5,11 +5,13 @@ package farm.query.vgirpc.log;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import farm.query.vgirpc.RpcError;
+import farm.query.vgirpc.errors.ErrorModel;
 import farm.query.vgirpc.wire.Metadata;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -92,27 +94,53 @@ public final class Message {
     }
 
     /**
-     * Build an {@link Level#EXCEPTION} message from a thrown exception: captures
-     * the (truncated) stack trace and a Python-compatible {@code exception_type}
-     * into the extras so cross-language clients can match by type name.
+     * Build an {@link Level#EXCEPTION} message from a thrown exception, traceback included.
+     *
+     * <p>Servers call {@link #fromException(Throwable, boolean)} with the traceback policy of the
+     * transport they are answering on; this form is for callers with no transport.
      *
      * @param t the exception
      * @return the corresponding error message
      */
     public static Message fromException(Throwable t) {
-        StringWriter sw = new StringWriter();
-        try (PrintWriter pw = new PrintWriter(sw)) {
-            t.printStackTrace(pw);
-        }
-        String tb = sw.toString();
-        if (tb.length() > MAX_TRACEBACK_CHARS) {
-            tb = tb.substring(0, MAX_TRACEBACK_CHARS) + "\n... <traceback truncated>";
-        }
+        return fromException(t, true);
+    }
+
+    /**
+     * Build an {@link Level#EXCEPTION} message from a thrown exception: a Python-compatible
+     * {@code exception_type} so cross-language clients can match by type name, the error model
+     * (WIRE_PROTOCOL.md §8) -- {@code error_code} always, {@code error_kind} when declared,
+     * {@code error_details} when declared and within the 4 KiB cap (dropped whole otherwise) --
+     * and, when asked, the (truncated) stack trace.
+     *
+     * @param t the exception
+     * @param includeTraceback whether to send the traceback. Servers send it by default on every
+     *     transport and omit it only when the operator turns tracebacks off.
+     * @return the corresponding error message
+     */
+    public static Message fromException(Throwable t, boolean includeTraceback) {
         Map<String, Object> extra = new LinkedHashMap<>();
         String typeName = mapExceptionType(t);
         extra.put("exception_type", typeName);
         extra.put("exception_message", t.getMessage() != null ? t.getMessage() : "");
-        extra.put("traceback", tb);
+        // Code first: required on every EXCEPTION batch, so it is set before anything that
+        // could be skipped.
+        extra.put("error_code", ErrorModel.codeOf(t).name());
+        String kind = ErrorModel.kindOf(t);
+        if (kind != null) extra.put("error_kind", kind);
+        List<Map<String, Object>> details = ErrorModel.detailsOf(t);
+        if (ErrorModel.encode(details) != null) extra.put("error_details", details);
+        if (includeTraceback) {
+            StringWriter sw = new StringWriter();
+            try (PrintWriter pw = new PrintWriter(sw)) {
+                t.printStackTrace(pw);
+            }
+            String tb = sw.toString();
+            if (tb.length() > MAX_TRACEBACK_CHARS) {
+                tb = tb.substring(0, MAX_TRACEBACK_CHARS) + "\n... <traceback truncated>";
+            }
+            extra.put("traceback", tb);
+        }
         // Type name lives in the wire extras (and clients read it from there
         // as RpcError.error_type). Keeping it as a prose prefix duplicates it
         // for humans — readers see "VGI Worker Exception: ValueError: <msg>"

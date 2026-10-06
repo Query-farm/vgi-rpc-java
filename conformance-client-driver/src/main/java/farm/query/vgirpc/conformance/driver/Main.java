@@ -674,6 +674,13 @@ public final class Main {
         node.put("error_type", error.errorType());
         node.put("error_message", error.errorMessage());
         node.put("traceback", error.remoteTraceback() == null ? "" : error.remoteTraceback());
+        // The error model, from the client's own error object -- never re-read from the batch,
+        // never defaulted: "" (the server sent no code) and "UNKNOWN" are different answers, and
+        // a driver that cannot get these from its client has found the client defect this field
+        // exists to catch.
+        node.put("error_code", error.errorCode());
+        node.put("error_kind", error.errorKind() == null ? "" : error.errorKind());
+        node.set("error_details", JSON.valueToTree(error.errorDetails()));
         return node;
     }
 

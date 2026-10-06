@@ -278,10 +278,12 @@ jobs:
             # this lane's transport, and this lane already has the reference
             # checkout and its conformance extras.
             cross_port: true
+            new_groups: true
           - name: launcher + shm
             transports: subprocess_shm
           - name: http
             transports: http,http_externalize_always
+            new_groups: true
           # --- client role -------------------------------------------------
           # The two lanes below drive this port's *client* through the JSONL
           # conformance client driver instead of driving its server.
@@ -303,6 +305,7 @@ jobs:
             role: client
             server: python
             transports: pipe,unix,tcp,http,http_externalize_always
+            new_groups: true
           # The second is triage, not a gate: same client, same tests, against
           # this port's own server. When the two lanes disagree the gap names the
           # side at fault in one run instead of two.
@@ -436,6 +439,28 @@ jobs:
           VGI_RPC_PYTHON_REPO: ${{ env.VGI_RPC_REPOS }}/vgi-rpc-python
           VGI_CLIENT_DRIVER: conformance-client-driver/build/install/conformance-client-driver/bin/conformance-client-driver
         run: python -m pytest tests/test_java_conformance.py -p no:cacheprovider -q --timeout=120
+
+      # The multi-protocol hosting / error-model groups skip *loudly* when the
+      # runner provides no `conformance_protocol_connector`, and a skip there
+      # reads as a pass in the totals above. This re-runs exactly those groups
+      # and fails on any skip, so "not run" cannot look like "passed".
+      - name: Multi-protocol and error-model groups ran (no skips)
+        if: matrix.new_groups
+        env:
+          CONFORMANCE_TRANSPORTS: ${{ matrix.transports }}
+          VGI_CONFORMANCE_ROLE: ${{ matrix.role || 'server' }}
+          VGI_CONFORMANCE_SERVER: ${{ matrix.server || 'java' }}
+          VGI_RPC_PYTHON_REPO: ${{ env.VGI_RPC_REPOS }}/vgi-rpc-python
+          VGI_CLIENT_DRIVER: conformance-client-driver/build/install/conformance-client-driver/bin/conformance-client-driver
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_java_conformance.py -p no:cacheprovider -q --timeout=120 -rs \
+            -k "Secondary or RoutingByPair or ErrorModel or TracebackPolicy or VersionMismatchCode or UnclassifiedErrorsAreUnknown or UnavailableCarriesARetryHint or ErrorKindsReachTheWire" \
+            | tee /tmp/new-groups.txt
+          if grep -q '^SKIPPED' /tmp/new-groups.txt; then
+            echo "::error::a multi-protocol / error-model group skipped; see SKIPPED lines above"
+            exit 1
+          fi
 
       # The suite above proves the wire; this proves the access-log record, which
       # nothing in CI checked until now — it was verified by hand, and drifted
