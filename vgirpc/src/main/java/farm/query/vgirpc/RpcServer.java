@@ -855,6 +855,33 @@ public final class RpcServer {
                     }
                     requestProtocol = routedProtocol;
                 }
+                // Framework built-ins (dunder names) are resolved BEFORE any protocol binding,
+                // reflection and identity included (WIRE_PROTOCOL.md §3.1): they belong to the
+                // server, not to a protocol, so whatever routing key the request carries is not
+                // consulted. A client bound to a non-primary protocol stamps that protocol's key
+                // on its __transport_options__ handshake; resolving bindings first answered it
+                // "Protocol 'vgi_rpc.Reflection.v1' has no method '__transport_options__'" and
+                // broke every shm_pipe connection a reflection-bound client opened.
+                if (TransportOptions.METHOD_NAME.equals(method)) {
+                    serveTransportOptions(transport);
+                    return;
+                }
+                // A reserved name this server does not offer, answered before routing is
+                // considered at all -- reserved names are owned by no protocol, so the answer
+                // cannot depend on which one the caller named, or on whether it named one. It is
+                // "no such method", not a routing complaint: the caller did nothing wrong with
+                // routing, and a client probing for optional introspection needs the capability
+                // answer. The one exception is __describe__, which is retired rather than merely
+                // absent -- see reservedMethodRefusal, and note that it is exactly the path a
+                // confused client reaches for, so answering it "this server does not host that
+                // protocol" would send the diagnosis in the wrong direction.
+                if (method.startsWith("__") && method.endsWith("__")) {
+                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
+                            reservedMethodRefusal(method),
+                            serverId, tracebacks());
+                    transport.writer().flush();
+                    return;
+                }
                 // Reported to the dispatch hook like any other dispatch, now that the record
                 // can name the protocol that owns the method. It could not before: this port
                 // filled DispatchInfo.protocol from protocolName(), the APPLICATION protocol,
@@ -895,26 +922,6 @@ public final class RpcServer {
                             throw t;
                         }
                     }
-                    return;
-                }
-                if (TransportOptions.METHOD_NAME.equals(method)) {
-                    serveTransportOptions(transport);
-                    return;
-                }
-                // A reserved name this server does not offer, answered before routing is
-                // considered at all -- reserved names are owned by no protocol, so the answer
-                // cannot depend on which one the caller named, or on whether it named one. It is
-                // "no such method", not a routing complaint: the caller did nothing wrong with
-                // routing, and a client probing for optional introspection needs the capability
-                // answer. The one exception is __describe__, which is retired rather than merely
-                // absent -- see reservedMethodRefusal, and note that it is exactly the path a
-                // confused client reaches for, so answering it "this server does not host that
-                // protocol" would send the diagnosis in the wrong direction.
-                if (method.startsWith("__") && method.endsWith("__")) {
-                    Wire.writeErrorStream(transport.writer(), RpcStream.EMPTY_SCHEMA,
-                            reservedMethodRefusal(method),
-                            serverId, tracebacks());
-                    transport.writer().flush();
                     return;
                 }
                 // Required, with no single-protocol exemption -- and checked only now, after the

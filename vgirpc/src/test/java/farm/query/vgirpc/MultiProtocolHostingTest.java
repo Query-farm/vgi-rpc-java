@@ -150,6 +150,30 @@ final class MultiProtocolHostingTest {
         }
     }
 
+    /**
+     * Built-ins resolve before any protocol binding, whichever routing key the request carries.
+     *
+     * <p>A client bound to a non-primary protocol stamps that protocol's key on its
+     * {@code __transport_options__} handshake. This server used to route reflection and identity
+     * first, and answered "Protocol 'vgi_rpc.Reflection.v1' has no method
+     * '__transport_options__'" -- which broke every shm_pipe connection a reflection-bound
+     * client opened.
+     */
+    @Test
+    void builtInsResolveBeforeAnyProtocolBinding() throws Exception {
+        try (Peer peer = Peer.start(server())) {
+            for (String key : List.of(Reflection.PROTOCOL_NAME, "demo.Second.v1", "demo.Primary.v1")) {
+                byte[] reply = peer.raw(key, "", TransportOptions.METHOD_NAME);
+                assertNotNull(reply, key);
+            }
+            // An unknown built-in is still "no such method", not a reflection-method complaint.
+            RpcError e = assertThrows(RpcError.class,
+                    () -> peer.raw(Reflection.PROTOCOL_NAME, "", "__no_such_builtin__"));
+            assertEquals(MethodNotImplementedError.ERROR_KIND, e.errorKind());
+            assertTrue(e.errorMessage().contains("reserved method"), e.errorMessage());
+        }
+    }
+
     @Test
     void anAbsentMethodOnASecondaryIsUnimplemented() throws Exception {
         try (Peer peer = Peer.start(server())) {
