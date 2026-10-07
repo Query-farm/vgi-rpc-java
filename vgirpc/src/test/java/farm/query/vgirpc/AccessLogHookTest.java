@@ -150,8 +150,9 @@ final class AccessLogHookTest {
                 "original_request_bytes")) {
             assertFalse(rec.has(forbidden), forbidden);
         }
-        // Transitional marker for the 0.50.0 schema; see AccessLogHook.
-        assertEquals("payload_omitted", rec.get("truncated").asText());
+        // Nothing is omitted, so no truncation marker (the reference stopped emitting
+        // "payload_omitted" in vgi-rpc 0.50.1).
+        assertFalse(rec.has("truncated"), "truncated");
     }
 
     /** Stream state tokens are reported by size; continuations carry no request shape. */

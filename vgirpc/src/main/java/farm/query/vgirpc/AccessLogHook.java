@@ -275,11 +275,6 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
             }
             rec.put("request_fields", fields);
             rec.put("request_rows", info.requestShape.rows());
-            // Transitional, for the released 0.50.0 access-log schema, which requires a unary
-            // record to carry request_data unless it is marked truncated. The newer schema
-            // accepts "payload_omitted" as a legacy marker, so this passes both.
-            // Remove once CI validates against vgi-rpc >= 0.50.1.
-            if ("unary".equals(info.methodType)) rec.put("truncated", "payload_omitted");
         }
         if ("stream".equals(info.methodType)) {
             rec.put("stream_id", info.streamId == null || info.streamId.isEmpty()
