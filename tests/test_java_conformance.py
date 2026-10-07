@@ -1511,7 +1511,7 @@ class TestHttpStreamAccessLog:
     bytes.
 
     So this asserts presence and shape, which a schema check structurally
-    cannot: an init record carrying ``request_data``, at least one continuation
+    cannot: an init record carrying ``request_fields``, at least one continuation
     carrying none, and one ``stream_id`` joining them — plus the reference
     validator over exactly those records, so shape and conformance are both
     covered.
@@ -1600,10 +1600,10 @@ class TestHttpStreamAccessLog:
             f"stream_id must be 32 lowercase hex characters, got {stream_id!r}"
         )
 
-        inits = [r for r in records if "request_data" in r]
-        conts = [r for r in records if "request_data" not in r]
+        inits = [r for r in records if "request_fields" in r]
+        conts = [r for r in records if "request_fields" not in r]
         assert len(inits) == 1, (
-            f"exactly one {method!r} record must carry request_data (the /init turn), got "
+            f"exactly one {method!r} record must carry request_fields (the /init turn), got "
             f"{len(inits)} of {len(records)}"
         )
         assert conts, (
@@ -1611,6 +1611,11 @@ class TestHttpStreamAccessLog:
             f"bytes actually move, and they were the half that went unlogged"
         )
         for rec in records:
+            leaked = {"request_data", "request_state", "response_state"} & rec.keys()
+            assert not leaked, (
+                f"payload fields {sorted(leaked)} in a {method!r} record: payloads and stream "
+                f"state can hold secrets and must never reach the access log"
+            )
             assert rec.get("http_status") == 200, f"expected http_status 200, got {rec.get('http_status')}"
             assert rec.get("request_bytes", -1) >= 0, "stream turns must report request_bytes"
 
@@ -1632,10 +1637,11 @@ class TestHttpStreamAccessLog:
         self._assert_stream_shape(records, "produce_n")
         # The init mints the first cursor; the turn that closes the stream mints
         # none, and its absence is the record saying so.
-        assert any("response_state" in r for r in records), "a turn that mints a cursor must log it"
-        assert any("request_state" in r for r in records), (
-            "a continuation must log the decrypted state the client sent, not the "
-            "AEAD ciphertext a reader cannot open"
+        assert any(r.get("response_state_bytes", 0) > 0 for r in records), (
+            "a turn that mints a cursor must log its size"
+        )
+        assert any(r.get("request_state_bytes", 0) > 0 for r in records), (
+            "a continuation must log the size of the token the client sent (never the token)"
         )
 
     def test_exchange_stream_logs_every_turn(
@@ -1800,8 +1806,8 @@ class TestHttpResponseCapAccessLog:
         assert len(records) >= 2, (
             f"expected an /init record and the overshooting /exchange record, got {len(records)}"
         )
-        inits = [r for r in records if "request_data" in r]
-        conts = [r for r in records if "request_data" not in r]
+        inits = [r for r in records if "request_fields" in r]
+        conts = [r for r in records if "request_fields" not in r]
         assert inits and conts, f"expected both an init and a continuation record, got {records}"
         assert all(r["status"] == "ok" for r in inits), (
             "the /init turn answered a well-formed response under the cap; marking it failed "

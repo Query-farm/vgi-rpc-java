@@ -688,32 +688,6 @@ public final class RpcServer {
     private static final class EndOfStream extends RuntimeException {}
 
     /**
-     * Serialize a parameters {@link VectorSchemaRoot} (with its custom metadata) into a
-     * self-contained Arrow IPC stream — schema message followed by one record batch
-     * message — for inclusion in access-log {@code request_data}.
-     *
-     * <p>Best-effort: returns {@code null} on any failure so observability never fails
-     * dispatch.
-     */
-    private static byte[] serializeRequestBatch(VectorSchemaRoot root, Map<String, String> meta,
-                                                 DictionaryProvider dictionaries) {
-        try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            try (IpcStreamWriter w = new IpcStreamWriter(baos)) {
-                // Dictionary-encoded params (enums) need their dictionary batches
-                // in the stream, or the writer refuses and the record loses
-                // request_data entirely — which the access-log schema reads as a
-                // missing required property on every enum-taking method.
-                w.writeBatch(root, meta, dictionaries);
-                w.writeEos();
-            }
-            return baos.toByteArray();
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    /**
      * Handle exactly one RPC call (no shared-memory session — used by the HTTP transport).
      *
      * @param transport the transport whose next request stream is read and answered
@@ -864,13 +838,11 @@ public final class RpcServer {
                     transport.writer().flush();
                     return;
                 }
-                // Snapshot request_data here for the same reason the kwargs are
-                // snapshotted above: draining mutates the reader's root, so a
-                // batch serialized after it carries zero rows. Only worth the
-                // re-encode when a hook will actually consume it.
-                byte[] requestDataSnapshot = dispatchHook == null ? null
-                        : serializeRequestBatch(paramsRoot, meta,
-                                resolvedParams != null ? null : reader.dictionaryProvider());
+                // Snapshot the request's shape here for the same reason the kwargs
+                // are snapshotted above: draining mutates the reader's root, so a
+                // row count read after it is zero. Names, types and rows only --
+                // never the values (see RequestShape).
+                RequestShape requestShape = dispatchHook == null ? null : RequestShape.of(paramsRoot);
                 // Drain remaining batches in this request stream so the next call sees a fresh stream
                 try { reader.drain(); } catch (IOException ignore) {}
                 String method;
@@ -945,7 +917,7 @@ public final class RpcServer {
                 // reason to stay silent is gone.
                 if (Reflection.PROTOCOL_NAME.equals(requestProtocol)) {
                     try (HookedDispatch d = beginDispatch(method, MethodType.UNARY,
-                            Reflection.PROTOCOL_NAME, requestDataSnapshot)) {
+                            Reflection.PROTOCOL_NAME, requestShape)) {
                         try {
                             serveReflection(transport, method, kwargsSnapshot);
                         } catch (Throwable t) {
@@ -966,7 +938,7 @@ public final class RpcServer {
                     RpcMethodInfo idInfo = identityMethods.get(method);
                     MethodType idType = idInfo == null ? MethodType.UNARY : idInfo.methodType();
                     try (HookedDispatch d = beginDispatch(method, idType,
-                            Identity.PROTOCOL_NAME, requestDataSnapshot)) {
+                            Identity.PROTOCOL_NAME, requestShape)) {
                         try {
                             serveIdentity(transport, method, kwargsSnapshot, requestSchema,
                                     parameterRows, shm);
@@ -1066,7 +1038,7 @@ public final class RpcServer {
                 // is what names it -- not protocolName(), which would happen to agree here and
                 // be wrong for the two framework protocols above. One code path, one rule.
                 try (HookedDispatch d = beginDispatch(method, info.methodType(),
-                        requestProtocol, requestDataSnapshot)) {
+                        requestProtocol, requestShape)) {
                     try {
                         if (info.methodType() == MethodType.UNARY) {
                             serveUnary(transport, info, kwargs, shm,
@@ -1152,11 +1124,11 @@ public final class RpcServer {
      * @param method the method being dispatched
      * @param methodType its kind, which decides whether a stream id is minted
      * @param protocol the routing key the request named, or {@code null} for an unrouted endpoint
-     * @param requestData the request batch as a self-contained IPC stream, or {@code null}
+     * @param requestShape the request batch's names, types and row count, or {@code null}
      * @return the open dispatch, or {@code null} when no hook is installed
      */
     private HookedDispatch beginDispatch(String method, MethodType methodType, String protocol,
-                                         byte[] requestData) {
+                                         RequestShape requestShape) {
         DispatchHook hook = dispatchHook;
         if (hook == null) return null;
         DispatchInfo info = new DispatchInfo();
@@ -1176,7 +1148,7 @@ public final class RpcServer {
         info.authenticated = auth != null && auth.authenticated();
         info.claims = auth != null ? auth.claims() : null;
         info.transportMetadata = scope.transportMetadata();
-        info.requestData = requestData;
+        info.requestShape = requestShape;
         if (methodType != MethodType.UNARY) {
             info.streamId = AccessLogHook.randomStreamId();
         }

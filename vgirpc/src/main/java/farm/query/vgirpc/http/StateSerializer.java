@@ -176,7 +176,7 @@ public final class StateSerializer {
                 ((PortableStreamState) instance).decode(data);
                 return instance;
             } catch (Exception e) {
-                throw new RuntimeException("state decode failed: " + cls.getName(), e);
+                throw stateFailure("state decode failed", cls, e);
             }
         }
         try {
@@ -212,8 +212,18 @@ public final class StateSerializer {
             }
             return instance;
         } catch (Exception e) {
-            throw new RuntimeException("state deserialize failed: " + cls.getName(), e);
+            throw stateFailure("state deserialize failed", cls, e);
         }
+    }
+
+    /**
+     * A decode failure that names the state class and the cause's type -- never the cause's
+     * message, and never chains the cause. A parser's message quotes the bytes it choked on, and
+     * those are the decrypted state, which can hold anything the call was given; an error
+     * reaches the client, the access log's error_message and any stack-trace logger.
+     */
+    private static RuntimeException stateFailure(String what, Class<?> cls, Exception cause) {
+        return new RuntimeException(what + ": " + cls.getName() + " (" + cause.getClass().getSimpleName() + ")");
     }
 
     /**

@@ -319,6 +319,7 @@ public final class HttpStreamHandler {
         // batch metadata; http must do the same or a producer that reads them
         // silently behaves as if they were absent.
         Map<String, String> requestMeta;
+        farm.query.vgirpc.RequestShape requestShape;
         LocationResolver.Resolved resolved = null;
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(requestBody), Allocators.root())) {
             // The request batch's own metadata, pointer or not: dispatch metadata
@@ -355,6 +356,7 @@ public final class HttpStreamHandler {
             // so this guards against a crafted /init rather than changing what a
             // real one sees.
             requestMeta = Map.copyOf(turnInputMetadata(meta));
+            requestShape = farm.query.vgirpc.RequestShape.of(root);
             kwargs = root.getRowCount() == 0
                     ? new LinkedHashMap<>()
                     : (resolved != null
@@ -374,11 +376,8 @@ public final class HttpStreamHandler {
         // can be joined to this one.
         String streamId = newStreamId();
         try (StreamTurn turn = beginTurn(protocol, method, streamId)) {
-            // The request body is already a self-contained Arrow IPC stream, so
-            // it is logged verbatim: byte-faithful, metadata intact, and free.
-            // Only the pipe transport, which reads from a shared stream with no
-            // discrete body, has to re-frame the batch.
-            onTurn(turn, i -> i.requestData = requestBody);
+            // The request's names, types and row count -- never its values.
+            onTurn(turn, i -> i.requestShape = requestShape);
             try {
                 return runInit(protocol, app.implementation(), method, info, kwargs, requestMeta, ctx, sink, streamId, turn,
                         responseLimitBytes, preferredResponseBytes);
@@ -521,10 +520,9 @@ public final class HttpStreamHandler {
             // reference draws. The stream id rides in the call token, so every
             // continuation's record joins the init's without server state.
             try (StreamTurn turn = beginTurn(protocol, method, call.streamId())) {
-                // The plaintext the client's opaque AEAD cursor decrypted to.
-                // Logging the ciphertext would give a reader nothing they could
-                // decode without the server's token key.
-                onTurn(turn, i -> i.requestState = token.state());
+                // The token's size, never the token: it serializes whatever the
+                // call was given, and a logged token is a replayable continuation.
+                onTurn(turn, i -> i.requestStateBytes = tokenB64.length());
                 try {
                     long boundLimit = Math.min(responseLimitBytes, call.responseLimitBytes());
                     Long boundPreferred = preferredResponseBytes == null ? null
@@ -748,10 +746,11 @@ public final class HttpStreamHandler {
     private String serializeContinuationToken(StreamState state, StateToken priorToken, AuthContext auth,
                                                StreamTurn turn, String protocol) {
         byte[] newStateBytes = StateSerializer.serialize(state);
-        onTurn(turn, i -> i.responseState = newStateBytes);
         StateToken newToken = new StateToken(newStateBytes, priorToken.callId(),
                 System.currentTimeMillis() / 1000);
-        return new String(newToken.pack(tokenKey, auth, protocol), StandardCharsets.US_ASCII);
+        String packed = new String(newToken.pack(tokenKey, auth, protocol), StandardCharsets.US_ASCII);
+        onTurn(turn, i -> i.responseStateBytes = packed.length());
+        return packed;
     }
 
     /**
@@ -808,11 +807,12 @@ public final class HttpStreamHandler {
         callStates.put(callId, Tokens.cacheIdentity(auth), call);
 
         byte[] stateBytes = StateSerializer.serialize(state);
-        onTurn(turn, i -> i.responseState = stateBytes);
         StateToken cursor = new StateToken(stateBytes, callId, now);
+        String packedCursor = new String(cursor.pack(tokenKey, auth, protocol), StandardCharsets.US_ASCII);
+        onTurn(turn, i -> i.responseStateBytes = packedCursor.length());
         return Map.of(
                 Metadata.STREAM_STATE,
-                new String(cursor.pack(tokenKey, auth, protocol), StandardCharsets.US_ASCII),
+                packedCursor,
                 Metadata.CALL_STATE,
                 new String(call.pack(tokenKey, auth, protocol), StandardCharsets.US_ASCII));
     }

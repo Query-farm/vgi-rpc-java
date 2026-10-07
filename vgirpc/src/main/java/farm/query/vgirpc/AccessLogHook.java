@@ -10,7 +10,6 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.Base64;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -29,7 +28,12 @@ import java.util.regex.Pattern;
  *
  * <p>Records are written synchronously by default. {@link Builder} adds the
  * optional behaviours the spec permits: deterministic sampling, background
- * emission, payload omission, and a replaceable claim-redaction policy.
+ * emission, and a replaceable claim-redaction policy.
+ *
+ * <p>No record carries a payload value, at any level, and no option adds one:
+ * a request is described by {@code request_fields} / {@code request_rows}, and
+ * an HTTP stream's state tokens by {@code request_state_bytes} /
+ * {@code response_state_bytes}. See {@link RequestShape}.
  */
 public final class AccessLogHook implements DispatchHook, AutoCloseable {
 
@@ -46,7 +50,6 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
     private final String serverVersion;
     private final double sampleRate;
     private final long sampleThreshold;
-    private final boolean logPayloads;
     private final ClaimRedactor claimRedactor;
     private final TraceCorrelator traceCorrelator;
     private final AsyncEmitter async;
@@ -68,7 +71,6 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         this.serverVersion = b.serverVersion == null ? "" : b.serverVersion;
         this.sampleRate = b.sampleRate;
         this.sampleThreshold = (long) (b.sampleRate * 0xFFFFFFFFL);
-        this.logPayloads = b.logPayloads;
         this.claimRedactor = b.claimRedactor;
         this.traceCorrelator = b.traceCorrelator;
         this.async = b.asyncQueueSize > 0 ? new AsyncEmitter(this, b.asyncQueueSize) : null;
@@ -79,7 +81,7 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
      *
      * @param out destination for one JSONL record per dispatch
      * @return a builder seeded with the conformant defaults: log everything,
-     *         synchronously, with payloads, redacting claims by key
+     *         synchronously, redacting claims by key
      */
     public static Builder builder(OutputStream out) {
         return new Builder(out);
@@ -90,7 +92,6 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         private final OutputStream out;
         private String serverVersion = "";
         private double sampleRate = 1.0;
-        private boolean logPayloads = true;
         private ClaimRedactor claimRedactor = ClaimRedactor.byKeyName();
         private TraceCorrelator traceCorrelator = TraceCorrelator.openTelemetry();
         private int asyncQueueSize;
@@ -130,20 +131,6 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
                         "access-log sample rate must be in (0.0, 1.0], got " + rate);
             }
             this.sampleRate = rate;
-            return this;
-        }
-
-        /**
-         * Whether request payloads are logged.
-         *
-         * @param enabled {@code false} drops {@code request_data} and marks the
-         *                record {@code truncated: "payload_omitted"} — distinct from
-         *                the size-driven {@code truncated: true}, so a consumer
-         *                scanning for real data loss has something to filter on
-         * @return this builder
-         */
-        public Builder logPayloads(boolean enabled) {
-            this.logPayloads = enabled;
             return this;
         }
 
@@ -275,32 +262,33 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         // these join them to the surrounding distributed trace.
         putTraceContext(rec);
         if (info.httpStatus > 0) rec.put("http_status", info.httpStatus);
-        if (info.requestData != null && info.requestData.length > 0) {
-            String encoded = Base64.getEncoder().encodeToString(info.requestData);
-            if (logPayloads) {
-                rec.put("request_data", encoded);
-            } else {
-                // Nothing was lost to a size cap here — this deployment simply
-                // does not log payloads. Sharing the size-driven `true` made the
-                // marker fire on essentially every record and stop meaning
-                // anything to a consumer looking for real data loss.
-                rec.put("original_request_bytes", encoded.length());
-                rec.put("truncated", "payload_omitted");
+        // The request's shape -- never its values, at any level, and no option turns them
+        // on: the framework cannot know which parameters are secret (a VGI catalog_attach
+        // carries API keys and passwords). See RequestShape.
+        if (info.requestShape != null) {
+            java.util.List<Map<String, String>> fields = new java.util.ArrayList<>();
+            for (RequestShape.FieldShape f : info.requestShape.fields()) {
+                Map<String, String> entry = new LinkedHashMap<>();
+                entry.put("name", f.name());
+                entry.put("type", f.type());
+                fields.add(entry);
             }
+            rec.put("request_fields", fields);
+            rec.put("request_rows", info.requestShape.rows());
+            // Transitional, for the released 0.50.0 access-log schema, which requires a unary
+            // record to carry request_data unless it is marked truncated. The newer schema
+            // accepts "payload_omitted" as a legacy marker, so this passes both.
+            // Remove once CI validates against vgi-rpc >= 0.50.1.
+            if ("unary".equals(info.methodType)) rec.put("truncated", "payload_omitted");
         }
         if ("stream".equals(info.methodType)) {
             rec.put("stream_id", info.streamId == null || info.streamId.isEmpty()
                     ? "00000000000000000000000000000000" : info.streamId);
         }
-        // Stream state, decrypted. The token on the wire is an opaque AEAD
-        // ciphertext; a log reader holding the server's token_key is not a
-        // situation to design for, so the plaintext is what gets logged.
-        // Gated with request_data: these are the same kind of payload and a
-        // deployment that opted out of one did not ask for the other.
-        if (logPayloads) {
-            putStateBytes(rec, "request_state", info.requestState);
-            putStateBytes(rec, "response_state", info.responseState);
-        }
+        // State tokens by size, never content: a token serializes whatever the call was
+        // given, secrets included, and a logged token is a replayable continuation.
+        if (info.requestStateBytes >= 0) rec.put("request_state_bytes", info.requestStateBytes);
+        if (info.responseStateBytes >= 0) rec.put("response_state_bytes", info.responseStateBytes);
         if (info.cancelled) rec.put("cancelled", true);
         if (info.sessionId != null && !info.sessionId.isEmpty()) {
             rec.put("session_id", info.sessionId);
@@ -396,13 +384,6 @@ public final class AccessLogHook implements DispatchHook, AutoCloseable {
         // leaving it saying "ok" is how a human reader gets told the opposite
         // of what the structured fields say.
         rec.put("message", rec.get("protocol") + "." + rec.get("method") + " error");
-    }
-
-    /** Base64 a decrypted state payload under {@code key}, skipping empties —
-     *  the schema's base64 pattern admits no zero-length string. */
-    private static void putStateBytes(Map<String, Object> rec, String key, byte[] state) {
-        if (state == null || state.length == 0) return;
-        rec.put(key, Base64.getEncoder().encodeToString(state));
     }
 
     /** HTTP fills {@code remote_addr} into the transport metadata, not the dispatch info. */

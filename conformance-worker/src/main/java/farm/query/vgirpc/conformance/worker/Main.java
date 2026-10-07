@@ -85,7 +85,6 @@ public final class Main {
         double accessLogSample = 1.0;
         boolean accessLogAsync = false;
         int accessLogQueueSize = 10000;
-        boolean accessLogPayloads = true;
         boolean strictMode = false;
         // 0 = unbounded; --strict bumps both to 1 MiB to mirror Python's
         // tests/serve_conformance_http_strict.py.
@@ -189,14 +188,9 @@ public final class Main {
                 case "--access-log-sample" -> accessLogSample = Double.parseDouble(c.requireValue(a));
                 case "--access-log-async" -> accessLogAsync = true;
                 case "--access-log-queue-size" -> accessLogQueueSize = Integer.parseInt(c.requireValue(a));
-                case "--access-log-no-payloads" -> accessLogPayloads = false;
-                // Accepted and ignored. The other ports gate request_data behind a
-                // DEBUG logger, so the porting guide's canonical verification command
-                // passes --access-log-debug to turn it on; this worker writes the
-                // record directly and logs payloads already, but rejecting an unknown
-                // arg would make that one command line fail on Java alone. Deliberately
-                // not the inverse of --access-log-no-payloads: payloads-by-default is
-                // what let this port catch a request_data bug the others logged past.
+                // Accepted and ignored, so the porting guide's canonical command line
+                // runs here unmodified. Records never carry payload values at any level,
+                // so there is nothing for a debug level to add.
                 case "--access-log-debug" -> { }
                 case "--strict" -> strictMode = true;
                 case "--max-response-bytes" -> maxResponseBytes = Long.parseLong(c.requireValue(a));
@@ -307,7 +301,6 @@ public final class Main {
             AccessLogHook hook = AccessLogHook.builder(accessLogOut)
                     .serverVersion("vgi-rpc-java-conformance")
                     .sampleRate(accessLogSample)
-                    .logPayloads(accessLogPayloads)
                     .asyncQueueSize(accessLogAsync ? accessLogQueueSize : 0)
                     .build();
             server.setDispatchHook(hook);

@@ -468,25 +468,24 @@ jobs:
           fi
 
       # The suite above proves the wire; this proves the access-log record, which
-      # nothing in CI checked until now — it was verified by hand, and drifted
-      # anyway. --require-request-data is what gives it teeth: without it the
-      # validator only checks request_data *when present*, so a worker that never
-      # emits the field passes vacuously. This worker logs payloads by default
-      # (no --access-log-debug needed), which is why it caught a request_data bug
-      # the ports that default to omitting it logged straight past.
+      # nothing in CI checked until it was verified by hand and drifted anyway.
+      # Records carry no payload values at any level (request_fields /
+      # request_rows describe the request; state tokens are reported by size),
+      # so there is no DEBUG variant to validate separately and no
+      # --require-request-data: the reference now rejects that flag, because the
+      # field it required put callers' secrets in the log.
       #
       # Deliberately unfiltered: a --filter that excluded the zero-parameter
       # methods (void.*) would drop the empty-schema/no-row case, and that is the
       # exact shape a bad validator rule mis-rejected in 0.36.1. The per-test
       # timeout is raised off the 5s default because the first call also pays JVM
       # startup and JIT on a shared runner.
-      - name: Verify access log (--require-request-data)
+      - name: Verify access log
         if: matrix.access_log
         run: >-
           vgi-rpc-test
-          --cmd "conformance-worker/build/install/conformance-worker/bin/conformance-worker --access-log $RUNNER_TEMP/java-access-log.jsonl"
+          --cmd "conformance-worker/build/install/conformance-worker/bin/conformance-worker --access-log $RUNNER_TEMP/java-access-log.jsonl --access-log-debug"
           --access-log "$RUNNER_TEMP/java-access-log.jsonl"
-          --require-request-data
           --timeout 30
 
       # The step above validates the *launcher* worker's log, where a whole

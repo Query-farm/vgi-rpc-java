@@ -129,34 +129,46 @@ final class AccessLogHookTest {
         assertThrows(IllegalArgumentException.class, () -> b.sampleRate(Double.NaN));
     }
 
-    // ---- truncation markers ----------------------------------------------
+    // ---- request shape, never payload ----------------------------------
 
     /**
-     * §5b: {@code "payload_omitted"} means nothing was lost to a cap. Sharing the
-     * size-driven {@code true} made the marker fire on nearly every record and
-     * left a consumer scanning for real data loss with nothing to filter on.
+     * §4.3: a record describes the request by names, types and rows -- never a value. The
+     * forbidden fields are absent, and so is any opt-in that could bring them back.
      */
     @Test
-    void omitting_payloads_is_not_reported_as_truncation() throws Exception {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        emit(AccessLogHook.builder(out).logPayloads(false).build(), unaryRecord(), null);
-
-        JsonNode rec = records(out).get(0);
-        assertEquals("payload_omitted", rec.get("truncated").asText());
-        assertFalse(rec.get("truncated").isBoolean(), "payload omission must not read as size-driven shedding");
-        assertFalse(rec.has("request_data"));
-        assertTrue(rec.get("original_request_bytes").asInt() > 0);
-    }
-
-    /** The default logs payloads, and a record that lost nothing carries no marker. */
-    @Test
-    void logging_payloads_emits_no_truncation_marker() throws Exception {
+    void a_record_carries_the_request_shape_and_no_payload() throws Exception {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         emit(AccessLogHook.builder(out).build(), unaryRecord(), null);
 
         JsonNode rec = records(out).get(0);
-        assertFalse(rec.has("truncated"));
-        assertEquals("AQIDBA==", rec.get("request_data").asText());
+        assertEquals(1, rec.get("request_fields").size());
+        assertEquals("api_key", rec.get("request_fields").get(0).get("name").asText());
+        assertEquals("Utf8", rec.get("request_fields").get(0).get("type").asText());
+        assertEquals(2, rec.get("request_fields").get(0).size(), "an entry carries name and type only");
+        assertEquals(1, rec.get("request_rows").asInt());
+        for (String forbidden : List.of("request_data", "request_state", "response_state",
+                "original_request_bytes")) {
+            assertFalse(rec.has(forbidden), forbidden);
+        }
+        // Transitional marker for the 0.50.0 schema; see AccessLogHook.
+        assertEquals("payload_omitted", rec.get("truncated").asText());
+    }
+
+    /** Stream state tokens are reported by size; continuations carry no request shape. */
+    @Test
+    void stream_state_is_logged_by_size_only() throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DispatchInfo info = streamRecord("0123456789abcdef0123456789abcdef");
+        info.requestShape = null;  // a continuation: the request was described at init
+        info.requestStateBytes = 120;
+        info.responseStateBytes = 140;
+        emit(AccessLogHook.builder(out).build(), info, null);
+
+        JsonNode rec = records(out).get(0);
+        assertEquals(120, rec.get("request_state_bytes").asInt());
+        assertEquals(140, rec.get("response_state_bytes").asInt());
+        assertFalse(rec.has("request_fields"));
+        assertFalse(rec.has("truncated"), "only unary records carry the transitional marker");
     }
 
     // ---- claim redaction -------------------------------------------------
@@ -328,7 +340,8 @@ final class AccessLogHookTest {
         info.serverId = "0123456789ab";
         info.protocol = "TestService";
         info.protocolHash = "0".repeat(64);
-        info.requestData = new byte[] {1, 2, 3, 4};
+        info.requestShape = new RequestShape(
+                List.of(new RequestShape.FieldShape("api_key", "Utf8")), 1);
         return info;
     }
 

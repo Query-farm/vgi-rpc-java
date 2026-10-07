@@ -52,23 +52,24 @@ public final class DispatchInfo {
     public String remoteAddr = "";
     /** HTTP response status code; 0 when the call did not arrive over HTTP. */
     public int httpStatus;
-    /** Self-contained Arrow IPC stream of the request batch (unary + stream init only). */
-    public byte[] requestData;
+    /**
+     * The request batch's parameter names, types and row count (unary + stream init only);
+     * {@code null} on stream continuations. Never the values: see {@link RequestShape}.
+     */
+    public RequestShape requestShape;
     /** Stream lifecycle identifier (32-char lowercase hex); empty on unary. */
     public String streamId = "";
     /**
-     * Decrypted stream state the client sent, on a stream continuation; null on
-     * unary and on stream init. The on-wire token is an opaque AEAD ciphertext —
-     * this is the plaintext, so a log reader can decode it without holding the
-     * server's token key.
+     * Size in bytes of the state token the client sent on an HTTP stream continuation;
+     * {@code -1} when there was none. The token itself is never exposed to hooks: it
+     * serializes whatever the call was given, secrets included, and it is replayable.
      */
-    public byte[] requestState;
+    public int requestStateBytes = -1;
     /**
-     * Decrypted stream state handed back to the client, on stream init and on
-     * any continuation that mints a fresh cursor. Null on unary and on the
-     * terminal continuation that closes the stream.
+     * Size in bytes of the state token handed back on an HTTP stream turn that mints one;
+     * {@code -1} when none was.
      */
-    public byte[] responseState;
+    public int responseStateBytes = -1;
     /** True when the client cancelled the stream before end-of-stream. */
     public boolean cancelled;
     /** Transport-level request metadata (e.g. HTTP headers) captured by the auth scope; may be null. */

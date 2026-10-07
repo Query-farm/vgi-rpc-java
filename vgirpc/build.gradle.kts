@@ -108,6 +108,13 @@ val java22TestTask = tasks.register<Test>("java22Test") {
 }
 tasks.named("check") { dependsOn(java22TestTask) }
 
+// The library's own loggers run at their most verbose level in tests, so
+// NoPayloadInLogsTest proves no payload value is logged at ANY level rather than
+// only at the default one. It asserts the level is in effect.
+tasks.named<Test>("test") {
+    systemProperty("org.slf4j.simpleLogger.log.farm.query.vgirpc", "trace")
+}
+
 // The java-test-fixtures variants (HttpRequestStub etc.) are test-only helpers
 // and must not be published to Maven Central — strip them from the java
 // component so they don't appear in the POM / Gradle module metadata. Done in
