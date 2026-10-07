@@ -387,7 +387,19 @@ public final class RpcConnection implements AutoCloseable {
     @Override
     public void close() { transport.close(); }
 
-    private final class ClientHandler implements InvocationHandler {
+    /**
+     * Dispatches a typed proxy's calls. Also the proxy's private route back to
+     * this connection for {@link Introspect#listProtocols(Object)}: as a
+     * {@code RawUnaryCaller} it issues a call to any protocol over this same
+     * connection, so reflection reaches the server a proxy is bound to without
+     * opening — or closing — anything, and without a public accessor.
+     */
+    private final class ClientHandler implements InvocationHandler, Introspect.RawUnaryCaller {
+
+        @Override
+        public byte[] call(String protocol, String method, AnnotatedBatch request) {
+            return callUnaryRaw(protocol, null, method, request);
+        }
 
         private final Map<String, RpcMethodInfo> methods;
         private final String protocol;

@@ -14,6 +14,9 @@ automatic serialization. No <code>.proto</code> files, no codegen.</p>
 
 <p>Serve an implementation with {@link farm.query.vgirpc.RpcServer} over
 stdio, AF_UNIX, or HTTP; connect with {@link farm.query.vgirpc.RpcConnection}.
+Ask any server what it hosts over a connection you already hold with
+{@link farm.query.vgirpc.Introspect#listProtocols(Object)} and
+{@link farm.query.vgirpc.Introspect#describeProtocol(Object, String)}.
 See the <a href="https://github.com/Query-farm/vgi-rpc-java">project
 README</a> for a runnable example.</p>
 </body>

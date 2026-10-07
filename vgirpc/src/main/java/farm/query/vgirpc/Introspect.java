@@ -166,15 +166,171 @@ public final class Introspect {
             List<ProtocolSummary> protocols) {}
 
     /**
+     * One protocol a server hosts, as {@code vgi_rpc.Reflection.v1} lists it.
+     *
+     * <p>The client-side view of the wire {@code ProtocolSummary}, returned by
+     * {@link #listProtocols(Object)} in the server's order: application
+     * protocols in registration order (the primary first), then the
+     * framework's own ({@code vgi_rpc.Reflection.v1}, and
+     * {@code vgi_rpc.Identity.v1} on an HTTP server that hosts it).
+     *
+     * @param name the protocol's wire name — its routing key, carrying its
+     *     major version, e.g. {@code "vgi_rpc.Reflection.v1"}
+     * @param version its declared semver, or {@code ""} when it declares none
+     * @param hash SHA-256 of its canonical description, as 64 lowercase hex
+     *     characters. Equal hashes mean an identical wire surface, in any port,
+     *     so a caller holding a cached description for this hash can skip
+     *     {@link #describeProtocol(Object, String)}
+     * @param deprecated whether callers should migrate off this protocol
+     * @param deprecationMessage what to migrate to; {@code ""} unless {@code deprecated}
+     * @param features capability tokens the protocol announces (immutable)
+     */
+    public record HostedProtocol(
+            String name,
+            String version,
+            String hash,
+            boolean deprecated,
+            String deprecationMessage,
+            List<String> features) {
+
+        /** Normalises {@code null}s to the defaults and freezes {@code features}. */
+        public HostedProtocol {
+            name = name == null ? "" : name;
+            version = version == null ? "" : version;
+            hash = hash == null ? "" : hash;
+            deprecationMessage = deprecationMessage == null ? "" : deprecationMessage;
+            features = features == null ? List.of() : List.copyOf(features);
+        }
+
+        /**
+         * A protocol with the defaults: not deprecated, no message, no features.
+         *
+         * @param name the protocol's wire name
+         * @param version its declared semver, or {@code ""}
+         * @param hash its canonical SHA-256, lowercase hex
+         */
+        public HostedProtocol(String name, String version, String hash) {
+            this(name, version, hash, false, "", List.of());
+        }
+    }
+
+    /**
+     * List the protocols a server hosts, over a connection the caller already holds.
+     *
+     * <p>One round trip — {@code vgi_rpc.Reflection.v1.list_protocols} — on
+     * {@code target}'s own connection; nothing new is opened and nothing is
+     * closed. Over HTTP the call shares the connection's {@code HttpClient},
+     * endpoint, auth headers, session and response budget; over every other
+     * transport it shares the byte stream, which the server demultiplexes by
+     * each request's routing key. On a byte-stream transport, do not call it
+     * while a stream is open on the same connection: the two would interleave
+     * on one channel.
+     *
+     * <p>A Java {@link RpcServer} always hosts reflection. A Python reference
+     * server hosts it only when built with {@code enable_describe=True} (the
+     * default is {@code false}); against one without it this throws
+     * {@link ReflectionNotSupportedError}.
+     *
+     * @param target an {@link RpcConnection} (any byte-stream transport: pipe,
+     *     subprocess, Unix socket, TCP, Iroh), an
+     *     {@link farm.query.vgirpc.http.HttpRpcConnection} (HTTP, including
+     *     HTTP over Iroh), a typed proxy returned by either's {@code proxy(Class)}
+     *     — bound to any protocol the server hosts — a raw
+     *     {@link farm.query.vgirpc.transport.RpcTransport}, or a
+     *     {@link RawUnaryCaller}
+     * @return one {@link HostedProtocol} per hosted protocol, in the server's
+     *     order: application protocols first, primary leading, then the
+     *     framework's own
+     * @throws ReflectionNotSupportedError if the server does not host
+     *     reflection; the connection is still usable
+     * @throws RpcError if the server answered with any other error, or the
+     *     transport failed
+     * @throws IllegalArgumentException if {@code target} is none of the above
+     */
+    public static List<HostedProtocol> listProtocols(Object target) {
+        ProtocolList listing = listProtocols(callerFor(target));
+        List<HostedProtocol> out = new ArrayList<>(listing.protocols().size());
+        for (ProtocolSummary p : listing.protocols()) {
+            out.add(new HostedProtocol(p.protocol(), p.protocolVersion(), p.protocolHash(),
+                    p.deprecated(), p.deprecationMessage(), p.features()));
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * Describe one hosted protocol, over a connection the caller already holds.
+     *
+     * <p>Two round trips on {@code target}'s connection: {@code list_protocols}
+     * (for the server identity the description carries, and to tell "no
+     * reflection" apart from "no such protocol"), then {@code describe(name)}.
+     * The connection rules are those of {@link #listProtocols(Object)}.
+     *
+     * @param target see {@link #listProtocols(Object)}
+     * @param name the protocol's wire name, as {@link #listProtocols(Object)} reports it
+     * @return the description, with each method's type and schemas
+     * @throws ReflectionNotSupportedError if the server does not host reflection
+     * @throws RpcError if the server does not host {@code name} ({@code errorKind()}
+     *     {@code "protocol_not_supported"}), answered with another error, or the
+     *     transport failed
+     * @throws IllegalArgumentException if {@code target} is not a supported target
+     */
+    public static ServiceDescription describeProtocol(Object target, String name) {
+        RawUnaryCaller caller = callerFor(target);
+        ProtocolList listing = listProtocols(caller);
+        return describe(caller, name, listing);
+    }
+
+    /**
+     * Resolve a caller-held client object to a reflection caller on the same connection.
+     *
+     * <p>Never opens or closes anything: every branch borrows the target's
+     * existing connection. A typed proxy reaches its connection through its
+     * invocation handler, which both connection classes implement as a
+     * {@link RawUnaryCaller} privately — the rebind hook stays off their public
+     * surface.
+     */
+    private static RawUnaryCaller callerFor(Object target) {
+        if (target instanceof RawUnaryCaller caller) return caller;
+        if (target instanceof RpcConnection connection) {
+            return (protocol, method, request) -> connection.callUnaryRaw(protocol, null, method, request);
+        }
+        if (target instanceof farm.query.vgirpc.http.HttpRpcConnection connection) {
+            return (protocol, method, request) -> connection.callUnaryRaw(protocol, null, method, request);
+        }
+        if (target instanceof farm.query.vgirpc.transport.RpcTransport transport) {
+            // A borrowed transport: the wrapper holds nothing of its own and is never closed.
+            RpcConnection borrowed = new RpcConnection(transport);
+            return (protocol, method, request) -> borrowed.callUnaryRaw(protocol, null, method, request);
+        }
+        if (target != null && java.lang.reflect.Proxy.isProxyClass(target.getClass())
+                && java.lang.reflect.Proxy.getInvocationHandler(target) instanceof RawUnaryCaller caller) {
+            return caller;
+        }
+        throw new IllegalArgumentException("cannot reach reflection through "
+                + (target == null ? "null" : "a " + target.getClass().getName())
+                + ": pass an RpcConnection, an HttpRpcConnection, a proxy returned by either's "
+                + "proxy(Class), an RpcTransport, or a RawUnaryCaller");
+    }
+
+    /**
      * Ask the peer what it hosts.
      *
      * @param caller how to reach the peer
      * @return the peer's listing
+     * @throws ReflectionNotSupportedError if the peer does not host reflection
      * @throws RpcError if the peer refused or answered something undecodable
      */
     public static ProtocolList listProtocols(RawUnaryCaller caller) {
-        byte[] payload = unwrapPayload(
-                caller.call(REFLECTION_PROTOCOL, "list_protocols", emptyRequest()), "list_protocols");
+        byte[] reply;
+        try {
+            reply = caller.call(REFLECTION_PROTOCOL, "list_protocols", emptyRequest());
+        } catch (ReflectionNotSupportedError e) {
+            throw e;
+        } catch (RpcError e) {
+            if (ReflectionNotSupportedError.isNotHosted(e)) throw new ReflectionNotSupportedError(e);
+            throw e;
+        }
+        byte[] payload = unwrapPayload(reply, "list_protocols");
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(payload), Allocators.root())) {
             if (r.readNextBatch() == null) {
                 throw new RpcError("ProtocolError", "list_protocols carried no batch", "");

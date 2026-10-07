@@ -27,7 +27,7 @@ This is a port of the Python reference implementation, [`vgi-rpc`](https://githu
 - **Transport-agnostic** — stdio pipe, subprocess, Unix domain socket, raw TCP socket (trusted networks — no auth/TLS), shared memory, or HTTP.
 - **Automatic schema inference** — Java types and `record` components map to Arrow types; `@ArrowField` refines them.
 - **Pluggable authentication** — `AuthContext` + authenticators for HTTP (bearer, mTLS/XFCC; JWT/OAuth in the optional `vgirpc-oauth` module).
-- **Runtime introspection** — the `vgi_rpc.Reflection.v1` protocol (`list_protocols`, then `describe`) for dynamic service discovery, with a canonical protocol hash every port agrees on. The old `__describe__` RPC is retired; a request for it is refused with a message naming its replacement.
+- **Runtime introspection** — the `vgi_rpc.Reflection.v1` protocol (`list_protocols`, then `describe`) for dynamic service discovery — `Introspect.listProtocols` / `describeProtocol` over any held connection (see [Discovering what a server hosts](#discovering-what-a-server-hosts)) — with a canonical protocol hash every port agrees on. The old `__describe__` RPC is retired; a request for it is refused with a message naming its replacement.
 - **Shared-memory transport** — zero-copy batch transfer between co-located processes (auto-negotiated on JDK 22+ via a multi-release overlay; transparent pipe fallback otherwise).
 - **Large-batch externalization** — oversized batches transparently spilled to S3 (`vgirpc-s3`) or GCS (`vgirpc-gcs`).
 - **Pre-published results** — a unary method can answer with an `ExternalRef` to an object published once, so a large, rarely-changing result is never re-serialized or re-uploaded per call.
@@ -239,6 +239,39 @@ The same answer comes back from `vgi_rpc.Reflection.v1`'s `describe`, which asks
 with the name as an argument rather than as a routing key. Both check the name against the grammar
 *before* the lookup, so a name that cannot be a protocol name is refused without being echoed back
 in the message.
+
+## Discovering what a server hosts
+
+`Introspect.listProtocols(target)` and `Introspect.describeProtocol(target, name)` ask
+`vgi_rpc.Reflection.v1` over a connection you already hold. `target` is an `RpcConnection` (pipe,
+subprocess, Unix socket, TCP, Iroh), an `HttpRpcConnection` (HTTP, HTTP over Iroh), a typed proxy
+from either one's `proxy(Class)` — bound to any protocol — or a raw `RpcTransport`. The connection is
+reused and never closed; nothing new is opened.
+
+```java
+try (RpcConnection conn = new RpcConnection(transport)) {
+    Calculator calc = conn.proxy(Calculator.class);
+    for (Introspect.HostedProtocol p : Introspect.listProtocols(calc)) {
+        // Server order: application protocols (primary first), then vgi_rpc.Reflection.v1.
+        System.out.println(p.name() + " " + p.version() + " " + p.hash());
+    }
+    Introspect.ServiceDescription d = Introspect.describeProtocol(conn, "Calculator");
+    calc.add(1, 2);   // the connection is still yours
+}
+```
+
+`HostedProtocol` is an immutable record: `name`, `version`, `hash`, `deprecated` (default `false`),
+`deprecationMessage` (default `""`) and `features` (default empty). `describeProtocol` lists first,
+then describes, so the two failures stay apart: a server that does not host reflection throws
+`ReflectionNotSupportedError` (an `RpcError` carrying the server's error fields), while an unknown
+name is an ordinary `RpcError` with `errorKind()` `"protocol_not_supported"`. No listing is ever
+inferred, and the connection stays usable after either.
+
+A Java `RpcServer` always hosts reflection. The Python reference hosts it only when built with
+`enable_describe=True` (the default is `false`; `vgi-rpc-conformance --describe`). Against a server
+without it, or one that predates reflection (`method_not_implemented`, `UNIMPLEMENTED`, or a bare
+HTTP 404), these throw `ReflectionNotSupportedError`. On a byte-stream transport, don't call them while
+a stream is open on the same connection: the calls would interleave on one channel.
 
 ## Wire compatibility
 
