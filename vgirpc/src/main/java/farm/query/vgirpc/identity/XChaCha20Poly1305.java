@@ -19,30 +19,45 @@ import java.util.Arrays;
  * key and the first 16 nonce bytes, and seals under the IETF cipher with nonce
  * {@code 0x00000000 || nonce[16..24]} -- exactly libsodium's definition, which is what makes a
  * grant minted here open in every other port and the reverse.
+ *
+ * <p>Public so a VGI SDK can seal its own cross-SDK envelopes (attach tickets, opaque data) with
+ * the same cipher instead of carrying a copy of it.
  */
-final class XChaCha20Poly1305 {
+public final class XChaCha20Poly1305 {
 
-    static final int KEY_LEN = 32;
-    static final int NONCE_LEN = 24;
-    static final int TAG_LEN = 16;
+    /** Key length in bytes. */
+    public static final int KEY_LEN = 32;
+    /** Nonce length in bytes. */
+    public static final int NONCE_LEN = 24;
+    /** Authentication tag length in bytes. */
+    public static final int TAG_LEN = 16;
 
     private XChaCha20Poly1305() {}
 
     /**
      * Seal {@code plaintext}.
      *
+     * @param key 32-byte key
+     * @param nonce 24-byte nonce; never reuse one under the same key
+     * @param plaintext bytes to seal
+     * @param aad associated data, authenticated but not encrypted
      * @return {@code ciphertext || tag}
      */
-    static byte[] seal(byte[] key, byte[] nonce, byte[] plaintext, byte[] aad) {
+    public static byte[] seal(byte[] key, byte[] nonce, byte[] plaintext, byte[] aad) {
         return run(Cipher.ENCRYPT_MODE, key, nonce, plaintext, aad);
     }
 
     /**
      * Open {@code ciphertext || tag}.
      *
+     * @param key 32-byte key
+     * @param nonce the 24-byte nonce it was sealed under
+     * @param sealed {@code ciphertext || tag}
+     * @param aad the associated data it was sealed with
+     * @return the plaintext
      * @throws AEADBadTagException when the tag does not verify (wrong key, AAD, or tampering)
      */
-    static byte[] open(byte[] key, byte[] nonce, byte[] sealed, byte[] aad) throws AEADBadTagException {
+    public static byte[] open(byte[] key, byte[] nonce, byte[] sealed, byte[] aad) throws AEADBadTagException {
         if (sealed.length < TAG_LEN) throw new AEADBadTagException("sealed body is shorter than a tag");
         try {
             return run(Cipher.DECRYPT_MODE, key, nonce, sealed, aad);
