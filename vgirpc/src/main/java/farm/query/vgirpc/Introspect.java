@@ -172,7 +172,7 @@ public final class Introspect {
      * {@link #listProtocols(Object)} in the server's order: application
      * protocols in registration order (the primary first), then the
      * framework's own ({@code vgi_rpc.Reflection.v1}, and
-     * {@code vgi_rpc.Identity.v1} on an HTTP server that hosts it).
+     * {@code vgi_rpc.Identity.v2} on an HTTP server that hosts it).
      *
      * @param name the protocol's wire name — its routing key, carrying its
      *     major version, e.g. {@code "vgi_rpc.Reflection.v1"}

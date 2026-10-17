@@ -29,7 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Identity credentials accepted as bearers (WIRE_PROTOCOL.md §16; IDENTITY_V1_SPEC.md §9.2-9.3).
+ * Identity credentials accepted as bearers (WIRE_PROTOCOL.md §16; IDENTITY_V2_SPEC.md §9.2-9.3).
  *
  * <p>The resolver here answers for almost anything, so a grant that wrongly fell through to it
  * would turn a 401 into a success -- a loud failure, not a quiet one.
@@ -202,7 +202,7 @@ final class IdentityBearerTest {
         }
     }
 
-    /** {@code vgi_rpc.Identity.v1/issue_grant}, addressed by name: no Java interface may claim
+    /** {@code vgi_rpc.Identity.v2/issue_grant}, addressed by name: no Java interface may claim
      *  the reserved prefix, so the typed proxy cannot reach it. */
     private static byte[] issueGrantRaw(HttpRpcConnection conn, String purpose) throws Exception {
         org.apache.arrow.vector.types.pojo.Schema params = farm.query.vgirpc.ServiceIntrospector

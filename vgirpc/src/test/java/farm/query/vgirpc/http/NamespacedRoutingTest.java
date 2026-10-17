@@ -79,7 +79,7 @@ final class NamespacedRoutingTest {
 
     private static final GrantMintHook MINTER =
             (principal, purpose, scopes, ttl) ->
-                    new IssuedGrant("grant-for-" + principal + "/" + purpose, 1000.0 + ttl, "g1");
+                    new IssuedGrant("grant-for-" + principal + "/" + purpose, java.time.Instant.ofEpochSecond(1000 + ttl), "g1");
 
     /**
      * A credential carrying {@code auth_time} -- the shape only an OIDC/JWT flow produces.
@@ -324,12 +324,12 @@ final class NamespacedRoutingTest {
     /**
      * The pre-0.46 {@code __introspect_token__} JSON route is retired, not merely unadvertised.
      *
-     * <p>{@code IDENTITY_V1_SPEC.md} §8: a port MUST NOT serve it. This server is configured
+     * <p>{@code IDENTITY_V2_SPEC.md} §8: a port MUST NOT serve it. This server is configured
      * exactly the way the old route used to answer -- a resolver, and the calling principal on
      * the introspector allowlist -- and the body names a credential that resolves. The answer is
      * the reserved-method refusal every other unimplemented reserved name gets, the principal
      * appears nowhere in it, and {@code /health} advertises no {@code VGI-Token-Introspection}.
-     * {@code vgi_rpc.Identity.v1} is the only introspection surface: two surfaces meant two sets
+     * {@code vgi_rpc.Identity.v2} is the only introspection surface: two surfaces meant two sets
      * of guards to keep identical, and the second had already kept a rate limiter the protocol
      * dropped.
      */

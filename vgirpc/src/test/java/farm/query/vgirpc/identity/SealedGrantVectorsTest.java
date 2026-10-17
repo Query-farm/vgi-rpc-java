@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
- * Sealed grants against the reference's {@code grant_token_vectors.json} (IDENTITY_V1_SPEC.md
+ * Sealed grants against the reference's {@code grant_token_vectors.json} (IDENTITY_V2_SPEC.md
  * §9), copied verbatim into test resources: every port mints and verifies byte-identically.
  *
  * <p>The file is decoded as UTF-8 explicitly -- one vector carries a non-ASCII audience, and a
@@ -147,6 +147,7 @@ final class SealedGrantVectorsTest {
         GrantClaims c = SealedGrants.verify(keys, g.token());
         assertEquals("p", c.principal());
         assertEquals(g.grant_id(), c.grantId());
+        assertEquals(java.time.Instant.ofEpochSecond(c.expiresAt()), g.expires_at());
         assertEquals(32, c.grantId().length());
         assertArrayEquals(keys.mintingKid(), SealedGrants.keyId(new byte[32]));
     }

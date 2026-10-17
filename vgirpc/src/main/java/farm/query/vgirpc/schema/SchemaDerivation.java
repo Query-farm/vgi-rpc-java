@@ -4,6 +4,7 @@
 package farm.query.vgirpc.schema;
 
 import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -37,6 +38,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>{@code long}, {@code Long}, {@code int}, {@code Integer} → int64</li>
  *   <li>{@code double}, {@code Double}, {@code float}, {@code Float} → float64</li>
  *   <li>{@code boolean}, {@code Boolean} → bool</li>
+ *   <li>{@code java.time.Instant} → timestamp[us, tz="UTC"]</li>
  *   <li>{@code List<T>} → list&lt;T&gt;</li>
  *   <li>{@code Map<K,V>} → map&lt;K,V&gt;</li>
  *   <li>{@code Optional<T>} or {@code @Nullable T} → nullable {@code T}</li>
@@ -202,7 +204,8 @@ public final class SchemaDerivation {
             // not nested-in-struct), drop child fields — Binary has no children.
             if (arrowType instanceof ArrowType.Binary || arrowType instanceof ArrowType.Utf8
                     || arrowType instanceof ArrowType.Bool || arrowType instanceof ArrowType.Int
-                    || arrowType instanceof ArrowType.FloatingPoint) {
+                    || arrowType instanceof ArrowType.FloatingPoint
+                    || arrowType instanceof ArrowType.Timestamp) {
                 children = Collections.emptyList();
             } else {
                 children = childFields(unwrapped);
@@ -290,6 +293,7 @@ public final class SchemaDerivation {
         if (raw == double.class || raw == Double.class) return new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
         if (raw == float.class || raw == Float.class) return new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
         if (raw == boolean.class || raw == Boolean.class) return new ArrowType.Bool();
+        if (raw == java.time.Instant.class) return new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC");
         if (raw == void.class || raw == Void.class) return new ArrowType.Null();
 
         // Nested record dataclass passed by reference: serialise as binary IPC bytes

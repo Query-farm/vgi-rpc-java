@@ -19,8 +19,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Bearer authenticators that close the {@code vgi_rpc.Identity.v1} loop (WIRE_PROTOCOL.md §16,
- * "Accepting identity credentials"; IDENTITY_V1_SPEC.md §9).
+ * Bearer authenticators that close the {@code vgi_rpc.Identity.v2} loop (WIRE_PROTOCOL.md §16,
+ * "Accepting identity credentials"; IDENTITY_V2_SPEC.md §9).
  *
  * <p>{@code issue_grant} mints a credential "presented later by unattended automation as an
  * ordinary bearer", and {@code resolve_token} answers which principal an opaque credential is --
@@ -31,7 +31,7 @@ import java.util.Map;
  *   <li>{@link #resolveToken} asks the worker's {@code resolveToken} hook.</li>
  *   <li>{@link #compose} puts them after the deployment's own authenticator in the normative
  *       order, and {@link HttpServer} applies it automatically for a server hosting
- *       {@code vgi_rpc.Identity.v1}.</li>
+ *       {@code vgi_rpc.Identity.v2}.</li>
  * </ul>
  *
  * <p>Routing is by prefix and strict both ways. A token without {@code vgig1.} never reaches the

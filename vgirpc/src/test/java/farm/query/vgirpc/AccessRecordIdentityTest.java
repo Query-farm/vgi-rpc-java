@@ -158,7 +158,7 @@ final class AccessRecordIdentityTest {
                 .resolveToken(token -> null)
                 .introspectPrincipals("alice")
                 .mintGrant((principal, purpose, scopes, ttl) ->
-                        new farm.query.vgirpc.identity.IssuedGrant("g", 1.0, "g1"))
+                        new farm.query.vgirpc.identity.IssuedGrant("g", java.time.Instant.ofEpochSecond(1), "g1"))
                 .build());
         String alsoMints = srv.protocolIdentityFor(Identity.PROTOCOL_NAME).protocolHash();
 

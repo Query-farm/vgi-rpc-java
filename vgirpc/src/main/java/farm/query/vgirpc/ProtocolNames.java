@@ -25,7 +25,7 @@ public final class ProtocolNames {
 
     /**
      * The prefix reserved for protocols the framework itself defines ({@code vgi_rpc.Reflection.v1},
-     * {@code vgi_rpc.Identity.v1}).
+     * {@code vgi_rpc.Identity.v2}).
      *
      * <p>An application protocol that claimed it could shadow one of those and make it unroutable
      * on the server that hosts both -- reflection in particular, which is the one endpoint a

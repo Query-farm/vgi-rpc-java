@@ -13,7 +13,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * A deployment's sealed-grant configuration (IDENTITY_V1_SPEC.md §9.1).
+ * A deployment's sealed-grant configuration (IDENTITY_V2_SPEC.md §9.1).
  *
  * <p>The first key mints; every key verifies. Rotation: add the new key first, keep the old one
  * after it until every grant it minted has expired, then drop it. Without a configuration grants

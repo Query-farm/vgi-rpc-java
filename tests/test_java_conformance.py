@@ -713,7 +713,7 @@ def conformance_http_capped_access_log(
 
 @pytest.fixture(scope="session")
 def conformance_http_identity_port() -> Iterator[int]:
-    """Spawn an HTTP worker hosting ``vgi_rpc.Identity.v1`` with both hooks.
+    """Spawn an HTTP worker hosting ``vgi_rpc.Identity.v2`` with both hooks.
 
     Backs the shared identity group. It needs its own worker because the
     protocol is nearly all *guards*, and every guard reads deployment policy:

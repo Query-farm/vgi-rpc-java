@@ -333,7 +333,7 @@ public final class RpcServer {
     public void setDispatchHook(DispatchHook hook) { this.dispatchHook = hook; }
 
     /**
-     * Host {@code vgi_rpc.Identity.v1} alongside the application protocol.
+     * Host {@code vgi_rpc.Identity.v2} alongside the application protocol.
      *
      * <p>Absent by default, and <em>absent</em> rather than routed-and-refusing when omitted:
      * that is what keeps a dependency upgrade from growing a credential-to-identity oracle on
@@ -374,7 +374,7 @@ public final class RpcServer {
     }
 
     /**
-     * Configure sealed grants (IDENTITY_V1_SPEC.md §9), overriding {@code VGI_RPC_GRANT_KEYS}.
+     * Configure sealed grants (IDENTITY_V2_SPEC.md §9), overriding {@code VGI_RPC_GRANT_KEYS}.
      *
      * <p>With keys, the framework mints sealed grants through {@code issue_grant} (unless the
      * hosted {@link IdentityImpl} supplies its own {@code mintGrant}) and an HTTP server accepts
@@ -408,7 +408,7 @@ public final class RpcServer {
     public IdentityImpl identity() { return identity; }
 
     /**
-     * The {@code vgi_rpc.Identity.v1} method table this server actually hosts.
+     * The {@code vgi_rpc.Identity.v2} method table this server actually hosts.
      *
      * <p>Narrowed to the methods whose hooks the deployment configured, so a transport routing on
      * the path answers "no such method" for an unconfigured one -- the same answer the raw
@@ -466,7 +466,7 @@ public final class RpcServer {
     }
 
     /**
-     * The {@code vgi_rpc.Identity.v1} method table {@code impl} hosts.
+     * The {@code vgi_rpc.Identity.v2} method table {@code impl} hosts.
      *
      * <p>Narrowing the method set narrows the protocol hash with it, which is the point: a client
      * discovers a worker that cannot mint grants by reflecting on it, rather than by calling and
@@ -1352,7 +1352,7 @@ public final class RpcServer {
     }
 
     /**
-     * Serve one call to {@code vgi_rpc.Identity.v1}.
+     * Serve one call to {@code vgi_rpc.Identity.v2}.
      *
      * <p>A method the deployment did not configure is not in {@link #identityMethods} at all, so
      * it reports as unknown rather than as a refusal -- the whole point of narrowing the binding.

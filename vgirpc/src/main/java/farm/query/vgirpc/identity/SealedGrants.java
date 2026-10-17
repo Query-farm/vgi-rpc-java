@@ -20,7 +20,7 @@ import java.util.regex.Pattern;
 
 /**
  * Sealed grants: the framework's own {@code issue_grant} credential, and its verifier
- * (IDENTITY_V1_SPEC.md §9.1).
+ * (IDENTITY_V2_SPEC.md §9.1).
  *
  * <p>{@code issue_grant} mints a standing delegation that unattended automation later presents
  * <em>as an ordinary bearer</em>, and until sealed grants nothing accepted one. With grant keys
@@ -205,7 +205,8 @@ public final class SealedGrants {
             } catch (IllegalArgumentException e) {
                 throw new GrantRefusedError(e.getMessage());
             }
-            return new IssuedGrant(minted.token(), (double) minted.claims().expiresAt(),
+            return new IssuedGrant(minted.token(),
+                    java.time.Instant.ofEpochSecond(minted.claims().expiresAt()),
                     minted.claims().grantId());
         };
     }

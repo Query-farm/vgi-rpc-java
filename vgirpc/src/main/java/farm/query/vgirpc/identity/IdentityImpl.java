@@ -61,7 +61,7 @@ public final class IdentityImpl implements Identity {
         this.resolveToken = b.resolveToken;
         this.grantKeys = b.grantKeys;
         // Grant keys and no hook of the worker's own: the framework mints sealed grants itself
-        // (IDENTITY_V1_SPEC.md §9.1), and an HTTP server hosting this identity accepts them back.
+        // (IDENTITY_V2_SPEC.md §9.1), and an HTTP server hosting this identity accepts them back.
         this.mintGrant = b.mintGrant != null ? b.mintGrant
                 : b.grantKeys != null ? SealedGrants.minter(b.grantKeys) : null;
         this.maxAuthAge = b.maxAuthAge;
@@ -157,7 +157,7 @@ public final class IdentityImpl implements Identity {
         }
 
         /**
-         * Sealed-grant configuration (IDENTITY_V1_SPEC.md §9).
+         * Sealed-grant configuration (IDENTITY_V2_SPEC.md §9).
          *
          * <p>When given and {@link #mintGrant} is not, the framework mints sealed grants itself;
          * an HTTP server hosting this identity then also accepts them back as bearer credentials.
@@ -351,7 +351,7 @@ public final class IdentityImpl implements Identity {
      *
      * <p>The whitespace set is {@link #stripWhitespace} rather than {@link String#strip()}, for
      * the same reason the anchors went: "whitespace" means different things in different
-     * languages, so {@code IDENTITY_V1_SPEC.md} §4 enumerates the floor every port must trim
+     * languages, so {@code IDENTITY_V2_SPEC.md} §4 enumerates the floor every port must trim
      * ({@code U+0009}-{@code U+000D}, {@code U+0020}, {@code U+0085}, {@code U+00A0}) instead of
      * delegating it. No single Java predicate spans that set: {@code strip()} uses
      * {@link Character#isWhitespace(char)}, which excludes the non-breaking spaces (U+00A0,
@@ -448,7 +448,7 @@ public final class IdentityImpl implements Identity {
     /**
      * Strip leading and trailing whitespace, over at least the set every port must trim.
      *
-     * <p>The floor is <em>enumerated</em> by {@code IDENTITY_V1_SPEC.md} §4 --
+     * <p>The floor is <em>enumerated</em> by {@code IDENTITY_V2_SPEC.md} §4 --
      * {@code U+0009}-{@code U+000D}, {@code U+0020}, {@code U+0085}, {@code U+00A0} -- rather
      * than delegated to any language's own notion of whitespace, because "whitespace" is itself
      * a divergence one layer down. No single Java predicate spans it:

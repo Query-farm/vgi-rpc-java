@@ -13,7 +13,7 @@ import java.util.Arrays;
  * XChaCha20-Poly1305 (libsodium's {@code crypto_aead_xchacha20poly1305_ietf}), built from the
  * JDK's IETF ChaCha20-Poly1305 plus an HChaCha20 subkey derivation.
  *
- * <p>The sealed-grant envelope (IDENTITY_V1_SPEC.md §9) is the reference's stream-state envelope:
+ * <p>The sealed-grant envelope (IDENTITY_V2_SPEC.md §9) is the reference's stream-state envelope:
  * {@code version || nonce(24) || ciphertext || tag(16)} under XChaCha20-Poly1305. The JDK ships
  * only the 12-byte-nonce IETF construction, so this derives the subkey with HChaCha20 from the
  * key and the first 16 nonce bytes, and seals under the IETF cipher with nonce

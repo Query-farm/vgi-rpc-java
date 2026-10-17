@@ -23,7 +23,7 @@ env:
   # {prefix}/{method}, and every call 404'd. The conformance lanes below track
   # the reference's main branch and so cannot catch this: there Java is the
   # server, and this is the one lane where Java is the client.
-  VGI_RPC_PYTHON_REV: 48d64e8a68c0d8dd61d6644d6cf3ced4fc61fbd0
+  VGI_RPC_PYTHON_REV: e04ddfa56c19b4cd7cc1e3729d165c763b0d98c7
 
 jobs:
   test:

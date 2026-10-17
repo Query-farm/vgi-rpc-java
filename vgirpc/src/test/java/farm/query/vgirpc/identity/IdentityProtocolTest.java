@@ -31,7 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * {@code vgi_rpc.Identity.v1} -- resolving a credential, and minting a grant.
+ * {@code vgi_rpc.Identity.v2} -- resolving a credential, and minting a grant.
  *
  * <p>The two methods are guarded very differently and the difference is the point, so most of
  * what is tested here is the <em>asymmetry</em>: introspection answers a question about somebody
@@ -70,7 +70,8 @@ final class IdentityProtocolTest {
 
     private static final GrantMintHook MINTER =
             (principal, purpose, scopes, ttl) ->
-                    new IssuedGrant("grant-for-" + principal, now() + ttl, "g1");
+                    new IssuedGrant("grant-for-" + principal,
+                            java.time.Instant.now().plusSeconds(ttl), "g1");
 
     private static IdentityImpl resolving() {
         return IdentityImpl.builder().resolveToken(RESOLVER).introspectPrincipals("proxy").build();
@@ -168,21 +169,21 @@ final class IdentityProtocolTest {
         void bothMethods() {
             IdentityImpl impl = IdentityImpl.builder()
                     .resolveToken(RESOLVER).mintGrant(MINTER).introspectPrincipals("proxy").build();
-            assertEquals("8317f2ad8e2476bb99e8b94800ab79b19a8cf0c6bdd6d66c2d82bd62ffbe69d5",
+            assertEquals("145267755ff90d5c3313d79c7ff771306f2530626380d01cb0e57a951d0f9ec3",
                     hash(impl), () -> "preimage: " + preimage(impl));
         }
 
         @Test
         void introspectOnly() {
             IdentityImpl impl = resolving();
-            assertEquals("27b75bef22e4c70baab92a5188a473506b89055d2cb2b58cc187f6fe7a436385",
+            assertEquals("4039fbf6db3e64ae234e0be605b977477150ace892f10b6c691920eaf925e7ac",
                     hash(impl), () -> "preimage: " + preimage(impl));
         }
 
         @Test
         void issueOnly() {
             IdentityImpl impl = IdentityImpl.builder().mintGrant(MINTER).build();
-            assertEquals("c71b12f453310139b6b6a445378064661c52711d03ae1e4fba29b8f7976ef4d8",
+            assertEquals("4199df7403c9ca1a02c4c524b405a999eb1489614a1480873ffc23a0e5b0d312",
                     hash(impl), () -> "preimage: " + preimage(impl));
         }
 
@@ -207,7 +208,7 @@ final class IdentityProtocolTest {
                             + "{\"name\":\"scopes\",\"nullable\":false,\"type\":\"list<item?:utf8>\"},"
                             + "{\"name\":\"ttl_seconds\",\"nullable\":false,\"type\":\"int64\"}],"
                             + "\"result\":[{\"name\":\"result\",\"nullable\":false,\"type\":\"binary\"}],"
-                            + "\"type\":\"unary\"}],\"protocol\":\"vgi_rpc.Identity.v1\"}",
+                            + "\"type\":\"unary\"}],\"protocol\":\"vgi_rpc.Identity.v2\"}",
                     preimage(impl));
         }
 
@@ -514,7 +515,7 @@ final class IdentityProtocolTest {
             IssuedGrant grant = impl.issue_grant(
                     "reports", List.of("read"), 3600, ctx(auth("alice", true, now())));
             assertEquals("grant-for-alice", grant.token());
-            assertTrue(grant.expires_at() > now());
+            assertTrue(grant.expires_at().isAfter(java.time.Instant.now()));
         }
 
         /**
@@ -784,7 +785,7 @@ final class IdentityProtocolTest {
         }
 
         /**
-         * The eight codepoints {@code IDENTITY_V1_SPEC.md} §4 makes every port trim.
+         * The eight codepoints {@code IDENTITY_V2_SPEC.md} §4 makes every port trim.
          *
          * <p>Pinned as an enumeration rather than as "whatever this language calls whitespace",
          * because that phrase is itself a divergence one layer down: neither

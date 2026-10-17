@@ -8,7 +8,7 @@ import farm.query.vgirpc.CallContext;
 import java.util.List;
 
 /**
- * {@code vgi_rpc.Identity.v1} -- resolving a credential, and minting a grant.
+ * {@code vgi_rpc.Identity.v2} -- resolving a credential, and minting a grant.
  *
  * <p>Identity lives here, at the RPC layer, rather than in any application protocol: a bearer
  * token is not an application concept, the auth primitives it builds on ({@code AuthContext},
@@ -59,7 +59,7 @@ public interface Identity {
      * <p>Under the reserved {@code vgi_rpc.} prefix, so an application cannot register a protocol
      * that impersonates it.
      */
-    String PROTOCOL_NAME = "vgi_rpc.Identity.v1";
+    String PROTOCOL_NAME = "vgi_rpc.Identity.v2";
 
     /**
      * Cap on a credential the framework will even attempt to resolve, in <strong>UTF-8

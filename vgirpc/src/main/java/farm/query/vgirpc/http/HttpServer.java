@@ -100,7 +100,7 @@ import java.util.concurrent.TimeoutException;
  * </ul>
  *
  * <p>There is no {@code __introspect_token__} route. Credential introspection is
- * the {@code vgi_rpc.Identity.v1} protocol (see {@link farm.query.vgirpc.identity.Identity}),
+ * the {@code vgi_rpc.Identity.v2} protocol (see {@link farm.query.vgirpc.identity.Identity}),
  * reached like any other protocol; the retired JSON route now answers as an
  * unimplemented reserved method.
  */
@@ -1444,7 +1444,7 @@ public final class HttpServer {
 
     /**
      * Append the identity bearer authenticators (WIRE_PROTOCOL.md §16) when the server hosts
-     * {@code vgi_rpc.Identity.v1} with sealed grants or a {@code resolveToken} hook.
+     * {@code vgi_rpc.Identity.v2} with sealed grants or a {@code resolveToken} hook.
      *
      * <p>Order: the deployment's own authenticator, then sealed grants, then
      * {@code resolveToken}. A deployment that composes them itself wraps its authenticator in

@@ -446,7 +446,7 @@ public final class Marshalling {
             case Date -> ((DateDayVector) v).setSafe(row, ((Number) value).intValue());
             case Time -> ((TimeMicroVector) v).setSafe(row, ((Number) value).longValue());
             case Timestamp -> {
-                long lv = ((Number) value).longValue();
+                long lv = timestampMicros(value);
                 if (((ArrowType.Timestamp) type).getTimezone() != null) {
                     ((TimeStampMicroTZVector) v).setSafe(row, lv);
                 } else {
@@ -471,6 +471,17 @@ public final class Marshalling {
             case Struct -> writeStruct(v, row, f, value);
             default -> throw new IllegalArgumentException("unsupported Arrow type: " + type);
         }
+    }
+
+    /**
+     * A timestamp value as microseconds since the Unix epoch: a {@link java.time.Instant} (the
+     * idiomatic Java type for a {@code timestamp[us, tz=...]} column) or a raw micros
+     * {@link Number}. Sub-microsecond precision is truncated toward negative infinity, which is
+     * what {@code Instant.truncatedTo(MICROS)} would keep.
+     */
+    static long timestampMicros(Object value) {
+        if (value instanceof java.time.Instant i) return Numbers.instantToMicros(i);
+        return ((Number) value).longValue();
     }
 
     /** Convert little-endian decimal bytes (Python wire format) to BigDecimal. */
@@ -565,7 +576,7 @@ public final class Marshalling {
             case Date -> w.dateDay().writeDateDay(((Number) e).intValue());
             case Time -> w.timeMicro().writeTimeMicro(((Number) e).longValue());
             case Timestamp -> {
-                long lv = ((Number) e).longValue();
+                long lv = timestampMicros(e);
                 if (((ArrowType.Timestamp) t).getTimezone() != null) {
                     w.timeStampMicroTZ().writeTimeStampMicroTZ(lv);
                 } else {
@@ -670,7 +681,7 @@ public final class Marshalling {
             case Date -> sw.dateDay(name).writeDateDay(((Number) v).intValue());
             case Time -> sw.timeMicro(name).writeTimeMicro(((Number) v).longValue());
             case Timestamp -> {
-                long lv = ((Number) v).longValue();
+                long lv = timestampMicros(v);
                 if (((ArrowType.Timestamp) t).getTimezone() != null) {
                     sw.timeStampMicroTZ(name).writeTimeStampMicroTZ(lv);
                 } else {

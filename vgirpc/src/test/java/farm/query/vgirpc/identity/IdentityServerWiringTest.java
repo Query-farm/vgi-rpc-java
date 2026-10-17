@@ -58,7 +58,7 @@ final class IdentityServerWiringTest {
     private static final GrantMintHook MINTER =
             (principal, purpose, scopes, ttl) ->
                     new IssuedGrant("grant-for-" + principal + "/" + purpose + String.join(",", scopes),
-                            1000.0 + ttl, "g1");
+                            java.time.Instant.ofEpochSecond(1000 + ttl), "g1");
 
     private static RpcServer serverWith(IdentityImpl impl) {
         RpcServer server = new RpcServer(App.class, new App() { }, "srv123");
@@ -226,6 +226,28 @@ final class IdentityServerWiringTest {
                 (byte[]) got.row().get("result"), IssuedGrant.class);
         assertEquals("grant-for-alice/reportsread,write", grant.token());
         assertEquals("g1", grant.grant_id());
+        assertEquals(java.time.Instant.ofEpochSecond(4600), grant.expires_at());
+    }
+
+    /**
+     * {@code expires_at} is a non-nullable {@code timestamp[us, tz="UTC"]} on the wire
+     * ({@code vgi_rpc.Identity.v2}); v1 carried float64 unix seconds.
+     */
+    @Test
+    void issuedGrantExpiresAtIsAUtcMicrosecondTimestamp() throws Exception {
+        org.apache.arrow.vector.types.pojo.Field f =
+                farm.query.vgirpc.schema.SchemaDerivation.schemaForRecord(IssuedGrant.class)
+                        .findField("expires_at");
+        assertEquals(new org.apache.arrow.vector.types.pojo.ArrowType.Timestamp(
+                org.apache.arrow.vector.types.TimeUnit.MICROSECOND, "UTC"), f.getType());
+        assertEquals(false, f.isNullable());
+        java.time.Instant at = java.time.Instant.parse("2030-01-01T00:00:00.123456789Z");
+        IssuedGrant back = RecordCodec.deserializeFromBytes(
+                RecordCodec.serializeToBytes(new IssuedGrant("t", at, "g")), IssuedGrant.class);
+        // Sub-microsecond precision does not survive the wire; the microseconds do.
+        assertEquals(java.time.Instant.parse("2030-01-01T00:00:00.123456Z"), back.expires_at());
+        assertEquals(1893456000_123456L, farm.query.vgirpc.marshal.Numbers.instantToMicros(back.expires_at()));
+        assertThrows(NullPointerException.class, () -> new IssuedGrant("t", null, "g"));
     }
 
     /**
@@ -283,11 +305,11 @@ final class IdentityServerWiringTest {
      */
     @Test
     void advertisesTheNarrowedHash() throws Exception {
-        assertEquals("27b75bef22e4c70baab92a5188a473506b89055d2cb2b58cc187f6fe7a436385",
+        assertEquals("4039fbf6db3e64ae234e0be605b977477150ace892f10b6c691920eaf925e7ac",
                 advertisedHash(serverWith(resolving())));
-        assertEquals("c71b12f453310139b6b6a445378064661c52711d03ae1e4fba29b8f7976ef4d8",
+        assertEquals("4199df7403c9ca1a02c4c524b405a999eb1489614a1480873ffc23a0e5b0d312",
                 advertisedHash(serverWith(IdentityImpl.builder().mintGrant(MINTER).build())));
-        assertEquals("8317f2ad8e2476bb99e8b94800ab79b19a8cf0c6bdd6d66c2d82bd62ffbe69d5",
+        assertEquals("145267755ff90d5c3313d79c7ff771306f2530626380d01cb0e57a951d0f9ec3",
                 advertisedHash(serverWith(IdentityImpl.builder()
                         .resolveToken(t -> null).mintGrant(MINTER)
                         .introspectPrincipals("proxy").build())));

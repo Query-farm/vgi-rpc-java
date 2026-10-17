@@ -122,7 +122,7 @@ public final class Main {
         // "off by default" property is itself a conformance contract
         // (TestCorsOffMode), and only --cors-origin opts a worker out of it.
         List<String> corsOrigins = new ArrayList<>();
-        // vgi_rpc.Identity.v1 is off unless asked for -- "a worker that configured no hook
+        // vgi_rpc.Identity.v2 is off unless asked for -- "a worker that configured no hook
         // hosts no identity protocol at all" is itself a conformance contract
         // (TestIdentityAbsentByDefault), and it is asserted against the *plain* worker, so
         // this flag must never default to anything but off.
@@ -206,7 +206,7 @@ public final class Main {
                 // Implies HTTP: Identity's guards all read an authenticated caller, and HTTP is
                 // the only transport that carries one. Implies principal-header auth below.
                 case "--identity" -> { mode = "http"; identityMode = c.requireValue(a); }
-                // Repeatable, first mints (IDENTITY_V1_SPEC.md §9.1); overrides VGI_RPC_GRANT_KEYS.
+                // Repeatable, first mints (IDENTITY_V2_SPEC.md §9.1); overrides VGI_RPC_GRANT_KEYS.
                 case "--grant-key" -> grantKeyArgs.add(c.requireValue(a));
                 case "--transport-kind-probe" -> transportKindProbe = true;
                 case "--fail-serve-start-once" -> failServeStartOnce = true;
@@ -499,7 +499,7 @@ public final class Main {
     private static final int AUTH_UNAVAILABLE_RETRY_AFTER = 7;
 
     // -----------------------------------------------------------------------
-    // vgi_rpc.Identity.v1 -- the pinned deployment policy
+    // vgi_rpc.Identity.v2 -- the pinned deployment policy
     //
     // IDENTITY_CONFORMANCE_FIXTURE.md is the normative contract for every value
     // below; six ports configure them identically or the shared group asserts
@@ -553,7 +553,7 @@ public final class Main {
     private static final String IDENTITY_TOKEN_PADDED_NAME = "conformance-padded";
 
     // There is no introspection rate limit to configure: introspection is not rate limited
-    // (IDENTITY_V1_SPEC.md §4, "No rate limiter"), and the shared group's
+    // (IDENTITY_V2_SPEC.md §4, "No rate limiter"), and the shared group's
     // TestIntrospectionIsNotThrottled asserts it. This fixture used to set 100,000 so a
     // production-tuned limiter could not fire mid-group.
 
@@ -569,11 +569,13 @@ public final class Main {
     /**
      * 2030-01-01T00:00:00Z, fixed rather than {@code now + ttl}.
      *
-     * <p>A constant can be asserted exactly, which also pins the float64 round trip.
+     * <p>A constant can be asserted exactly, which also pins the {@code timestamp[us, tz="UTC"]}
+     * round trip (1893456000000000 microseconds).
      * {@code expires_at} is a declaration rather than an enforcement -- the real lifetime lives
      * inside the opaque token -- so nothing is lost.
      */
-    private static final double IDENTITY_GRANT_EXPIRES_AT = 1893456000.0;
+    private static final java.time.Instant IDENTITY_GRANT_EXPIRES_AT =
+            java.time.Instant.parse("2030-01-01T00:00:00Z");
 
     /** Correlation handle a full grant carries. */
     private static final String IDENTITY_GRANT_ID = "conformance-grant-id";

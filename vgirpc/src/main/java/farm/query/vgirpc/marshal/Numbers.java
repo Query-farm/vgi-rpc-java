@@ -27,6 +27,33 @@ public final class Numbers {
         if (target == float.class  || target == Float.class)   return n.floatValue();
         if (target == short.class  || target == Short.class)   return (short) n.longValue();
         if (target == byte.class   || target == Byte.class)    return (byte) n.longValue();
+        if (target == java.time.Instant.class) return microsToInstant(n.longValue());
         return value;
+    }
+
+    /**
+     * Microseconds since the Unix epoch, as an {@link java.time.Instant} -- the decoding of a
+     * {@code timestamp[us, tz=...]} column.
+     *
+     * @param micros microseconds since 1970-01-01T00:00:00Z
+     * @return the instant
+     */
+    public static java.time.Instant microsToInstant(long micros) {
+        return java.time.Instant.ofEpochSecond(
+                Math.floorDiv(micros, 1_000_000L), Math.floorMod(micros, 1_000_000L) * 1_000L);
+    }
+
+    /**
+     * An {@link java.time.Instant} as microseconds since the Unix epoch, truncating any
+     * sub-microsecond part toward the past -- the encoding of a {@code timestamp[us, tz=...]}
+     * column.
+     *
+     * @param instant the instant
+     * @return microseconds since 1970-01-01T00:00:00Z
+     * @throws ArithmeticException if the instant does not fit an int64 of microseconds
+     */
+    public static long instantToMicros(java.time.Instant instant) {
+        return Math.addExact(Math.multiplyExact(instant.getEpochSecond(), 1_000_000L),
+                instant.getNano() / 1_000L);
     }
 }
