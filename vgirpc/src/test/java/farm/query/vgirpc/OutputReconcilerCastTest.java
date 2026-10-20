@@ -508,12 +508,29 @@ final class OutputReconcilerCastTest {
                 struct("x", 1), null);
     }
 
-    // --- not covered by the probes the reference was asked about -------------
+    // --- temporal (OutputReconcilerTemporalTest has the full pyarrow oracle) ---
 
-    /** pyarrow parses ISO-8601 strings to timestamps and dates; this port does not, and refuses. */
-    @Test void stringToTemporalIsRefused() {
-        refused(STR, new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.SECOND, null), "no exact cast",
-                "1970-01-01 00:00:01");
-        refused(STR, new ArrowType.Date(org.apache.arrow.vector.types.DateUnit.DAY), "no exact cast", "1970-01-02");
+    @Test void stringToTemporal() {
+        ArrowType ts = new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.SECOND, null);
+        ArrowType date = new ArrowType.Date(org.apache.arrow.vector.types.DateUnit.DAY);
+        // pyarrow: [datetime(1970, 1, 1, 0, 0, 1)] and [date(1970, 1, 2)]
+        VectorSchemaRoot r1 = VectorSchemaRoot.create(new Schema(List.of(col(STR))), Allocators.root());
+        put(r1.getVector(0), 0, "1970-01-01 00:00:01");
+        r1.getVector(0).setValueCount(1);
+        r1.setRowCount(1);
+        OutputCollector out = new OutputCollector(new Schema(List.of(col(ts))), "test", true);
+        out.emit(r1);
+        try (VectorSchemaRoot r = out.dataEntry().root()) {
+            assertEquals(1L, ((org.apache.arrow.vector.TimeStampVector) r.getVector(0)).get(0));
+        }
+        VectorSchemaRoot r2 = VectorSchemaRoot.create(new Schema(List.of(col(STR))), Allocators.root());
+        put(r2.getVector(0), 0, "1970-01-02");
+        r2.getVector(0).setValueCount(1);
+        r2.setRowCount(1);
+        OutputCollector out2 = new OutputCollector(new Schema(List.of(col(date))), "test", true);
+        out2.emit(r2);
+        try (VectorSchemaRoot r = out2.dataEntry().root()) {
+            assertEquals(1, ((org.apache.arrow.vector.DateDayVector) r.getVector(0)).get(0));
+        }
     }
 }

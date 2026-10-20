@@ -441,4 +441,307 @@ final class ArrowCasts {
         if (Double.isInfinite(x)) return x > 0 ? "inf" : "-inf";
         return String.format(Locale.ROOT, "%f", x);
     }
+
+    // ------------------------------------------------------------------
+    // Temporal <-> string (arrow/util/value_parsing.h, arrow/util/formatting.h,
+    // compute/kernels/scalar_cast_temporal.cc, scalar_cast_string.cc)
+    // ------------------------------------------------------------------
+
+    static long perSecond(org.apache.arrow.vector.types.TimeUnit u) {
+        return switch (u) {
+            case SECOND -> 1L;
+            case MILLISECOND -> 1_000L;
+            case MICROSECOND -> 1_000_000L;
+            case NANOSECOND -> 1_000_000_000L;
+        };
+    }
+
+    private static String unitName(org.apache.arrow.vector.types.TimeUnit u) {
+        return switch (u) {
+            case SECOND -> "s";
+            case MILLISECOND -> "ms";
+            case MICROSECOND -> "us";
+            case NANOSECOND -> "ns";
+        };
+    }
+
+    static String timestampTypeName(ArrowType.Timestamp t) {
+        return "timestamp[" + unitName(t.getUnit()) + (t.getTimezone() != null ? ", tz=" + t.getTimezone() : "") + "]";
+    }
+
+    /** Thrown inside the ISO-8601 port where Arrow's parser returns {@code false}. */
+    private static final class ParseFail extends RuntimeException {
+        ParseFail() { super(null, null, false, false); }
+    }
+
+    /** {@code ParseUnsigned(s + at, n)}: exactly {@code n} ASCII digits. */
+    private static int digits(byte[] s, int at, int n) {
+        int v = 0;
+        for (int i = at; i < at + n; i++) {
+            if (i >= s.length || s[i] < '0' || s[i] > '9') throw new ParseFail();
+            v = v * 10 + (s[i] - '0');
+        }
+        return v;
+    }
+
+    private static byte at(byte[] s, int i) { return i >= 0 && i < s.length ? s[i] : 0; }
+
+    /** {@code ParseYYYY_MM_DD}: days since the epoch, proleptic Gregorian, year 0000 to 9999. */
+    private static long parseYmd(byte[] s) {
+        if (at(s, 4) != '-' || at(s, 7) != '-') throw new ParseFail();
+        int y = digits(s, 0, 4);
+        int m = digits(s, 5, 2);
+        int d = digits(s, 8, 2);
+        if (m < 1 || m > 12 || d < 1 || d > java.time.YearMonth.of(y, m).lengthOfMonth()) throw new ParseFail();
+        return java.time.LocalDate.of(y, m, d).toEpochDay();
+    }
+
+    private static long hh(byte[] s, int at) {
+        int h = digits(s, at, 2);
+        if (h >= 24) throw new ParseFail();
+        return h * 3600L;
+    }
+
+    private static long hhColonMm(byte[] s, int at) {
+        if (at(s, at + 2) != ':') throw new ParseFail();
+        int h = digits(s, at, 2);
+        int m = digits(s, at + 3, 2);
+        if (h >= 24 || m >= 60) throw new ParseFail();
+        return h * 3600L + m * 60L;
+    }
+
+    private static long hhmm(byte[] s, int at) {
+        int h = digits(s, at, 2);
+        int m = digits(s, at + 2, 2);
+        if (h >= 24 || m >= 60) throw new ParseFail();
+        return h * 3600L + m * 60L;
+    }
+
+    private static long hhMmSs(byte[] s, int at) {
+        if (at(s, at + 2) != ':' || at(s, at + 5) != ':') throw new ParseFail();
+        int h = digits(s, at, 2);
+        int m = digits(s, at + 3, 2);
+        int sec = digits(s, at + 6, 2);
+        if (h >= 24 || m >= 60 || sec >= 60) throw new ParseFail();
+        return h * 3600L + m * 60L + sec;
+    }
+
+    /** {@code ParseSubSeconds}: at most as many digits as the unit holds, right-padded to it. */
+    private static long subSeconds(byte[] s, int at, int length, org.apache.arrow.vector.types.TimeUnit unit) {
+        int max = switch (unit) {
+            case MILLISECOND -> 3;
+            case MICROSECOND -> 6;
+            case NANOSECOND -> 9;
+            case SECOND -> throw new ParseFail();
+        };
+        if (length > max) throw new ParseFail();
+        long v = digits(s, at, length);
+        for (int i = length; i < max; i++) v *= 10;
+        return v;
+    }
+
+    /**
+     * String to timestamp: {@code ParseTimestampISO8601} plus the cast's
+     * zone rule. Accepted: {@code YYYY-MM-DD}, then {@code [ T]hh},
+     * {@code hh:mm} or {@code hh:mm:ss} with up to the unit's fractional
+     * digits, then an optional {@code Z}, {@code [+-]HH}, {@code [+-]HHMM} or
+     * {@code [+-]HH:MM}, shifted to UTC. A target with a timezone requires an
+     * offset; one without requires none. Overflow of the unit is refused.
+     */
+    static long parseTimestamp(String str, ArrowType.Timestamp type) {
+        byte[] s = str.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        boolean expectZone = type.getTimezone() != null && !type.getTimezone().isEmpty();
+        boolean[] zonePresent = {false};
+        long result = 0;
+        String failure = null;
+        try {
+            result = parseIso8601(s, type.getUnit(), zonePresent);
+        } catch (ParseFail | ArithmeticException e) {
+            failure = "";
+        }
+        String base = "Failed to parse string: '" + str + "' as a scalar of type " + timestampTypeName(type);
+        if (zonePresent[0] != expectZone) {
+            throw new IllegalArgumentException(base + (expectZone
+                    ? ": expected a zone offset. If these timestamps are in local time, cast to timestamp without "
+                            + "timezone, then call assume_timezone."
+                    : ": expected no zone offset."));
+        }
+        if (failure != null) throw new IllegalArgumentException(base);
+        return result;
+    }
+
+    private static long parseIso8601(byte[] s, org.apache.arrow.vector.types.TimeUnit unit, boolean[] zonePresent) {
+        int length = s.length;
+        if (length < 10) throw new ParseFail();
+        long perSec = perSecond(unit);
+        long seconds = Math.multiplyExact(parseYmd(s), 86400L);
+        if (length == 10) return Math.multiplyExact(seconds, perSec);
+        if (s[10] != ' ' && s[10] != 'T') throw new ParseFail();
+        zonePresent[0] = false;
+        long zoneOffset = 0;
+        if (s[length - 1] == 'Z') {
+            --length;
+            zonePresent[0] = true;
+        } else if (s[length - 3] == '+' || s[length - 3] == '-') {
+            length -= 3;
+            zoneOffset = hh(s, length + 1);
+            if (s[length] == '+') zoneOffset = -zoneOffset;
+            zonePresent[0] = true;
+        } else if (s[length - 5] == '+' || s[length - 5] == '-') {
+            length -= 5;
+            zoneOffset = hhmm(s, length + 1);
+            if (s[length] == '+') zoneOffset = -zoneOffset;
+            zonePresent[0] = true;
+        } else if ((s[length - 6] == '+' || s[length - 6] == '-') && s[length - 3] == ':') {
+            length -= 6;
+            zoneOffset = hhColonMm(s, length + 1);
+            if (s[length] == '+') zoneOffset = -zoneOffset;
+            zonePresent[0] = true;
+        }
+        long sinceMidnight = switch (length) {
+            case 13 -> hh(s, 11);
+            case 16 -> hhColonMm(s, 11);
+            case 19, 21, 22, 23, 24, 25, 26, 27, 28, 29 -> hhMmSs(s, 11);
+            default -> throw new ParseFail();
+        };
+        seconds = Math.addExact(Math.addExact(seconds, sinceMidnight), zoneOffset);
+        if (length <= 19) return Math.multiplyExact(seconds, perSec);
+        if (s[19] != '.') throw new ParseFail();
+        long sub = subSeconds(s, 20, length - 20, unit);
+        return Math.addExact(Math.multiplyExact(seconds, perSec), sub);
+    }
+
+    /** String to date32 / date64: exactly {@code YYYY-MM-DD}. */
+    static long parseDate(String str, boolean millis) {
+        byte[] s = str.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        try {
+            if (s.length != 10) throw new ParseFail();
+            long days = parseYmd(s);
+            return millis ? days * 86_400_000L : days;
+        } catch (ParseFail e) {
+            throw new IllegalArgumentException("Failed to parse string: '" + str + "' as a scalar of type "
+                    + (millis ? "date64[ms]" : "date32[day]"));
+        }
+    }
+
+    // Formatting ---------------------------------------------------------
+
+    /** {@code IsDateTimeInRange}: from the start of year -32767 to the end of year 32767. */
+    private static final long MIN_DAY_INCL = -12687428L;
+    private static final long MAX_DAY_EXCL = 11248738L;
+
+    private static boolean inRange(long v, long perDay, boolean nanos) {
+        if (nanos) return true;
+        return v >= MIN_DAY_INCL * perDay && v < MAX_DAY_EXCL * perDay;
+    }
+
+    private static String outOfRange(long v) { return "<value out of range: " + v + ">"; }
+
+    /** {@code FormatYYYY_MM_DD}: at least four year digits, a leading '-' for negative years. */
+    private static void ymd(StringBuilder sb, long epochDay) {
+        java.time.LocalDate d = java.time.LocalDate.ofEpochDay(epochDay);
+        int y = d.getYear();
+        if (y < 0) sb.append('-');
+        String ys = Integer.toString(Math.abs(y));
+        sb.append("0".repeat(Math.max(0, 4 - ys.length()))).append(ys).append('-');
+        two(sb, d.getMonthValue());
+        sb.append('-');
+        two(sb, d.getDayOfMonth());
+    }
+
+    private static void two(StringBuilder sb, long v) {
+        if (v < 10) sb.append('0');
+        sb.append(v);
+    }
+
+    /** {@code FormatHH_MM_SS}: the unit's full fractional digits. */
+    private static void hms(StringBuilder sb, long sinceMidnight, long perSec) {
+        long secs = sinceMidnight / perSec;
+        two(sb, secs / 3600);
+        sb.append(':');
+        two(sb, (secs / 60) % 60);
+        sb.append(':');
+        two(sb, secs % 60);
+        if (perSec > 1) {
+            String sub = Long.toString(sinceMidnight % perSec);
+            int width = Long.toString(perSec).length() - 1;
+            sb.append('.').append("0".repeat(width - sub.length())).append(sub);
+        }
+    }
+
+    /**
+     * Timestamp to string. Without a timezone: {@code StringFormatter<TimestampType>},
+     * {@code YYYY-MM-DD HH:MM:SS[.f...]}, or {@code <value out of range: v>}.
+     * With one: the cast's zoned format, local time in that zone then
+     * {@code %z} ({@code +HHMM}, seconds of a historical offset truncated),
+     * or {@code Z} for exactly {@code "UTC"}.
+     */
+    static String formatTimestamp(long v, ArrowType.Timestamp type) {
+        long perSec = perSecond(type.getUnit());
+        long perDay = perSec * 86400L;
+        boolean nanos = type.getUnit() == org.apache.arrow.vector.types.TimeUnit.NANOSECOND;
+        String tz = type.getTimezone();
+        if (tz == null || tz.isEmpty()) {
+            if (!inRange(v, perDay, nanos)) return outOfRange(v);
+            return local(v, perSec, perDay).toString();
+        }
+        if (!inRange(v, perDay, nanos)) {
+            // Arrow's zoned formatter has no range check, and past year 32767 it
+            // prints wrapped garbage (a 309237645313-hour clock). Refuse instead.
+            throw new IllegalArgumentException("timestamp " + v + " is outside the years -32767..32767 that can be "
+                    + "formatted with timezone " + tz);
+        }
+        java.time.ZoneId zone;
+        try {
+            zone = java.time.ZoneId.of(tz);
+        } catch (java.time.DateTimeException e) {
+            throw new IllegalArgumentException("Cannot locate timezone '" + tz + "'");
+        }
+        java.time.ZoneOffset off = zone.getRules().getOffset(java.time.Instant.ofEpochSecond(Math.floorDiv(v, perSec)));
+        long localValue = Math.addExact(v, Math.multiplyExact((long) off.getTotalSeconds(), perSec));
+        StringBuilder sb = local(localValue, perSec, perDay);
+        if (tz.equals("UTC")) {
+            sb.append('Z');
+        } else {
+            int total = off.getTotalSeconds();
+            sb.append(total < 0 ? '-' : '+');
+            int abs = Math.abs(total);
+            two(sb, abs / 3600);
+            two(sb, (abs / 60) % 60);
+        }
+        return sb.toString();
+    }
+
+    private static StringBuilder local(long v, long perSec, long perDay) {
+        StringBuilder sb = new StringBuilder(36);
+        ymd(sb, Math.floorDiv(v, perDay));
+        sb.append(' ');
+        hms(sb, Math.floorMod(v, perDay), perSec);
+        return sb;
+    }
+
+    /** date32 to string. */
+    static String formatDate32(long days) {
+        if (days < MIN_DAY_INCL || days >= MAX_DAY_EXCL) return outOfRange(days);
+        StringBuilder sb = new StringBuilder(11);
+        ymd(sb, days);
+        return sb.toString();
+    }
+
+    /** date64 to string: the day is the millisecond count truncated toward zero. */
+    static String formatDate64(long millis) {
+        if (!inRange(millis, 86_400_000L, false)) return outOfRange(millis);
+        StringBuilder sb = new StringBuilder(11);
+        ymd(sb, millis / 86_400_000L);
+        return sb.toString();
+    }
+
+    /** time32 / time64 to string: {@code HH:MM:SS[.f...]} within one day, else out of range. */
+    static String formatTime(long v, org.apache.arrow.vector.types.TimeUnit unit) {
+        long perSec = perSecond(unit);
+        if (v < 0 || v >= 86400L * perSec) return outOfRange(v);
+        StringBuilder sb = new StringBuilder(18);
+        hms(sb, v, perSec);
+        return sb.toString();
+    }
 }

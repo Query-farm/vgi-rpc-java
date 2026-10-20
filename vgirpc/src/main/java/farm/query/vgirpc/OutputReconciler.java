@@ -23,6 +23,10 @@ import org.apache.arrow.vector.FloatingPointVector;
 import org.apache.arrow.vector.LargeVarBinaryVector;
 import org.apache.arrow.vector.LargeVarCharVector;
 import org.apache.arrow.vector.NullVector;
+import org.apache.arrow.vector.TimeMicroVector;
+import org.apache.arrow.vector.TimeMilliVector;
+import org.apache.arrow.vector.TimeNanoVector;
+import org.apache.arrow.vector.TimeSecVector;
 import org.apache.arrow.vector.TimeStampVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.ValueVector;
@@ -75,7 +79,9 @@ import java.util.Set;
  *       binary and large binary (UTF-8 validated into a string type);</li>
  *   <li>decimals: rescale, precision, integer, floating-point and string
  *       conversions with Arrow's own refusals ({@link ArrowCasts});</li>
- *   <li>timestamp unit and timezone, date32 / date64, null-typed to anything;</li>
+ *   <li>timestamp unit and timezone, date32 / date64, null-typed to anything;
+ *       string to timestamp (ISO-8601, zone offsets into UTC) and date, and
+ *       timestamp / date / time to string, formatted as Arrow formats them;</li>
  *   <li>containers recursively: list, large list and fixed-size list among
  *       themselves (a list to a fixed-size list only when every list has that
  *       size), map keys and values, struct children matched by name with
@@ -529,6 +535,33 @@ final class OutputReconciler {
             if (st instanceof ArrowType.Decimal) {
                 return (r, i) -> setString(tv, i, ArrowCasts.decimalToString(unscaled(sv, r), scaleOf(sf)));
             }
+            if (st instanceof ArrowType.Timestamp sts) {
+                return (r, i) -> setString(tv, i, ArrowCasts.formatTimestamp(((TimeStampVector) sv).get(r), sts));
+            }
+            if (st instanceof ArrowType.Date sd) {
+                return (r, i) -> setString(tv, i, sd.getUnit() == DateUnit.DAY
+                        ? ArrowCasts.formatDate32(((DateDayVector) sv).get(r))
+                        : ArrowCasts.formatDate64(((DateMilliVector) sv).get(r)));
+            }
+            if (st instanceof ArrowType.Time stm) {
+                return (r, i) -> setString(tv, i, ArrowCasts.formatTime(timeValue(sv, r), stm.getUnit()));
+            }
+        }
+        // String (not binary: the reference has no binary -> temporal cast) to
+        // timestamp and date. String -> time32 / time64 is unsupported in the
+        // reference too, so it falls through to the refusal below.
+        if (isString(st)) {
+            if (tt instanceof ArrowType.Timestamp tts) {
+                return (r, i) -> ((TimeStampVector) tv).setSafe(i, ArrowCasts.parseTimestamp(string(sv, r), tts));
+            }
+            if (tt instanceof ArrowType.Date td) {
+                return (r, i) -> {
+                    boolean millis = td.getUnit() == DateUnit.MILLISECOND;
+                    long v = ArrowCasts.parseDate(string(sv, r), millis);
+                    if (millis) ((DateMilliVector) tv).setSafe(i, v);
+                    else ((DateDayVector) tv).setSafe(i, (int) v);
+                };
+            }
         }
         if (isBytes(st)) {
             if (tt instanceof ArrowType.Int ti) {
@@ -666,6 +699,13 @@ final class OutputReconciler {
             };
         }
         throw refuse(tf, sf, "no exact cast is available");
+    }
+
+    private static long timeValue(FieldVector v, int r) {
+        if (v instanceof TimeSecVector t) return t.get(r);
+        if (v instanceof TimeMilliVector t) return t.get(r);
+        if (v instanceof TimeMicroVector t) return t.get(r);
+        return ((TimeNanoVector) v).get(r);
     }
 
     private static BigInteger unscaled(FieldVector v, int r) {
