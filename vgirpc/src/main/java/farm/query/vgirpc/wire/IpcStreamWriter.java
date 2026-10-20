@@ -142,7 +142,20 @@ public final class IpcStreamWriter implements AutoCloseable {
         // emitted schema (no-op unless a union field is affected). Remove with
         // UnionTypeIdWorkaround once the upstream fix lands.
         root = UnionTypeIdWorkaround.canonicalize(root);
+        boolean started = delegate != null;
         ensureSchemaAndDictsStarted(root, provider);
+        if (started && provider != null && root.getRowCount() > 0) {
+            // A later batch may reference different dictionaries than the
+            // first one did. The stock writer's ensureDictionariesWritten
+            // compares each used dictionary against the copy it kept from the
+            // last emission and writes a replacement dictionary batch for any
+            // that changed. Skipping this -- as this writer did -- left every
+            // batch after the first decoding against the first batch's
+            // dictionaries: silently wrong values on any multi-batch stream
+            // (pipe, socket, subprocess). A zero-row batch references no
+            // dictionary entries, so it needs none.
+            invokeEnsureDictionariesWritten(delegate, provider);
+        }
         VectorUnloader unloader = unloaderFor(root);
         try (ArrowRecordBatch batch = unloader.getRecordBatch()) {
             writeRecordBatch(batch, customMetadata);
@@ -230,7 +243,7 @@ public final class IpcStreamWriter implements AutoCloseable {
         // pyarrow/Arrow C++ rejects the stream with "IPC stream did not
         // have the expected number of dictionaries at the start".
         delegate.start();
-        invokeEnsureDictionariesWritten(delegate);
+        invokeEnsureDictionariesWritten(delegate, null);
         declaredSchema = null;
         // Adopt the delegate's WriteChannel so currentPosition (which drives
         // 8-byte message-frame alignment via WriteChannel.align()) stays
@@ -264,8 +277,14 @@ public final class IpcStreamWriter implements AutoCloseable {
      * dictionaryIdsUsed)} reflectively. Stock's {@code writeBatch()} does
      * this between {@code ensureStarted()} and {@code writeRecordBatch()};
      * we replicate that step because we don't go through {@code writeBatch}.
+     *
+     * @param provider the dictionaries to emit, or {@code null} for the
+     *     provider the delegate was constructed with. A provider that lacks
+     *     any dictionary the stream's schema uses is skipped: it cannot be
+     *     the batch's own (a control batch handed the input-side provider,
+     *     say), and the previously written dictionaries stay in force.
      */
-    private static void invokeEnsureDictionariesWritten(ArrowStreamWriter delegate) {
+    private static void invokeEnsureDictionariesWritten(ArrowStreamWriter delegate, DictionaryProvider provider) {
         try {
             Class<?> writerCls = org.apache.arrow.vector.ipc.ArrowWriter.class;
             java.lang.reflect.Field providerField = writerCls.getDeclaredField("dictionaryProvider");
@@ -275,7 +294,13 @@ public final class IpcStreamWriter implements AutoCloseable {
             java.lang.reflect.Method ensure = writerCls.getDeclaredMethod(
                     "ensureDictionariesWritten", DictionaryProvider.class, java.util.Set.class);
             ensure.setAccessible(true);
-            ensure.invoke(delegate, providerField.get(delegate), idsField.get(delegate));
+            @SuppressWarnings("unchecked")
+            java.util.Set<Long> ids = (java.util.Set<Long>) idsField.get(delegate);
+            DictionaryProvider p = provider != null ? provider : (DictionaryProvider) providerField.get(delegate);
+            if (provider != null) {
+                for (Long id : ids) if (provider.lookup(id) == null) return;
+            }
+            ensure.invoke(delegate, p, ids);
         } catch (ReflectiveOperationException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw new RuntimeException("Cannot invoke ArrowWriter.ensureDictionariesWritten; "
