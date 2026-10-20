@@ -10,6 +10,7 @@ import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -25,6 +26,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
@@ -161,6 +163,64 @@ final class ExternalizeRoundTripTest {
                 ptr.root().close();
             }
         }
+    }
+
+    /**
+     * A dictionary-encoded batch whose declared stream schema differs from the
+     * root's own schema only in nullability must still upload its
+     * dictionaries.
+     *
+     * <p>That is what a collector root looks like against the method's declared
+     * output schema, and both the HTTP stream path and the pipe-family tick
+     * loop hand the declared schema to the uploader. The payload used to
+     * declare the dictionary and deliver none, so the fetched stream could not
+     * be decoded.
+     */
+    @Test
+    void roundtrip_dictionary_batch_whose_schema_differs_only_in_nullability() throws Exception {
+        assertDictRoundTrip(dictSchema(false), dictSchema(true));
+    }
+
+    @Test
+    void roundtrip_dictionary_batch_declared_with_its_own_schema() throws Exception {
+        // Control: the equal-schema path.
+        assertDictRoundTrip(dictSchema(false), null);
+    }
+
+    private void assertDictRoundTrip(Schema encodeSchema, Schema declared) throws Exception {
+        ExternalLocationConfig cfg = ExternalLocationConfig.builder()
+                .storage(new MapStorage())
+                .thresholdBytes(1)
+                .urlValidator(ExternalLocationConfig.permissiveValidator())
+                .build();
+        try (Marshalling.EncodedRow encoded = Marshalling.encodeRowForWire(
+                encodeSchema, Map.of("s", "hello", "v", 7L), Allocators.root())) {
+            assertNotNull(encoded.provider(), "the fixture must actually dictionary-encode");
+            Schema wire = declared != null ? declared : encoded.root().getSchema();
+            if (declared != null) {
+                assertNotEquals(declared, encoded.root().getSchema(),
+                        "fixture must exercise the declared-schema-differs path");
+            }
+            Externalizer.Pointer ptr = Externalizer.maybeExternalize(
+                    encoded.root(), null, cfg, wire, encoded.provider());
+            assertNotNull(ptr);
+            try (LocationResolver.Resolved resolved =
+                         new LocationResolver(cfg).resolve(ptr.customMetadata())) {
+                assertEquals(1, resolved.root().getRowCount());
+                Map<String, Object> row = Marshalling.decodeRow(resolved.root(), resolved.dictionaries());
+                assertEquals("hello", row.get("s"));
+                assertEquals(7L, row.get("v"));
+            } finally {
+                ptr.root().close();
+            }
+        }
+    }
+
+    private static Schema dictSchema(boolean nullableV) {
+        return new Schema(List.of(
+                new Field("s", new FieldType(false, new ArrowType.Utf8(),
+                        new DictionaryEncoding(0L, false, new ArrowType.Int(16, true))), null),
+                new Field("v", new FieldType(nullableV, new ArrowType.Int(64, true), null), null)));
     }
 
     // Helpers ------------------------------------------------------------

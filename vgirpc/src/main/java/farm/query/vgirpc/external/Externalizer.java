@@ -12,9 +12,6 @@ import farm.query.vgirpc.wire.Wire;
 import farm.query.vgirpc.wire.Metadata;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
-import org.apache.arrow.vector.VectorUnloader;
-import org.apache.arrow.vector.compression.NoCompressionCodec;
-import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayOutputStream;
@@ -268,26 +265,34 @@ public final class Externalizer {
 
     /**
      * Serialise {@code root} as a complete standalone IPC stream (schema +
-     * one batch + EOS) declaring {@code wireSchema}, matching the wire format
-     * the fetcher consumes.
+     * dictionary batches + one batch + EOS) declaring {@code wireSchema},
+     * matching the wire format the fetcher consumes.
+     *
+     * <p>When {@code wireSchema} differs from the root's own schema (in
+     * practice: field nullability, a collector root against the method's
+     * declared output schema) the root's vectors are written unchanged under
+     * the declared schema -- byte-for-byte what inline delivery emits, and what
+     * the reference does when it serialises a collector cycle under
+     * {@code output_schema}. Both cases go through the same
+     * {@link IpcStreamWriter#writeBatch(VectorSchemaRoot, Map, DictionaryProvider)}
+     * path, so the dictionaries the batch references are always written. They
+     * used to be written only when the schemas compared equal: the other branch
+     * unloaded a bare {@link org.apache.arrow.vector.ipc.message.ArrowRecordBatch},
+     * which carries no dictionaries, and uploaded a stream whose schema declared
+     * dictionaries it never delivered.
      */
     private static byte[] serializeSingleBatch(VectorSchemaRoot root,
                                                Map<String, String> meta,
                                                Schema wireSchema,
                                                DictionaryProvider dictionaryProvider) throws Exception {
+        // A view over the root's own vectors, declaring wireSchema. Not closed:
+        // closing a VectorSchemaRoot closes its vectors, which the caller owns.
+        VectorSchemaRoot declared = wireSchema.equals(root.getSchema())
+                ? root
+                : new VectorSchemaRoot(wireSchema, root.getFieldVectors(), root.getRowCount());
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         try (IpcStreamWriter w = new IpcStreamWriter(bos)) {
-            if (wireSchema.equals(root.getSchema())) {
-                w.writeBatch(root, meta, dictionaryProvider);
-            } else {
-                // Declare the enclosing stream's schema and write the root's
-                // buffers unchanged — byte-for-byte what inline delivery emits.
-                w.writeSchema(wireSchema);
-                VectorUnloader unloader = new VectorUnloader(root, true, NoCompressionCodec.INSTANCE, true);
-                try (ArrowRecordBatch rb = unloader.getRecordBatch()) {
-                    w.writeBatch(rb, meta);
-                }
-            }
+            w.writeBatch(declared, meta, dictionaryProvider);
             w.writeEos();
         }
         return bos.toByteArray();

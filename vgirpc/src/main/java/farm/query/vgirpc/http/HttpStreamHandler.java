@@ -1026,9 +1026,7 @@ public final class HttpStreamHandler {
      * the uploaded payload ahead of its record batch, so the fetched stream
      * decodes on its own. The pointer is then written with the same provider,
      * so the enclosing stream still carries the dictionaries its declared
-     * schema references. (The uploader emits dictionaries only when the root's
-     * schema equals {@code outputSchema}; its nullability-only re-declaration
-     * path writes the record batch without them.)
+     * schema references.
      *
      * <p>{@code outputSchema} is handed to the uploader so the standalone
      * payload declares the schema this stream declared. A collector root often
