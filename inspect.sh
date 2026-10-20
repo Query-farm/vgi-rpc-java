@@ -33,7 +33,8 @@ fi
 PATTERN="${1:?usage: inspect.sh <test-pattern> [more pytest args...]}"
 shift || true
 
-pkill -f conformance-worker 2>/dev/null
+# Scoped to this checkout's worker; see run_tests.sh.
+pkill -f "$(pwd -P)/conformance-worker/build/install/conformance-worker/" 2>/dev/null
 sleep 0.3
 
 "$PY" -m pytest tests/test_java_conformance.py \

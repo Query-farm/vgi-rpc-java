@@ -53,3 +53,37 @@ def pytest_collection_modifyitems(items):
             continue
         if current < floor:
             item.add_marker(pytest.mark.timeout(floor))
+
+
+#: Budget for the teardown that finalises the session's fixtures (see below).
+_SESSION_TEARDOWN_TIMEOUT = 120
+
+
+def pytest_runtest_teardown(item, nextitem):
+    """Give the session-fixture teardown its own budget, not the last test's.
+
+    pytest finalises every session-scoped fixture inside the teardown of the
+    *last* item a process runs, and pytest-timeout times setup, call and
+    teardown as one budget. The shared suite's ``pytest.mark.timeout(5)`` is a
+    per-test liveness guard, but that last item's teardown also stops every
+    worker the session started -- here some thirty fixtures, each a
+    ``terminate()`` + ``wait()`` on a JVM -- so whichever test happened to run
+    last could fail with ``Timeout (>5.0s)`` for work that was never its own.
+
+    Serially that is one item per run; under pytest-xdist it is one per xdist
+    worker, all shutting their JVMs down at once, and on a loaded machine it
+    failed for real. So for that one teardown the timer is restarted with a
+    budget sized for the shutdown: still a hang guard, no longer a coin flip.
+    """
+    if nextitem is not None or not item.config.pluginmanager.hasplugin("timeout"):
+        return
+    try:
+        from pytest_timeout import _get_item_settings
+    except ImportError:
+        return
+    settings = _get_item_settings(item)
+    if not settings.timeout or settings.func_only or settings.timeout >= _SESSION_TEARDOWN_TIMEOUT:
+        return
+    hook = item.config.hook
+    hook.pytest_timeout_cancel_timer(item=item)
+    hook.pytest_timeout_set_timer(item=item, settings=settings._replace(timeout=_SESSION_TEARDOWN_TIMEOUT))

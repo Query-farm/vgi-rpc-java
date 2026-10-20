@@ -50,7 +50,18 @@ else prefers the reference venv at `~/Development/vgi-rpc-python/.venv`, else fa
 `inspect.sh` honours the same variable. Point `VGI_RPC_PYTHON` at a checkout of
 [`vgi-rpc-python`](https://github.com/Query-farm/vgi-rpc-python) — **not** a `~/Development/vgi-rpc`
 sibling, which is an older tree without the multiservice routing work: running against it fails every
-HTTP test in a way that reads as a worker bug. Full pytest output is written to `/tmp/pytest_java.txt`.
+HTTP test in a way that reads as a worker bug. Full pytest output is written to `build/pytest_java.txt`
+(per checkout; override with `PYTEST_OUT`).
+
+The suite runs **in parallel** under pytest-xdist: `CONFORMANCE_WORKERS` sets the worker count
+(default `auto` = `min(8, CPUs)`; `0` runs serially; the reference venv must have `pytest-xdist`, else it
+falls back to serial with a warning). Every fixture spawns its own worker on an ephemeral port or a
+`mkstemp` socket, so xdist workers share nothing — but each xdist worker starts its own session
+fixtures, i.e. its own set of JVMs, and the shared suite's 5 s per-test timeouts include fixture
+setup. That is why `auto` stops at 8: at one per core on a 48-core box ~1400 JVMs cold-start at
+once and most of the suite errors with `Timeout (>5.0s)` in setup. On a loaded or small machine pin
+a lower count rather than letting JVM start-up contention trip those timeouts. The stale-worker cleanup at start-up kills only
+*this checkout's* installed worker, so concurrent runs from other worktrees are safe.
 
 Before pushing: `./gradlew build` must pass, and `./run_tests.sh` must pass for the transports that
 apply to the change.

@@ -10,7 +10,18 @@
 #   ./run_tests.sh --client --python-server   # the Java CLIENT vs the Python reference
 #   ./run_tests.sh --client                   # the Java client vs this port's server (triage)
 #
-# Full output lands in /tmp/pytest_java.txt; the summary is printed here.
+# Parallel by default: pytest-xdist with CONFORMANCE_WORKERS workers (default
+# "auto" = min(8, CPUs): each xdist worker starts its own ~30 session JVMs, and
+# one per core on a 48-core box cold-starts ~1400 of them at once, so fixture
+# setup misses the suite's 5 s per-test timeout). CONFORMANCE_WORKERS=0 runs
+# serially; any other number
+# pins the worker count. Every fixture spawns its own worker process on an
+# ephemeral port / mkstemp socket, so xdist workers share no state. Without
+# pytest-xdist installed the suite falls back to serial with a warning.
+#
+# Full output lands in build/pytest_java.txt (override with PYTEST_OUT) — per
+# checkout, so concurrent runs from different worktrees never clobber each
+# other; the summary is printed here.
 # With --coverage, every spawned conformance worker runs under the JaCoCo agent
 # (one .exec per process), then a merged HTML/XML report for the vgirpc library
 # is produced and its headline numbers printed.
@@ -27,7 +38,13 @@ if [[ -z "${JAVA_HOME:-}" ]] && [[ -x /usr/libexec/java_home ]]; then
 fi
 cd "$(dirname "$0")"
 
-OUT=/tmp/pytest_java.txt
+mkdir -p build
+OUT="${PYTEST_OUT:-$PWD/build/pytest_java.txt}"
+WORKERS="${CONFORMANCE_WORKERS:-auto}"
+if [[ "$WORKERS" == "auto" ]]; then
+    WORKERS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    (( WORKERS > 8 )) && WORKERS=8
+fi
 # Python with the vgi_rpc reference package importable. Override with
 # VGI_RPC_PYTHON; else prefer a local reference venv, else system python3.
 #
@@ -101,19 +118,32 @@ EOF
     echo "=== coverage: workers instrumented; .exec → $EXECDIR ==="
 fi
 
-# Kill stragglers from a previous run (HTTP/unix workers persist).
-pkill -f conformance-worker 2>/dev/null
+# Kill stragglers from a previous run (HTTP/unix workers persist). Scoped to
+# THIS checkout's installed worker (its JVM's classpath carries the resolved
+# install path): a bare `pkill -f conformance-worker` also killed the workers
+# of every other run on the machine — other worktrees, other ports' suites.
+pkill -f "$(pwd -P)/conformance-worker/build/install/conformance-worker/" 2>/dev/null
 sleep 0.3
+
+XDIST=()
+if [[ "$WORKERS" != "0" ]]; then
+    if "$PY" -c "import xdist" 2>/dev/null; then
+        XDIST=(-n "$WORKERS")
+    else
+        echo "WARNING: pytest-xdist not importable by $PY; running serially" >&2
+    fi
+fi
+echo "=== pytest workers: ${XDIST[*]:-serial} ==="
 
 # -p no:cacheprovider keeps .pytest_cache out of the tree; --tb=line gives
 # one-line tracebacks; -q keeps progress dots compact.
 if [[ -n "$FILTER" ]]; then
     "$PY" -m pytest tests/test_java_conformance.py \
-        -p no:cacheprovider --tb=short -q -k "$FILTER" \
+        -p no:cacheprovider --tb=short -q ${XDIST[@]+"${XDIST[@]}"} -k "$FILTER" \
         > "$OUT" 2>&1
 else
     "$PY" -m pytest tests/test_java_conformance.py \
-        -p no:cacheprovider --tb=line -q \
+        -p no:cacheprovider --tb=line -q ${XDIST[@]+"${XDIST[@]}"} \
         > "$OUT" 2>&1
 fi
 PYTEST_EXIT=$?
