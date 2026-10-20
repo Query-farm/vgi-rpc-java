@@ -128,7 +128,10 @@ public final class Externalizer {
         if (existingMeta != null) pointerMeta.putAll(existingMeta);
         pointerMeta.put(Metadata.LOCATION, url.toString());
         pointerMeta.put(Metadata.LOCATION_SHA256, up.sha256());
-        pointerMeta.put(Metadata.LOCATION_SOURCE, "external");
+        // No vgi_rpc.location.source here: that key is the *reader's*
+        // provenance stamp on a batch it resolved (its value is the URL the
+        // payload came from -- see LocationResolver), and the reference writer
+        // (make_external_location_batch) never emits it on a pointer.
 
         return new Pointer(pointer, pointerMeta);
     }

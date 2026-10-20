@@ -134,10 +134,10 @@ public final class LocationResolver {
                 if (md != null) fetched.putAll(md);
                 // Stamped at resolve time, not copied from the pointer. A reader
                 // that only passes through what the writer happened to set
-                // reports nothing when the writer set nothing -- and this port's
-                // own Externalizer pre-stamps the source, so that gap passes by
-                // coincidence against a Java peer and yields empty provenance
-                // against every other. WIRE_PROTOCOL.md §12 requires both keys
+                // reports nothing when the writer set nothing -- and no
+                // conforming writer sets it (this port's Externalizer once did,
+                // which hid that gap against a Java peer and yielded empty
+                // provenance against every other). WIRE_PROTOCOL.md §12 requires both keys
                 // on a resolved batch: how long the fetch took, and where from.
                 // Put last, so the reader's stamp wins: a payload cannot choose
                 // its own provenance.

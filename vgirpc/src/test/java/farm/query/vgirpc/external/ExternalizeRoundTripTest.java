@@ -99,8 +99,33 @@ final class ExternalizeRoundTripTest {
                 String url = ptr.customMetadata().get(Metadata.LOCATION);
                 assertNotNull(url);
                 assertNotNull(ptr.customMetadata().get(Metadata.LOCATION_SHA256));
-                assertEquals("external", ptr.customMetadata().get(Metadata.LOCATION_SOURCE));
+                // Exactly the writer's keys. vgi_rpc.location.source is the
+                // reader's provenance stamp on a resolved batch; the reference
+                // writer never puts it on a pointer.
+                assertEquals(java.util.Set.of(Metadata.LOCATION, Metadata.LOCATION_SHA256),
+                        ptr.customMetadata().keySet());
                 assertEquals(1, objects.size());
+            } finally {
+                ptr.root().close();
+            }
+        }
+    }
+
+    @Test
+    void maybeExternalize_pointer_carries_caller_metadata_plus_location_keys_only() throws Exception {
+        ExternalLocationConfig cfg = ExternalLocationConfig.builder()
+                .storage(new MapStorage())
+                .thresholdBytes(16)
+                .urlValidator(ExternalLocationConfig.permissiveValidator())
+                .build();
+        try (VectorSchemaRoot root = makeRoot(1000)) {
+            Externalizer.Pointer ptr = Externalizer.maybeExternalize(root, Map.of("app.key", "v"), cfg);
+            assertNotNull(ptr);
+            try {
+                assertEquals(java.util.Set.of("app.key", Metadata.LOCATION, Metadata.LOCATION_SHA256),
+                        ptr.customMetadata().keySet());
+                assertNull(ptr.customMetadata().get(Metadata.LOCATION_SOURCE),
+                        "a writer must not stamp the reader-side provenance key");
             } finally {
                 ptr.root().close();
             }
@@ -127,6 +152,10 @@ final class ExternalizeRoundTripTest {
                 // decodeRow only reads row 0; make sure the round-tripped value matches.
                 assertEquals(0L, row.get("v"));
                 assertNull(resolved.customMetadata().get(Metadata.LOCATION));
+                // Provenance is stamped by the reader, with the URL it fetched.
+                assertEquals(ptr.customMetadata().get(Metadata.LOCATION),
+                        resolved.customMetadata().get(Metadata.LOCATION_SOURCE));
+                assertNotNull(resolved.customMetadata().get(Metadata.LOCATION_FETCH));
             } finally {
                 resolved.root().close();
                 ptr.root().close();

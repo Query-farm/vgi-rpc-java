@@ -1021,10 +1021,14 @@ public final class HttpStreamHandler {
      * pointer — right up to the point an operator caps the external channel and
      * the cap has nothing to govern.
      *
-     * <p>Dictionary-encoded batches stay inline. {@link Externalizer} serialises
-     * the payload without a dictionary provider, so an externalised dictionary
-     * batch would upload an undecodable stream; inline is the correct answer
-     * until the uploader can carry dictionaries.
+     * <p>Dictionary-encoded batches are externalised too. {@code dicts} is
+     * handed to {@link Externalizer}, which writes the dictionary batches into
+     * the uploaded payload ahead of its record batch, so the fetched stream
+     * decodes on its own. The pointer is then written with the same provider,
+     * so the enclosing stream still carries the dictionaries its declared
+     * schema references. (The uploader emits dictionaries only when the root's
+     * schema equals {@code outputSchema}; its nullability-only re-declaration
+     * path writes the record batch without them.)
      *
      * <p>{@code outputSchema} is handed to the uploader so the standalone
      * payload declares the schema this stream declared. A collector root often
