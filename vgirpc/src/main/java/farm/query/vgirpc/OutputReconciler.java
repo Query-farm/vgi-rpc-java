@@ -12,6 +12,12 @@ import org.apache.arrow.vector.BaseVariableWidthVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DateDayVector;
 import org.apache.arrow.vector.DateMilliVector;
+import org.apache.arrow.vector.Decimal256Vector;
+import org.apache.arrow.vector.DecimalVector;
+import org.apache.arrow.vector.complex.FixedSizeListVector;
+import org.apache.arrow.vector.complex.LargeListVector;
+import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.FloatingPointVector;
 import org.apache.arrow.vector.LargeVarBinaryVector;
@@ -35,6 +41,8 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
@@ -54,29 +62,35 @@ import java.util.Set;
  * the reference's {@code OutputCollector.emit} does: select the declared
  * columns by name, then cast what still differs.
  *
- * <p>The reference casts with pyarrow's safe cast. This mirrors its outcome for
- * the conversions it shares with Arrow Java, value-checked the same way:
+ * <p>The reference casts with pyarrow's safe cast (Arrow C++'s cast kernels).
+ * This reproduces its outcome -- the values it produces and the cases it
+ * refuses -- for the conversions probed against pyarrow 25.0.1 (see
+ * {@code OutputReconcilerTest}):
  * <ul>
  *   <li>nullability / field-metadata only: the vectors are relabelled, unchanged;</li>
- *   <li>integer to integer (any width, signed or unsigned), refused when a value
- *       is out of the target's range;</li>
- *   <li>integer to floating point, refused beyond the float's exact-integer range;
- *       floating point to floating point; floating point to integer, refused on a
- *       fractional or out-of-range value; boolean to integer;</li>
- *   <li>among string, large string, binary and large binary (binary to a string
- *       type is refused on invalid UTF-8);</li>
- *   <li>timestamp unit and timezone (refused when a coarser unit would lose data),
- *       date32 / date64 (refused when date64 is not a whole day);</li>
- *   <li>null-typed to any type (all null);</li>
- *   <li>dictionary-encoded to its value type (or anything that casts to from it),
+ *   <li>integers, floating point and booleans among themselves, value-checked
+ *       (out of range, truncating, beyond a float's exact-integer range);</li>
+ *   <li>to and from strings: numbers and booleans formatted and parsed exactly
+ *       as Arrow C++ does ({@link ArrowCasts}); among string, large string,
+ *       binary and large binary (UTF-8 validated into a string type);</li>
+ *   <li>decimals: rescale, precision, integer, floating-point and string
+ *       conversions with Arrow's own refusals ({@link ArrowCasts});</li>
+ *   <li>timestamp unit and timezone, date32 / date64, null-typed to anything;</li>
+ *   <li>containers recursively: list, large list and fixed-size list among
+ *       themselves (a list to a fixed-size list only when every list has that
+ *       size), map keys and values, struct children matched by name with
+ *       undeclared children dropped;</li>
+ *   <li>dictionary-encoded to its value type (or anything that casts from it),
  *       plain string / binary to a dictionary, and dictionary to a dictionary
  *       with a different encoding.</li>
  * </ul>
- * Anything else -- a missing column, a nested container whose children differ
- * beyond nullability, decimals, numbers to or from strings -- is refused with an
- * {@link IllegalArgumentException} naming the field, rather than sending a
- * stream whose schema is not the declared one. Nulls in a field the output
- * schema declares non-nullable are refused too, as pyarrow refuses them.
+ * Refused, with an {@link IllegalArgumentException} naming the field, rather
+ * than sending a stream whose schema is not the declared one: everything the
+ * reference refuses; a missing column; and one case the reference accepts by
+ * corrupting data -- a declared struct child the batch does not have, which
+ * pyarrow fills with nulls. Nulls in a top-level field the output schema
+ * declares non-nullable are refused too, as pyarrow refuses them (it does not
+ * check nested fields, and neither does this).
  */
 final class OutputReconciler {
 
@@ -250,15 +264,15 @@ final class OutputReconciler {
         return e.getIndexType() != null ? e.getIndexType() : new ArrowType.Int(32, true);
     }
 
-    /** The first declared-non-nullable field (dotted path) whose vector holds a null, or {@code null}. */
+    /**
+     * The first declared-non-nullable top-level field whose vector holds a
+     * null, or {@code null}. Top level only, as the reference's cast checks:
+     * pyarrow casts {@code [[1, None]]} to {@code list<item: int64 not null>}
+     * and a null struct over a non-nullable child without complaint.
+     */
     private static String nullInNonNullable(List<Field> declared, List<FieldVector> vectors) {
         for (int i = 0; i < declared.size(); i++) {
-            Field f = declared.get(i);
-            FieldVector v = vectors.get(i);
-            if (!f.isNullable() && v.getNullCount() > 0) return f.getName();
-            if (f.getDictionary() != null) continue;  // an index vector has no children to check
-            String child = nullInNonNullable(f.getChildren(), v.getChildrenFromFields());
-            if (child != null) return f.getName() + "." + child;
+            if (!declared.get(i).isNullable() && vectors.get(i).getNullCount() > 0) return declared.get(i).getName();
         }
         return null;
     }
@@ -267,7 +281,7 @@ final class OutputReconciler {
     // Casts
     // ------------------------------------------------------------------
 
-    /** Cast one column into a new vector laid out for {@code tf}. Never closes {@code sv}. */
+    /** Cast one top-level column into a new vector laid out for {@code tf}. Never closes {@code sv}. */
     private static FieldVector castColumn(FieldVector sv, Field sf, Field tf, DictionaryProvider provider,
                                           int rows, BufferAllocator alloc, Map<Long, DictBuilder> newDicts) {
         DictionaryEncoding se = sf.getDictionary();
@@ -285,18 +299,12 @@ final class OutputReconciler {
         }
         if (te != null) return encode(sv, sf, tf, rows, alloc, newDicts);
 
-        if (!sf.getChildren().isEmpty() || !tf.getChildren().isEmpty()) {
-            throw refuse(tf, sf, "nested types are reconciled only when they differ in nullability");
-        }
         FieldVector tv = tf.createVector(alloc);
         try {
             tv.allocateNew();
-            if (sf.getType().equals(tf.getType())) {
-                for (int r = 0; r < rows; r++) tv.copyFromSafe(r, r, sv);  // e.g. a decoded dictionary
-            } else {
-                castValues(sv, sf, tv, tf, rows);
-            }
-            tv.setValueCount(rows);
+            int[] identity = new int[rows];
+            for (int r = 0; r < rows; r++) identity[r] = r;
+            fill(sv, sf, tv, tf, identity);
             return tv;
         } catch (RuntimeException e) {
             tv.close();
@@ -304,118 +312,380 @@ final class OutputReconciler {
         }
     }
 
-    private static void castValues(FieldVector sv, Field sf, FieldVector tv, Field tf, int rows) {
+    /**
+     * Write {@code src.length} rows into {@code tv}: row {@code i} is the cast of
+     * source row {@code src[i]}, or null where {@code src[i] < 0}. Recurses
+     * through list, large list, fixed-size list, map and struct, so an element
+     * or child is cast exactly as a top-level column would be.
+     */
+    private static void fill(FieldVector sv, Field sf, FieldVector tv, Field tf, int[] src) {
+        int n = src.length;
+        if (sf.getDictionary() != null || tf.getDictionary() != null) {
+            if (sf.getDictionary() == null || tf.getDictionary() == null
+                    || !sameEncoding(sf.getDictionary(), tf.getDictionary())) {
+                throw refuse(tf, sf, "dictionaries nested inside a container are not re-encoded");
+            }
+        }
+        if (sf.getDictionary() != null || sameLayout(new Field(tf.getName(), sf.getFieldType(), sf.getChildren()), tf)) {
+            for (int i = 0; i < n; i++) {
+                if (src[i] < 0) setNull(tv, i);
+                else tv.copyFromSafe(src[i], i, sv);
+            }
+            tv.setValueCount(n);
+            return;
+        }
         ArrowType st = sf.getType();
         ArrowType tt = tf.getType();
+        if (isListLike(tt)) {
+            fillList(sv, sf, tv, tf, src);
+        } else if (tt instanceof ArrowType.Struct) {
+            if (!(st instanceof ArrowType.Struct)) throw refuse(tf, sf, "no exact cast is available");
+            fillStruct(sv, sf, tv, tf, src, false);
+        } else {
+            if (!sf.getChildren().isEmpty() || st instanceof ArrowType.Union) {
+                throw refuse(tf, sf, "no exact cast is available");
+            }
+            castValues(sv, sf, tv, tf, src);
+            tv.setValueCount(n);
+        }
+    }
+
+    private static boolean isListLike(ArrowType t) {
+        return t instanceof ArrowType.List || t instanceof ArrowType.LargeList
+                || t instanceof ArrowType.FixedSizeList || t instanceof ArrowType.Map;
+    }
+
+    /** List / large list / fixed-size list / map: rebuild the offsets, then cast the elements. */
+    private static void fillList(FieldVector sv, Field sf, FieldVector tv, Field tf, int[] src) {
+        ArrowType st = sf.getType();
+        ArrowType tt = tf.getType();
+        boolean sourceIsMap = st instanceof ArrowType.Map;
+        boolean targetIsMap = tt instanceof ArrowType.Map;
+        if (!isListLike(st) || sourceIsMap != targetIsMap) throw refuse(tf, sf, "no exact cast is available");
+        int fixedSize = tt instanceof ArrowType.FixedSizeList f ? f.getListSize() : -1;
+        if (fixedSize >= 0 && st instanceof ArrowType.FixedSizeList sfl && sfl.getListSize() != fixedSize) {
+            throw refuse(tf, sf, "Size of FixedSizeList is not the same");
+        }
+        int n = src.length;
+        List<Integer> elements = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            int r = src[i];
+            boolean isNull = r < 0 || sv.isNull(r);
+            long start = 0;
+            long end = 0;
+            if (!isNull) {
+                if (sv instanceof LargeListVector l) {
+                    start = l.getOffsetBuffer().getLong((long) r * 8);
+                    end = l.getOffsetBuffer().getLong((long) (r + 1) * 8);
+                } else if (sv instanceof ListVector l) {   // includes MapVector
+                    start = l.getOffsetBuffer().getInt((long) r * 4);
+                    end = l.getOffsetBuffer().getInt((long) (r + 1) * 4);
+                } else {
+                    int size = ((FixedSizeListVector) sv).getListSize();
+                    start = (long) r * size;
+                    end = start + size;
+                }
+            }
+            if (fixedSize >= 0) {
+                if (!isNull && end - start != fixedSize) {
+                    throw refuse(tf, sf, "ListType can only be casted to FixedSizeListType if the lists are all the "
+                            + "expected size.");
+                }
+                FixedSizeListVector t = (FixedSizeListVector) tv;
+                if (isNull) {
+                    t.setNull(i);
+                    for (int j = 0; j < fixedSize; j++) elements.add(-1);
+                } else {
+                    t.setNotNull(i);
+                    for (long j = start; j < end; j++) elements.add(Math.toIntExact(j));
+                }
+                continue;
+            }
+            long len = end - start;
+            if (isNull) {
+                setNull(tv, i);
+            } else if (tv instanceof LargeListVector t) {
+                t.startNewValue(i);
+                t.endValue(i, len);
+            } else {
+                ListVector t = (ListVector) tv;
+                t.startNewValue(i);
+                t.endValue(i, Math.toIntExact(len));
+            }
+            for (long j = start; j < end; j++) elements.add(Math.toIntExact(j));
+        }
+        int[] childSrc = new int[elements.size()];
+        for (int j = 0; j < childSrc.length; j++) childSrc[j] = elements.get(j);
+        FieldVector sChild = dataVector(sv);
+        FieldVector tChild = dataVector(tv);
+        Field sChildField = sf.getChildren().get(0);
+        Field tChildField = tf.getChildren().get(0);
+        if (targetIsMap) {
+            fillStruct(sChild, sChildField, tChild, tChildField, childSrc, true);
+        } else {
+            fill(sChild, sChildField, tChild, tChildField, childSrc);
+        }
+        tv.setValueCount(n);
+    }
+
+    private static FieldVector dataVector(FieldVector v) {
+        if (v instanceof LargeListVector l) return l.getDataVector();
+        if (v instanceof ListVector l) return l.getDataVector();
+        return ((FixedSizeListVector) v).getDataVector();
+    }
+
+    /**
+     * Struct: each declared child is cast from the source child of the same
+     * name (a map's entries match key and value by position). Undeclared
+     * source children are dropped, as the reference drops them. A declared
+     * child the source lacks -- renamed or new -- is refused: pyarrow fills it
+     * with nulls, silently discarding the data under the old name.
+     */
+    private static void fillStruct(FieldVector sv, Field sf, FieldVector tv, Field tf, int[] src, boolean positional) {
+        StructVector s = (StructVector) sv;
+        StructVector t = (StructVector) tv;
+        List<Field> sKids = sf.getChildren();
+        List<Field> tKids = tf.getChildren();
+        int n = src.length;
+        int[] childSrc = new int[n];
+        for (int i = 0; i < n; i++) {
+            int r = src[i];
+            boolean isNull = r < 0 || s.isNull(r);
+            childSrc[i] = isNull ? -1 : r;
+            if (isNull) t.setNull(i);
+            else t.setIndexDefined(i);
+        }
+        for (int j = 0; j < tKids.size(); j++) {
+            Field tc = tKids.get(j);
+            int k = -1;
+            if (positional) {
+                if (sKids.size() != tKids.size()) throw refuse(tf, sf, "map entries differ in shape");
+                k = j;
+            } else {
+                for (int m = 0; m < sKids.size(); m++) {
+                    if (sKids.get(m).getName().equals(tc.getName())) { k = m; break; }
+                }
+                if (k < 0) {
+                    throw refuse(tf, sf, "the emitted struct has no child '" + tc.getName() + "' (it has "
+                            + names(sKids) + "); the reference would silently fill it with nulls");
+                }
+            }
+            fill(s.getChildrenFromFields().get(k), sKids.get(k), t.getChildrenFromFields().get(j), tc, childSrc);
+        }
+        t.setValueCount(n);
+    }
+
+    private static void castValues(FieldVector sv, Field sf, FieldVector tv, Field tf, int[] src) {
+        ArrowType st = sf.getType();
+        ArrowType tt = tf.getType();
+        int n = src.length;
         if (st instanceof ArrowType.Null) {
-            for (int r = 0; r < rows; r++) setNull(tv, r);
+            for (int i = 0; i < n; i++) setNull(tv, i);
             return;
         }
-        if (st instanceof ArrowType.Int si && tt instanceof ArrowType.Int ti) {
-            BaseIntVector src = (BaseIntVector) sv;
-            BaseIntVector dst = (BaseIntVector) tv;
-            for (int r = 0; r < rows; r++) {
-                if (sv.isNull(r)) { setNull(tv, r); continue; }
-                long v = src.getValueAsLong(r);
+        Cast cast = scalarCast(sv, sf, tv, tf);
+        for (int i = 0; i < n; i++) {
+            int r = src[i];
+            if (r < 0 || sv.isNull(r)) { setNull(tv, i); continue; }
+            try {
+                cast.apply(r, i);
+            } catch (ArithmeticException | IllegalArgumentException e) {
+                throw refuse(tf, sf, e.getMessage());
+            }
+        }
+    }
+
+    /** One value: read source row {@code r}, write target row {@code i}. */
+    @FunctionalInterface
+    private interface Cast {
+        void apply(int r, int i);
+    }
+
+    private static Cast scalarCast(FieldVector sv, Field sf, FieldVector tv, Field tf) {
+        ArrowType st = sf.getType();
+        ArrowType tt = tf.getType();
+
+        // --- to and from strings / binary ----------------------------------
+        if (isBytes(st) && isBytes(tt)) {
+            boolean checkUtf8 = !isString(st) && isString(tt);
+            return (r, i) -> {
+                byte[] b = getBytes(sv, r);
+                if (checkUtf8 && !validUtf8(b)) throw new IllegalArgumentException("row " + r + " is not valid UTF-8");
+                setBytes(tv, i, b);
+            };
+        }
+        if (isString(tt)) {
+            if (st instanceof ArrowType.Int si) {
+                return (r, i) -> setString(tv, i, ArrowCasts.formatInt(((BaseIntVector) sv).getValueAsLong(r), si));
+            }
+            if (st instanceof ArrowType.FloatingPoint fp) {
+                return (r, i) -> setString(tv, i, fp.getPrecision() == FloatingPointPrecision.SINGLE
+                        ? ArrowCasts.formatFloat((float) ((FloatingPointVector) sv).getValueAsDouble(r))
+                        : ArrowCasts.formatDouble(((FloatingPointVector) sv).getValueAsDouble(r)));
+            }
+            if (st instanceof ArrowType.Bool) {
+                return (r, i) -> setString(tv, i, ((BitVector) sv).get(r) != 0 ? "true" : "false");
+            }
+            if (st instanceof ArrowType.Decimal) {
+                return (r, i) -> setString(tv, i, ArrowCasts.decimalToString(unscaled(sv, r), scaleOf(sf)));
+            }
+        }
+        if (isBytes(st)) {
+            if (tt instanceof ArrowType.Int ti) {
+                return (r, i) -> ((BaseIntVector) tv).setWithPossibleTruncate(i, ArrowCasts.parseInt(string(sv, r), ti));
+            }
+            if (tt instanceof ArrowType.FloatingPoint fp) {
+                return (r, i) -> {
+                    String s = string(sv, r);
+                    ((FloatingPointVector) tv).setWithPossibleTruncate(i,
+                            fp.getPrecision() == FloatingPointPrecision.SINGLE ? ArrowCasts.parseFloat(s)
+                                    : ArrowCasts.parseDouble(s, fp.getPrecision() == FloatingPointPrecision.DOUBLE
+                                            ? "double" : "halffloat"));
+                };
+            }
+            if (tt instanceof ArrowType.Bool) {
+                return (r, i) -> ((BitVector) tv).setSafe(i, ArrowCasts.parseBool(string(sv, r)) ? 1 : 0);
+            }
+            if (tt instanceof ArrowType.Decimal td) {
+                return (r, i) -> setDecimal(tv, i, ArrowCasts.parseDecimal(string(sv, r), td.getPrecision(),
+                        td.getScale(), td.getBitWidth()));
+            }
+        }
+
+        // --- decimals -------------------------------------------------------
+        if (st instanceof ArrowType.Decimal sd && tt instanceof ArrowType.Decimal td) {
+            return (r, i) -> setDecimal(tv, i, ArrowCasts.decimalToDecimal(unscaled(sv, r), sd.getScale(),
+                    td.getPrecision(), td.getScale()));
+        }
+        if (st instanceof ArrowType.Int si && tt instanceof ArrowType.Decimal td) {
+            return (r, i) -> setDecimal(tv, i, ArrowCasts.intToDecimal(((BaseIntVector) sv).getValueAsLong(r), si,
+                    td.getPrecision(), td.getScale()));
+        }
+        if (st instanceof ArrowType.Decimal sd && tt instanceof ArrowType.Int ti) {
+            return (r, i) -> ((BaseIntVector) tv).setWithPossibleTruncate(i,
+                    ArrowCasts.decimalToInt(unscaled(sv, r), sd.getScale(), ti).longValue());
+        }
+        if (st instanceof ArrowType.Decimal sd && tt instanceof ArrowType.FloatingPoint fp) {
+            return (r, i) -> ((FloatingPointVector) tv).setWithPossibleTruncate(i,
+                    fp.getPrecision() == FloatingPointPrecision.DOUBLE
+                            ? ArrowCasts.decimalToDouble(unscaled(sv, r), sd.getScale(), sd.getBitWidth())
+                            : ArrowCasts.decimalToFloat(unscaled(sv, r), sd.getScale(), sd.getBitWidth()));
+        }
+        if (st instanceof ArrowType.FloatingPoint fp && tt instanceof ArrowType.Decimal td) {
+            return (r, i) -> {
+                double d = ((FloatingPointVector) sv).getValueAsDouble(r);
+                setDecimal(tv, i, fp.getPrecision() == FloatingPointPrecision.SINGLE
+                        ? ArrowCasts.floatToDecimal((float) d, td.getPrecision(), td.getScale(), td.getBitWidth())
+                        : ArrowCasts.doubleToDecimal(d, td.getPrecision(), td.getScale(), td.getBitWidth()));
+            };
+        }
+
+        // --- numbers and booleans -------------------------------------------
+        if (st instanceof ArrowType.Int && tt instanceof ArrowType.Int ti) {
+            return (r, i) -> {
+                long v = ((BaseIntVector) sv).getValueAsLong(r);
                 boolean huge = sv instanceof UInt8Vector && v < 0;  // an unsigned value >= 2^63
                 if (!fits(v, huge, ti)) {
-                    throw refuse(tf, sf, "integer value " + (huge ? Long.toUnsignedString(v) : Long.toString(v))
-                            + " is not in range: " + range(ti));
+                    throw new IllegalArgumentException("Integer value "
+                            + (huge ? Long.toUnsignedString(v) : Long.toString(v)) + " not in range: " + range(ti));
                 }
-                dst.setWithPossibleTruncate(r, v);
-            }
-            return;
+                ((BaseIntVector) tv).setWithPossibleTruncate(i, v);
+            };
         }
         if (st instanceof ArrowType.Bool && tt instanceof ArrowType.Int) {
-            for (int r = 0; r < rows; r++) {
-                if (sv.isNull(r)) { setNull(tv, r); continue; }
-                ((BaseIntVector) tv).setWithPossibleTruncate(r, ((BitVector) sv).get(r));
-            }
-            return;
+            return (r, i) -> ((BaseIntVector) tv).setWithPossibleTruncate(i, ((BitVector) sv).get(r));
+        }
+        if (st instanceof ArrowType.Bool && tt instanceof ArrowType.FloatingPoint) {
+            return (r, i) -> ((FloatingPointVector) tv).setWithPossibleTruncate(i, ((BitVector) sv).get(r));
+        }
+        if (st instanceof ArrowType.Int && tt instanceof ArrowType.Bool) {
+            return (r, i) -> ((BitVector) tv).setSafe(i, ((BaseIntVector) sv).getValueAsLong(r) != 0 ? 1 : 0);
+        }
+        if (st instanceof ArrowType.FloatingPoint && tt instanceof ArrowType.Bool) {
+            return (r, i) -> ((BitVector) tv).setSafe(i, ((FloatingPointVector) sv).getValueAsDouble(r) != 0 ? 1 : 0);
         }
         if (st instanceof ArrowType.Int && tt instanceof ArrowType.FloatingPoint tfp) {
             long limit = tfp.getPrecision() == FloatingPointPrecision.DOUBLE ? 1L << 53
                     : tfp.getPrecision() == FloatingPointPrecision.SINGLE ? 1L << 24 : 1L << 11;
-            BaseIntVector src = (BaseIntVector) sv;
-            for (int r = 0; r < rows; r++) {
-                if (sv.isNull(r)) { setNull(tv, r); continue; }
-                long v = src.getValueAsLong(r);
+            return (r, i) -> {
+                long v = ((BaseIntVector) sv).getValueAsLong(r);
                 boolean huge = sv instanceof UInt8Vector && v < 0;
                 if (huge || v > limit || v < -limit) {
-                    throw refuse(tf, sf, "integer value " + (huge ? Long.toUnsignedString(v) : Long.toString(v))
-                            + " is not exactly representable: range is -" + limit + " to " + limit);
+                    throw new IllegalArgumentException("Integer value "
+                            + (huge ? Long.toUnsignedString(v) : Long.toString(v)) + " not in range: -" + limit
+                            + " to " + limit);
                 }
-                ((FloatingPointVector) tv).setWithPossibleTruncate(r, (double) v);
-            }
-            return;
+                ((FloatingPointVector) tv).setWithPossibleTruncate(i, (double) v);
+            };
         }
         if (st instanceof ArrowType.FloatingPoint && tt instanceof ArrowType.FloatingPoint) {
-            for (int r = 0; r < rows; r++) {
-                if (sv.isNull(r)) { setNull(tv, r); continue; }
-                ((FloatingPointVector) tv).setWithPossibleTruncate(r, ((FloatingPointVector) sv).getValueAsDouble(r));
-            }
-            return;
+            return (r, i) -> ((FloatingPointVector) tv).setWithPossibleTruncate(i,
+                    ((FloatingPointVector) sv).getValueAsDouble(r));
         }
         if (st instanceof ArrowType.FloatingPoint && tt instanceof ArrowType.Int ti) {
-            for (int r = 0; r < rows; r++) {
-                if (sv.isNull(r)) { setNull(tv, r); continue; }
+            return (r, i) -> {
                 double d = ((FloatingPointVector) sv).getValueAsDouble(r);
-                if (d != Math.rint(d) || Double.isInfinite(d)) {
-                    throw refuse(tf, sf, "float value " + d + " would be truncated");
-                }
-                if (!fitsDouble(d, ti)) {
-                    throw refuse(tf, sf, "float value " + d + " is not in range: " + range(ti));
+                if (d != Math.rint(d) || Double.isInfinite(d) || !fitsDouble(d, ti)) {
+                    throw new IllegalArgumentException("Float value " + String.format(java.util.Locale.ROOT, "%f", d)
+                            + " was truncated converting to " + ArrowCasts.intName(ti));
                 }
                 long v = (!ti.getIsSigned() && ti.getBitWidth() == 64 && d >= 0x1p63)
                         ? (long) (d - 0x1p63) ^ Long.MIN_VALUE : (long) d;
-                ((BaseIntVector) tv).setWithPossibleTruncate(r, v);
-            }
-            return;
+                ((BaseIntVector) tv).setWithPossibleTruncate(i, v);
+            };
         }
-        if (isBytes(st) && isBytes(tt)) {
-            boolean checkUtf8 = !isString(st) && isString(tt);
-            for (int r = 0; r < rows; r++) {
-                if (sv.isNull(r)) { setNull(tv, r); continue; }
-                byte[] b = getBytes(sv, r);
-                if (checkUtf8 && !validUtf8(b)) throw refuse(tf, sf, "row " + r + " is not valid UTF-8");
-                setBytes(tv, r, b);
-            }
-            return;
-        }
+
+        // --- temporal -------------------------------------------------------
         if (st instanceof ArrowType.Timestamp sts && tt instanceof ArrowType.Timestamp tts) {
             long from = perSecond(sts.getUnit());
             long to = perSecond(tts.getUnit());
-            for (int r = 0; r < rows; r++) {
-                if (sv.isNull(r)) { setNull(tv, r); continue; }
+            return (r, i) -> {
                 long v = ((TimeStampVector) sv).get(r);
                 long cast;
                 if (to >= from) {
                     cast = Math.multiplyExact(v, to / from);
                 } else {
                     long div = from / to;
-                    if (v % div != 0) throw refuse(tf, sf, "casting would lose data: " + v);
+                    if (v % div != 0) throw new IllegalArgumentException("Casting would lose data: " + v);
                     cast = v / div;
                 }
-                ((TimeStampVector) tv).setSafe(r, cast);
-            }
-            return;
+                ((TimeStampVector) tv).setSafe(i, cast);
+            };
         }
         if (st instanceof ArrowType.Date sd && tt instanceof ArrowType.Date td) {
             final long msPerDay = 86_400_000L;
-            for (int r = 0; r < rows; r++) {
-                if (sv.isNull(r)) { setNull(tv, r); continue; }
+            return (r, i) -> {
                 long ms = sd.getUnit() == DateUnit.DAY ? ((DateDayVector) sv).get(r) * msPerDay
                         : ((DateMilliVector) sv).get(r);
                 if (td.getUnit() == DateUnit.DAY) {
-                    if (ms % msPerDay != 0) throw refuse(tf, sf, "casting would lose data: " + ms);
-                    ((DateDayVector) tv).setSafe(r, Math.toIntExact(ms / msPerDay));
+                    if (ms % msPerDay != 0) throw new IllegalArgumentException("Casting would lose data: " + ms);
+                    ((DateDayVector) tv).setSafe(i, Math.toIntExact(ms / msPerDay));
                 } else {
-                    ((DateMilliVector) tv).setSafe(r, ms);
+                    ((DateMilliVector) tv).setSafe(i, ms);
                 }
-            }
-            return;
+            };
         }
         throw refuse(tf, sf, "no exact cast is available");
+    }
+
+    private static BigInteger unscaled(FieldVector v, int r) {
+        if (v instanceof DecimalVector d) return d.getObject(r).unscaledValue();
+        return ((Decimal256Vector) v).getObject(r).unscaledValue();
+    }
+
+    private static int scaleOf(Field f) { return ((ArrowType.Decimal) f.getType()).getScale(); }
+
+    private static void setDecimal(FieldVector v, int i, BigInteger unscaled) {
+        if (v instanceof DecimalVector d) d.setSafe(i, new BigDecimal(unscaled, d.getScale()));
+        else ((Decimal256Vector) v).setSafe(i, new BigDecimal(unscaled, ((Decimal256Vector) v).getScale()));
+    }
+
+    private static String string(FieldVector v, int r) {
+        return new String(getBytes(v, r), StandardCharsets.UTF_8);
+    }
+
+    private static void setString(FieldVector v, int i, String s) {
+        setBytes(v, i, s.getBytes(StandardCharsets.UTF_8));
     }
 
     /** Encode a plain column into the target's dictionary, collecting the dictionary values per id. */
@@ -532,7 +802,11 @@ final class OutputReconciler {
     }
 
     private static void setNull(FieldVector v, int r) {
-        if (v instanceof BaseFixedWidthVector x) x.setNull(r);
+        if (v instanceof LargeListVector x) x.setNull(r);
+        else if (v instanceof ListVector x) x.setNull(r);
+        else if (v instanceof FixedSizeListVector x) x.setNull(r);
+        else if (v instanceof StructVector x) x.setNull(r);
+        else if (v instanceof BaseFixedWidthVector x) x.setNull(r);
         else if (v instanceof BaseVariableWidthVector x) x.setNull(r);
         else if (v instanceof BaseLargeVariableWidthVector x) x.setNull(r);
         else if (!(v instanceof NullVector)) {

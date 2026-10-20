@@ -52,10 +52,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Each case is one the reference was probed on (pyarrow 25.0.1, its
  * {@code select}-then-{@code cast} on a batch whose schema differs from
- * {@code output_schema}); the comment on each states pyarrow's outcome. The
- * three cases the reference accepts and this port refuses are marked
- * DIVERGES: refusing is the safe side, since the alternative is a stream whose
- * schema is not the declared one.
+ * {@code output_schema}); the comment on each states pyarrow's outcome.
+ * {@link OutputReconcilerCastTest} holds the value-by-value cases for strings,
+ * decimals and containers.
  */
 final class OutputReconcilerTest {
 
@@ -226,12 +225,14 @@ final class OutputReconcilerTest {
         assertTrue(refused(schema(f("s", ArrowType.Utf8.INSTANCE)), r).getMessage().contains("UTF-8"));
     }
 
-    @Test void int64ToStringIsRefused() {  // pyarrow: OK ('5') -- DIVERGES, refused here
-        refused(schema(f("v", ArrowType.Utf8.INSTANCE)), ints(I64, 5));
+    @Test void int64ToString() {  // pyarrow: OK ('5'); OutputReconcilerCastTest has the formatting cases
+        assertEquals(List.of("5"), emitValues(schema(f("v", ArrowType.Utf8.INSTANCE)), ints(I64, 5)));
     }
 
-    @Test void stringToInt64IsRefused() {  // pyarrow: OK (parses '5') -- DIVERGES, refused here
-        refused(schema(f("v", I64)), strings("v", ArrowType.Utf8.INSTANCE, "5"));
+    @Test void stringToInt64() {  // pyarrow: OK (parses '5'); 'x' fails to parse
+        assertEquals(List.of(5L), emitValues(schema(f("v", I64)), strings("v", ArrowType.Utf8.INSTANCE, "5")));
+        assertTrue(refused(schema(f("v", I64)), strings("v", ArrowType.Utf8.INSTANCE, "x"))
+                .getMessage().contains("Failed to parse string: 'x' as a scalar of type int64"));
     }
 
     // --- temporal / null ---------------------------------------------------
@@ -337,13 +338,23 @@ final class OutputReconcilerTest {
         e.root().close();
     }
 
-    @Test void listOfInt32ToListOfInt64IsRefused() {  // pyarrow: OK -- DIVERGES, refused here
+    @Test void listOfInt32ToListOfInt64() {  // pyarrow: OK
         Schema target = schema(new Field("l", FieldType.nullable(ArrowType.List.INSTANCE),
                 List.of(new Field("item", FieldType.nullable(I64), null))));
         VectorSchemaRoot r = VectorSchemaRoot.create(schema(new Field("l", FieldType.nullable(ArrowType.List.INSTANCE),
                 List.of(new Field("item", FieldType.nullable(I32), null)))), Allocators.root());
-        r.setRowCount(0);
-        refused(target, r);
+        ListVector lv = (ListVector) r.getVector(0);
+        UnionListWriter w = lv.getWriter();
+        w.setPosition(0);
+        w.startList();
+        w.integer().writeInt(9);
+        w.endList();
+        lv.setValueCount(1);
+        r.setRowCount(1);
+        OutputCollector.Entry e = emit(target, r, null);
+        try (VectorSchemaRoot out = e.root()) {
+            assertEquals(List.of(9L), ((ListVector) out.getVector(0)).getObject(0));
+        }
     }
 
     // --- dictionaries ------------------------------------------------------
