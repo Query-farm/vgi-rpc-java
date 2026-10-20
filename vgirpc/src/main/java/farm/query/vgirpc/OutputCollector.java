@@ -6,8 +6,10 @@ package farm.query.vgirpc;
 import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.wire.Metadata;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.ArrayList;
@@ -15,6 +17,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Accumulator for stream output. Each call to {@code process()} must emit at most
@@ -157,8 +160,69 @@ public final class OutputCollector {
             throw new RpcError("ProtocolError",
                     "only one data batch may be emitted per stream turn", "");
         }
+        root = declaring(root);
         dataIdx = entries.size();
         entries.add(new Entry(root, customMetadata, true, dictionaryProvider));
+    }
+
+    /**
+     * Label {@code root} with {@link #outputSchema} when the two differ only in
+     * field nullability or field metadata, so the batch goes on the wire under
+     * the schema the method declares.
+     *
+     * <p>Every writer lets the first batch it is handed define the stream's
+     * schema, so without this a handler that built its root with a nullable
+     * field where the method declares {@code not null} (any root not built from
+     * {@code outputSchema} itself) put the handler's schema on the wire -- unless
+     * a log batch, which is built from {@code outputSchema}, happened to go
+     * first. The reference reconciles in the same place: its
+     * {@code OutputCollector.emit} casts a batch whose schema differs to
+     * {@code output_schema}, and that cast refuses nulls in a non-nullable
+     * field, as this does.
+     *
+     * <p>Only a relabel: the vectors and buffers are the root's own, which is
+     * exact because neither nullability nor field metadata changes an Arrow
+     * buffer layout. A root that differs in any other way (types, names,
+     * dictionary representation) is returned unchanged.
+     */
+    private VectorSchemaRoot declaring(VectorSchemaRoot root) {
+        if (outputSchema == null) return root;
+        Schema actual = root.getSchema();
+        if (actual.equals(outputSchema)) return root;
+        if (!sameLayout(actual.getFields(), outputSchema.getFields())) return root;
+        String nullIn = nullInNonNullable(outputSchema.getFields(), root.getFieldVectors());
+        if (nullIn != null) {
+            root.close();  // ownership transferred with emit()
+            throw new IllegalArgumentException("emitted batch has null values in field '" + nullIn
+                    + "', which the output schema declares non-nullable");
+        }
+        return new VectorSchemaRoot(outputSchema, root.getFieldVectors(), root.getRowCount());
+    }
+
+    /** Same names, types, dictionary encodings and children, recursively; nullability and metadata ignored. */
+    private static boolean sameLayout(List<Field> a, List<Field> b) {
+        if (a.size() != b.size()) return false;
+        for (int i = 0; i < a.size(); i++) {
+            Field fa = a.get(i);
+            Field fb = b.get(i);
+            if (!fa.getName().equals(fb.getName())) return false;
+            if (!fa.getType().equals(fb.getType())) return false;
+            if (!Objects.equals(fa.getDictionary(), fb.getDictionary())) return false;
+            if (!sameLayout(fa.getChildren(), fb.getChildren())) return false;
+        }
+        return true;
+    }
+
+    /** The first declared-non-nullable field (dotted path) whose vector holds a null, or {@code null}. */
+    private static String nullInNonNullable(List<Field> declared, List<FieldVector> vectors) {
+        for (int i = 0; i < declared.size(); i++) {
+            Field f = declared.get(i);
+            FieldVector v = vectors.get(i);
+            if (!f.isNullable() && v.getNullCount() > 0) return f.getName();
+            String child = nullInNonNullable(f.getChildren(), v.getChildrenFromFields());
+            if (child != null) return f.getName() + "." + child;
+        }
+        return null;
     }
 
     /**

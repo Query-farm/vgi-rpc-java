@@ -18,6 +18,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class OutputCollectorTest {
     private static final Schema SCHEMA = new Schema(List.of(new Field(
@@ -40,6 +41,49 @@ final class OutputCollectorTest {
         } finally {
             for (OutputCollector.Entry entry : out.entries()) entry.root().close();
             second.close();
+        }
+    }
+
+    private static final Schema NULLABLE = new Schema(List.of(new Field(
+            "value", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+
+    @Test
+    void labelsANullabilityOnlyDifferentRootWithTheOutputSchema() {
+        OutputCollector out = new OutputCollector(SCHEMA, "test", true);
+        VectorSchemaRoot root = VectorSchemaRoot.create(NULLABLE, Allocators.root());
+        root.allocateNew();
+        ((BigIntVector) root.getVector(0)).setSafe(0, 42);
+        root.setRowCount(1);
+        out.emit(root);
+        try (VectorSchemaRoot data = out.dataEntry().root()) {
+            assertEquals(SCHEMA, data.getSchema(), "the reference casts an emitted batch to output_schema");
+            assertEquals(42L, ((BigIntVector) data.getVector(0)).get(0));
+        }
+    }
+
+    @Test
+    void refusesNullsInAFieldTheOutputSchemaDeclaresNonNullable() {
+        OutputCollector out = new OutputCollector(SCHEMA, "test", true);
+        VectorSchemaRoot root = VectorSchemaRoot.create(NULLABLE, Allocators.root());
+        root.allocateNew();
+        ((BigIntVector) root.getVector(0)).setNull(0);
+        root.setRowCount(1);
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> out.emit(root));
+        assertTrue(e.getMessage().contains("'value'"), e.getMessage());
+        assertEquals(0, out.entries().size());
+    }
+
+    @Test
+    void leavesARootThatDiffersInTypeUnchanged() {
+        Schema int32 = new Schema(List.of(new Field(
+                "value", FieldType.nullable(new ArrowType.Int(32, true)), null)));
+        OutputCollector out = new OutputCollector(SCHEMA, "test", true);
+        VectorSchemaRoot root = VectorSchemaRoot.create(int32, Allocators.root());
+        root.allocateNew();
+        root.setRowCount(0);
+        out.emit(root);
+        try (VectorSchemaRoot data = out.dataEntry().root()) {
+            assertEquals(int32, data.getSchema());
         }
     }
 
