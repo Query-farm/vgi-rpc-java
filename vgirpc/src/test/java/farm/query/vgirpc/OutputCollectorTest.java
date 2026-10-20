@@ -74,16 +74,19 @@ final class OutputCollectorTest {
     }
 
     @Test
-    void leavesARootThatDiffersInTypeUnchanged() {
+    void castsARootThatDiffersInTypeToTheOutputSchema() {
+        // The reference's emit casts too; OutputReconcilerTest covers the cases.
         Schema int32 = new Schema(List.of(new Field(
                 "value", FieldType.nullable(new ArrowType.Int(32, true)), null)));
         OutputCollector out = new OutputCollector(SCHEMA, "test", true);
         VectorSchemaRoot root = VectorSchemaRoot.create(int32, Allocators.root());
         root.allocateNew();
-        root.setRowCount(0);
+        ((org.apache.arrow.vector.IntVector) root.getVector(0)).setSafe(0, 5);
+        root.setRowCount(1);
         out.emit(root);
         try (VectorSchemaRoot data = out.dataEntry().root()) {
-            assertEquals(int32, data.getSchema());
+            assertEquals(SCHEMA, data.getSchema());
+            assertEquals(5L, ((BigIntVector) data.getVector(0)).get(0));
         }
     }
 

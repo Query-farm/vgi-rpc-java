@@ -82,15 +82,37 @@ final class StreamDeclaredSchemaTest {
         }
     }
 
+    /** Declared dictionary-encoded; the handler emits plain strings, a different value each tick. */
+    static final Schema DICT_SCHEMA = new Schema(List.of(new Field("s", new FieldType(true, new ArrowType.Utf8(),
+            new org.apache.arrow.vector.types.pojo.DictionaryEncoding(0L, false, new ArrowType.Int(16, true))), null)));
+    static final Schema PLAIN_SCHEMA = new Schema(List.of(
+            new Field("s", FieldType.nullable(new ArrowType.Utf8()), null)));
+
+    public static final class Letters extends ProducerState {
+        public long n;
+        public Letters() {}
+        @Override public void produce(OutputCollector out, CallContext ctx) {
+            if (n >= 3) { out.finish(); return; }
+            VectorSchemaRoot root = VectorSchemaRoot.create(PLAIN_SCHEMA, Allocators.root());
+            root.allocateNew();
+            ((org.apache.arrow.vector.VarCharVector) root.getVector(0)).setSafe(0,
+                    new String[] {"a", "b", "c"}[(int) n++].getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            root.setRowCount(1);
+            out.emit(root);
+        }
+    }
+
     public interface SchemaService {
         RpcStream<Echo> echo();
         RpcStream<Count> count();
+        RpcStream<Letters> letters();
         long ping(long v);
     }
 
     public static final class Impl implements SchemaService {
         @Override public RpcStream<Echo> echo() { return RpcStream.exchange(IN_SCHEMA, OUT_SCHEMA, new Echo()); }
         @Override public RpcStream<Count> count() { return RpcStream.producer(OUT_SCHEMA, new Count()); }
+        @Override public RpcStream<Letters> letters() { return RpcStream.producer(DICT_SCHEMA, new Letters()); }
         @Override public long ping(long v) { return v; }
     }
 
@@ -118,6 +140,40 @@ final class StreamDeclaredSchemaTest {
     @Timeout(30)
     void httpProducerDeclaresTheOutputSchema() throws Exception {
         withHttp(svc -> { assertProducer(svc.count()); return null; });
+    }
+
+    /**
+     * Plain strings emitted against a dictionary-encoded declaration are
+     * encoded per batch, each batch with its own dictionary; every tick must
+     * decode against its own (a pipe stream runs all ticks through one writer).
+     */
+    @Test
+    @Timeout(30)
+    void pipeProducerEncodesPlainStringsPerTick() throws Exception {
+        withPipe(svc -> { assertLetters(svc.letters()); return null; });
+    }
+
+    @Test
+    @Timeout(30)
+    void httpProducerEncodesPlainStringsPerTick() throws Exception {
+        withHttp(svc -> { assertLetters(svc.letters()); return null; });
+    }
+
+    private static void assertLetters(RpcStream<Letters> stream) {
+        try {
+            java.util.List<Object> got = new java.util.ArrayList<>();
+            for (AnnotatedBatch b : stream.batches()) {
+                // A received dictionary column is in Arrow Java's memory form
+                // (the field states the index type); the encoding is what the
+                // wire declared.
+                assertEquals(DICT_SCHEMA.getFields().get(0).getDictionary(),
+                        b.root().getSchema().getFields().get(0).getDictionary());
+                got.add(farm.query.vgirpc.marshal.Marshalling.decodeRow(b.root(), b.dictionaryProvider()).get("s"));
+            }
+            assertEquals(List.of("a", "b", "c"), got);
+        } finally {
+            stream.close();
+        }
     }
 
     private static void assertExchange(RpcStream<Echo> stream) {
