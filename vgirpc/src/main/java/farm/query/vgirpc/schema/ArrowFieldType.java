@@ -36,7 +36,9 @@ public enum ArrowFieldType {
     DURATION_US(new ArrowType.Duration(TimeUnit.MICROSECOND)),
     DECIMAL128_20_4(new ArrowType.Decimal(20, 4, 128)),
     BINARY_8(new ArrowType.FixedSizeBinary(8)),
-    DICT_INT16_UTF8(new ArrowType.Utf8());
+    DICT_INT16_UTF8(new ArrowType.Utf8()),
+    /** Binary values deduplicated by content, with signed 32-bit indices. */
+    DICT_INT32_BINARY(new ArrowType.Binary());
 
     private final ArrowType arrowType;
     ArrowFieldType(ArrowType t) { this.arrowType = t; }

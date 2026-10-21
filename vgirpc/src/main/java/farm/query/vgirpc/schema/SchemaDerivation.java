@@ -57,6 +57,21 @@ public final class SchemaDerivation {
         return new DictionaryEncoding(id, false, new ArrowType.Int(16, true));
     }
 
+    private static DictionaryEncoding annotationDictionary(ArrowFieldType type, long id) {
+        return switch (type) {
+            case DICT_INT16_UTF8 -> stringDictionary(id);
+            case DICT_INT32_BINARY -> new DictionaryEncoding(id, false, new ArrowType.Int(32, true));
+            default -> null;
+        };
+    }
+
+    private static Field assignDictionaryIds(Field field, long[] next) {
+        var encoding = field.getDictionary();
+        if (encoding != null) encoding = new DictionaryEncoding(next[0]++, encoding.isOrdered(), encoding.getIndexType());
+        var children = field.getChildren().stream().map(child -> assignDictionaryIds(child, next)).toList();
+        return new Field(field.getName(), new FieldType(field.isNullable(), field.getType(), encoding, field.getMetadata()), children);
+    }
+
     /**
      * Derive an Arrow schema for an {@link ArrowSerializableRecord} class by walking
      * its record components. Cached. Uses {@code putIfAbsent} rather than
@@ -80,7 +95,8 @@ public final class SchemaDerivation {
         for (RecordComponent rc : cls.getRecordComponents()) {
             fields.add(buildField(rc.getName(), rc.getGenericType(), rc));
         }
-        return new Schema(fields);
+        long[] next = {0};
+        return new Schema(fields.stream().map(field -> assignDictionaryIds(field, next)).toList());
     }
 
     /** Build a Field for a parameter (uses parameter name from -parameters compile flag). */
@@ -114,9 +130,9 @@ public final class SchemaDerivation {
      */
     public static Field withParameterDictionary(Field f, AnnotatedElement annSource, long id) {
         ArrowField override = annSource.getAnnotation(ArrowField.class);
-        if (override == null || override.value() != ArrowFieldType.DICT_INT16_UTF8) return f;
-        DictionaryEncoding enc = new DictionaryEncoding(id, /*ordered=*/false,
-                new ArrowType.Int(16, /*isSigned=*/true));
+        if (override == null) return f;
+        DictionaryEncoding enc = annotationDictionary(override.value(), id);
+        if (enc == null) return f;
         return new Field(f.getName(),
                 new FieldType(f.isNullable(), f.getType(), enc, f.getMetadata()),
                 f.getChildren());
@@ -125,7 +141,7 @@ public final class SchemaDerivation {
     /** @return true when {@code annSource} asks for a dictionary-encoded column. */
     public static boolean wantsParameterDictionary(AnnotatedElement annSource) {
         ArrowField override = annSource.getAnnotation(ArrowField.class);
-        return override != null && override.value() == ArrowFieldType.DICT_INT16_UTF8;
+        return override != null && annotationDictionary(override.value(), 0) != null;
     }
 
     /** Build a Field for the (single) result column of a unary method, named "result". */
@@ -144,8 +160,7 @@ public final class SchemaDerivation {
         Type unwrapped = unwrapOptional(type);
         ArrowField override = annSource.getAnnotation(ArrowField.class);
         if (override != null) {
-            DictionaryEncoding dictionary = override.value() == ArrowFieldType.DICT_INT16_UTF8
-                    ? stringDictionary(0) : null;
+            DictionaryEncoding dictionary = annotationDictionary(override.value(), 0);
             return new Field(name, new FieldType(nullable, override.value().arrowType(), dictionary),
                     Collections.emptyList());
         }
@@ -211,8 +226,9 @@ public final class SchemaDerivation {
                 children = childFields(unwrapped);
             }
         }
-        DictionaryEncoding dictionary = rawClass(unwrapped).isEnum()
-                ? stringDictionary(0) : null;
+        DictionaryEncoding dictionary = override != null && override.value() == ArrowFieldType.DICT_INT32_BINARY
+                ? annotationDictionary(override.value(), 0)
+                : rawClass(unwrapped).isEnum() ? stringDictionary(0) : null;
         FieldType ft = new FieldType(nullable, arrowType, dictionary);
         return new Field(name, ft, children);
     }
@@ -226,8 +242,7 @@ public final class SchemaDerivation {
                 return new Field(name, new FieldType(true, new ArrowType.List(), null), List.of(inner));
             }
         }
-        DictionaryEncoding dictionary = override.value() == ArrowFieldType.DICT_INT16_UTF8
-                ? stringDictionary(0) : null;
+        DictionaryEncoding dictionary = annotationDictionary(override.value(), 0);
         return new Field(name,
                 new FieldType(true, override.value().arrowType(), dictionary),
                 Collections.emptyList());

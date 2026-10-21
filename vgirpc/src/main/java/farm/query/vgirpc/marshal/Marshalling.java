@@ -69,17 +69,27 @@ public final class Marshalling {
 
     /** Build a single-row {@link VectorSchemaRoot} from a parameter map matching {@code schema}. */
     public static VectorSchemaRoot encodeRow(Schema schema, Map<String, Object> values, BufferAllocator alloc) {
+        return encodeRows(schema, List.of(values), alloc);
+    }
+
+    /** Build a collection batch using the same scalar/container conversions as unary rows. */
+    public static VectorSchemaRoot encodeRows(Schema schema, List<Map<String, Object>> rows, BufferAllocator alloc) {
         VectorSchemaRoot root = VectorSchemaRoot.create(schema, alloc);
-        root.allocateNew();
-        for (int i = 0; i < schema.getFields().size(); i++) {
-            Field f = schema.getFields().get(i);
-            FieldVector v = root.getVector(i);
-            Object val = values.get(f.getName());
-            if (val instanceof Optional<?> opt) val = opt.orElse(null);
-            writeScalar(v, 0, f, val);
-        }
-        root.setRowCount(1);
-        return root;
+        boolean ok = false;
+        try {
+            root.allocateNew();
+            for (int row = 0; row < rows.size(); row++) {
+                for (int i = 0; i < schema.getFields().size(); i++) {
+                    Field field = schema.getFields().get(i);
+                    Object value = rows.get(row).get(field.getName());
+                    if (value instanceof Optional<?> opt) value = opt.orElse(null);
+                    writeScalar(root.getVector(i), row, field, value);
+                }
+            }
+            root.setRowCount(rows.size());
+            ok = true;
+            return root;
+        } finally { if (!ok) root.close(); }
     }
 
     /**
@@ -142,41 +152,54 @@ public final class Marshalling {
      */
     public static EncodedRow encodeRowForWire(Schema schema, Map<String, Object> values,
             BufferAllocator alloc) {
+        return encodeRowsForWire(schema, List.of(values), alloc);
+    }
+
+    /** Build a multi-row batch with dictionaries unified across every row. */
+    public static EncodedRow encodeRowsForWire(Schema schema, List<Map<String, Object>> rows,
+            BufferAllocator alloc) {
         List<Field> fields = schema.getFields();
         boolean anyDict = fields.stream().anyMatch(Marshalling::hasDictionary);
         if (!anyDict) {
-            return new EncodedRow(encodeRow(schema, values, alloc), null, List.of());
+            return new EncodedRow(encodeRows(schema, rows, alloc), null, List.of());
         }
 
         // Build dictionaries from every encoded leaf, including leaves nested
         // under list/map/struct. All leaves sharing an id share one value table.
-        Map<Long, LinkedHashMap<String, Integer>> indices = new LinkedHashMap<>();
+        Map<Long, LinkedHashMap<Object, Integer>> indices = new LinkedHashMap<>();
         Map<Long, DictionaryEncoding> encodings = new LinkedHashMap<>();
+        Map<Long, Field> dictionaryFields = new LinkedHashMap<>();
         // Discover definitions from the schema first. Walking values alone is
         // insufficient: an empty list/map (or a null optional container) can
         // still declare a nested dictionary that Arrow requires the stream to
         // publish, even though that dictionary has zero values.
-        for (Field f : fields) collectDictionaryDefinitions(f, indices, encodings);
-        for (Field f : fields) collectDictionaryValues(f, values.get(f.getName()), indices, encodings);
-
-        List<Field> memoryFields = new ArrayList<>(fields.size());
-        Map<String, Object> memoryValues = new LinkedHashMap<>();
-        for (Field f : fields) {
-            memoryFields.add(toDictionaryMemoryField(f));
-            memoryValues.put(f.getName(), toDictionaryMemoryValue(f, values.get(f.getName()), indices));
+        for (Field f : fields) collectDictionaryDefinitions(f, indices, encodings, dictionaryFields);
+        for (Map<String, Object> values : rows) {
+            for (Field f : fields) collectDictionaryValues(f, values.get(f.getName()), indices, encodings);
         }
 
-        VectorSchemaRoot memoryRoot = encodeRow(new Schema(memoryFields), memoryValues, alloc);
+        List<Field> memoryFields = new ArrayList<>(fields.size());
+        for (Field f : fields) memoryFields.add(toDictionaryMemoryField(f));
+        List<Map<String, Object>> memoryRows = new ArrayList<>(rows.size());
+        for (Map<String, Object> values : rows) {
+            Map<String, Object> memoryValues = new LinkedHashMap<>();
+            for (Field f : fields) memoryValues.put(f.getName(), toDictionaryMemoryValue(f, values.get(f.getName()), indices));
+            memoryRows.add(memoryValues);
+        }
+
+        VectorSchemaRoot memoryRoot = encodeRows(new Schema(memoryFields), memoryRows, alloc);
         DictionaryProvider.MapDictionaryProvider provider =
                 new DictionaryProvider.MapDictionaryProvider();
         List<FieldVector> owned = new ArrayList<>();
         boolean ok = false;
         try {
-            for (Map.Entry<Long, LinkedHashMap<String, Integer>> entry : indices.entrySet()) {
-                VarCharVector dictVec = new VarCharVector("dictionary-" + entry.getKey(), alloc);
+            for (Map.Entry<Long, LinkedHashMap<Object, Integer>> entry : indices.entrySet()) {
+                Field source = dictionaryFields.get(entry.getKey());
+                FieldVector dictVec = new Field("dictionary-" + entry.getKey(), new FieldType(false, source.getType(), null), source.getChildren()).createVector(alloc);
                 dictVec.allocateNew();
-                for (Map.Entry<String, Integer> value : entry.getValue().entrySet()) {
-                    dictVec.setSafe(value.getValue(), value.getKey().getBytes(StandardCharsets.UTF_8));
+                for (Map.Entry<Object, Integer> value : entry.getValue().entrySet()) {
+                    Object decoded = value.getKey() instanceof java.nio.ByteBuffer buffer ? binaryDictionaryValue(buffer) : value.getKey();
+                    writeScalar(dictVec, value.getValue(), dictVec.getField(), decoded);
                 }
                 dictVec.setValueCount(entry.getValue().size());
                 owned.add(dictVec);
@@ -202,21 +225,33 @@ public final class Marshalling {
         return f.getChildren().stream().anyMatch(Marshalling::hasDictionary);
     }
 
-    private static String dictionaryString(Object value) {
+    private static Object dictionaryValue(Field field, Object value) {
+        if (field.getType() instanceof ArrowType.Binary) {
+            if (!(value instanceof byte[] bytes)) throw new IllegalArgumentException("Binary dictionary value must be byte[]");
+            return java.nio.ByteBuffer.wrap(bytes.clone()).asReadOnlyBuffer();
+        }
         return value instanceof Enum<?> e ? e.name() : value.toString();
+    }
+
+    private static byte[] binaryDictionaryValue(java.nio.ByteBuffer value) {
+        byte[] bytes = new byte[value.remaining()];
+        value.duplicate().get(bytes);
+        return bytes;
     }
 
     private static void collectDictionaryDefinitions(
             Field f,
-            Map<Long, LinkedHashMap<String, Integer>> indices,
-            Map<Long, DictionaryEncoding> encodings) {
+            Map<Long, LinkedHashMap<Object, Integer>> indices,
+            Map<Long, DictionaryEncoding> encodings, Map<Long, Field> dictionaryFields) {
         if (f.getDictionary() != null) {
             long id = f.getDictionary().getId();
             indices.computeIfAbsent(id, ignored -> new LinkedHashMap<>());
             encodings.putIfAbsent(id, f.getDictionary());
+            Field previous = dictionaryFields.putIfAbsent(id, f);
+            if (previous != null && !previous.getType().equals(f.getType())) throw new IllegalArgumentException("Dictionary id has conflicting value types");
         }
         for (Field child : f.getChildren()) {
-            collectDictionaryDefinitions(child, indices, encodings);
+            collectDictionaryDefinitions(child, indices, encodings, dictionaryFields);
         }
     }
 
@@ -228,16 +263,16 @@ public final class Marshalling {
 
     private static void collectDictionaryValues(
             Field f, Object value,
-            Map<Long, LinkedHashMap<String, Integer>> indices,
+            Map<Long, LinkedHashMap<Object, Integer>> indices,
             Map<Long, DictionaryEncoding> encodings) {
         if (value instanceof Optional<?> optional) value = optional.orElse(null);
         if (f.getDictionary() != null) {
             long id = f.getDictionary().getId();
-            LinkedHashMap<String, Integer> dict = indices.computeIfAbsent(id, ignored -> new LinkedHashMap<>());
+            LinkedHashMap<Object, Integer> dict = indices.computeIfAbsent(id, ignored -> new LinkedHashMap<>());
             encodings.putIfAbsent(id, f.getDictionary());
             if (value == null) return;
-            String text = dictionaryString(value);
-            dict.computeIfAbsent(text, ignored -> dict.size());
+            Object item = dictionaryValue(f, value);
+            dict.computeIfAbsent(item, ignored -> dict.size());
             return;
         }
         if (value == null) return;
@@ -280,11 +315,11 @@ public final class Marshalling {
     }
 
     private static Object toDictionaryMemoryValue(
-            Field f, Object value, Map<Long, LinkedHashMap<String, Integer>> indices) {
+            Field f, Object value, Map<Long, LinkedHashMap<Object, Integer>> indices) {
         if (value instanceof Optional<?> optional) value = optional.orElse(null);
         if (value == null) return null;
         if (f.getDictionary() != null) {
-            return indices.get(f.getDictionary().getId()).get(dictionaryString(value));
+            return indices.get(f.getDictionary().getId()).get(dictionaryValue(f, value));
         }
         return switch (f.getType().getTypeID()) {
             case List -> {
@@ -367,9 +402,10 @@ public final class Marshalling {
             org.apache.arrow.vector.dictionary.Dictionary d = provider.lookup(de.getId());
             if (d != null) {
                 FieldVector dv = d.getVector();
-                if (dv instanceof VarCharVector vc) {
-                    return new String(vc.get(idx), java.nio.charset.StandardCharsets.UTF_8);
-                }
+                if (idx < 0 || idx >= dv.getValueCount()) throw new IllegalArgumentException("Invalid dictionary index");
+                if (dv.isNull(idx)) return null;
+                if (dv instanceof VarCharVector vc) return new String(vc.get(idx), java.nio.charset.StandardCharsets.UTF_8);
+                if (dv instanceof VarBinaryVector binary) return binary.get(idx);
             }
         }
         return readScalar(v, row, f);
@@ -523,16 +559,12 @@ public final class Marshalling {
     }
 
     private static void writeList(FieldVector v, int row, Field f, List<?> values) {
-        ListVector lv = (ListVector) v;
-        UnionListWriter w = lv.getWriter();
-        w.setPosition(row);
-        w.startList();
+        ListVector list = (ListVector) v;
+        int start = list.startNewValue(row);
         Field child = f.getChildren().get(0);
-        for (Object e : values) {
-            writeListElement(w, child, e);
-        }
-        w.endList();
-        lv.setLastSet(row);
+        FieldVector data = list.getDataVector();
+        for (int i = 0; i < values.size(); i++) writeScalar(data, start + i, child, values.get(i));
+        list.endValue(row, values.size());
     }
 
     private static void writeListElement(ListWriter w, Field child, Object e) {
@@ -729,20 +761,18 @@ public final class Marshalling {
     }
 
     private static void writeMap(FieldVector v, int row, Field f, Map<?, ?> values) {
-        MapVector mv = (MapVector) v;
-        UnionMapWriter w = mv.getWriter();
-        w.setPosition(row);
-        w.startMap();
+        MapVector map = (MapVector) v;
+        int start = map.startNewValue(row);
         Field entries = f.getChildren().get(0);
-        Field keyField = entries.getChildren().get(0);
-        Field valField = entries.getChildren().get(1);
-        for (Map.Entry<?, ?> e : values.entrySet()) {
-            w.startEntry();
-            writeMapKey(w, keyField, e.getKey());
-            writeMapValue(w, valField, e.getValue());
-            w.endEntry();
+        FieldVector data = map.getDataVector();
+        int offset = 0;
+        for (Map.Entry<?, ?> entry : values.entrySet()) {
+            Map<String, Object> pair = new LinkedHashMap<>();
+            pair.put(entries.getChildren().get(0).getName(), entry.getKey());
+            pair.put(entries.getChildren().get(1).getName(), entry.getValue());
+            writeScalar(data, start + offset++, entries, pair);
         }
-        w.endMap();
+        map.endValue(row, values.size());
     }
 
     private static void writeMapKey(MapWriter w, Field f, Object key) {
@@ -991,9 +1021,10 @@ public final class Marshalling {
             if (provider != null) {
                 int idx = readIntIndex(v, row);
                 org.apache.arrow.vector.dictionary.Dictionary d = provider.lookup(de.getId());
-                if (d != null && d.getVector() instanceof VarCharVector vc) {
-                    return new String(vc.get(idx), java.nio.charset.StandardCharsets.UTF_8);
-                }
+                if (d != null && (idx < 0 || idx >= d.getVector().getValueCount())) throw new IllegalArgumentException("Invalid dictionary index");
+                if (d != null && d.getVector().isNull(idx)) return null;
+                if (d != null && d.getVector() instanceof VarCharVector vc) return new String(vc.get(idx), java.nio.charset.StandardCharsets.UTF_8);
+                if (d != null && d.getVector() instanceof VarBinaryVector binary) return binary.get(idx);
             }
         }
         ArrowType t = f.getType();

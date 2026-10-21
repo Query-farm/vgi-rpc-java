@@ -56,6 +56,7 @@ public final class IpcStreamWriter implements AutoCloseable {
     private Schema declaredSchema;
     private boolean schemaEmittedDirect;
     private boolean closed;
+    private boolean eosWritten;
 
     /**
      * Write an Arrow IPC stream to an {@link OutputStream}.
@@ -182,7 +183,9 @@ public final class IpcStreamWriter implements AutoCloseable {
 
     /** Write the EOS marker. Idempotent on close. */
     public void writeEos() throws IOException {
+        if (eosWritten) return;
         ArrowStreamWriter.writeEndOfStream(out, IpcOption.DEFAULT);
+        eosWritten = true;
     }
 
     /**
@@ -201,7 +204,7 @@ public final class IpcStreamWriter implements AutoCloseable {
             // delegate.close() — that would close the underlying channel
             // (the per-connection socket), but in VGI the channel persists
             // across many RPCs on the same connection.
-            delegate.end();
+            if (!eosWritten) { delegate.end(); eosWritten = true; }
             // ArrowStreamWriter.ensureDictionariesWritten() stashes a *copy* of
             // each dictionary vector in its private previousDictionaries map
             // (used to detect dict changes across batches). Those copies are
