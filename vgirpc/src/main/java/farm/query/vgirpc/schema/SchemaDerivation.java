@@ -117,11 +117,9 @@ public final class SchemaDerivation {
      * "expected Arrow type dictionary&lt;values=string, indices=int16&gt; but the
      * request batch carried string".</p>
      *
-     * <p>Applied to PARAMETERS only. Result columns carry the same annotation and
-     * are deliberately left as plain utf8: every VGI reader resolves either
-     * encoding, no peer validates a result schema this strictly, and encoding
-     * them would mean threading a dictionary provider through every result and
-     * stream write path for no correctness gain.</p>
+     * <p>This parameter helper also assigns distinct stream-local ids. Record
+     * fields retain the same declared encoding through {@link #buildField};
+     * peers may validate embedded result-record schemas strictly.</p>
      *
      * @param f  the derived field
      * @param annSource the parameter the field came from
@@ -212,8 +210,7 @@ public final class SchemaDerivation {
             arrowType = override.value().arrowType();
             children = Collections.emptyList();
         } else {
-            // Java declares enums as plain utf8 on the wire. The reader is tolerant
-            // of clients that send dict-encoded enum columns and resolves them.
+            // Enum fields use UTF-8 values with int16 dictionary indices below.
             arrowType = inferArrowType(unwrapped);
             // For records that are sent as IPC binary blobs (e.g. unary params/results,
             // not nested-in-struct), drop child fields — Binary has no children.
@@ -226,9 +223,10 @@ public final class SchemaDerivation {
                 children = childFields(unwrapped);
             }
         }
-        DictionaryEncoding dictionary = override != null && override.value() == ArrowFieldType.DICT_INT32_BINARY
-                ? annotationDictionary(override.value(), 0)
-                : rawClass(unwrapped).isEnum() ? stringDictionary(0) : null;
+        DictionaryEncoding dictionary = override == null ? null : annotationDictionary(override.value(), 0);
+        if (dictionary == null && rawClass(unwrapped).isEnum()) {
+            dictionary = stringDictionary(0);
+        }
         FieldType ft = new FieldType(nullable, arrowType, dictionary);
         return new Field(name, ft, children);
     }
