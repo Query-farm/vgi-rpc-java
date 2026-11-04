@@ -22,7 +22,6 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
 import java.util.Map;
 
@@ -73,7 +72,7 @@ public final class IpcStreamWriter implements AutoCloseable {
      * survive both.
      *
      * <p>This port needs neither, because nothing ever offers the kernel a
-     * buffer that big. {@link Channels#newChannel(OutputStream)} copies
+     * buffer that big. {@link StreamChannels#writable(OutputStream)} copies
      * through a fixed 8 KiB heap array, so an arbitrarily large
      * {@link java.nio.ByteBuffer} reaches {@code raw} as a run of 8 KiB
      * writes; every transport then wraps {@code raw} in a 64 KiB
@@ -87,7 +86,7 @@ public final class IpcStreamWriter implements AutoCloseable {
      * @param raw the destination byte stream
      */
     public IpcStreamWriter(OutputStream raw) {
-        this.rawChannel = Channels.newChannel(raw);
+        this.rawChannel = StreamChannels.writable(raw);
         this.out = new WriteChannel(rawChannel);
     }
 

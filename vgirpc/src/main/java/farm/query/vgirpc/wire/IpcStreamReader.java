@@ -16,7 +16,6 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.util.Map;
 
@@ -47,7 +46,7 @@ public final class IpcStreamReader implements AutoCloseable {
      * @param allocator allocator for the decoded vectors
      */
     public IpcStreamReader(InputStream raw, BufferAllocator allocator) {
-        this(Channels.newChannel(raw), allocator);
+        this(StreamChannels.readable(raw), allocator);
     }
 
     /** Read directly from a {@link ReadableByteChannel} (e.g. a shared-memory
