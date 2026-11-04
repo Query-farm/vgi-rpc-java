@@ -58,7 +58,7 @@ dependencies {
 <dependency>
   <groupId>farm.query</groupId>
   <artifactId>vgirpc</artifactId>
-  <version>0.33.0</version>
+  <version>0.33.3</version>
 </dependency>
 ```
 
