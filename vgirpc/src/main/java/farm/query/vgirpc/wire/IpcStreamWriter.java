@@ -203,15 +203,14 @@ public final class IpcStreamWriter implements AutoCloseable {
             // delegate.close() — that would close the underlying channel
             // (the per-connection socket), but in VGI the channel persists
             // across many RPCs on the same connection.
-            if (!eosWritten) { delegate.end(); eosWritten = true; }
-            // ArrowStreamWriter.ensureDictionariesWritten() stashes a *copy* of
-            // each dictionary vector in its private previousDictionaries map
-            // (used to detect dict changes across batches). Those copies are
-            // allocated from the worker's allocator and are only freed by
-            // ArrowStreamWriter.close() — which we skip to keep the channel
-            // open. Release them here so dict-encoded responses don't leak a
-            // dictionary copy per emit.
-            releaseDelegateDictionaryCopies(delegate);
+            try {
+                if (!eosWritten) { delegate.end(); eosWritten = true; }
+            } finally {
+                // ArrowStreamWriter keeps dictionary copies to detect changes
+                // across batches. Release those copies without closing the
+                // shared channel, including when writing EOS failed.
+                releaseDelegateDictionaryCopies(delegate);
+            }
             return;
         }
         if (!schemaEmittedDirect) {
@@ -219,6 +218,17 @@ public final class IpcStreamWriter implements AutoCloseable {
             MessageSerializer.serialize(out, s);
         }
         writeEos();
+    }
+
+    /**
+     * Release writer-internal buffers without writing or flushing any bytes.
+     * Use after a transport failure, when writing EOS would be unsafe. The
+     * caller owns the underlying channel and any input vectors. Idempotent.
+     */
+    public void abort() {
+        if (closed) return;
+        closed = true;
+        if (delegate != null) releaseDelegateDictionaryCopies(delegate);
     }
 
     /**
