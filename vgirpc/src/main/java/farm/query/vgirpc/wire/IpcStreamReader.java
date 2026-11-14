@@ -15,7 +15,6 @@ import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.message.MessageChannelReader;
 import org.apache.arrow.vector.ipc.message.VgiMessageReader;
-import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.validate.ValidateVectorBufferVisitor;
 
@@ -35,8 +34,8 @@ import java.util.Map;
  * {@link ArrowStreamReader} so the original (wire-format) schema can be
  * recovered before {@code ArrowReader.initialize} converts it to memory
  * format. Record and dictionary batches are structurally validated against
- * their original field-node lengths before stock Arrow loading can normalize
- * them. Dictionary tracking, framing and EOS use the stock reader.</p>
+ * their original field-node lengths before Arrow propagates the root row count
+ * into the loaded vectors. Dictionary tracking, framing and EOS use the stock reader.</p>
  */
 public final class IpcStreamReader implements AutoCloseable {
 
@@ -172,16 +171,15 @@ public final class IpcStreamReader implements AutoCloseable {
 
         @Override
         protected void loadRecordBatch(ArrowRecordBatch batch) {
-            boolean validated = false;
             try {
-                validateWireShape(batch, getVectorSchemaRoot().getSchema().getFields());
-                validated = true;
+                VectorSchemaRoot target = getVectorSchemaRoot();
+                loadAndValidate(batch, target);
+                target.setRowCount(batch.getLength());
             } catch (IOException | RuntimeException failure) {
                 throw new IllegalArgumentException("Malformed Arrow IPC batch: " + failure.getMessage(), failure);
             } finally {
-                if (!validated) batch.close();
+                batch.close();
             }
-            super.loadRecordBatch(batch);
         }
 
         @Override
@@ -190,7 +188,10 @@ public final class IpcStreamReader implements AutoCloseable {
             try {
                 Dictionary dictionary = lookup(batch.getDictionaryId());
                 if (dictionary == null) throw new IllegalArgumentException("Unknown dictionary ID " + batch.getDictionaryId());
-                validateWireShape(batch.getDictionary(), List.of(dictionary.getVector().getField()));
+                try (VectorSchemaRoot owner = VectorSchemaRoot.create(
+                        new Schema(List.of(dictionary.getVector().getField())), validationAllocator)) {
+                    loadAndValidate(batch.getDictionary(), owner);
+                }
                 validated = true;
             } catch (RuntimeException failure) {
                 throw new IllegalArgumentException("Malformed Arrow IPC dictionary batch: " + failure.getMessage(), failure);
@@ -200,31 +201,30 @@ public final class IpcStreamReader implements AutoCloseable {
             super.loadDictionary(batch);
         }
 
-        private void validateWireShape(ArrowRecordBatch batch, List<Field> fields) {
+        private void loadAndValidate(ArrowRecordBatch batch, VectorSchemaRoot target) {
             if (batch.getLength() < 0) throw new IllegalArgumentException("Negative IPC batch length");
             // VectorLoader finishes by propagating the root row count into
             // vectors. ListVector.setValueCount then resets its child's count
             // from the final offset, potentially allocating/padding a corrupt
             // list into apparently valid data. Validate the original field-node
-            // lengths before that normalization using temporary retained buffers.
-            try (VectorSchemaRoot owner = VectorSchemaRoot.create(new Schema(fields), validationAllocator)) {
-                VectorSchemaRoot raw = new VectorSchemaRoot(fields, owner.getFieldVectors(), batch.getLength()) {
-                    @Override public void setRowCount(int count) {
-                        if (count != getRowCount()) throw new IllegalArgumentException("Unexpected IPC root length");
-                        // Preserve the individual counts loaded from field nodes.
-                    }
-                };
-                new VectorLoader(raw).load(batch);
-                // These vector types were created from the schema above. Arrow
-                // 19's separate type visitor incorrectly treats MapVector as
-                // ListVector and rejects valid maps, so check buffers directly.
-                var validator = new ValidateVectorBufferVisitor();
-                for (var vector : raw.getFieldVectors()) {
-                    if (vector.getValueCount() != batch.getLength()) {
-                        throw new IllegalArgumentException("IPC root and field-node lengths differ");
-                    }
-                    vector.accept(validator, null);
+            // lengths before that normalization. This wrapper borrows target's
+            // vectors: the target owns them and they are only loaded once.
+            VectorSchemaRoot raw = new VectorSchemaRoot(target.getSchema().getFields(), target.getFieldVectors(), batch.getLength()) {
+                @Override public void setRowCount(int count) {
+                    if (count != getRowCount()) throw new IllegalArgumentException("Unexpected IPC root length");
+                    // Preserve the individual counts loaded from field nodes.
                 }
+            };
+            new VectorLoader(raw).load(batch);
+            // These vector types were created from the schema above. Arrow
+            // 19's separate type visitor incorrectly treats MapVector as
+            // ListVector and rejects valid maps, so check buffers directly.
+            var validator = new ValidateVectorBufferVisitor();
+            for (var vector : raw.getFieldVectors()) {
+                if (vector.getValueCount() != batch.getLength()) {
+                    throw new IllegalArgumentException("IPC root and field-node lengths differ");
+                }
+                vector.accept(validator, null);
             }
         }
     }
