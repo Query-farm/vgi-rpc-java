@@ -168,6 +168,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             throw e;
         } catch (IOException e) {
             closed = true;
+            releaseResources();
             throw new RpcError("TransportError", "stream tick failed: " + e.getMessage(), "");
         }
     }
@@ -201,6 +202,7 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             throw e;
         } catch (IOException e) {
             closed = true;
+            releaseResources();
             throw new RpcError("TransportError", "stream exchange failed: " + e.getMessage(), "");
         }
     }
@@ -223,7 +225,21 @@ public final class ClientStreamSession<S extends StreamState> extends RpcStream<
             inputWriter.close();
             transport.writer().flush();
         } catch (Exception ignore) {}
-        drainOutput();
+        try {
+            drainOutput();
+        } finally {
+            releaseResources();
+        }
+    }
+
+    /** Free client-owned buffers without doing I/O on a failed transport. */
+    private void releaseResources() {
+        releaseResolvedRoot();
+        if (inputWriter != null) inputWriter.abort();
+        if (outputReader != null) {
+            try { outputReader.close(); } catch (IOException ignore) { /* best-effort */ }
+            outputReader = null;
+        }
     }
 
     /**
