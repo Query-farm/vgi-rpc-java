@@ -5,18 +5,24 @@ package farm.query.vgirpc.wire;
 
 import org.apache.arrow.flatbuf.Message;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.dictionary.Dictionary;
 import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ReadChannel;
+import org.apache.arrow.vector.ipc.message.ArrowDictionaryBatch;
+import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.message.MessageChannelReader;
 import org.apache.arrow.vector.ipc.message.VgiMessageReader;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.validate.ValidateVectorBufferVisitor;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.channels.ReadableByteChannel;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -28,8 +34,9 @@ import java.util.Map;
  * without desyncing the stream), and we subclass
  * {@link ArrowStreamReader} so the original (wire-format) schema can be
  * recovered before {@code ArrowReader.initialize} converts it to memory
- * format. Everything else — dictionary tracking, dict-batch loading,
- * record-batch loading, framing, EOS — is inherited from stock Arrow.</p>
+ * format. Record and dictionary batches are structurally validated against
+ * their original field-node lengths before stock Arrow loading can normalize
+ * them. Dictionary tracking, framing and EOS use the stock reader.</p>
  */
 public final class IpcStreamReader implements AutoCloseable {
 
@@ -149,9 +156,11 @@ public final class IpcStreamReader implements AutoCloseable {
      */
     private static final class StreamReaderImpl extends ArrowStreamReader {
         Schema wireSchema;
+        private final BufferAllocator validationAllocator;
 
         StreamReaderImpl(MessageChannelReader mr, BufferAllocator alloc) {
             super(mr, alloc);
+            validationAllocator = alloc;
         }
 
         @Override
@@ -159,6 +168,64 @@ public final class IpcStreamReader implements AutoCloseable {
             Schema s = super.readSchema();
             wireSchema = s;
             return s;
+        }
+
+        @Override
+        protected void loadRecordBatch(ArrowRecordBatch batch) {
+            boolean validated = false;
+            try {
+                validateWireShape(batch, getVectorSchemaRoot().getSchema().getFields());
+                validated = true;
+            } catch (IOException | RuntimeException failure) {
+                throw new IllegalArgumentException("Malformed Arrow IPC batch: " + failure.getMessage(), failure);
+            } finally {
+                if (!validated) batch.close();
+            }
+            super.loadRecordBatch(batch);
+        }
+
+        @Override
+        protected void loadDictionary(ArrowDictionaryBatch batch) {
+            boolean validated = false;
+            try {
+                Dictionary dictionary = lookup(batch.getDictionaryId());
+                if (dictionary == null) throw new IllegalArgumentException("Unknown dictionary ID " + batch.getDictionaryId());
+                validateWireShape(batch.getDictionary(), List.of(dictionary.getVector().getField()));
+                validated = true;
+            } catch (RuntimeException failure) {
+                throw new IllegalArgumentException("Malformed Arrow IPC dictionary batch: " + failure.getMessage(), failure);
+            } finally {
+                if (!validated) batch.close();
+            }
+            super.loadDictionary(batch);
+        }
+
+        private void validateWireShape(ArrowRecordBatch batch, List<Field> fields) {
+            if (batch.getLength() < 0) throw new IllegalArgumentException("Negative IPC batch length");
+            // VectorLoader finishes by propagating the root row count into
+            // vectors. ListVector.setValueCount then resets its child's count
+            // from the final offset, potentially allocating/padding a corrupt
+            // list into apparently valid data. Validate the original field-node
+            // lengths before that normalization using temporary retained buffers.
+            try (VectorSchemaRoot owner = VectorSchemaRoot.create(new Schema(fields), validationAllocator)) {
+                VectorSchemaRoot raw = new VectorSchemaRoot(fields, owner.getFieldVectors(), batch.getLength()) {
+                    @Override public void setRowCount(int count) {
+                        if (count != getRowCount()) throw new IllegalArgumentException("Unexpected IPC root length");
+                        // Preserve the individual counts loaded from field nodes.
+                    }
+                };
+                new VectorLoader(raw).load(batch);
+                // These vector types were created from the schema above. Arrow
+                // 19's separate type visitor incorrectly treats MapVector as
+                // ListVector and rejects valid maps, so check buffers directly.
+                var validator = new ValidateVectorBufferVisitor();
+                for (var vector : raw.getFieldVectors()) {
+                    if (vector.getValueCount() != batch.getLength()) {
+                        throw new IllegalArgumentException("IPC root and field-node lengths differ");
+                    }
+                    vector.accept(validator, null);
+                }
+            }
         }
     }
 
