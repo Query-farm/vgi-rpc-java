@@ -157,7 +157,10 @@ jobs:
           distribution: temurin
           java-version: '25'
 
+      # No uv cache: its post-job prune waits on the vendor's cache lock.
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -173,6 +176,7 @@ jobs:
           log="$RUNNER_TEMP/fake-vendor.log"
           nohup uvx --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
             vgi-rpc-fake-vendor --test-routes --token "test-token=tenant-a" > "$log" 2>&1 &
+          echo "FAKE_VENDOR_PID=$!" >> "$GITHUB_ENV"
           url=""
           for _ in $(seq 1 360); do
             url="$(sed -n 's/^URL://p' "$log" | head -1)"
@@ -191,6 +195,10 @@ jobs:
           xml=vgirpc/build/test-results/test/TEST-farm.query.vgirpc.vendor.FakeVendorTest.xml
           grep -q 'skipped="0"' "$xml" || { echo "::error::FakeVendorTest was skipped"; exit 1; }
           grep -q 'tests="0"' "$xml" && { echo "::error::FakeVendorTest ran no tests"; exit 1; } || true
+
+      - name: Stop the fake blob vendor
+        if: always()
+        run: '[ -z "${FAKE_VENDOR_PID:-}" ] || kill "$FAKE_VENDOR_PID" 2>/dev/null || true'
 
   iroh-integration:
     name: native Iroh HTTP integration / Linux x64
