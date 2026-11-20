@@ -20,7 +20,9 @@ env:
   # The Python reference *worker* that same lane calls into. It tracks main like
   # every other lane: a stale pin here once left this client posting routes the
   # worker did not know, and every call 404'd.
-  VGI_RPC_PYTHON_REV: main
+  # TODO(release-wave): back to main. Upload-URL v2 lives on the reference's
+  # protocol-3.4 branch until the release wave, so this branch tracks that.
+  VGI_RPC_PYTHON_REV: protocol-3.4
 
 jobs:
   test:
@@ -147,7 +149,8 @@ jobs:
     env:
       # The vgi-rpc-python commit whose vgi-rpc-fake-vendor --test-routes this
       # job runs (the same pin as the vgi extension's start_fake_blob_vendor.sh).
-      VGI_RPC_FAKE_VENDOR_REF: af57e6bb395e5198b2a5336def976d73bfc87d8f
+      # protocol-3.4: the fake vendor that verifies sized PUTs (upload-URL v2).
+      VGI_RPC_FAKE_VENDOR_REF: a07ccf2e1bf1c0832ae43757a55e8b4817674b2d
     steps:
       - uses: actions/checkout@v4
 
@@ -414,8 +417,9 @@ jobs:
       # yardstick, and a pinned yardstick is how that lane rotted for eleven days while
       # reporting green. A reference change that breaks this port should turn
       # this port red the same day.
-      - name: Clone vgi-rpc-python reference (main, deliberately unpinned)
-        run: git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git "$VGI_RPC_REPOS/vgi-rpc-python"
+      # TODO(release-wave): back to main (upload-URL v2 is on protocol-3.4 until then).
+      - name: Clone vgi-rpc-python reference (protocol-3.4 branch, deliberately unpinned)
+        run: git clone --depth 1 --branch protocol-3.4 https://github.com/Query-farm/vgi-rpc-python.git "$VGI_RPC_REPOS/vgi-rpc-python"
 
       - name: Install Python dependencies
         run: |

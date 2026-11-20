@@ -1781,50 +1781,46 @@ public final class HttpServer {
      * shape vended blank PUT URLs that storage accepted any bytes on.
      */
     private static List<UploadRequest> parseUploadRequests(VectorSchemaRoot root, Long maxUploadBytes) {
+        boolean hasCount = root.getSchema().getFields().stream().anyMatch(f -> f.getName().equals("count"));
         org.apache.arrow.vector.FieldVector raw = root.getVector("uploads");
-        if (raw == null || root.getSchema().getFields().stream().anyMatch(f -> f.getName().equals("count"))) {
-            throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": retired count shape; this server requires "
+        if (hasCount || raw == null) {
+            throw new IllegalArgumentException(UPLOAD_URL_METHOD
+                    + " request uses the retired count shape: this server requires "
                     + UPLOAD_URL_HEADER + ": " + UPLOAD_URL_PROTOCOL_VERSION
-                    + " (send 'uploads', one (size, sha256) entry per upload)");
+                    + " and an 'uploads' parameter (list<struct<size: int64, sha256: utf8>>, one entry per upload)");
         }
-        if (!(raw instanceof ListVector list) || !(list.getDataVector() instanceof StructVector items)) {
-            throw new IllegalArgumentException(UPLOAD_URL_METHOD
-                    + ": 'uploads' must be list<struct<size: int64, sha256: utf8>>");
-        }
-        if (root.getRowCount() != 1 || list.isNull(0)) {
-            throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": 'uploads' must be one non-null list");
-        }
-        org.apache.arrow.vector.ValueVector sizeChild = items.getChild("size");
-        org.apache.arrow.vector.ValueVector shaChild = items.getChild("sha256");
-        if (!(sizeChild instanceof BigIntVector sizes) || !(shaChild instanceof VarCharVector shas)) {
-            throw new IllegalArgumentException(UPLOAD_URL_METHOD
-                    + ": 'uploads' must be list<struct<size: int64, sha256: utf8>>");
+        if (!(raw instanceof ListVector list) || !(list.getDataVector() instanceof StructVector items)
+                || root.getRowCount() != 1 || list.isNull(0)) {
+            throw new IllegalArgumentException(UPLOAD_URL_METHOD + " 'uploads' must have 1-"
+                    + MAX_UPLOAD_URL_COUNT + " entries, got null");
         }
         int start = list.getElementStartIndex(0);
-        int end = list.getElementEndIndex(0);
-        int n = end - start;
+        int n = list.getElementEndIndex(0) - start;
         if (n < 1 || n > MAX_UPLOAD_URL_COUNT) {
-            throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": 'uploads' must have between 1 and "
+            throw new IllegalArgumentException(UPLOAD_URL_METHOD + " 'uploads' must have 1-"
                     + MAX_UPLOAD_URL_COUNT + " entries, got " + n);
         }
+        // Read by name, never by schema comparison; a missing or mistyped child
+        // reads as null and is refused as such.
+        BigIntVector sizes = items.getChild("size") instanceof BigIntVector v ? v : null;
+        VarCharVector shas = items.getChild("sha256") instanceof VarCharVector v ? v : null;
         List<UploadRequest> out = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
             int at = start + i;
-            if (items.isNull(at) || sizes.isNull(at) || shas.isNull(at)) {
-                throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": uploads[" + i + "] has a null field");
+            boolean entry = !items.isNull(at);
+            Long size = entry && sizes != null && !sizes.isNull(at) ? sizes.get(at) : null;
+            if (size == null || size < 1) {
+                throw new IllegalArgumentException(UPLOAD_URL_METHOD + " uploads[" + i
+                        + "].size must be an integer >= 1, got " + (size == null ? "None" : size));
             }
-            long size = sizes.get(at);
-            if (size < 1) {
-                throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": uploads[" + i
-                        + "].size must be >= 1, got " + size);
-            }
-            String sha = new String(shas.get(at), StandardCharsets.UTF_8);
-            if (!SHA256_HEX.matcher(sha).matches()) {
-                throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": uploads[" + i
+            String sha = entry && shas != null && !shas.isNull(at)
+                    ? new String(shas.get(at), StandardCharsets.UTF_8) : null;
+            if (sha == null || !SHA256_HEX.matcher(sha).matches()) {
+                throw new IllegalArgumentException(UPLOAD_URL_METHOD + " uploads[" + i
                         + "].sha256 must be 64 lowercase hex characters");
             }
             if (maxUploadBytes != null && size > maxUploadBytes) {
-                throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": uploads[" + i + "].size " + size
+                throw new IllegalArgumentException(UPLOAD_URL_METHOD + " uploads[" + i + "].size " + size
                         + " exceeds " + MAX_UPLOAD_BYTES_HEADER + " (" + maxUploadBytes + ")");
             }
             out.add(new UploadRequest(size, sha));

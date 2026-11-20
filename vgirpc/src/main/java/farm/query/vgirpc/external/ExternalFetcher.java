@@ -193,7 +193,7 @@ public final class ExternalFetcher {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             String actual = HexFormat.of().formatHex(md.digest(body));
             if (!actual.equalsIgnoreCase(expectedHex)) {
-                throw new IOException("external sha256 mismatch for " + safeUri(url)
+                throw new IOException("ExternalLocation sha256 mismatch (SHA-256 checksum mismatch) for " + safeUri(url)
                         + ": expected " + expectedHex + ", got " + actual);
             }
         } catch (Exception e) {

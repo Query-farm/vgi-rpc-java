@@ -131,6 +131,11 @@ final class LocationResolverTest {
                 () -> resolver.resolveRequest(pointer));
         org.junit.jupiter.api.Assertions.assertTrue(
                 e.getMessage().contains("missing vgi_rpc.location.sha256"), e.getMessage());
+        pointer.put(Metadata.LOCATION_SHA256, "ABC");
+        IllegalArgumentException bad = assertThrows(IllegalArgumentException.class,
+                () -> resolver.resolveRequest(pointer));
+        org.junit.jupiter.api.Assertions.assertTrue(
+                bad.getMessage().contains("not 64 lowercase hex"), bad.getMessage());
         assertEquals(0, hits.get());
     }
 

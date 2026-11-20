@@ -412,14 +412,15 @@ final class CapabilityHeadersTest {
     @Test
     void upload_url_entry_count_bounds_are_refused() throws Exception {
         startUploadServer(null);
-        assertTrue(refusal(UploadRequests.v2(0)).errorMessage().contains("between 1 and 100"));
-        assertTrue(refusal(UploadRequests.v2(101)).errorMessage().contains("between 1 and 100"));
+        assertTrue(refusal(UploadRequests.v2(0)).errorMessage().contains("must have 1-100 entries"));
+        assertTrue(refusal(UploadRequests.v2(101)).errorMessage().contains("must have 1-100 entries"));
     }
 
     @Test
     void upload_url_bad_size_and_hash_are_refused() throws Exception {
         startUploadServer(null);
-        assertTrue(refusal(UploadRequests.v2(1, 0, UploadRequests.SHA)).errorMessage().contains(">= 1"));
+        assertTrue(refusal(UploadRequests.v2(1, 0, UploadRequests.SHA)).errorMessage()
+                .contains("uploads[0].size must be an integer >= 1, got 0"));
         assertTrue(refusal(UploadRequests.v2(1, 5, "A".repeat(64))).errorMessage().contains("64 lowercase hex"));
         assertTrue(refusal(UploadRequests.v2(1, 5, "a".repeat(63))).errorMessage().contains("64 lowercase hex"));
     }

@@ -698,7 +698,9 @@ final class HttpRawClientSurfaceTest {
                 // Verify like R2: a signed checksum the body does not match is refused.
                 String want = exchange.getRequestHeaders().getFirst("x-amz-checksum-sha256");
                 if (want != null && !want.equals(java.util.Base64.getEncoder().encodeToString(sha256(put)))) {
-                    exchange.sendResponseHeaders(400, -1);
+                    byte[] xml = "<Error><Code>BadDigest</Code></Error>".getBytes(StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(400, xml.length);
+                    exchange.getResponseBody().write(xml);
                     exchange.close();
                     return;
                 }
@@ -868,6 +870,7 @@ final class HttpRawClientSurfaceTest {
         assertEquals(java.util.Base64.getEncoder().encodeToString(sha256(uploaded)),
                 putHeaders.get().getFirst("x-amz-checksum-sha256"));
         assertEquals(Integer.toString(uploaded.length), putHeaders.get().getFirst("Content-Length"));
+        assertEquals("application/octet-stream", putHeaders.get().getFirst("Content-Type"));
     }
 
     /** Storage that refuses the body (a checksum mismatch) fails the call; nothing is sent inline. */
@@ -880,6 +883,7 @@ final class HttpRawClientSurfaceTest {
                 .uploadUrlProvider((size, sha256) -> signed(blob, "0".repeat(64))));
         RpcError error = assertThrows(RpcError.class, () -> conn.proxy(RawDemo.class).shout(bigValue()));
         assertEquals("ExternalUploadFailed", error.errorType());
+        assertTrue(error.errorMessage().contains("HTTP 400 BadDigest"), error.errorMessage());
         assertNull(stored.get());
     }
 

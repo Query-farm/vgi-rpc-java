@@ -94,13 +94,19 @@ public final class LocationResolver {
      * @param pointerMeta the pointer batch's custom metadata
      * @return the fetched batch, its metadata and its dictionaries
      * @throws IllegalArgumentException if the pointer has no
-     *     {@code vgi_rpc.location.sha256}
+     *     {@code vgi_rpc.location.sha256}, or one that is not 64 lowercase hex
      * @throws Exception if the fetch, the digest check or the decode fails
      */
     public Resolved resolveRequest(Map<String, String> pointerMeta) throws Exception {
         String sha = pointerMeta.get(Metadata.LOCATION_SHA256);
-        if (sha == null || sha.isEmpty()) {
-            throw new IllegalArgumentException("request pointer batch missing vgi_rpc.location.sha256");
+        String url = redactUrl(pointerMeta.get(Metadata.LOCATION));
+        if (sha == null) {
+            throw new IllegalArgumentException("Request pointer is missing vgi_rpc.location.sha256 "
+                    + "(required on request pointers since vgi-rpc upload-URL protocol v2): " + url);
+        }
+        if (!sha.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException(
+                    "Request pointer vgi_rpc.location.sha256 is not 64 lowercase hex characters: " + url);
         }
         return resolve(pointerMeta, null);
     }

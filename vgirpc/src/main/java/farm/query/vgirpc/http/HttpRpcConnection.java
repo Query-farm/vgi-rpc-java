@@ -617,6 +617,17 @@ public final class HttpRpcConnection implements AutoCloseable {
         }
     }
 
+    private static final java.util.regex.Pattern STORAGE_ERROR_CODE =
+            java.util.regex.Pattern.compile("<Code>([A-Za-z0-9]{1,64})</Code>");
+
+    /** The S3-style {@code <Code>} of a storage error body (BadDigest, IncompleteBody, ...), or {@code null}. */
+    private static String storageErrorCode(byte[] body) {
+        if (body == null || body.length == 0) return null;
+        String head = new String(body, 0, Math.min(body.length, 4096), StandardCharsets.ISO_8859_1);
+        java.util.regex.Matcher m = STORAGE_ERROR_CODE.matcher(head);
+        return m.find() ? m.group(1) : null;
+    }
+
     /** Read row {@code i} of a {@code map<utf8, utf8>} column into an ordered map. */
     private static Map<String, String> readHeaderMap(org.apache.arrow.vector.complex.MapVector map, int i) {
         Map<String, String> out = new LinkedHashMap<>();
@@ -1221,8 +1232,9 @@ public final class HttpRpcConnection implements AutoCloseable {
         HttpReply put = execute("PUT", slot.uploadUrl(), uploadHeaders(slot), body,
                 what + " (upload)", 64L << 10, (h, status, w) -> 64L << 10);
         if (put.status() < 200 || put.status() >= 300) {
+            String code = storageErrorCode(put.body());
             throw new RpcError("ExternalUploadFailed",
-                    "PUT to upload URL failed: HTTP " + put.status(), "");
+                    "PUT to upload URL failed: HTTP " + put.status() + (code == null ? "" : " " + code), "");
         }
         return pointerRequestBody(body, slot.downloadUrl(), announced.sha256(), what);
     }
@@ -1242,11 +1254,12 @@ public final class HttpRpcConnection implements AutoCloseable {
      */
     private Map<String, String> uploadHeaders(UploadUrl slot) {
         Map<String, String> out = new java.util.TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        out.put(HttpHeaders.CONTENT_TYPE, HttpServer.ARROW_CONTENT_TYPE);
         if (sameOrigin(slot.uploadUrl(), endpoint)) headers.forEach(out::put);
-        // Last, so they win: the signature covers them byte for byte, including
-        // a Content-Type the backend chose to sign.
+        // Then the slot's own headers, verbatim: the signature covers them byte
+        // for byte, including a Content-Type the backend chose to sign (GCS).
         slot.uploadHeaders().forEach(out::put);
+        // Only when the slot named none: opaque bytes, as the reference sends.
+        out.putIfAbsent(HttpHeaders.CONTENT_TYPE, "application/octet-stream");
         return out;
     }
 
