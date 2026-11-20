@@ -801,7 +801,7 @@ public final class RpcServer {
                     }
                 } else if (locationResolver != null && LocationResolver.isPointer(paramsRoot.getRowCount(), meta)) {
                     try {
-                        LocationResolver.Resolved res = locationResolver.resolve(meta);
+                        LocationResolver.Resolved res = locationResolver.resolveRequest(meta);
                         resolvedParams = res;
                         paramsRoot = res.root();
                     } catch (Exception fetchExc) {
@@ -1574,7 +1574,7 @@ public final class RpcServer {
             }
         } else if (locationResolver != null && LocationResolver.isPointer(inputRoot.getRowCount(), meta)) {
             try {
-                LocationResolver.Resolved res = locationResolver.resolve(meta);
+                LocationResolver.Resolved res = locationResolver.resolveRequest(meta);
                 resolvedRoot = res;
                 inputRoot = res.root();
                 // The fetched batch's metadata plus the reader's provenance, never

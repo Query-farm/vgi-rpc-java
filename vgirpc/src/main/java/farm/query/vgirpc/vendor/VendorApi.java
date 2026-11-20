@@ -8,7 +8,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import farm.query.vgirpc.external.LocationResolver;
-import farm.query.vgirpc.external.UploadUrlProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,9 +52,7 @@ final class VendorApi implements AutoCloseable {
     static final String GET_PATH = "/v1/blobs/get";
     static final String DELETE_PATH = "/v1/blobs/delete";
     static final String DELETE_SCOPE_PATH = "/v1/blobs/delete_scope";
-    static final String UPLOAD_URLS_PATH = "/v1/upload_urls";
     static final String INFO_PATH = "/v1/info";
-    static final int MAX_UPLOAD_URLS = 100;
     static final int MAX_DELETE_IDS = 1000;
 
     final String baseUrl;
@@ -444,28 +441,6 @@ final class VendorApi implements AutoCloseable {
         JsonNode resp = postJson(DELETE_SCOPE_PATH, "delete_scope", body);
         JsonNode d = resp.get("deleted");
         return d != null && d.isIntegralNumber() ? d.asLong() : 0;
-    }
-
-    List<UploadUrlProvider.UploadUrl> uploadUrls(int count) {
-        if (count < 1 || count > MAX_UPLOAD_URLS) {
-            throw new IllegalArgumentException("count must be between 1 and " + MAX_UPLOAD_URLS);
-        }
-        ObjectNode body = JSON.createObjectNode();
-        body.put("count", count);
-        JsonNode resp = postJson(UPLOAD_URLS_PATH, "upload_urls", body);
-        JsonNode urls = field(resp, "urls", "upload_urls");
-        if (!urls.isArray() || urls.isEmpty()) {
-            throw new VendorError("Blob vendor upload_urls response has malformed 'urls'");
-        }
-        List<UploadUrlProvider.UploadUrl> out = new ArrayList<>();
-        for (JsonNode item : urls) {
-            if (!item.isObject()) throw new VendorError("Blob vendor upload_urls response has a malformed entry");
-            out.add(new UploadUrlProvider.UploadUrl(
-                    strField(item, "upload_url", "upload_urls"),
-                    strField(item, "download_url", "upload_urls"),
-                    parseExpires(field(item, "expires_at", "upload_urls"))));
-        }
-        return out;
     }
 
     VendorInfo info() {

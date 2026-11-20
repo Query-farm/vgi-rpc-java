@@ -400,7 +400,7 @@ public final class Wire {
             if (resolver != null && LocationResolver.isPointer(root.getRowCount(), meta)) {
                 LocationResolver.Resolved resolved;
                 try {
-                    resolved = resolver.resolve(meta);
+                    resolved = resolver.resolveRequest(meta);
                 } catch (Exception e) {
                     throw new IOException("failed to resolve externalized request", e);
                 }

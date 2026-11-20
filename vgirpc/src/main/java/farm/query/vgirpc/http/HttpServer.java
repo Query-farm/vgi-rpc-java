@@ -42,7 +42,12 @@ import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.TimeStampMicroTZVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.MapVector;
+import org.apache.arrow.vector.complex.StructVector;
+import org.apache.arrow.vector.complex.impl.UnionMapWriter;
 import org.apache.arrow.vector.types.TimeUnit;
+import org.apache.arrow.vector.util.Text;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -111,8 +116,17 @@ public final class HttpServer {
 
     /** Capability response header (mirrors {@code vgi_rpc/http/_common.py}): the request-body size cap in bytes. */
     public static final String MAX_REQUEST_BYTES_HEADER = "VGI-Max-Request-Bytes";
-    /** Capability response header: {@code "true"} when the {@code __upload_url__} endpoint is wired up. */
+    /**
+     * Capability response header: the upload-URL protocol version, {@value #UPLOAD_URL_PROTOCOL_VERSION},
+     * when the {@code __upload_url__} endpoint is wired up. A v1 server sent {@code "true"}.
+     */
     public static final String UPLOAD_URL_HEADER = "VGI-Upload-URL-Support";
+    /**
+     * The upload-URL protocol version this server speaks and this client requires:
+     * {@code __upload_url__/init} takes one {@code (size, sha256)} entry per upload
+     * and answers with sized URLs plus the headers the PUT must carry.
+     */
+    public static final String UPLOAD_URL_PROTOCOL_VERSION = "2";
     /** Capability response header: advisory per-object upload size cap in bytes. */
     public static final String MAX_UPLOAD_BYTES_HEADER = "VGI-Max-Upload-Bytes";
     /** Capability response header: operator-configured cap on inline response bodies, in bytes. */
@@ -147,22 +161,36 @@ public final class HttpServer {
      * need not copy the constant.
      */
     public static final String UPLOAD_URL_METHOD = "__upload_url__";
-    /** Cap on the {@code count} parameter to one {@code __upload_url__/init} call. */
+    /** Cap on the number of {@code uploads} entries in one {@code __upload_url__/init} call. */
     public static final int MAX_UPLOAD_URL_COUNT = 100;
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    /** Schema for the {@code __upload_url__} request batch. */
+    /**
+     * Schema for the {@code __upload_url__} request batch:
+     * {@code uploads: list<struct<size: int64 not null, sha256: utf8 not null>> not null},
+     * one entry per upload.
+     */
     public static final Schema UPLOAD_URL_PARAMS_SCHEMA = new Schema(List.of(
-            new Field("count", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+            new Field("uploads", FieldType.notNullable(new ArrowType.List()), List.of(
+                    new Field("item", FieldType.nullable(new ArrowType.Struct()), List.of(
+                            new Field("size", FieldType.notNullable(new ArrowType.Int(64, true)), null),
+                            new Field("sha256", FieldType.notNullable(new ArrowType.Utf8()), null)))))));
 
-    /** Schema for the upload-URL response batch. */
+    /**
+     * Schema for the upload-URL response batch: one row per request entry, in
+     * order, each with the headers the client must send on its PUT.
+     */
     public static final Schema UPLOAD_URL_RESPONSE_SCHEMA = new Schema(List.of(
-            new Field("upload_url", FieldType.nullable(new ArrowType.Utf8()), null),
-            new Field("download_url", FieldType.nullable(new ArrowType.Utf8()), null),
+            new Field("upload_url", FieldType.notNullable(new ArrowType.Utf8()), null),
+            new Field("download_url", FieldType.notNullable(new ArrowType.Utf8()), null),
             new Field("expires_at",
-                    FieldType.nullable(new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")),
-                    null)));
+                    FieldType.notNullable(new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC")),
+                    null),
+            new Field("upload_headers", FieldType.notNullable(new ArrowType.Map(false)), List.of(
+                    new Field("entries", FieldType.notNullable(new ArrowType.Struct()), List.of(
+                            new Field("key", FieldType.notNullable(new ArrowType.Utf8()), null),
+                            new Field("value", FieldType.nullable(new ArrowType.Utf8()), null)))))));
 
     private static final Schema UPLOAD_URL_SCHEMA = UPLOAD_URL_RESPONSE_SCHEMA;
 
@@ -416,12 +444,13 @@ public final class HttpServer {
      *                         Default {@code false}.
      * @param uploadUrlProvider when non-null, wires the {@code __upload_url__/init}
      *                         endpoint (presigned upload/download URL minting) and
-     *                         advertises {@code VGI-Upload-URL-Support: true}.
+     *                         advertises {@code VGI-Upload-URL-Support: 2}.
      *                         {@code null} disables the endpoint.
      * @param maxUploadBytes   advisory per-object upload cap advertised via
      *                         {@code VGI-Max-Upload-Bytes} when an upload-URL
      *                         provider is set; {@code null} omits the header.
-     *                         Not enforced server-side.
+     *                         {@code __upload_url__/init} refuses an entry whose
+     *                         declared size exceeds it.
      * @param advertisedMaxResponseBytes operator-facing cap on inline response
      *                         bodies, advertised via {@code VGI-Max-Response-Bytes}
      *                         and enforced post-flush for unary and stream-exchange
@@ -856,7 +885,7 @@ public final class HttpServer {
              */
             public Builder advertiseMaxRequestBytes(boolean v) { this.advertiseMaxRequestBytes = v; return this; }
             /**
-             * Wire the {@code __upload_url__/init} endpoint and advertise {@code VGI-Upload-URL-Support: true}.
+             * Wire the {@code __upload_url__/init} endpoint and advertise {@code VGI-Upload-URL-Support: 2}.
              *
              * @param p mints presigned upload/download URL pairs; {@code null} disables the endpoint (default)
              * @return this builder
@@ -1492,7 +1521,7 @@ public final class HttpServer {
         // to gzip when zstd is disabled (mirrors vgi-python's factory).
         resp.setHeader(SUPPORTED_ENCODINGS_HEADER, enabledEncodings());
         if (uploadUrlProvider != null) {
-            resp.setHeader(UPLOAD_URL_HEADER, "true");
+            resp.setHeader(UPLOAD_URL_HEADER, UPLOAD_URL_PROTOCOL_VERSION);
             if (maxUploadBytes != null) {
                 resp.setHeader(MAX_UPLOAD_BYTES_HEADER, Long.toString(maxUploadBytes));
             }
@@ -1646,7 +1675,7 @@ public final class HttpServer {
             resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "could not read request body");
             return;
         }
-        int count = 1;
+        List<UploadRequest> uploads;
         try (IpcStreamReader r = new IpcStreamReader(new ByteArrayInputStream(body), Allocators.root())) {
             Map<String, String> meta = r.readNextBatch();
             if (meta == null) {
@@ -1659,19 +1688,16 @@ public final class HttpServer {
                         "method mismatch: expected " + UPLOAD_URL_METHOD);
                 return;
             }
-            VectorSchemaRoot root = r.root();
-            if (root.getRowCount() > 0) {
-                org.apache.arrow.vector.FieldVector v = root.getVector("count");
-                if (v instanceof BigIntVector bi && !bi.isNull(0)) {
-                    long c = bi.get(0);
-                    if (c > 0) count = (int) Math.min(c, MAX_UPLOAD_URL_COUNT);
-                }
-            }
+            uploads = parseUploadRequests(r.root(), maxUploadBytes);
+        } catch (IllegalArgumentException refused) {
+            // Refused before any URL is minted: a typed ValueError batch under 400.
+            writeBadRequestArrow(req, resp, refused);
+            return;
         } catch (IOException ioe) {
             resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "invalid Arrow IPC body");
             return;
         }
-        count = Math.max(1, Math.min(count, MAX_UPLOAD_URL_COUNT));
+        int count = uploads.size();
 
         // Generate the URLs and write the response IPC stream. Keep the
         // authenticated identity in scope just like ordinary RPC dispatch so
@@ -1691,14 +1717,18 @@ public final class HttpServer {
             VarCharVector uploadVec = (VarCharVector) root.getVector("upload_url");
             VarCharVector downloadVec = (VarCharVector) root.getVector("download_url");
             TimeStampMicroTZVector expiresVec = (TimeStampMicroTZVector) root.getVector("expires_at");
+            MapVector headersVec = (MapVector) root.getVector("upload_headers");
             uploadVec.allocateNew();
             downloadVec.allocateNew();
             expiresVec.allocateNew(count);
+            headersVec.allocateNew();
+            UnionMapWriter headersWriter = headersVec.getWriter();
             try {
                 for (int i = 0; i < count; i++) {
+                    UploadRequest want = uploads.get(i);
                     UploadUrlProvider.UploadUrl url;
                     try {
-                        url = uploadUrlProvider.generateUploadUrl();
+                        url = uploadUrlProvider.generateUploadUrl(want.size(), want.sha256());
                     } catch (Exception e) {
                         throw new IOException("upload URL generation failed: " + e.getMessage(), e);
                     }
@@ -1707,6 +1737,15 @@ public final class HttpServer {
                     Instant exp = url.expiresAt() != null ? url.expiresAt() : Instant.now().plusSeconds(3600);
                     long micros = exp.getEpochSecond() * 1_000_000L + exp.getNano() / 1_000L;
                     expiresVec.setSafe(i, micros);
+                    headersWriter.setPosition(i);
+                    headersWriter.startMap();
+                    for (Map.Entry<String, String> h : url.headers().entrySet()) {
+                        headersWriter.startEntry();
+                        headersWriter.key().varChar().writeVarChar(new Text(h.getKey()));
+                        headersWriter.value().varChar().writeVarChar(new Text(h.getValue()));
+                        headersWriter.endEntry();
+                    }
+                    headersWriter.endMap();
                 }
                 root.setRowCount(count);
                 w.writeBatch(root, null);
@@ -1726,6 +1765,71 @@ public final class HttpServer {
             return;
         }
         writeArrowResponse(req, resp, out.toByteArray());
+    }
+
+    /** One {@code uploads} entry of an {@code __upload_url__/init} request. */
+    private record UploadRequest(long size, String sha256) {}
+
+    private static final java.util.regex.Pattern SHA256_HEX = java.util.regex.Pattern.compile("[0-9a-f]{64}");
+
+    /**
+     * Read and validate the {@code uploads} list of an upload-URL request.
+     *
+     * <p>Every refusal is an {@link IllegalArgumentException} (a {@code ValueError} on
+     * the wire) raised before any URL is minted. A v1 request -- a {@code count}
+     * column, or no {@code uploads} -- is refused outright, never served: the v1
+     * shape vended blank PUT URLs that storage accepted any bytes on.
+     */
+    private static List<UploadRequest> parseUploadRequests(VectorSchemaRoot root, Long maxUploadBytes) {
+        org.apache.arrow.vector.FieldVector raw = root.getVector("uploads");
+        if (raw == null || root.getSchema().getFields().stream().anyMatch(f -> f.getName().equals("count"))) {
+            throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": retired count shape; this server requires "
+                    + UPLOAD_URL_HEADER + ": " + UPLOAD_URL_PROTOCOL_VERSION
+                    + " (send 'uploads', one (size, sha256) entry per upload)");
+        }
+        if (!(raw instanceof ListVector list) || !(list.getDataVector() instanceof StructVector items)) {
+            throw new IllegalArgumentException(UPLOAD_URL_METHOD
+                    + ": 'uploads' must be list<struct<size: int64, sha256: utf8>>");
+        }
+        if (root.getRowCount() != 1 || list.isNull(0)) {
+            throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": 'uploads' must be one non-null list");
+        }
+        org.apache.arrow.vector.ValueVector sizeChild = items.getChild("size");
+        org.apache.arrow.vector.ValueVector shaChild = items.getChild("sha256");
+        if (!(sizeChild instanceof BigIntVector sizes) || !(shaChild instanceof VarCharVector shas)) {
+            throw new IllegalArgumentException(UPLOAD_URL_METHOD
+                    + ": 'uploads' must be list<struct<size: int64, sha256: utf8>>");
+        }
+        int start = list.getElementStartIndex(0);
+        int end = list.getElementEndIndex(0);
+        int n = end - start;
+        if (n < 1 || n > MAX_UPLOAD_URL_COUNT) {
+            throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": 'uploads' must have between 1 and "
+                    + MAX_UPLOAD_URL_COUNT + " entries, got " + n);
+        }
+        List<UploadRequest> out = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            int at = start + i;
+            if (items.isNull(at) || sizes.isNull(at) || shas.isNull(at)) {
+                throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": uploads[" + i + "] has a null field");
+            }
+            long size = sizes.get(at);
+            if (size < 1) {
+                throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": uploads[" + i
+                        + "].size must be >= 1, got " + size);
+            }
+            String sha = new String(shas.get(at), StandardCharsets.UTF_8);
+            if (!SHA256_HEX.matcher(sha).matches()) {
+                throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": uploads[" + i
+                        + "].sha256 must be 64 lowercase hex characters");
+            }
+            if (maxUploadBytes != null && size > maxUploadBytes) {
+                throw new IllegalArgumentException(UPLOAD_URL_METHOD + ": uploads[" + i + "].size " + size
+                        + " exceeds " + MAX_UPLOAD_BYTES_HEADER + " (" + maxUploadBytes + ")");
+            }
+            out.add(new UploadRequest(size, sha));
+        }
+        return out;
     }
 
     private record RequestIdentity(AuthContext auth, PeerEvidenceSet evidence) {}

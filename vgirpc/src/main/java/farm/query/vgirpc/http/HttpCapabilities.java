@@ -43,8 +43,11 @@ import java.util.List;
  * @param stickyEchoHeaders names (without the {@code VGI-Echo-} prefix) the
  *     worker asks a session-bound client to echo on later requests; never
  *     {@code null}, possibly empty
- * @param uploadUrlSupport whether {@code __upload_url__/init} is routed, i.e.
- *     whether {@link HttpRpcConnection#requestUploadUrls(int)} can succeed
+ * @param uploadUrlVersion the upload-URL protocol version the worker
+ *     advertises in {@code VGI-Upload-URL-Support}: {@code 0} when absent (the
+ *     endpoint is not routed), {@code 1} for a v1 worker's {@code "true"},
+ *     otherwise the integer it sent. This client uploads only to {@code 2}
+ *     and up ({@link HttpRpcConnection#requestUploadUrls(java.util.List)}).
  * @param maxRequestBytes largest inline request body the worker accepts, or
  *     {@code null} for no advertised limit
  * @param maxResponseBytes largest response body the worker will produce, or
@@ -62,7 +65,7 @@ public record HttpCapabilities(
         boolean stickyEnabled,
         Integer stickyDefaultTtl,
         List<String> stickyEchoHeaders,
-        boolean uploadUrlSupport,
+        int uploadUrlVersion,
         Long maxRequestBytes,
         Long maxResponseBytes,
         Long maxExternalizedResponseBytes,
@@ -77,6 +80,16 @@ public record HttpCapabilities(
     public HttpCapabilities {
         stickyEchoHeaders = stickyEchoHeaders == null ? List.of() : List.copyOf(stickyEchoHeaders);
         supportedEncodings = supportedEncodings == null ? List.of() : List.copyOf(supportedEncodings);
+    }
+
+    /**
+     * Whether the worker routes {@code __upload_url__/init} at all, whatever
+     * protocol version it speaks.
+     *
+     * @return {@code true} when {@code VGI-Upload-URL-Support} was advertised
+     */
+    public boolean uploadUrlSupport() {
+        return uploadUrlVersion > 0;
     }
 
     /**

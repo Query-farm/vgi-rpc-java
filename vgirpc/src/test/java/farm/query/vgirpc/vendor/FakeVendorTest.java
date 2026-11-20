@@ -162,16 +162,33 @@ class FakeVendorTest {
     }
 
     @Test
-    void generateUploadUrlVendsAWorkingPair() throws Exception {
+    void generateUploadUrlVendsASizedChecksummedPair() throws Exception {
         try (VendorStorage s = new VendorStorage(url, token)) {
-            long before = stats().get("upload_urls").asLong();
-            UploadUrlProvider.UploadUrl u = s.generateUploadUrl();
-            assertNotEquals(u.uploadUrl(), u.downloadUrl());
-            assertEquals(before + 1, stats().get("upload_urls").asLong());
             byte[] body = new byte[] {7, 7, 7};
-            HttpResponse<Void> put = HTTP.send(HttpRequest.newBuilder(URI.create(u.uploadUrl()))
-                    .PUT(HttpRequest.BodyPublishers.ofByteArray(body)).build(), HttpResponse.BodyHandlers.discarding());
-            assertTrue(put.statusCode() / 100 == 2, "PUT " + put.statusCode());
+            String sha = java.util.HexFormat.of().formatHex(VendorStorage.sha256(body));
+            long before = stats().get("puts").asLong();
+            long unsizedBefore = stats().path("upload_urls").asLong();
+            UploadUrlProvider.UploadUrl u = s.generateUploadUrl(body.length, sha);
+            assertNotEquals(u.uploadUrl(), u.downloadUrl());
+            // The sized purpose=rpc grant, never the unsized /v1/upload_urls path.
+            assertEquals(before + 1, stats().get("puts").asLong());
+            assertEquals(unsizedBefore, stats().path("upload_urls").asLong());
+            assertEquals(java.util.Base64.getEncoder().encodeToString(VendorStorage.sha256(body)),
+                    u.headers().get("x-amz-checksum-sha256"));
+            assertTrue(u.headers().keySet().stream().noneMatch("content-length"::equalsIgnoreCase));
+
+            // Wrong bytes of the right length: storage refuses them.
+            HttpRequest.Builder bad = HttpRequest.newBuilder(URI.create(u.uploadUrl()))
+                    .PUT(HttpRequest.BodyPublishers.ofByteArray(new byte[] {7, 7, 8}));
+            u.headers().forEach(bad::header);
+            HttpResponse<Void> refused = HTTP.send(bad.build(), HttpResponse.BodyHandlers.discarding());
+            assertEquals(400, refused.statusCode());
+
+            HttpRequest.Builder put = HttpRequest.newBuilder(URI.create(u.uploadUrl()))
+                    .PUT(HttpRequest.BodyPublishers.ofByteArray(body));
+            u.headers().forEach(put::header);
+            HttpResponse<Void> ok = HTTP.send(put.build(), HttpResponse.BodyHandlers.discarding());
+            assertTrue(ok.statusCode() / 100 == 2, "PUT " + ok.statusCode());
             HttpResponse<byte[]> get = HTTP.send(HttpRequest.newBuilder(URI.create(u.downloadUrl())).GET().build(),
                     HttpResponse.BodyHandlers.ofByteArray());
             assertArrayEquals(body, get.body());

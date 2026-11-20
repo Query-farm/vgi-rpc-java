@@ -53,8 +53,6 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -114,7 +112,7 @@ import java.util.function.Consumer;
  * {@linkplain #callUnaryRaw call} / {@linkplain #openStreamRaw stream} surface
  * that relays framed Arrow rather than decoded values,
  * {@linkplain #capabilities() capability discovery},
- * {@linkplain #requestUploadUrls(int) upload URLs}, and
+ * {@linkplain #requestUploadUrls(java.util.List) upload URLs}, and
  * {@linkplain #beginSession(String) sticky sessions}. An externalized
  * ({@code vgi_rpc.location}) batch is resolved transparently when the builder
  * was given an {@link ExternalLocationConfig}, and is reported as an
@@ -499,20 +497,47 @@ public final class HttpRpcConnection implements AutoCloseable {
      * caller can branch on "this deployment cannot externalize" without
      * matching on message text or HTTP status.</p>
      *
-     * @param count how many slots to request; the worker caps this at
+     * <p>Upload-URL protocol v2: one {@link UploadRequest} per body, carrying
+     * its exact size and SHA-256, and one slot back per entry in the same
+     * order. A worker advertising anything but {@code VGI-Upload-URL-Support: 2}
+     * is refused before the request is sent.</p>
+     *
+     * @param uploads one entry per body to upload, 1 to
      *     {@link HttpServer#MAX_UPLOAD_URL_COUNT}
-     * @return the vended slots, in the order the worker returned them
-     * @throws IllegalArgumentException if {@code count} is not positive
+     * @return the vended slots, in request order
+     * @throws IllegalArgumentException if {@code uploads} is empty or too long
      * @throws RpcError if the worker refuses, does not support upload URLs, or
      *     the call fails in transport
      */
-    public java.util.List<UploadUrl> requestUploadUrls(int count) {
-        if (count <= 0) throw new IllegalArgumentException("count must be positive");
+    public java.util.List<UploadUrl> requestUploadUrls(java.util.List<UploadRequest> uploads) {
+        if (uploads == null || uploads.isEmpty() || uploads.size() > HttpServer.MAX_UPLOAD_URL_COUNT) {
+            throw new IllegalArgumentException("uploads must have between 1 and "
+                    + HttpServer.MAX_UPLOAD_URL_COUNT + " entries");
+        }
+        // Refused before the request, as the reference does: a server that
+        // advertises no upload URLs is NotSupported, one on another protocol
+        // version is a ProtocolError.
+        HttpCapabilities caps = capabilities();
+        if (caps.uploadUrlVersion() == 0) {
+            throw new RpcError("NotSupported", "Server does not support upload URLs", "");
+        }
+        requireUploadUrlV2(caps);
         byte[] body;
         try (VectorSchemaRoot params = VectorSchemaRoot.create(
                 HttpServer.UPLOAD_URL_PARAMS_SCHEMA, Allocators.root())) {
-            params.allocateNew();
-            ((org.apache.arrow.vector.BigIntVector) params.getVector("count")).setSafe(0, count);
+            org.apache.arrow.vector.complex.ListVector list =
+                    (org.apache.arrow.vector.complex.ListVector) params.getVector("uploads");
+            org.apache.arrow.vector.complex.impl.UnionListWriter lw = list.getWriter();
+            lw.setPosition(0);
+            lw.startList();
+            for (UploadRequest u : uploads) {
+                org.apache.arrow.vector.complex.writer.BaseWriter.StructWriter sw = lw.struct();
+                sw.start();
+                sw.bigInt("size").writeBigInt(u.size());
+                sw.varChar("sha256").writeVarChar(new org.apache.arrow.vector.util.Text(u.sha256()));
+                sw.end();
+            }
+            lw.endList();
             params.setRowCount(1);
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             // No routing key: this endpoint is owned by no protocol, and
@@ -545,6 +570,10 @@ public final class HttpRpcConnection implements AutoCloseable {
                         (org.apache.arrow.vector.VarCharVector) root.getVector("download_url");
                 org.apache.arrow.vector.TimeStampMicroTZVector expires =
                         (org.apache.arrow.vector.TimeStampMicroTZVector) root.getVector("expires_at");
+                if (!(root.getVector("upload_headers") instanceof org.apache.arrow.vector.complex.MapVector hdrs)) {
+                    throw new RpcError("ProtocolError", what
+                            + ": response has no upload_headers column (not an upload-URL v2 server)", "");
+                }
                 for (int i = 0; i < root.getRowCount(); i++) {
                     urls.add(new UploadUrl(
                             upload.isNull(i) ? null : new String(upload.get(i), StandardCharsets.UTF_8),
@@ -553,13 +582,56 @@ public final class HttpRpcConnection implements AutoCloseable {
                             // sub-second precision on a deadline minutes away is
                             // noise, and floor keeps a slot from looking valid
                             // for a microsecond longer than it is.
-                            expires.isNull(i) ? 0L : Math.floorDiv(expires.get(i), 1_000_000L)));
+                            expires.isNull(i) ? 0L : Math.floorDiv(expires.get(i), 1_000_000L),
+                            readHeaderMap(hdrs, i)));
                 }
             }
         } catch (IOException e) {
             throw new RpcError("TransportError", what + ": " + e.getMessage(), "");
         }
+        if (urls.size() != uploads.size()) {
+            throw new RpcError("ProtocolError", what + ": asked for " + uploads.size()
+                    + " upload URLs, got " + urls.size(), "");
+        }
         return java.util.List.copyOf(urls);
+    }
+
+    /**
+     * Refuse a server that does not speak upload-URL protocol v2.
+     *
+     * <p>Never falls back to the count shape: a v1 slot is a blank PUT URL
+     * storage accepts any bytes on, which is what v2 exists to end. Error
+     * types and texts match the reference client.
+     */
+    private static void requireUploadUrlV2(HttpCapabilities caps) {
+        int version = caps.uploadUrlVersion();
+        if (version < UPLOAD_URL_PROTOCOL) {
+            throw new RpcError("ProtocolError", "Server upload protocol is too old: it advertises "
+                    + HttpServer.UPLOAD_URL_HEADER + " v" + version + " and this client needs "
+                    + HttpServer.UPLOAD_URL_PROTOCOL_VERSION, "");
+        }
+        if (version > UPLOAD_URL_PROTOCOL) {
+            throw new RpcError("ProtocolError", "Server upload protocol is newer than this client: it advertises "
+                    + HttpServer.UPLOAD_URL_HEADER + ": " + version + " and this client speaks "
+                    + HttpServer.UPLOAD_URL_PROTOCOL_VERSION, "");
+        }
+    }
+
+    /** Read row {@code i} of a {@code map<utf8, utf8>} column into an ordered map. */
+    private static Map<String, String> readHeaderMap(org.apache.arrow.vector.complex.MapVector map, int i) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (map.isNull(i)) return out;
+        org.apache.arrow.vector.complex.StructVector entries =
+                (org.apache.arrow.vector.complex.StructVector) map.getDataVector();
+        org.apache.arrow.vector.VarCharVector keys =
+                (org.apache.arrow.vector.VarCharVector) entries.getChildByOrdinal(0);
+        org.apache.arrow.vector.VarCharVector values =
+                (org.apache.arrow.vector.VarCharVector) entries.getChildByOrdinal(1);
+        for (int j = map.getElementStartIndex(i); j < map.getElementEndIndex(i); j++) {
+            out.put(new String(keys.get(j), StandardCharsets.UTF_8),
+                    values.isNull(j) ? "" : new String(values.get(j), StandardCharsets.UTF_8));
+        }
+        return out;
     }
 
     /**
@@ -1116,7 +1188,7 @@ public final class HttpRpcConnection implements AutoCloseable {
         }
         if (caps == null) return body;
         Long max = caps.maxRequestBytes();
-        if (max == null || !caps.uploadUrlSupport() || body.length <= max) return body;
+        if (max == null || caps.uploadUrlVersion() == 0 || body.length <= max) return body;
         return externalizeRequest(body, what);
     }
 
@@ -1140,18 +1212,19 @@ public final class HttpRpcConnection implements AutoCloseable {
                     "Request exceeds max_request_bytes and the server does not advertise "
                             + "upload_url_support", "");
         }
-        java.util.List<UploadUrl> urls = requestUploadUrls(1);
-        if (urls.isEmpty()) throw new RpcError("ProtocolError", "Server returned no upload URLs", "");
+        requireUploadUrlV2(caps);
+        UploadRequest announced = UploadRequest.of(body);
+        java.util.List<UploadUrl> urls = requestUploadUrls(java.util.List.of(announced));
         UploadUrl slot = urls.getFirst();
         validateExternalUrl(slot.uploadUrl());
         validateExternalUrl(slot.downloadUrl());
-        HttpReply put = execute("PUT", slot.uploadUrl(), uploadHeaders(slot.uploadUrl()), body,
+        HttpReply put = execute("PUT", slot.uploadUrl(), uploadHeaders(slot), body,
                 what + " (upload)", 64L << 10, (h, status, w) -> 64L << 10);
         if (put.status() < 200 || put.status() >= 300) {
             throw new RpcError("ExternalUploadFailed",
                     "PUT to upload URL failed: HTTP " + put.status(), "");
         }
-        return pointerRequestBody(body, slot.downloadUrl(), what);
+        return pointerRequestBody(body, slot.downloadUrl(), announced.sha256(), what);
     }
 
     /**
@@ -1167,10 +1240,13 @@ public final class HttpRpcConnection implements AutoCloseable {
      * request that carries an {@code Authorization} header beside a signed
      * query string. Session headers never ride: they are not this exchange's.
      */
-    private Map<String, String> uploadHeaders(String uploadUrl) {
-        Map<String, String> out = new LinkedHashMap<>();
+    private Map<String, String> uploadHeaders(UploadUrl slot) {
+        Map<String, String> out = new java.util.TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         out.put(HttpHeaders.CONTENT_TYPE, HttpServer.ARROW_CONTENT_TYPE);
-        if (sameOrigin(uploadUrl, endpoint)) headers.forEach(out::put);
+        if (sameOrigin(slot.uploadUrl(), endpoint)) headers.forEach(out::put);
+        // Last, so they win: the signature covers them byte for byte, including
+        // a Content-Type the backend chose to sign.
+        slot.uploadHeaders().forEach(out::put);
         return out;
     }
 
@@ -1210,7 +1286,7 @@ public final class HttpRpcConnection implements AutoCloseable {
      * resolves the pointer. Replacing the payload must not replace the
      * envelope.</p>
      */
-    private byte[] pointerRequestBody(byte[] body, String locationUrl, String what) {
+    private byte[] pointerRequestBody(byte[] body, String locationUrl, String sha256Hex, String what) {
         try (IpcStreamReader r = new IpcStreamReader(
                 new ByteArrayInputStream(body), Allocators.root())) {
             Map<String, String> md = r.readNextBatch();
@@ -1221,7 +1297,7 @@ public final class HttpRpcConnection implements AutoCloseable {
             Schema schema = r.root().getSchema();
             Map<String, String> merged = new LinkedHashMap<>(md);
             merged.put(Metadata.LOCATION, locationUrl);
-            merged.put(Metadata.LOCATION_SHA256, sha256Hex(body));
+            merged.put(Metadata.LOCATION_SHA256, sha256Hex);
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             try (IpcStreamWriter w = new IpcStreamWriter(buf)) {
                 w.writeSchema(schema);
@@ -1232,21 +1308,6 @@ public final class HttpRpcConnection implements AutoCloseable {
             throw new RpcError("TransportError",
                     what + ": could not build the pointer request: " + e.getMessage(), "");
         }
-    }
-
-    private static String sha256Hex(byte[] data) {
-        MessageDigest digest;
-        try {
-            digest = MessageDigest.getInstance("SHA-256");
-        } catch (NoSuchAlgorithmException impossible) {
-            throw new IllegalStateException("SHA-256 is required of every JVM", impossible);
-        }
-        byte[] hash = digest.digest(data);
-        StringBuilder out = new StringBuilder(hash.length * 2);
-        for (byte b : hash) {
-            out.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
-        }
-        return out.toString();
     }
 
     /** Sticky-session state for this connection; {@code null} when no scope is open. */
@@ -1405,7 +1466,7 @@ public final class HttpRpcConnection implements AutoCloseable {
                 "true".equals(reply.first(StickyHeaders.STICKY_ENABLED)),
                 parseIntOrNull(reply.first(StickyHeaders.STICKY_TTL)),
                 parseNameList(reply.first(StickyHeaders.STICKY_ECHO)),
-                "true".equals(reply.first(HttpServer.UPLOAD_URL_HEADER)),
+                parseUploadUrlVersion(reply.first(HttpServer.UPLOAD_URL_HEADER)),
                 parseLongOrNull(reply.first(HttpServer.MAX_REQUEST_BYTES_HEADER)),
                 parseLongOrNull(reply.first(HttpServer.MAX_RESPONSE_BYTES_HEADER)),
                 parseLongOrNull(reply.first(HttpServer.MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER)),
@@ -1450,6 +1511,22 @@ public final class HttpRpcConnection implements AutoCloseable {
             if (!name.isEmpty()) names.add(name);
         }
         return List.copyOf(names);
+    }
+
+    /** The upload-URL protocol version this client speaks; a server must advertise at least this. */
+    private static final int UPLOAD_URL_PROTOCOL = Integer.parseInt(HttpServer.UPLOAD_URL_PROTOCOL_VERSION);
+
+    /**
+     * Parse {@code VGI-Upload-URL-Support}: absent is {@code 0}, the v1 server's
+     * {@code "true"} is {@code 1}, and an integer is that version. Anything else
+     * reads as {@code 0} -- unknown, so never uploaded to.
+     */
+    static int parseUploadUrlVersion(String raw) {
+        if (raw == null || raw.isBlank()) return 0;
+        String v = raw.trim();
+        if (v.equalsIgnoreCase("true")) return 1;
+        // A positive ASCII decimal without a leading zero, as the reference parses it.
+        return v.matches("[1-9][0-9]{0,8}") ? Integer.parseInt(v) : 0;
     }
 
     private static Long parseLongOrNull(String raw) {

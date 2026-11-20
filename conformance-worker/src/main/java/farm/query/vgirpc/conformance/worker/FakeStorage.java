@@ -3,6 +3,8 @@
 
 package farm.query.vgirpc.conformance.worker;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import farm.query.vgirpc.external.ExternalStorage;
 import farm.query.vgirpc.external.UploadUrlProvider;
 
@@ -13,6 +15,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -52,6 +56,8 @@ final class FakeStorage implements ExternalStorage, UploadUrlProvider {
 
     /** Pause between attempts, giving the peer time to accept from a backlog of 5. */
     private static final Duration RETRY_DELAY = Duration.ofMillis(50);
+
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final String baseUrl;
     private final HttpClient http;
@@ -120,13 +126,25 @@ final class FakeStorage implements ExternalStorage, UploadUrlProvider {
         }
     }
 
+    /**
+     * Allocate a client upload slot (upload-URL protocol v2).
+     *
+     * <p>The announced size and SHA-256 ride in the {@code /alloc} body so a
+     * fake storage that verifies uploads can refuse a mismatched PUT; any
+     * {@code upload_headers} object it returns is handed to the client
+     * verbatim.</p>
+     */
     @Override
-    public UploadUrl generateUploadUrl() throws IOException {
+    public UploadUrl generateUploadUrl(long size, String sha256Hex) throws IOException {
         try {
+            // A sized allocation: fake_storage then verifies the PUT like S3/R2.
+            String sha256B64 = java.util.Base64.getEncoder()
+                    .encodeToString(java.util.HexFormat.of().parseHex(sha256Hex));
+            String allocBody = "{\"size\":" + size + ",\"sha256_b64\":\"" + sha256B64 + "\"}";
             HttpRequest alloc = HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl + "/alloc"))
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString("{}"))
+                    .POST(HttpRequest.BodyPublishers.ofString(allocBody))
                     .build();
             HttpResponse<String> allocResp = sendWithRetry(alloc, HttpResponse.BodyHandlers.ofString());
             if (allocResp.statusCode() / 100 != 2) {
@@ -135,11 +153,20 @@ final class FakeStorage implements ExternalStorage, UploadUrlProvider {
             String legacyUrl = extractUrl(OBJECT_URL, allocResp.body(), "object_url", null);
             String uploadUrl = extractUrl(UPLOAD_URL, allocResp.body(), "upload_url", legacyUrl);
             String downloadUrl = extractUrl(DOWNLOAD_URL, allocResp.body(), "download_url", legacyUrl);
-            return new UploadUrl(uploadUrl, downloadUrl, Instant.now().plus(Duration.ofHours(1)));
+            return new UploadUrl(uploadUrl, downloadUrl, Instant.now().plus(Duration.ofHours(1)),
+                    uploadHeaders(allocResp.body()));
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted during fake-storage alloc", ie);
         }
+    }
+
+    /** The {@code upload_headers} object of an {@code /alloc} response, or none. */
+    private static Map<String, String> uploadHeaders(String body) throws IOException {
+        JsonNode node = JSON.readTree(body).path("upload_headers");
+        Map<String, String> out = new LinkedHashMap<>();
+        if (node.isObject()) node.properties().forEach(e -> out.put(e.getKey(), e.getValue().asText()));
+        return out;
     }
 
     /** Extract a JSON URL field, falling back to the legacy dual-method URL. */

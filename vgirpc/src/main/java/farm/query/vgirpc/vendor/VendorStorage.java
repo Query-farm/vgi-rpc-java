@@ -13,7 +13,9 @@ import java.net.URI;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Base64;
+import java.util.HexFormat;
 import java.util.Map;
 
 /**
@@ -24,8 +26,12 @@ import java.util.Map;
  * {@code rpc} by default), PUTs the bytes with exactly the grant's required
  * headers, and returns the grant's download URL. The {@code Externalizer} puts
  * that URL in the pointer batch as {@code vgi_rpc.location}, next to
- * {@code vgi_rpc.location.sha256}. {@link #generateUploadUrl} (client uploads)
- * asks {@code POST /v1/upload_urls} for one unsized PUT/GET pair.</p>
+ * {@code vgi_rpc.location.sha256}. {@link #generateUploadUrl} (client uploads,
+ * upload-URL protocol v2) asks the same sized endpoint, always purpose
+ * {@code rpc}, for a grant covering the client's announced size and SHA-256,
+ * and hands the client the grant's PUT URL, its required headers and its GET
+ * URL: storage refuses any other body. The unsized {@code /v1/upload_urls}
+ * path is not used.</p>
  *
  * <p>Thread-safe. Objects are cleaned up by the vendor (registry alarm plus
  * storage lifecycle rules); vgi-rpc never deletes them.</p>
@@ -98,13 +104,28 @@ public final class VendorStorage extends VendorClient implements ExternalStorage
     }
 
     @Override
-    public UploadUrl generateUploadUrl() {
-        UploadUrl upload = api.uploadUrls(1).get(0);
-        if (pinHosts) {
-            check(upload.uploadUrl());
-            check(upload.downloadUrl());
+    public UploadUrl generateUploadUrl(long size, String sha256Hex) {
+        byte[] digest;
+        try {
+            digest = HexFormat.of().parseHex(sha256Hex);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("sha256 must be 64 lowercase hex characters");
         }
-        return upload;
+        if (digest.length != 32) throw new IllegalArgumentException("sha256 must be 64 lowercase hex characters");
+        // Always rpc: a client upload is a request payload the server fetches
+        // once, which is what rpc objects (a GET URL, the short lifecycle) are.
+        PutGrant grant = api.put(size, Base64.getEncoder().encodeToString(digest), "rpc", null, null, null);
+        String downloadUrl = grant.downloadUrl();
+        if (downloadUrl == null) downloadUrl = api.get(grant.objectId()).downloadUrl();
+        if (pinHosts) {
+            check(grant.uploadUrl());
+            check(downloadUrl);
+        }
+        Instant expires = grant.expiresAt();
+        if (grant.downloadExpiresAt() != null && (expires == null || grant.downloadExpiresAt().isBefore(expires))) {
+            expires = grant.downloadExpiresAt();
+        }
+        return new UploadUrl(grant.uploadUrl(), downloadUrl, expires, grant.requiredHeaders());
     }
 
     static String b64Sha256(byte[] data) {

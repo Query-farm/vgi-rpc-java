@@ -7,6 +7,8 @@ dependencies {
     implementation(project(":conformance"))
     // Optional — only needed by --auth-jwt / --auth-pkce modes
     implementation(project(":vgirpc-oauth"))
+    // FakeStorage reads the /alloc response's upload_headers object.
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.21.0")
     // --sticky-auth declares an Authenticator lambda inline, so this module has to
     // name HttpServletRequest at compile time. vgirpc keeps Jetty on `implementation`
     // (not exposed to consumers), but it is on the runtime classpath transitively —

@@ -82,6 +82,30 @@ public final class LocationResolver {
     }
 
     /**
+     * Resolve a <em>request</em> pointer -- one a client sent a server -- which
+     * must carry {@code vgi_rpc.location.sha256}.
+     *
+     * <p>The bytes behind a request pointer were PUT by the client to storage
+     * the server does not control, through a URL the client chose to name; the
+     * digest is the only thing tying what the server fetches to what the client
+     * hashed. A pointer without it is refused before anything is fetched, and a
+     * body whose digest differs fails as {@code sha256 mismatch}.
+     *
+     * @param pointerMeta the pointer batch's custom metadata
+     * @return the fetched batch, its metadata and its dictionaries
+     * @throws IllegalArgumentException if the pointer has no
+     *     {@code vgi_rpc.location.sha256}
+     * @throws Exception if the fetch, the digest check or the decode fails
+     */
+    public Resolved resolveRequest(Map<String, String> pointerMeta) throws Exception {
+        String sha = pointerMeta.get(Metadata.LOCATION_SHA256);
+        if (sha == null || sha.isEmpty()) {
+            throw new IllegalArgumentException("request pointer batch missing vgi_rpc.location.sha256");
+        }
+        return resolve(pointerMeta, null);
+    }
+
+    /**
      * Resolve a pointer batch, relaying any log batches the fetched object
      * carries to {@code onLog}.
      *

@@ -332,7 +332,7 @@ public final class HttpStreamHandler {
             LocationResolver resolver = rpc.locationResolver();
             if (resolver != null && LocationResolver.isPointer(root.getRowCount(), meta)) {
                 try {
-                    resolved = resolver.resolve(meta);
+                    resolved = resolver.resolveRequest(meta);
                     root = resolved.root();
                 } catch (Exception e) {
                     return errorStream(e);
@@ -482,7 +482,7 @@ public final class HttpStreamHandler {
             LocationResolver resolver = rpc.locationResolver();
             if (resolver != null && LocationResolver.isPointer(ownedInput.getRowCount(), wireMeta)) {
                 try {
-                    resolved = resolver.resolve(wireMeta);
+                    resolved = resolver.resolveRequest(wireMeta);
                     actualInput = resolved.root();
                     inputMeta = resolved.fetchedMetadata();
                 } catch (Exception e) {

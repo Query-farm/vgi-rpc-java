@@ -395,7 +395,7 @@ final class HttpRawClientSurfaceTest {
                 .stickyDefaultTtlSeconds(300)
                 .stickyEchoHeaders(Map.of("Backend", "b7"))
                 .maxUploadBytes(16L << 20)
-                .uploadUrlProvider(() -> new UploadUrlProvider.UploadUrl(
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
                         "http://storage.invalid/put", "http://storage.invalid/get",
                         Instant.ofEpochSecond(1_767_225_600L))));
         HttpCapabilities caps = conn.capabilities();
@@ -496,9 +496,10 @@ final class HttpRawClientSurfaceTest {
     @Timeout(30)
     void uploadUrlsComeBackWithWholeSecondExpiries() throws Exception {
         HttpRpcConnection conn = connect(b -> b.uploadUrlProvider(
-                () -> new UploadUrlProvider.UploadUrl("http://storage.invalid/put",
+                (size, sha256) -> new UploadUrlProvider.UploadUrl("http://storage.invalid/put",
                         "http://storage.invalid/get", Instant.ofEpochSecond(1_767_225_600L, 500_000))));
-        List<UploadUrl> urls = conn.requestUploadUrls(2);
+        List<UploadUrl> urls = conn.requestUploadUrls(List.of(
+                new UploadRequest(10, UploadRequests.SHA), new UploadRequest(20, "b".repeat(64))));
         assertEquals(2, urls.size());
         assertEquals("http://storage.invalid/put", urls.getFirst().uploadUrl());
         assertEquals("http://storage.invalid/get", urls.getFirst().downloadUrl());
@@ -510,8 +511,40 @@ final class HttpRawClientSurfaceTest {
     @Timeout(30)
     void uploadUrlsOnAWorkerWithoutAProviderAreNotSupported() throws Exception {
         HttpRpcConnection conn = connect(b -> { });
-        RpcError error = assertThrows(RpcError.class, () -> conn.requestUploadUrls(1));
+        RpcError error = assertThrows(RpcError.class,
+                () -> conn.requestUploadUrls(List.of(new UploadRequest(1, UploadRequests.SHA))));
         assertEquals("NotSupported", error.errorType());
+    }
+
+    /** Each entry reaches the provider as sent, and its headers come back in order, per entry. */
+    @Test
+    @Timeout(30)
+    void uploadUrlsCarryEachEntrysSizeHashAndHeaders() throws Exception {
+        List<String> seen = new java.util.concurrent.CopyOnWriteArrayList<>();
+        HttpRpcConnection conn = connect(b -> b.uploadUrlProvider((size, sha256) -> {
+            seen.add(size + ":" + sha256);
+            return new UploadUrlProvider.UploadUrl("http://storage.invalid/put/" + size,
+                    "http://storage.invalid/get/" + size, null,
+                    Map.of("x-amz-checksum-sha256", "c2l6ZS" + size, "Content-Length", "999"));
+        }));
+        List<UploadUrl> urls = conn.requestUploadUrls(List.of(
+                new UploadRequest(10, UploadRequests.SHA), new UploadRequest(20, "b".repeat(64))));
+        assertEquals(List.of("10:" + UploadRequests.SHA, "20:" + "b".repeat(64)), seen);
+        assertEquals("http://storage.invalid/put/20", urls.get(1).uploadUrl());
+        // Content-Length is never an upload header: the client sends a plain one.
+        assertEquals(Map.of("x-amz-checksum-sha256", "c2l6ZS10"), urls.get(0).uploadHeaders());
+        assertEquals(Map.of("x-amz-checksum-sha256", "c2l6ZS20"), urls.get(1).uploadHeaders());
+    }
+
+    /** The capability header is the protocol version, and the client reads it as one. */
+    @Test
+    @Timeout(30)
+    void uploadUrlSupportIsVersionTwo() throws Exception {
+        HttpRpcConnection conn = connect(b -> b.uploadUrlProvider((size, sha256) ->
+                new UploadUrlProvider.UploadUrl("http://storage.invalid/put", "http://storage.invalid/get", null)));
+        assertEquals(2, conn.capabilities().uploadUrlVersion());
+        assertEquals(1, syntheticHealth(Map.of(HttpServer.UPLOAD_URL_HEADER, "true"))
+                .capabilities().uploadUrlVersion());
     }
 
     // --- sticky sessions --------------------------------------------------
@@ -639,13 +672,37 @@ final class HttpRawClientSurfaceTest {
     /** In-memory object store: PUT keeps the bytes, GET hands them back. */
     private com.sun.net.httpserver.HttpServer storage;
     private final AtomicReference<byte[]> stored = new AtomicReference<>();
+    private final AtomicReference<com.sun.net.httpserver.Headers> putHeaders = new AtomicReference<>();
+
+    private static byte[] sha256(byte[] data) {
+        try {
+            return java.security.MessageDigest.getInstance("SHA-256").digest(data);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** A provider that signs like S3: the checksum header the PUT must carry. */
+    private static UploadUrlProvider.UploadUrl signed(String blob, String sha256Hex) {
+        return new UploadUrlProvider.UploadUrl(blob, blob, null, Map.of("x-amz-checksum-sha256",
+                java.util.Base64.getEncoder().encodeToString(java.util.HexFormat.of().parseHex(sha256Hex))));
+    }
 
     private String startStorage() throws Exception {
         storage = com.sun.net.httpserver.HttpServer.create(
                 new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0), 0);
         storage.createContext("/blob", exchange -> {
             if ("PUT".equals(exchange.getRequestMethod())) {
-                stored.set(exchange.getRequestBody().readAllBytes());
+                byte[] put = exchange.getRequestBody().readAllBytes();
+                putHeaders.set(exchange.getRequestHeaders());
+                // Verify like R2: a signed checksum the body does not match is refused.
+                String want = exchange.getRequestHeaders().getFirst("x-amz-checksum-sha256");
+                if (want != null && !want.equals(java.util.Base64.getEncoder().encodeToString(sha256(put)))) {
+                    exchange.sendResponseHeaders(400, -1);
+                    exchange.close();
+                    return;
+                }
+                stored.set(put);
                 exchange.sendResponseHeaders(200, -1);
             } else {
                 byte[] body = stored.get();
@@ -733,7 +790,7 @@ final class HttpRawClientSurfaceTest {
         AtomicReference<Map<String, String>> sent = new AtomicReference<>();
         HttpRpcConnection conn = connect(b -> b
                 .maxRequestBytes(4096)
-                .uploadUrlProvider(() -> new UploadUrlProvider.UploadUrl(blob, blob, null))
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(blob, blob, null))
                 .preHandlers(List.of(new UnaryIntercept("/shout", sent, 0))));
         String value = bigValue();
         assertEquals("HI", conn.proxy(RawDemo.class).shout(value));
@@ -768,7 +825,7 @@ final class HttpRawClientSurfaceTest {
         String blob = startStorage();
         AtomicReference<Map<String, String>> sent = new AtomicReference<>();
         HttpRpcConnection conn = connect(b -> b
-                .uploadUrlProvider(() -> new UploadUrlProvider.UploadUrl(blob, blob, null))
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(blob, blob, null))
                 .preHandlers(List.of(new UnaryIntercept("/shout", sent, 1))));
         assertEquals("HI", conn.proxy(RawDemo.class).shout(bigValue()));
         Map<String, String> metadata = sent.get();
@@ -789,6 +846,59 @@ final class HttpRawClientSurfaceTest {
         RpcError error = assertThrows(RpcError.class, () -> conn.proxy(RawDemo.class).shout(bigValue()));
         assertEquals("RequestTooLarge", error.errorType());
         assertTrue(error.errorMessage().contains("upload_url_support"), error.errorMessage());
+    }
+
+    /** The PUT carries the slot's signed headers, and the provider saw the body's real size and hash. */
+    @Test
+    @Timeout(30)
+    void theUploadPutCarriesTheSlotsHeaders() throws Exception {
+        String blob = startStorage();
+        AtomicReference<String> announced = new AtomicReference<>();
+        HttpRpcConnection conn = connect(b -> b
+                .maxRequestBytes(4096)
+                .uploadUrlProvider((size, sha256) -> {
+                    announced.set(size + ":" + sha256);
+                    return signed(blob, sha256);
+                })
+                .preHandlers(List.of(new UnaryIntercept("/shout", new AtomicReference<>(), 0))));
+        assertEquals("HI", conn.proxy(RawDemo.class).shout(bigValue()));
+        byte[] uploaded = stored.get();
+        assertNotNull(uploaded);
+        assertEquals(uploaded.length + ":" + sha256Hex(uploaded), announced.get());
+        assertEquals(java.util.Base64.getEncoder().encodeToString(sha256(uploaded)),
+                putHeaders.get().getFirst("x-amz-checksum-sha256"));
+        assertEquals(Integer.toString(uploaded.length), putHeaders.get().getFirst("Content-Length"));
+    }
+
+    /** Storage that refuses the body (a checksum mismatch) fails the call; nothing is sent inline. */
+    @Test
+    @Timeout(30)
+    void storageRefusingTheBodyFailsTheCall() throws Exception {
+        String blob = startStorage();
+        HttpRpcConnection conn = connect(b -> b
+                .maxRequestBytes(4096)
+                .uploadUrlProvider((size, sha256) -> signed(blob, "0".repeat(64))));
+        RpcError error = assertThrows(RpcError.class, () -> conn.proxy(RawDemo.class).shout(bigValue()));
+        assertEquals("ExternalUploadFailed", error.errorType());
+        assertNull(stored.get());
+    }
+
+    /** A v1 server ({@code VGI-Upload-URL-Support: true}) is never uploaded to, and never asked for count URLs. */
+    @Test
+    @Timeout(30)
+    void anOversizedRequestToAVersionOneServerFailsAsTooOld() throws Exception {
+        HttpRpcConnection conn = syntheticHealth(Map.of(
+                HttpServer.UPLOAD_URL_HEADER, "true",
+                HttpServer.MAX_REQUEST_BYTES_HEADER, "4096",
+                HttpServer.ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER, "true"));
+        assertEquals(1, conn.capabilities().uploadUrlVersion());
+        RpcError error = assertThrows(RpcError.class, () -> conn.proxy(RawDemo.class).shout(bigValue()));
+        assertEquals("ProtocolError", error.errorType(), error.getMessage());
+        assertTrue(error.errorMessage().contains("upload protocol is too old"), error.errorMessage());
+        // Nor does asking for URLs directly fall back to the count shape.
+        RpcError direct = assertThrows(RpcError.class,
+                () -> conn.requestUploadUrls(List.of(new UploadRequest(1, UploadRequests.SHA))));
+        assertTrue(direct.errorMessage().contains("upload protocol is too old"), direct.errorMessage());
     }
 
     private static String sha256Hex(byte[] data) throws Exception {

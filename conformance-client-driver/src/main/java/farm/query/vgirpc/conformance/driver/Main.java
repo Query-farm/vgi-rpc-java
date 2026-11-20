@@ -573,7 +573,7 @@ public final class Main {
         try {
             return switch (op) {
                 case "capabilities" -> capabilities();
-                case "request_upload_urls" -> uploadUrls(request.path("count").asInt(1));
+                case "request_upload_urls" -> uploadUrls(request.path("uploads"));
                 case "session_begin" -> {
                     JsonNode token = request.get("token");
                     http.beginSession(token == null || token.isNull() ? null : token.asText());
@@ -614,6 +614,9 @@ public final class Main {
         ArrayNode echo = node.putArray("sticky_echo_headers");
         caps.stickyEchoHeaders().forEach(echo::add);
         node.put("upload_url_support", caps.uploadUrlSupport());
+        // null when absent or unparseable, per CLIENT_DRIVER_PROTOCOL.md.
+        if (caps.uploadUrlVersion() == 0) node.putNull("upload_url_version");
+        else node.put("upload_url_version", caps.uploadUrlVersion());
         putNullableLong(node, "max_request_bytes", caps.maxRequestBytes());
         putNullableLong(node, "max_response_bytes", caps.maxResponseBytes());
         putNullableLong(node, "max_externalized_response_bytes", caps.maxExternalizedResponseBytes());
@@ -624,14 +627,27 @@ public final class Main {
         return response;
     }
 
-    private ObjectNode uploadUrls(int count) {
+    /**
+     * Upload-URL protocol v2: relay the {@code uploads} list, one
+     * {@code {size, sha256}} object per entry, exactly as given. A request
+     * without one is refused rather than defaulted -- the retired count shape
+     * has no v2 meaning.
+     */
+    private ObjectNode uploadUrls(JsonNode uploads) {
+        if (!uploads.isArray()) return refusal("request_upload_urls requires 'uploads': [{size, sha256}, ...]");
+        java.util.List<farm.query.vgirpc.http.UploadRequest> wanted = new java.util.ArrayList<>();
+        for (JsonNode u : uploads) {
+            wanted.add(new farm.query.vgirpc.http.UploadRequest(u.path("size").asLong(), u.path("sha256").asText()));
+        }
         ObjectNode response = JSON.createObjectNode().put("ok", true);
         ArrayNode urls = response.putArray("urls");
-        for (UploadUrl url : http.requestUploadUrls(count)) {
+        for (UploadUrl url : http.requestUploadUrls(wanted)) {
             ObjectNode entry = urls.addObject();
             entry.put("upload_url", url.uploadUrl());
             entry.put("download_url", url.downloadUrl());
             entry.put("expires_at", url.expiresAtUnixSeconds());
+            ObjectNode headers = entry.putObject("upload_headers");
+            url.uploadHeaders().forEach(headers::put);
         }
         return response;
     }

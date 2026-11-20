@@ -22,7 +22,30 @@ package farm.query.vgirpc.http;
  *
  * @param uploadUrl the URL to PUT the payload to
  * @param downloadUrl the URL to name as {@code vgi_rpc.location} afterwards
+ * <p>Upload-URL protocol v2: each slot is vended for one announced
+ * {@code (size, sha256)}, and {@code uploadHeaders} are the headers the PUT must
+ * carry verbatim -- on S3/R2 the signed {@code x-amz-checksum-sha256}, which is
+ * how storage itself refuses a body other than the one announced.</p>
+ *
+ * @param uploadUrl the URL to PUT the payload to
+ * @param downloadUrl the URL to name as {@code vgi_rpc.location} afterwards
  * @param expiresAtUnixSeconds when the slot stops being usable, in seconds
  *     since the Unix epoch
+ * @param uploadHeaders headers the PUT must carry verbatim; never {@code null}
  */
-public record UploadUrl(String uploadUrl, String downloadUrl, long expiresAtUnixSeconds) {}
+public record UploadUrl(String uploadUrl, String downloadUrl, long expiresAtUnixSeconds,
+                        java.util.Map<String, String> uploadHeaders) {
+
+    /** Copy the header map, preserving its order. */
+    public UploadUrl {
+        uploadHeaders = uploadHeaders == null ? java.util.Map.of()
+                : java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(uploadHeaders));
+    }
+
+    @Override
+    public String toString() {
+        // Never print the signed URLs.
+        return "UploadUrl[expiresAtUnixSeconds=" + expiresAtUnixSeconds
+                + ", uploadHeaders=" + uploadHeaders.keySet() + "]";
+    }
+}

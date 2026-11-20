@@ -106,7 +106,32 @@ final class LocationResolverTest {
         Map<String, String> pointer = new LinkedHashMap<>();
         pointer.put(Metadata.LOCATION, "http://127.0.0.1:" + port + "/blob2");
         pointer.put(Metadata.LOCATION_SHA256, "0".repeat(64));  // guaranteed mismatch
-        assertThrows(java.io.IOException.class, () -> resolver.resolve(pointer));
+        java.io.IOException e = assertThrows(java.io.IOException.class, () -> resolver.resolve(pointer));
+        org.junit.jupiter.api.Assertions.assertTrue(e.getMessage().contains("sha256 mismatch"), e.getMessage());
+        java.io.IOException req = assertThrows(java.io.IOException.class, () -> resolver.resolveRequest(pointer));
+        org.junit.jupiter.api.Assertions.assertTrue(req.getMessage().contains("sha256 mismatch"), req.getMessage());
+    }
+
+    /** A request pointer without its digest is refused before anything is fetched. */
+    @Test
+    void request_pointer_without_sha256_is_refused() throws Exception {
+        AtomicInteger hits = new AtomicInteger();
+        byte[] ipc = buildIpcStream(new long[]{5});
+        http.createContext("/nosha", exchange -> {
+            hits.incrementAndGet();
+            exchange.sendResponseHeaders(200, ipc.length);
+            exchange.getResponseBody().write(ipc);
+            exchange.getResponseBody().close();
+        });
+        LocationResolver resolver = new LocationResolver(
+                ExternalLocationConfig.builder().urlValidator(ExternalLocationConfig.permissiveValidator()).build());
+        Map<String, String> pointer = new LinkedHashMap<>();
+        pointer.put(Metadata.LOCATION, "http://127.0.0.1:" + port + "/nosha");
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> resolver.resolveRequest(pointer));
+        org.junit.jupiter.api.Assertions.assertTrue(
+                e.getMessage().contains("missing vgi_rpc.location.sha256"), e.getMessage());
+        assertEquals(0, hits.get());
     }
 
     @Test

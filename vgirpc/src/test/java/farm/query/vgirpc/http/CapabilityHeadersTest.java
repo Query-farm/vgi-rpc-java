@@ -14,7 +14,6 @@ import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.IpcStreamWriter;
 import farm.query.vgirpc.wire.Metadata;
 import farm.query.vgirpc.wire.Wire;
-import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -316,7 +315,7 @@ final class CapabilityHeadersTest {
         startWithConfig(HttpServer.Config.builder().prefix("/vgi")
                 .supportedEncodings(List.of())
                 .authenticator(request -> { throw new InvalidCredentials("bad token"); })
-                .uploadUrlProvider(() -> new UploadUrlProvider.UploadUrl(
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
                         "https://upload.invalid", "https://download.invalid", Instant.now())));
 
         HttpResponse<byte[]> resp = post(request(base + "/__upload_url__/init")
@@ -332,7 +331,7 @@ final class CapabilityHeadersTest {
         String longPart = "x".repeat(700);
         startWithConfig(HttpServer.Config.builder().prefix("/vgi")
                 .supportedEncodings(List.of())
-                .uploadUrlProvider(() -> new UploadUrlProvider.UploadUrl(
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
                         "https://upload.invalid/" + longPart,
                         "https://download.invalid/" + longPart, Instant.now())));
 
@@ -348,6 +347,88 @@ final class CapabilityHeadersTest {
             assertTrue(error.errorMessage().contains("__upload_url__"));
             assertTrue(error.errorMessage().contains("max_response_bytes"));
         }
+    }
+
+    // ---- upload-URL protocol v2 -------------------------------------------
+
+    private void startUploadServer(Long maxUploadBytes) throws Exception {
+        HttpServer.Config.Builder b = HttpServer.Config.builder().prefix("/vgi")
+                .supportedEncodings(List.of())
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
+                        "https://upload.invalid/" + size, "https://download.invalid/" + sha256, Instant.now(),
+                        Map.of("x-amz-checksum-sha256", "Zm9v")));
+        if (maxUploadBytes != null) b.maxUploadBytes(maxUploadBytes);
+        startWithConfig(b);
+    }
+
+    private RpcError refusal(byte[] body) throws Exception {
+        HttpResponse<byte[]> resp = post(request(base + "/__upload_url__/init")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body)));
+        assertEquals(400, resp.statusCode());
+        try (IpcStreamReader reader = new IpcStreamReader(
+                new java.io.ByteArrayInputStream(resp.body()), Allocators.root())) {
+            RpcError error = Wire.errorFromMetadata(reader.readNextBatch());
+            assertEquals("ValueError", error.errorType());
+            return error;
+        }
+    }
+
+    @Test
+    void upload_url_support_header_is_version_two() throws Exception {
+        startUploadServer(null);
+        HttpResponse<Void> resp = options(base + "/health");
+        assertEquals(HttpServer.UPLOAD_URL_PROTOCOL_VERSION,
+                resp.headers().firstValue(HttpServer.UPLOAD_URL_HEADER).orElseThrow());
+        assertEquals("2", HttpServer.UPLOAD_URL_PROTOCOL_VERSION);
+    }
+
+    @Test
+    void upload_url_v2_round_trip_returns_one_row_per_entry_with_headers() throws Exception {
+        startUploadServer(null);
+        HttpResponse<byte[]> resp = post(request(base + "/__upload_url__/init")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(UploadRequests.v2(3, 42, UploadRequests.SHA))));
+        assertEquals(200, resp.statusCode());
+        try (IpcStreamReader reader = new IpcStreamReader(
+                new java.io.ByteArrayInputStream(resp.body()), Allocators.root())) {
+            reader.readNextBatch();
+            VectorSchemaRoot root = reader.root();
+            assertEquals(HttpServer.UPLOAD_URL_RESPONSE_SCHEMA, root.getSchema());
+            assertEquals(3, root.getRowCount());
+            assertEquals("https://upload.invalid/42", root.getVector("upload_url").getObject(0).toString());
+            assertEquals("https://download.invalid/" + UploadRequests.SHA,
+                    root.getVector("download_url").getObject(2).toString());
+            assertTrue(root.getVector("upload_headers").getObject(1).toString().contains("x-amz-checksum-sha256"));
+        }
+    }
+
+    @Test
+    void upload_url_retired_count_shape_is_refused() throws Exception {
+        startUploadServer(null);
+        RpcError error = refusal(UploadRequests.v1Count(1));
+        assertTrue(error.errorMessage().contains("retired count shape"), error.errorMessage());
+        assertTrue(error.errorMessage().contains("VGI-Upload-URL-Support: 2"), error.errorMessage());
+    }
+
+    @Test
+    void upload_url_entry_count_bounds_are_refused() throws Exception {
+        startUploadServer(null);
+        assertTrue(refusal(UploadRequests.v2(0)).errorMessage().contains("between 1 and 100"));
+        assertTrue(refusal(UploadRequests.v2(101)).errorMessage().contains("between 1 and 100"));
+    }
+
+    @Test
+    void upload_url_bad_size_and_hash_are_refused() throws Exception {
+        startUploadServer(null);
+        assertTrue(refusal(UploadRequests.v2(1, 0, UploadRequests.SHA)).errorMessage().contains(">= 1"));
+        assertTrue(refusal(UploadRequests.v2(1, 5, "A".repeat(64))).errorMessage().contains("64 lowercase hex"));
+        assertTrue(refusal(UploadRequests.v2(1, 5, "a".repeat(63))).errorMessage().contains("64 lowercase hex"));
+    }
+
+    @Test
+    void upload_url_size_over_max_upload_bytes_is_refused() throws Exception {
+        startUploadServer(1000L);
+        RpcError error = refusal(UploadRequests.v2(1, 1001, UploadRequests.SHA));
+        assertTrue(error.errorMessage().contains("exceeds VGI-Max-Upload-Bytes"), error.errorMessage());
     }
 
     // ---- helpers ---------------------------------------------------------
@@ -431,20 +512,8 @@ final class CapabilityHeadersTest {
         return captured.toByteArray();
     }
 
-    private static byte[] uploadRequest(long count) throws Exception {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        try (VectorSchemaRoot root = VectorSchemaRoot.create(
-                     HttpServer.UPLOAD_URL_PARAMS_SCHEMA, Allocators.root());
-             IpcStreamWriter writer = new IpcStreamWriter(out)) {
-            BigIntVector counts = (BigIntVector) root.getVector("count");
-            counts.allocateNew(1);
-            counts.setSafe(0, count);
-            root.setRowCount(1);
-            writer.writeBatch(root, Map.of(
-                    Metadata.RPC_METHOD, HttpServer.UPLOAD_URL_METHOD,
-                    Metadata.REQUEST_VERSION_KEY, Metadata.REQUEST_VERSION));
-        }
-        return out.toByteArray();
+    private static byte[] uploadRequest(int count) throws Exception {
+        return UploadRequests.v2(count);
     }
 
     /** Writes through to the transport while keeping a copy of the request bytes. */
