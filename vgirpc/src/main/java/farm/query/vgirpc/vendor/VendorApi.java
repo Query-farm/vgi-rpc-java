@@ -374,11 +374,13 @@ final class VendorApi implements AutoCloseable {
     // -- wire mapping -----------------------------------------------------
 
     PutGrant put(long size, String sha256B64, String purpose, BlobScope scope, String contentEncoding,
-                 String idempotencyKey) {
+                 String idempotencyKey, String origin) {
         ObjectNode body = JSON.createObjectNode();
         body.put("size", size);
         body.put("sha256_b64", sha256B64);
         body.put("purpose", purpose);
+        // Advisory: the vendor ignores it; test fakes count and fault client uploads by it.
+        if (origin != null) body.put("origin", origin);
         if (scope != null) {
             ObjectNode s = body.putObject("scope");
             s.put("shard", scope.shard());

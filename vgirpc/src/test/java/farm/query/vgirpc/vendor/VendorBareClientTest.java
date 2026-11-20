@@ -46,6 +46,7 @@ class VendorBareClientTest {
     private final Map<String, byte[]> objects = new ConcurrentHashMap<>();
     private final List<Map<String, List<String>>> storageHeaders = new CopyOnWriteArrayList<>();
     private final List<String> apiAuth = new CopyOnWriteArrayList<>();
+    private final List<JsonNode> putRequests = new CopyOnWriteArrayList<>();
     private final AtomicBoolean offHostGrant = new AtomicBoolean();
     private final AtomicInteger storage503 = new AtomicInteger();
     private final AtomicBoolean storage403 = new AtomicBoolean();
@@ -83,6 +84,7 @@ class VendorBareClientTest {
                     "download_hosts", List.of("127.0.0.1:" + server.getAddress().getPort()),
                     "url_prefixes", List.of(base + "/store/"));
             case "/v1/blobs/put" -> {
+                putRequests.add(req);
                 String id = "obj" + objects.size();
                 objects.put(id, new byte[0]);
                 String host = offHostGrant.get() ? "https://evil.example.com" : base;
@@ -218,5 +220,25 @@ class VendorBareClientTest {
             assertFalse(e.getMessage().contains("SECRET"), e.getMessage());
         }
         assertTrue(storageHeaders.isEmpty(), "nothing may be sent to an unpinned host");
+    }
+
+    @Test
+    void clientUploadGrantsCarryTheOriginMarkerAndServerWritesDoNot() {
+        byte[] body = "client request".getBytes(StandardCharsets.UTF_8);
+        try (VendorStorage s = new VendorStorage(base, TOKEN, "rpc", java.time.Duration.ofSeconds(5), 3, 0.01,
+                600, true)) {
+            s.generateUploadUrl(body.length, java.util.HexFormat.of().formatHex(VendorStorage.sha256(body)));
+            s.upload("server result".getBytes(StandardCharsets.UTF_8), null);
+        }
+        try (VendorBlobClient c = client()) {
+            c.putBytes("stored value".getBytes(StandardCharsets.UTF_8), null, null);
+        }
+        assertEquals(3, putRequests.size());
+        JsonNode upload = putRequests.get(0);
+        assertEquals("client_upload", VendorStorage.CLIENT_UPLOAD_ORIGIN);
+        assertEquals(VendorStorage.CLIENT_UPLOAD_ORIGIN, upload.path("origin").asText(null));
+        assertEquals("rpc", upload.path("purpose").asText());
+        assertFalse(putRequests.get(1).has("origin"), "a server result write is not a client upload");
+        assertFalse(putRequests.get(2).has("origin"), "a storage write is not a client upload");
     }
 }

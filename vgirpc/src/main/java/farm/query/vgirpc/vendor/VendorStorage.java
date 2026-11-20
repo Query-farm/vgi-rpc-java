@@ -30,8 +30,11 @@ import java.util.Map;
  * upload-URL protocol v2) asks the same sized endpoint, always purpose
  * {@code rpc}, for a grant covering the client's announced size and SHA-256,
  * and hands the client the grant's PUT URL, its required headers and its GET
- * URL: storage refuses any other body. The unsized {@code /v1/upload_urls}
- * path is not used.</p>
+ * URL: storage refuses any other body. That grant request carries the
+ * advisory {@code origin: "client_upload"} ({@link #CLIENT_UPLOAD_ORIGIN}),
+ * which the vendor ignores and test fakes use to tell client uploads from the
+ * server's own writes. The unsized {@code /v1/upload_urls} path is not
+ * used.</p>
  *
  * <p>Thread-safe. Objects are cleaned up by the vendor (registry alarm plus
  * storage lifecycle rules); vgi-rpc never deletes them.</p>
@@ -42,6 +45,15 @@ public final class VendorStorage extends VendorClient implements ExternalStorage
 
     private final String purpose;
     private final boolean pinHosts;
+
+    /**
+     * The advisory {@code origin} on a {@code /v1/blobs/put} grant minted for a
+     * client to upload a request ({@link #generateUploadUrl}). The vendor ignores
+     * it; test fakes count and fault client uploads by it. Server result and
+     * storage writes never send it. Mirrors vgi-rpc-python
+     * {@code vgi_rpc.vendor.CLIENT_UPLOAD_ORIGIN}.
+     */
+    public static final String CLIENT_UPLOAD_ORIGIN = "client_upload";
 
     /**
      * Create a vendor-backed storage.
@@ -93,7 +105,7 @@ public final class VendorStorage extends VendorClient implements ExternalStorage
 
     @Override
     public URI upload(byte[] body, String contentEncoding) {
-        PutGrant grant = api.put(body.length, b64Sha256(body), purpose, null, contentEncoding, null);
+        PutGrant grant = api.put(body.length, b64Sha256(body), purpose, null, contentEncoding, null, null);
         if (pinHosts) check(grant.uploadUrl());
         api.putObject(grant, body, contentEncoding);
         String downloadUrl = grant.downloadUrl();
@@ -114,7 +126,8 @@ public final class VendorStorage extends VendorClient implements ExternalStorage
         if (digest.length != 32) throw new IllegalArgumentException("sha256 must be 64 lowercase hex characters");
         // Always rpc: a client upload is a request payload the server fetches
         // once, which is what rpc objects (a GET URL, the short lifecycle) are.
-        PutGrant grant = api.put(size, Base64.getEncoder().encodeToString(digest), "rpc", null, null, null);
+        PutGrant grant = api.put(size, Base64.getEncoder().encodeToString(digest), "rpc", null, null, null,
+                CLIENT_UPLOAD_ORIGIN);
         String downloadUrl = grant.downloadUrl();
         if (downloadUrl == null) downloadUrl = api.get(grant.objectId()).downloadUrl();
         if (pinHosts) {

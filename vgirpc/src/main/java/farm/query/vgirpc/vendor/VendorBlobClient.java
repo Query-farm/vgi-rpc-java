@@ -91,7 +91,7 @@ public final class VendorBlobClient extends VendorClient {
     public BlobRef putBytes(byte[] data, BlobScope scope, String idempotencyKey) {
         byte[] digest = VendorStorage.sha256(data);
         PutGrant grant = api.put(data.length, Base64.getEncoder().encodeToString(digest), purpose, scope, null,
-                idempotencyKey);
+                idempotencyKey, null);
         check(grant.uploadUrl());
         api.putObject(grant, data, null);
         return new BlobRef(grant.objectId(), data.length, HexFormat.of().formatHex(digest));

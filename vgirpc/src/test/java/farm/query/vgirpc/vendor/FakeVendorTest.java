@@ -150,7 +150,12 @@ class FakeVendorTest {
     void storageUploadReturnsAPinnedDownloadUrl() throws Exception {
         byte[] body = "arrow-ipc-bytes".getBytes(StandardCharsets.UTF_8);
         try (VendorStorage s = new VendorStorage(url, token)) {
+            JsonNode start = stats();
             URI download = s.upload(body, null);
+            // A server result write: puts_rpc, never a client-upload grant.
+            JsonNode after = stats();
+            assertEquals(start.get("puts_rpc").asLong() + 1, after.get("puts_rpc").asLong());
+            assertEquals(start.get("puts_upload").asLong(), after.get("puts_upload").asLong());
             assertDoesNotThrow(() -> s.urlValidator().accept(download));
             HttpResponse<byte[]> r = HTTP.send(HttpRequest.newBuilder(download).GET().build(),
                     HttpResponse.BodyHandlers.ofByteArray());
@@ -166,13 +171,19 @@ class FakeVendorTest {
         try (VendorStorage s = new VendorStorage(url, token)) {
             byte[] body = new byte[] {7, 7, 7};
             String sha = java.util.HexFormat.of().formatHex(VendorStorage.sha256(body));
-            long before = stats().get("puts").asLong();
-            long unsizedBefore = stats().path("upload_urls").asLong();
+            JsonNode start = stats();
+            long before = start.get("puts").asLong();
+            long unsizedBefore = start.path("upload_urls").asLong();
             UploadUrlProvider.UploadUrl u = s.generateUploadUrl(body.length, sha);
             assertNotEquals(u.uploadUrl(), u.downloadUrl());
-            // The sized purpose=rpc grant, never the unsized /v1/upload_urls path.
-            assertEquals(before + 1, stats().get("puts").asLong());
-            assertEquals(unsizedBefore, stats().path("upload_urls").asLong());
+            // The sized purpose=rpc grant, never the unsized /v1/upload_urls path,
+            // marked origin=client_upload: the fake counts it as a client upload
+            // grant (puts_upload), not a server rpc write (puts_rpc).
+            JsonNode granted = stats();
+            assertEquals(before + 1, granted.get("puts").asLong());
+            assertEquals(unsizedBefore, granted.path("upload_urls").asLong());
+            assertEquals(start.get("puts_upload").asLong() + 1, granted.get("puts_upload").asLong());
+            assertEquals(start.get("puts_rpc").asLong(), granted.get("puts_rpc").asLong());
             assertEquals(java.util.Base64.getEncoder().encodeToString(VendorStorage.sha256(body)),
                     u.headers().get("x-amz-checksum-sha256"));
             assertTrue(u.headers().keySet().stream().noneMatch("content-length"::equalsIgnoreCase));
@@ -189,6 +200,10 @@ class FakeVendorTest {
             u.headers().forEach(put::header);
             HttpResponse<Void> ok = HTTP.send(put.build(), HttpResponse.BodyHandlers.discarding());
             assertTrue(ok.statusCode() / 100 == 2, "PUT " + ok.statusCode());
+            JsonNode uploaded = stats();
+            assertEquals(granted.get("client_uploads").asLong() + 1, uploaded.get("client_uploads").asLong());
+            assertEquals(granted.get("client_upload_refusals").asLong() + 1,
+                    uploaded.get("client_upload_refusals").asLong());
             HttpResponse<byte[]> get = HTTP.send(HttpRequest.newBuilder(URI.create(u.downloadUrl())).GET().build(),
                     HttpResponse.BodyHandlers.ofByteArray());
             assertArrayEquals(body, get.body());
