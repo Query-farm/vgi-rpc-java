@@ -274,7 +274,14 @@ public final class HttpServer {
     /** Browser access policy, or {@code null} when no origin was configured —
      *  CORS is opt-in, and off means not one {@code Access-Control-*} header. */
     private final CorsPolicy cors;
+    /** {@link Config#strictAuth()}: authenticate every request but the exempt two before routing. */
+    private final boolean strictAuth;
+    /** {@link Config#wwwAuthenticate()}: the challenge on every 401, or {@code null}. */
+    private final String wwwAuthenticate;
     private int port;
+
+    /** Request attribute carrying the identity the strict gate resolved, so routes reuse it. */
+    private static final String STRICT_IDENTITY_ATTRIBUTE = HttpServer.class.getName() + ".strictIdentity";
 
     /**
      * Defaults: loopback bind, ephemeral port, no prefix, anonymous auth,
@@ -352,6 +359,8 @@ public final class HttpServer {
             this.sessionTokenKey = null;
             this.sessionRegistry = null;
         }
+        this.strictAuth = config.strictAuth();
+        this.wwwAuthenticate = config.wwwAuthenticate();
         this.cors = config.corsOrigins().isEmpty()
                 ? null
                 : new CorsPolicy(config.corsOrigins(), config.corsMaxAgeSeconds(), corsExposeHeaders());
@@ -517,6 +526,21 @@ public final class HttpServer {
      *                         header. Default
      *                         {@value #DEFAULT_CORS_MAX_AGE_SECONDS}s. Ignored
      *                         when {@code corsOrigins} is empty.
+     * @param strictAuth       authenticate <em>every</em> request before routing,
+     *                         except {@code HEAD {prefix}/health} and CORS
+     *                         preflights ({@code OPTIONS} carrying
+     *                         {@code Access-Control-Request-Method}). The health
+     *                         probe's {@code GET}, other {@code OPTIONS}, the
+     *                         landing page and unknown paths all need a
+     *                         credential, and authentication runs before the
+     *                         request body is read, size-checked or
+     *                         decompressed. Requires an {@code authenticator};
+     *                         refuses a {@code peerAuthenticationPolicy}.
+     *                         Default {@code false}.
+     * @param wwwAuthenticate  the {@code WWW-Authenticate} challenge set on every
+     *                         401, replacing whatever the authenticator supplied;
+     *                         {@code null} (the default) keeps the
+     *                         authenticator's own.
      */
     public record Config(
             String host,
@@ -554,7 +578,9 @@ public final class HttpServer {
             int peerProviderConcurrency,
             long hostingMaxRequestBytes,
             long hostingMaxResponseBytes,
-            long preferredResponseBytes) {
+            long preferredResponseBytes,
+            boolean strictAuth,
+            String wwwAuthenticate) {
 
         /** 1 hour. */
         public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
@@ -676,6 +702,18 @@ public final class HttpServer {
                 throw new IllegalArgumentException(
                         "peerProviderConcurrency must be at least the configured provider count");
             }
+            if (strictAuth && (authenticator == null || authenticator == Authenticator.ANONYMOUS)) {
+                throw new IllegalArgumentException("strictAuth requires an authenticator");
+            }
+            if (strictAuth && peerAuthenticationPolicy != null) {
+                throw new IllegalArgumentException(
+                        "strictAuth authenticates by credential only; it cannot be combined with a "
+                                + "peerAuthenticationPolicy");
+            }
+            if (wwwAuthenticate != null && (wwwAuthenticate.isBlank()
+                    || wwwAuthenticate.indexOf('\r') >= 0 || wwwAuthenticate.indexOf('\n') >= 0)) {
+                throw new IllegalArgumentException("wwwAuthenticate must be a non-blank single-line header value");
+            }
             java.util.HashSet<String> providerNames = new java.util.HashSet<>();
             for (PeerIdentityProvider provider : peerIdentityProviders) {
                 if (provider == null || provider.provider() == null || provider.provider().isBlank()
@@ -742,6 +780,8 @@ public final class HttpServer {
             private String peerServiceName;
             private long peerResolutionTimeoutMs = 5_000;
             private int peerProviderConcurrency = 64;
+            private boolean strictAuth;
+            private String wwwAuthenticate;
 
             /**
              * Listen address (default {@code "127.0.0.1"}). See {@link Config#host()}.
@@ -1054,6 +1094,29 @@ public final class HttpServer {
              * @return this builder
              */
             public Builder corsMaxAgeSeconds(long v) { this.corsMaxAgeSeconds = v; return this; }
+            /**
+             * Authenticate every request before routing. See {@link Config#strictAuth()}.
+             *
+             * <p>The only requests that skip the {@link #authenticator(Authenticator)} are
+             * {@code HEAD {prefix}/health} (a liveness probe that carries no credential) and CORS
+             * preflights, which browsers send without credentials. Everything else, including
+             * {@code GET /health}, the landing page, other {@code OPTIONS} requests and paths that
+             * route nowhere, is answered 401 without a valid credential, before the body is read.
+             * Mirrors vgi-rpc-python's {@code make_wsgi_app(strict_auth=True)}.
+             *
+             * @param v {@code true} to authenticate every request (default {@code false})
+             * @return this builder
+             */
+            public Builder strictAuth(boolean v) { this.strictAuth = v; return this; }
+            /**
+             * Set the {@code WWW-Authenticate} challenge on every 401, replacing the
+             * authenticator's own. Mirrors vgi-rpc-python's {@code www_authenticate}.
+             *
+             * @param challenge the header value (e.g. {@code Bearer error="invalid_token"}), or
+             *        {@code null} to keep the authenticator's
+             * @return this builder
+             */
+            public Builder wwwAuthenticate(String challenge) { this.wwwAuthenticate = challenge; return this; }
 
             /**
              * Build the immutable config.
@@ -1074,7 +1137,8 @@ public final class HttpServer {
                         landingInfo, corsOrigins, corsMaxAgeSeconds,
                         peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
                         peerResolutionTimeoutMs, peerProviderConcurrency,
-                        hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes);
+                        hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes,
+                        strictAuth, wwwAuthenticate);
             }
         }
 
@@ -1097,7 +1161,8 @@ public final class HttpServer {
                     p, corsOrigins, corsMaxAgeSeconds,
                     peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
                     peerResolutionTimeoutMs, peerProviderConcurrency,
-                    hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes);
+                    hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes,
+                    strictAuth, wwwAuthenticate);
         }
     }
 
@@ -1182,6 +1247,17 @@ public final class HttpServer {
             try (CallOutcome outcome = CallOutcome.open();
                  AccessLogScope access = AccessLogScope.open(requestId)) {
                 try {
+                    // Strict mode: one gate ahead of every route, so nothing is answered -- and no
+                    // body is read, size-checked or decompressed -- for a caller without a valid
+                    // credential. The routes reuse the identity resolved here.
+                    if (strictAuth && !strictlyExempt(req)) {
+                        try {
+                            req.setAttribute(STRICT_IDENTITY_ATTRIBUTE, authenticateIdentity(req));
+                        } catch (AuthException e) {
+                            writeUnauthorized(resp, e);
+                            return;
+                        }
+                    }
                     super.service(req, resp);
                 } catch (AuthUnavailableException e) {
                     // Caught here rather than at each authenticate() call site so
@@ -1197,6 +1273,19 @@ public final class HttpServer {
                     access.httpStatus(resp.getStatus());
                 }
             }
+        }
+
+        /**
+         * The two requests {@link Config#strictAuth()} lets through without a credential: the
+         * {@code HEAD} liveness probe on {@code health}, and CORS preflights, which browsers never
+         * attach credentials to and which run no handler code.
+         */
+        private boolean strictlyExempt(HttpServletRequest req) {
+            String method = req.getMethod();
+            if ("OPTIONS".equals(method) && req.getHeader("Access-Control-Request-Method") != null) {
+                return true;
+            }
+            return "HEAD".equals(method) && "health".equals(pathInfo(req));
         }
 
         @Override
@@ -1832,6 +1921,7 @@ public final class HttpServer {
 
     /** Resolve application auth first, then transport evidence, without credential downgrade. */
     private RequestIdentity authenticateIdentity(HttpServletRequest req) throws AuthException {
+        if (req.getAttribute(STRICT_IDENTITY_ATTRIBUTE) instanceof RequestIdentity resolved) return resolved;
         AuthContext auth = AuthContext.ANONYMOUS;
         MissingCredentials missing = null;
         try {
@@ -2328,8 +2418,9 @@ public final class HttpServer {
      * appear on a successful response.</p>
      */
     private void writeUnauthorized(HttpServletResponse resp, AuthException e) throws IOException {
-        if (e.wwwAuthenticate() != null) {
-            resp.setHeader(HttpHeaders.WWW_AUTHENTICATE, e.wwwAuthenticate());
+        String challenge = wwwAuthenticate != null ? wwwAuthenticate : e.wwwAuthenticate();
+        if (challenge != null) {
+            resp.setHeader(HttpHeaders.WWW_AUTHENTICATE, challenge);
         }
         AuthReason reason = e.reason();
         resp.setHeader(HttpHeaders.VGI_AUTH_REASON, reason.code());
