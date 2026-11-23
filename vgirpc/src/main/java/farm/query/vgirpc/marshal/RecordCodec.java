@@ -4,6 +4,7 @@
 package farm.query.vgirpc.marshal;
 
 import farm.query.vgirpc.schema.ArrowSerializableRecord;
+import farm.query.vgirpc.schema.RawBinary;
 import farm.query.vgirpc.schema.SchemaDerivation;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
@@ -48,6 +49,7 @@ public final class RecordCodec {
         if (v == null) return null;
         if (v instanceof Optional<?> o) return convertForArrow(o.orElse(null));
         if (v instanceof Enum<?> e) return e.name();
+        if (v instanceof RawBinary rb) return rb.rawBinary();
         if (v instanceof ArrowSerializableRecord r) return toRowMap(r);
         if (v instanceof List<?> list) {
             List<Object> out = new ArrayList<>(list.size());
@@ -126,6 +128,9 @@ public final class RecordCodec {
         if (ptype.isEnum()) {
             return Enum.valueOf((Class<Enum>) ptype.asSubclass(Enum.class), (String) raw);
         }
+        if (RawBinary.class.isAssignableFrom(ptype) && raw instanceof byte[] bytes) {
+            return rawBinaryFromBytes(ptype, rc, bytes);
+        }
         if (ArrowSerializableRecord.class.isAssignableFrom(ptype) && raw instanceof Map<?, ?> m) {
             return fromRowMap((Class<? extends ArrowSerializableRecord>) ptype, (Map<String, Object>) m);
         }
@@ -174,6 +179,23 @@ public final class RecordCodec {
             return out;
         }
         return raw;
+    }
+
+    /** Build a {@link RawBinary} component through its static {@code fromRawBinary(byte[], Type, String)}. */
+    private static Object rawBinaryFromBytes(Class<?> ptype, RecordComponent rc, byte[] bytes) {
+        String path = rc.getDeclaringRecord().getSimpleName() + "." + rc.getName();
+        try {
+            java.lang.reflect.Method factory = ptype.getMethod(
+                    "fromRawBinary", byte[].class, java.lang.reflect.Type.class, String.class);
+            return factory.invoke(null, bytes, rc.getGenericType(), path);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException re) throw re;
+            throw new RuntimeException(path + ": " + cause, cause);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(ptype.getName()
+                    + " implements RawBinary but has no public static fromRawBinary(byte[], Type, String)", e);
+        }
     }
 
     private static Class<?> rawClass(java.lang.reflect.Type t) {

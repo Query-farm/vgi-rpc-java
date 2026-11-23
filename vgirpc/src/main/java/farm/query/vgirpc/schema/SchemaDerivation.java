@@ -276,6 +276,11 @@ public final class SchemaDerivation {
     public static ArrowType inferArrowType(Type type) {
         Class<?> raw = rawClass(type);
 
+        // Raw-preserving binary values (e.g. a nested record held as its IPC bytes) → binary
+        if (RawBinary.class.isAssignableFrom(raw)) {
+            return new ArrowType.Binary();
+        }
+
         // Records that implement ArrowSerializableRecord → struct
         if (raw.isRecord() && ArrowSerializableRecord.class.isAssignableFrom(raw)) {
             return new ArrowType.Struct();
