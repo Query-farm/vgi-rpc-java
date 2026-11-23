@@ -32,6 +32,7 @@ public final class ExternalLocationConfig {
     private final boolean maxFetchBytesExplicit;
     /** Max bytes after external content decompression. */
     private final long maxDecompressedBytes;
+    private final boolean maxDecompressedBytesExplicit;
     /** Retry attempts on transient fetch errors (caller count, not including first). */
     private final int maxRetries;
     /** Delay between retries. */
@@ -51,6 +52,7 @@ public final class ExternalLocationConfig {
         this.maxFetchBytes = b.maxFetchBytes;
         this.maxFetchBytesExplicit = b.maxFetchBytesSet;
         this.maxDecompressedBytes = b.maxDecompressedBytes;
+        this.maxDecompressedBytesExplicit = b.maxDecompressedBytesSet;
         this.maxRetries = b.maxRetries;
         this.retryDelay = b.retryDelay;
         this.httpTimeout = b.httpTimeout;
@@ -70,9 +72,33 @@ public final class ExternalLocationConfig {
      * @return hard cap (bytes) on a fetched body; oversized fetches are rejected. */
     public long maxFetchBytes() { return maxFetchBytes; }
     /** @return whether {@link #maxFetchBytes()} was set explicitly (not the 512 MiB default).
-     *  An explicit fetch cap below the advertised upload cap refuses server startup; the
-     *  default one clamps the advertised upload cap instead. */
+     *  An HTTP server whose configured upload cap exceeds a <em>default</em> fetch cap raises
+     *  the fetch cap to match; an <em>explicit</em> fetch cap below it refuses startup. */
     public boolean maxFetchBytesExplicit() { return maxFetchBytesExplicit; }
+
+    /**
+     * A copy with the fetch cap raised (or set) to {@code bytes}, still marked as not
+     * explicitly configured. The decoded-body cap follows it unless that was set explicitly.
+     *
+     * @param bytes the new fetch cap
+     * @return the copy
+     */
+    public ExternalLocationConfig withDefaultMaxFetchBytes(long bytes) {
+        Builder b = new Builder();
+        b.storage = storage;
+        b.thresholdBytes = thresholdBytes;
+        b.maxFetchBytes = bytes;
+        b.maxFetchBytesSet = false;
+        b.maxDecompressedBytes = maxDecompressedBytesExplicit ? maxDecompressedBytes : bytes;
+        b.maxDecompressedBytesSet = maxDecompressedBytesExplicit;
+        b.maxRetries = maxRetries;
+        b.retryDelay = retryDelay;
+        b.httpTimeout = httpTimeout;
+        b.urlValidator = urlValidator;
+        b.maxRangeParallelism = maxRangeParallelism;
+        b.compression = compression;
+        return new ExternalLocationConfig(b);
+    }
     /** Safety cap applied after external content decompression.
      * @return hard cap (bytes) on the decoded body. */
     public long maxDecompressedBytes() { return maxDecompressedBytes; }

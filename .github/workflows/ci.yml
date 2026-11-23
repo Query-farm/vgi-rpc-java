@@ -152,8 +152,9 @@ jobs:
       # protocol-3.4: the fake vendor that verifies sized PUTs (upload-URL v2) and
       # counts client-upload grants by their origin marker (f0fb675), plus the
       # protocol-3.4 StateRef counters (puts_state_ref, gets_state_ref, gets_upload)
-      # and the origin delete route (3a06983).
-      VGI_RPC_FAKE_VENDOR_REF: 3a06983
+      # and the origin delete route; 6a21ee3 also imports zstandard lazily, so the
+      # bare uvx install starts.
+      VGI_RPC_FAKE_VENDOR_REF: 6a21ee3
     steps:
       - uses: actions/checkout@v4
 
@@ -180,9 +181,7 @@ jobs:
       - name: Start the fake blob vendor
         run: |
           log="$RUNNER_TEMP/fake-vendor.log"
-          # --with zstandard: at 3a06983 `import vgi_rpc` needs zstandard (state_ref ->
-          # _token_codec), which the base package does not declare (only extras do).
-          nohup uvx --with zstandard --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
+          nohup uvx --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
             vgi-rpc-fake-vendor --test-routes --token "test-token=tenant-a" > "$log" 2>&1 &
           echo "FAKE_VENDOR_PID=$!" >> "$GITHUB_ENV"
           url=""

@@ -251,8 +251,9 @@ own context: continuations, `onCancel`, unary calls and the first producer tick 
 - **Argument references.** Every `__upload_url__/init` row also carries `object_id` and `ref`, a sealed
   reference bound to the caller's principal. `ctx.resolveArgumentRef(ref, size, sha256)` (or
   `ArgumentRefs.resolve`) opens, fetches through the object cache and verifies it. The advertised
-  `VGI-Max-Upload-Bytes` is always sent with upload URLs and never exceeds the server's fetch cap
-  (`VGI_RPC_MAX_FETCH_BYTES`, default 512 MiB).
+  `VGI-Max-Upload-Bytes` is always sent with upload URLs: by default it is the server's fetch cap
+  (`VGI_RPC_MAX_FETCH_BYTES`, default 512 MiB); a larger configured upload cap raises a default fetch cap
+  to match, and is refused at startup against an explicit lower one.
 
 ## Protocol names
 

@@ -569,11 +569,24 @@ final class CapabilityHeadersTest {
     }
 
     @Test
-    void upload_cap_above_the_default_fetch_cap_is_clamped() throws Exception {
-        startUploadServer(4L << 30);
+    void upload_cap_above_the_default_fetch_cap_raises_the_fetch_cap() throws Exception {
+        RpcServer rpc = new RpcServer(EchoService.class, new EchoImpl());
+        farm.query.vgirpc.external.ExternalLocationConfig cfg =
+                farm.query.vgirpc.external.ExternalLocationConfig.builder().build();
+        rpc.setExternalConfig(cfg);
+        rpc.setLocationResolver(new farm.query.vgirpc.external.LocationResolver(cfg));
+        server = new HttpServer(rpc, HttpServer.Config.builder().prefix("/vgi")
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
+                        "https://u.invalid", "https://d.invalid", Instant.now(), Map.of(), "obj"))
+                .maxUploadBytes(4L << 30)
+                .build());
+        server.start();
+        base = "http://127.0.0.1:" + server.port() + "/vgi";
         HttpResponse<Void> resp = options(base + "/health");
-        assertEquals(Long.toString(farm.query.vgirpc.external.ExternalLocationConfig.DEFAULT_MAX_FETCH_BYTES),
+        assertEquals(Long.toString(4L << 30),
                 resp.headers().firstValue(HttpServer.MAX_UPLOAD_BYTES_HEADER).orElseThrow());
+        assertEquals(4L << 30, rpc.externalConfig().maxFetchBytes(), "the default fetch cap was raised");
+        assertEquals(4L << 30, rpc.locationResolver().config().maxFetchBytes(), "and the resolver with it");
     }
 
     @Test

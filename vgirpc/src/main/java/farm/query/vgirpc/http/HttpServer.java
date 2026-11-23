@@ -479,9 +479,9 @@ public final class HttpServer {
      *                         inbound fetch cap (512 MiB unless the external config
      *                         sets another): an upload comes back as a pointer the
      *                         server fetches under that cap, so the advertised size
-     *                         never exceeds it. A larger value is clamped to the
-     *                         default fetch cap with a warning, and refused at startup
-     *                         when the fetch cap was set explicitly below it.
+     *                         never exceeds it. A larger value raises a default fetch
+     *                         cap to match, and is refused at startup when the fetch cap
+     *                         was set explicitly below it.
      *                         {@code __upload_url__/init} refuses an entry whose
      *                         declared size exceeds it.
      * @param advertisedMaxResponseBytes operator-facing cap on inline response
@@ -1748,30 +1748,50 @@ public final class HttpServer {
     }
 
     /**
-     * Fix 1 of the 3.4 plan: the {@code VGI-Max-Upload-Bytes} to advertise never exceeds the
-     * server's inbound fetch cap, and is always advertised alongside upload URLs.
+     * Fix 1 of the 3.4 plan: the {@code VGI-Max-Upload-Bytes} to advertise, always sent with
+     * upload URLs, and never above the cap the server fetches the uploads back under.
      *
      * <p>An upload comes back to the server as a pointer it fetches under the external
-     * config's {@code maxFetchBytes}; advertising more would let a client upload a request the
-     * server then refuses, after the whole upload.</p>
+     * config's {@code maxFetchBytes}. Unset, the upload cap is that fetch cap. Set above a
+     * <em>default</em> fetch cap, the fetch cap is raised to match (the external config and a
+     * resolver built from it are replaced), so the operator's upload cap works as written. Set
+     * above an <em>explicit</em> fetch cap, startup is refused: clients would upload requests
+     * the server then refuses to fetch.</p>
      */
     private static Long resolveMaxUploadBytes(RpcServer rpc, UploadUrlProvider provider, Long requested) {
         if (provider == null) return requested;
         farm.query.vgirpc.external.ExternalLocationConfig external = rpc.externalConfig();
-        long fetchCap = external != null ? external.maxFetchBytes()
+        farm.query.vgirpc.external.LocationResolver resolver = rpc.locationResolver();
+        farm.query.vgirpc.external.ExternalLocationConfig fetching =
+                external != null ? external : resolver != null ? resolver.config() : null;
+        long fetchCap = fetching != null ? fetching.maxFetchBytes()
                 : farm.query.vgirpc.external.ExternalLocationConfig.DEFAULT_MAX_FETCH_BYTES;
         if (requested == null) return fetchCap;
         if (requested < 1) throw new IllegalArgumentException("maxUploadBytes must be a positive integer, got " + requested);
         if (requested <= fetchCap) return requested;
-        if (external != null && external.maxFetchBytesExplicit()) {
+        if (fetching != null && fetching.maxFetchBytesExplicit()) {
             throw new IllegalArgumentException("maxUploadBytes (" + requested + ") exceeds the server's inbound "
                     + "fetch cap (ExternalLocationConfig.maxFetchBytes = " + fetchCap + "): clients would upload "
                     + "requests the server then refuses to fetch. Raise maxFetchBytes (VGI_RPC_MAX_FETCH_BYTES "
                     + "for BlobVendor.externalConfigFromEnv) or lower maxUploadBytes (VGI_RPC_MAX_UPLOAD_BYTES).");
         }
-        LOG.warn("maxUploadBytes ({}) exceeds the server's default inbound fetch cap ({}); advertising {} "
-                + "(set VGI_RPC_MAX_FETCH_BYTES to raise it)", requested, fetchCap, fetchCap);
-        return fetchCap;
+        // The fetch cap is only the default: raise it so the configured upload cap works.
+        if (external != null) {
+            farm.query.vgirpc.external.ExternalLocationConfig raised = external.withDefaultMaxFetchBytes(requested);
+            rpc.setExternalConfig(raised);
+            if (resolver != null && resolver.config() == external) {
+                rpc.setLocationResolver(new farm.query.vgirpc.external.LocationResolver(raised));
+                resolver = null;
+            }
+        }
+        if (resolver != null && resolver.config().maxFetchBytes() < requested
+                && !resolver.config().maxFetchBytesExplicit()) {
+            rpc.setLocationResolver(new farm.query.vgirpc.external.LocationResolver(
+                    resolver.config().withDefaultMaxFetchBytes(requested)));
+        }
+        LOG.info("maxUploadBytes ({}) exceeds the default inbound fetch cap ({}); raised the fetch cap to match",
+                requested, fetchCap);
+        return requested;
     }
 
     private static long minConfigured(long current, long candidate) {
