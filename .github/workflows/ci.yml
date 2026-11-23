@@ -180,7 +180,9 @@ jobs:
       - name: Start the fake blob vendor
         run: |
           log="$RUNNER_TEMP/fake-vendor.log"
-          nohup uvx --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
+          # --with zstandard: at 3a06983 `import vgi_rpc` needs zstandard (state_ref ->
+          # _token_codec), which the base package does not declare (only extras do).
+          nohup uvx --with zstandard --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
             vgi-rpc-fake-vendor --test-routes --token "test-token=tenant-a" > "$log" 2>&1 &
           echo "FAKE_VENDOR_PID=$!" >> "$GITHUB_ENV"
           url=""
