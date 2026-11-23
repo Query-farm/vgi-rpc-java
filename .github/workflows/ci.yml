@@ -20,9 +20,7 @@ env:
   # The Python reference *worker* that same lane calls into. It tracks main like
   # every other lane: a stale pin here once left this client posting routes the
   # worker did not know, and every call 404'd.
-  # TODO(release-wave): back to main. Upload-URL v2 lives on the reference's
-  # protocol-3.4 branch until the release wave, so this branch tracks that.
-  VGI_RPC_PYTHON_REV: protocol-3.4
+  VGI_RPC_PYTHON_REV: main
 
 jobs:
   test:
@@ -421,9 +419,8 @@ jobs:
       # yardstick, and a pinned yardstick is how that lane rotted for eleven days while
       # reporting green. A reference change that breaks this port should turn
       # this port red the same day.
-      # TODO(release-wave): back to main (upload-URL v2 is on protocol-3.4 until then).
-      - name: Clone vgi-rpc-python reference (protocol-3.4 branch, deliberately unpinned)
-        run: git clone --depth 1 --branch protocol-3.4 https://github.com/Query-farm/vgi-rpc-python.git "$VGI_RPC_REPOS/vgi-rpc-python"
+      - name: Clone vgi-rpc-python reference (main, deliberately unpinned)
+        run: git clone --depth 1 https://github.com/Query-farm/vgi-rpc-python.git "$VGI_RPC_REPOS/vgi-rpc-python"
 
       - name: Install Python dependencies
         run: |
