@@ -209,6 +209,51 @@ short-TTL lifecycle rule used for per-call uploads, a pre-signed URL expires (re
 ref before then), and a ref must only be returned to callers who are all entitled to the same
 content.
 
+## Stream state by reference (`StateRef`, protocol 3.4)
+
+On HTTP every stream continuation echoes the stream's state back to the server. Data that does not
+change for the life of a stream belongs in a `StateRef`: create it in the stream method, keep it in a
+state field, resolve it on any turn.
+
+```java
+public RpcStream<ScanState> scan(byte[] query, CallContext ctx) {
+    StateRef ref = ctx.stateRef(query);          // byte[] or an ArrowSerializableRecord
+    return RpcStream.producer(SCHEMA, new ScanState(ref));
+}
+
+static final class ScanState extends ProducerState {
+    StateRef query;                              // serialized as its encoded bytes
+    @Override public void produce(OutputCollector out, CallContext ctx) {
+        byte[] q = ctx.resolve(query);           // any turn, any replica
+    }
+}
+```
+
+On pipe, stdio, Unix and TCP the value stays in memory. On HTTP the first cursor mint decides its form:
+inline (compressed inside the sealed cursor) when it is small or no `ObjectStore` is configured, else
+stored once and carried as a ~130-byte sealed tag. `ctx.stateRef` is allowed only on the stream method's
+own context: continuations, `onCancel`, unary calls and the first producer tick refuse it
+(`state_ref_misuse`). The rest of the contract is vgi-rpc-python's `tools/cross-port/specs/STATE_REF_V1.md`:
+
+- **Turn budget.** `floor((max_request_bytes - 4096) / 1.34) - call_token_bytes`. A cursor over budget logs
+  `cursor_large` and sends the client a WARN log under `HttpServer.Config.Builder.cursorRule(WARN)` (the
+  default); `ERROR` refuses the turn with `cursor_too_large`. A request cap below 16 KiB disables the rule
+  with a startup warning. The inline limit is `stateRefInlineBytes` (`VGI_RPC_STATE_REF_INLINE_BYTES`,
+  default 16384), capped at a quarter of the budget.
+- **Storage.** `ObjectStore` (`putObject`, `get(objectId, maxBytes)`) sits next to `ExternalStorage`;
+  `VendorStorage`, `S3Storage`, `GcsStorage` and the conformance fake storage implement both. Objects carry
+  no TTL and the server never deletes them: **set a bucket lifecycle rule of at least one day** on the
+  `rpc` prefix.
+- **Replicas.** Every replica must share one `tokenKey`. Stored tags are sealed under it, and the
+  default `tokenTtlSeconds` is now 21600 (6 hours, the maximum stream duration).
+- **Object cache.** One per process (`ObjectCache.defaultCache()`), keyed by `object_id`, single-flight,
+  bounded by `VGI_RPC_OBJECT_CACHE_BYTES` (default `min(1 GiB, 40%` of memory`)`), entries stale after a day.
+- **Argument references.** Every `__upload_url__/init` row also carries `object_id` and `ref`, a sealed
+  reference bound to the caller's principal. `ctx.resolveArgumentRef(ref, size, sha256)` (or
+  `ArgumentRefs.resolve`) opens, fetches through the object cache and verifies it. The advertised
+  `VGI-Max-Upload-Bytes` is always sent with upload URLs and never exceeds the server's fetch cap
+  (`VGI_RPC_MAX_FETCH_BYTES`, default 512 MiB).
+
 ## Protocol names
 
 A service's **wire name** is its routing key: it rides every request as `vgi_rpc.protocol`, and

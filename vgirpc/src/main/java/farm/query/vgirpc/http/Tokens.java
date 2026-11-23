@@ -4,7 +4,7 @@
 package farm.query.vgirpc.http;
 
 import farm.query.vgirpc.AuthContext;
-import com.github.luben.zstd.Zstd;
+import farm.query.vgirpc.stateref.TokenCodec;
 
 import java.nio.charset.StandardCharsets;
 
@@ -29,26 +29,6 @@ final class Tokens {
 
     /** Length of the random per-stream id minted at {@code /init}. */
     static final int CALL_ID_LEN = 16;
-
-    /** Codec tags for the sealed payload. See {@link #packPayload}. */
-    private static final byte CODEC_RAW = 0x00;
-    private static final byte CODEC_ZSTD = 0x01;
-
-    /**
-     * Matches the Python reference's choice. At token payload sizes this
-     * measures the same speed as level 1 and slightly smaller, while the
-     * levels that compress materially better cost many times the CPU for a
-     * few hundred bytes.
-     */
-    private static final int ZSTD_LEVEL = 3;
-
-    /**
-     * Bounds decompression. The payload is authenticated before it is ever
-     * decompressed, so this guards against a framework bug rather than an
-     * attacker — but an unbounded decompress on a request path is not worth
-     * having.
-     */
-    private static final long MAX_PLAINTEXT_BYTES = 64L << 20;
 
     /**
      * Scope for tokens that belong to the server rather than to any one protocol -- session
@@ -152,7 +132,8 @@ final class Tokens {
     }
 
     /**
-     * Compress a token payload and tag which codec was used.
+     * Compress a token payload and tag which codec was used: the standard token codec
+     * ({@link TokenCodec}, STATE_REF_V1.md §7).
      *
      * <p>Compression is skipped when it does not pay — small payloads can come
      * out larger, and the flag byte means the reader does not have to guess.
@@ -160,11 +141,7 @@ final class Tokens {
      * suite cannot check it; the token tests pin it instead.</p>
      */
     static byte[] packPayload(byte[] plaintext) {
-        byte[] packed = Zstd.compress(plaintext, ZSTD_LEVEL);
-        if (packed.length < plaintext.length) {
-            return prefixed(CODEC_ZSTD, packed);
-        }
-        return prefixed(CODEC_RAW, plaintext);
+        return TokenCodec.pack(plaintext);
     }
 
     /**
@@ -173,34 +150,10 @@ final class Tokens {
      * the same uniform "Malformed state token" every other token failure uses.
      */
     static byte[] unpackPayload(byte[] data) {
-        if (data.length == 0) {
+        try {
+            return TokenCodec.unpack(data, TokenCodec.MAX_TOKEN_PLAINTEXT_BYTES);
+        } catch (TokenCodec.TokenCodecException e) {
             throw new IllegalArgumentException("Malformed state token");
         }
-        byte[] body = new byte[data.length - 1];
-        System.arraycopy(data, 1, body, 0, body.length);
-        switch (data[0]) {
-            case CODEC_RAW:
-                return body;
-            case CODEC_ZSTD:
-                long size = Zstd.getFrameContentSize(body);
-                if (size <= 0 || size > MAX_PLAINTEXT_BYTES) {
-                    throw new IllegalArgumentException("Malformed state token");
-                }
-                byte[] out = new byte[(int) size];
-                long ret = Zstd.decompress(out, body);
-                if (Zstd.isError(ret) || ret != size) {
-                    throw new IllegalArgumentException("Malformed state token");
-                }
-                return out;
-            default:
-                throw new IllegalArgumentException("Malformed state token");
-        }
-    }
-
-    private static byte[] prefixed(byte tag, byte[] body) {
-        byte[] out = new byte[1 + body.length];
-        out[0] = tag;
-        System.arraycopy(body, 0, out, 1, body.length);
-        return out;
     }
 }

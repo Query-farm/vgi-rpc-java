@@ -316,7 +316,7 @@ final class CapabilityHeadersTest {
                 .supportedEncodings(List.of())
                 .authenticator(request -> { throw new InvalidCredentials("bad token"); })
                 .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
-                        "https://upload.invalid", "https://download.invalid", Instant.now())));
+                        "https://upload.invalid", "https://download.invalid", Instant.now(), Map.of(), "obj")));
 
         HttpResponse<byte[]> resp = post(request(base + "/__upload_url__/init")
                 .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, "1")
@@ -333,7 +333,7 @@ final class CapabilityHeadersTest {
                 .supportedEncodings(List.of())
                 .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
                         "https://upload.invalid/" + longPart,
-                        "https://download.invalid/" + longPart, Instant.now())));
+                        "https://download.invalid/" + longPart, Instant.now(), Map.of(), "obj")));
 
         HttpResponse<byte[]> resp = post(request(base + "/__upload_url__/init")
                 .header(HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER, Long.toString(64L << 10))
@@ -356,7 +356,7 @@ final class CapabilityHeadersTest {
                 .supportedEncodings(List.of())
                 .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
                         "https://upload.invalid/" + size, "https://download.invalid/" + sha256, Instant.now(),
-                        Map.of("x-amz-checksum-sha256", "Zm9v")));
+                        Map.of("x-amz-checksum-sha256", "Zm9v"), "obj-" + size));
         if (maxUploadBytes != null) b.maxUploadBytes(maxUploadBytes);
         startWithConfig(b);
     }
@@ -556,5 +556,64 @@ final class CapabilityHeadersTest {
             try { out.close(); } catch (Exception ignore) { /* best-effort */ }
             try { in.close(); } catch (Exception ignore) { /* best-effort */ }
         }
+    }
+
+    // ---- protocol 3.4: fix 1 and the grant columns --------------------------
+
+    @Test
+    void upload_cap_defaults_to_the_fetch_cap_and_is_always_advertised() throws Exception {
+        startUploadServer(null);
+        HttpResponse<Void> resp = options(base + "/health");
+        assertEquals(Long.toString(farm.query.vgirpc.external.ExternalLocationConfig.DEFAULT_MAX_FETCH_BYTES),
+                resp.headers().firstValue(HttpServer.MAX_UPLOAD_BYTES_HEADER).orElseThrow());
+    }
+
+    @Test
+    void upload_cap_above_the_default_fetch_cap_is_clamped() throws Exception {
+        startUploadServer(4L << 30);
+        HttpResponse<Void> resp = options(base + "/health");
+        assertEquals(Long.toString(farm.query.vgirpc.external.ExternalLocationConfig.DEFAULT_MAX_FETCH_BYTES),
+                resp.headers().firstValue(HttpServer.MAX_UPLOAD_BYTES_HEADER).orElseThrow());
+    }
+
+    @Test
+    void upload_cap_above_an_explicit_fetch_cap_refuses_startup() {
+        RpcServer rpc = new RpcServer(EchoService.class, new EchoImpl());
+        rpc.setExternalConfig(farm.query.vgirpc.external.ExternalLocationConfig.builder()
+                .maxFetchBytes(1L << 20).build());
+        HttpServer.Config config = HttpServer.Config.builder()
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
+                        "https://u.invalid", "https://d.invalid", Instant.now(), Map.of(), "obj"))
+                .maxUploadBytes(2L << 20)
+                .build();
+        IllegalArgumentException e = org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class, () -> new HttpServer(rpc, config));
+        assertTrue(e.getMessage().contains("fetch cap"), e.getMessage());
+    }
+
+    @Test
+    void grant_rows_carry_the_object_id_and_a_sealed_ref() throws Exception {
+        startUploadServer(null);
+        HttpResponse<byte[]> resp = post(request(base + "/__upload_url__/init")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(UploadRequests.v2(2, 42, UploadRequests.SHA))));
+        assertEquals(200, resp.statusCode());
+        try (IpcStreamReader reader = new IpcStreamReader(
+                new java.io.ByteArrayInputStream(resp.body()), Allocators.root())) {
+            reader.readNextBatch();
+            VectorSchemaRoot root = reader.root();
+            assertEquals("obj-42", root.getVector("object_id").getObject(0).toString());
+            byte[] ref = (byte[]) root.getVector("ref").getObject(1);
+            assertEquals(0x01, ref[0], "a versioned sealed envelope");
+        }
+    }
+
+    @Test
+    void a_provider_without_an_object_id_is_refused() throws Exception {
+        startWithConfig(HttpServer.Config.builder().prefix("/vgi").supportedEncodings(List.of())
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
+                        "https://u.invalid", "https://d.invalid", Instant.now())));
+        HttpResponse<byte[]> resp = post(request(base + "/__upload_url__/init")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(UploadRequests.v2(1, 42, UploadRequests.SHA))));
+        assertEquals(500, resp.statusCode());
     }
 }

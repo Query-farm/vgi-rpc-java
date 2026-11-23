@@ -23,10 +23,15 @@ import java.util.Base64;
  * a continuation landing on a process that never saw the {@code /init} has
  * only the client's copy to work from.</p>
  *
- * <p>Wire format (v1):
+ * <p>Since v3 (protocol 3.4, STATE_REF_V1.md §8) the two schemas sit behind a
+ * {@link farm.query.vgirpc.stateref.StateRef} so wide tables do not blow the
+ * turn budget: inline in the common case, stored once (one GET per process per
+ * stream, then the object cache) when they are large.</p>
+ *
+ * <p>Wire format (v3):
  * <pre>
  *   base64(
- *     [1 byte:   version = 1]
+ *     [1 byte:   version = 3]
  *     [12 bytes: ChaCha20-Poly1305 nonce (random)]
  *     [..]       ciphertext + Poly1305 tag
  *                sealed payload:
@@ -34,22 +39,31 @@ import java.util.Base64;
  *                  [..]      the plaintext below, compressed per codec
  *                plaintext:
  *                  [8 bytes: created_at uint64 LE]
+ *                  [8 bytes: response_limit_bytes uint64 LE]
  *                  [16 bytes: call_id]
- *                  [4 bytes: schema_len LE]       [output_schema bytes]
- *                  [4 bytes: input_schema_len LE] [input_schema bytes]
- *                  [4 bytes: stream_id_len LE]    [stream_id utf8]
+ *                  [4 bytes: schemas_len LE]   [schemas_ref: StateRef bytes whose value is
+ *                                               u32 LE len || output_schema || u32 LE len || input_schema]
+ *                  [4 bytes: stream_id_len LE] [stream_id utf8]
  *   )
  * </pre>
+ *
+ * @param schemasRef the encoded {@code StateRef} holding both schemas
+ * @param streamId the stream's lifecycle id
+ * @param callId the stream's 16-byte call id
+ * @param createdAt seconds since the epoch at mint
+ * @param responseLimitBytes the negotiated response cap
+ * @param sealedLength the token's sealed (base64-decoded) length when known, else 0; not
+ *     part of the wire format
  */
 public record CallToken(
-        byte[] outputSchema,
-        byte[] inputSchema,
+        byte[] schemasRef,
         String streamId,
         byte[] callId,
         long createdAt,
-        long responseLimitBytes) {
+        long responseLimitBytes,
+        long sealedLength) {
 
-    private static final byte VERSION = 2;
+    private static final byte VERSION = 3;
     private static final int VERSION_LEN = 1;
 
     /**
@@ -60,10 +74,24 @@ public record CallToken(
     private static final byte[] BOUND_AAD_PREFIX = "vgi_rpc.call.v2\0".getBytes(StandardCharsets.UTF_8);
 
     public CallToken {
-        outputSchema = outputSchema.clone();
-        inputSchema = inputSchema.clone();
+        schemasRef = schemasRef.clone();
         callId = callId.clone();
         streamId = streamId != null ? streamId : "";
+    }
+
+    /**
+     * A call token whose schemas are inline (no storage involved).
+     *
+     * @param outputSchema serialized output schema
+     * @param inputSchema serialized input schema
+     * @param streamId the stream id
+     * @param callId the call id
+     * @param createdAt seconds since the epoch
+     * @param responseLimitBytes the negotiated response cap
+     */
+    public CallToken(byte[] outputSchema, byte[] inputSchema, String streamId,
+                     byte[] callId, long createdAt, long responseLimitBytes) {
+        this(inlineSchemasRef(outputSchema, inputSchema), streamId, callId, createdAt, responseLimitBytes, 0);
     }
 
     /** Compatibility constructor for callers that do not negotiate a response budget. */
@@ -72,9 +100,80 @@ public record CallToken(
         this(outputSchema, inputSchema, streamId, callId, createdAt, Long.MAX_VALUE);
     }
 
-    @Override public byte[] outputSchema() { return outputSchema.clone(); }
-    @Override public byte[] inputSchema()  { return inputSchema.clone(); }
-    @Override public byte[] callId()       { return callId.clone(); }
+    /**
+     * The {@code schemas_ref} value: {@code u32 LE len || output || u32 LE len || input}.
+     *
+     * @param outputSchema serialized output schema
+     * @param inputSchema serialized input schema
+     * @return the value bytes
+     */
+    public static byte[] packSchemas(byte[] outputSchema, byte[] inputSchema) {
+        ByteBuffer b = ByteBuffer.allocate(8 + outputSchema.length + inputSchema.length)
+                .order(ByteOrder.LITTLE_ENDIAN);
+        putSegment(b, outputSchema);
+        putSegment(b, inputSchema);
+        return b.array();
+    }
+
+    /**
+     * Reverse {@link #packSchemas}.
+     *
+     * @param value the value bytes
+     * @return {@code [output, input]}
+     * @throws IllegalArgumentException on a malformed value
+     */
+    public static byte[][] unpackSchemas(byte[] value) {
+        ByteBuffer b = ByteBuffer.wrap(value).order(ByteOrder.LITTLE_ENDIAN);
+        try {
+            byte[] out = getSegment(b);
+            byte[] in = getSegment(b);
+            if (b.hasRemaining()) throw new IllegalArgumentException("Malformed state token");
+            return new byte[][] {out, in};
+        } catch (java.nio.BufferUnderflowException e) {
+            throw new IllegalArgumentException("Malformed state token");
+        }
+    }
+
+    private static byte[] inlineSchemasRef(byte[] outputSchema, byte[] inputSchema) {
+        byte[] payload = farm.query.vgirpc.stateref.TokenCodec.pack(packSchemas(outputSchema, inputSchema));
+        byte[] ref = new byte[1 + payload.length];
+        ref[0] = 0x01;
+        System.arraycopy(payload, 0, ref, 1, payload.length);
+        return ref;
+    }
+
+    /** @return the token with its sealed length recorded */
+    CallToken withSealedLength(long length) {
+        return new CallToken(schemasRef, streamId, callId, createdAt, responseLimitBytes, length);
+    }
+
+    /**
+     * The output schema of an inline {@code schemas_ref} (tests, tools). The server resolves
+     * through the {@code StateRef} machinery, which also handles the stored form.
+     *
+     * @return the serialized output schema
+     * @throws IllegalStateException when the schemas are stored
+     */
+    public byte[] outputSchema() { return inlineSchemas()[0]; }
+
+    /**
+     * @return the serialized input schema of an inline {@code schemas_ref}
+     * @throws IllegalStateException when the schemas are stored
+     */
+    public byte[] inputSchema() { return inlineSchemas()[1]; }
+
+    private byte[][] inlineSchemas() {
+        if (schemasRef.length == 0 || schemasRef[0] != 0x01) {
+            throw new IllegalStateException("the call token's schemas are stored; resolve them through the server");
+        }
+        byte[] payload = new byte[schemasRef.length - 1];
+        System.arraycopy(schemasRef, 1, payload, 0, payload.length);
+        return unpackSchemas(farm.query.vgirpc.stateref.TokenCodec.unpack(payload,
+                farm.query.vgirpc.stateref.TokenCodec.MAX_TOKEN_PLAINTEXT_BYTES));
+    }
+
+    @Override public byte[] schemasRef() { return schemasRef.clone(); }
+    @Override public byte[] callId()     { return callId.clone(); }
 
     /** Serialise, AEAD-seal, and base64-encode the token. */
     public byte[] pack(byte[] tokenKey, String principal) {
@@ -101,15 +200,13 @@ public record CallToken(
     private byte[] packWithAad(byte[] tokenKey, byte[] aad) {
         byte[] streamIdBytes = streamId.getBytes(StandardCharsets.UTF_8);
         int payloadLen = 8 + 8 + Tokens.CALL_ID_LEN
-                + 4 + outputSchema.length
-                + 4 + inputSchema.length
+                + 4 + schemasRef.length
                 + 4 + streamIdBytes.length;
         ByteBuffer payload = ByteBuffer.allocate(payloadLen).order(ByteOrder.LITTLE_ENDIAN);
         payload.putLong(createdAt);
         payload.putLong(responseLimitBytes);
         payload.put(callId);
-        putSegment(payload, outputSchema);
-        putSegment(payload, inputSchema);
+        putSegment(payload, schemasRef);
         putSegment(payload, streamIdBytes);
         byte[] sealed = Crypto.chacha20Poly1305Seal(
                 tokenKey, Tokens.packPayload(payload.array()), aad);
@@ -190,12 +287,10 @@ public record CallToken(
                         + "s, ttl=" + ttlSeconds + "s)");
             }
         }
-        byte[] outputSchema = getSegment(bb);
-        byte[] inputSchema = getSegment(bb);
+        byte[] schemasRef = getSegment(bb);
         byte[] streamIdBytes = getSegment(bb);
-        return new CallToken(outputSchema, inputSchema,
-                new String(streamIdBytes, StandardCharsets.UTF_8), callId, createdAt,
-                responseLimitBytes);
+        return new CallToken(schemasRef, new String(streamIdBytes, StandardCharsets.UTF_8), callId,
+                createdAt, responseLimitBytes, raw.length);
     }
 
     private static void putSegment(ByteBuffer b, byte[] seg) {

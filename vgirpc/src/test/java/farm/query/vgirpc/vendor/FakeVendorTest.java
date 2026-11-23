@@ -228,4 +228,45 @@ class FakeVendorTest {
             assertTrue(s.info().uploadHosts().size() >= 1);
         }
     }
+
+    @Test
+    void putObjectAndGetByIdRoundTrip() throws Exception {
+        // The protocol-3.4 object API (STATE_REF_V1.md §10.1): a sized rpc grant marked
+        // origin=state_ref, then a GET minted server-side from the object_id.
+        try (VendorStorage s = new VendorStorage(url, token)) {
+            byte[] body = "a sealed StateRef object".repeat(40).getBytes(StandardCharsets.UTF_8);
+            JsonNode start = stats();
+            String id = s.putObject(body);
+            assertTrue(!id.isEmpty());
+            JsonNode put = stats();
+            assertEquals(start.get("puts_state_ref").asLong() + 1, put.get("puts_state_ref").asLong());
+            assertEquals(start.get("puts_rpc").asLong() + 1, put.get("puts_rpc").asLong());
+            assertArrayEquals(body, s.get(id, 1L << 20));
+            JsonNode got = stats();
+            assertEquals(put.get("gets_state_ref").asLong() + 1, got.get("gets_state_ref").asLong());
+            assertEquals(0, got.path("upload_urls").asLong());
+            assertThrows(VendorError.class, () -> s.get(id, body.length - 1L), "the fetch cap is enforced");
+
+            JsonNode deleted = admin("/__admin__/delete?origin=state_ref");
+            assertTrue(deleted.get("deleted").asLong() >= 1);
+            assertThrows(farm.query.vgirpc.external.ObjectMissingException.class, () -> s.get(id, 1L << 20));
+        }
+    }
+
+    @Test
+    void generateUploadUrlCarriesTheObjectId() throws Exception {
+        try (VendorStorage s = new VendorStorage(url, token)) {
+            byte[] body = new byte[] {1, 2, 3, 4};
+            UploadUrlProvider.UploadUrl u = s.generateUploadUrl(body.length,
+                    java.util.HexFormat.of().formatHex(VendorStorage.sha256(body)));
+            assertTrue(!u.objectId().isEmpty(), "every provider supplies the object_id (protocol 3.4)");
+            HttpRequest.Builder put = HttpRequest.newBuilder(URI.create(u.uploadUrl()))
+                    .PUT(HttpRequest.BodyPublishers.ofByteArray(body));
+            u.headers().forEach(put::header);
+            assertEquals(200, HTTP.send(put.build(), HttpResponse.BodyHandlers.discarding()).statusCode() / 100 * 100);
+            JsonNode before = stats();
+            assertArrayEquals(body, s.get(u.objectId(), 1024));
+            assertEquals(before.get("gets_upload").asLong() + 1, stats().get("gets_upload").asLong());
+        }
+    }
 }

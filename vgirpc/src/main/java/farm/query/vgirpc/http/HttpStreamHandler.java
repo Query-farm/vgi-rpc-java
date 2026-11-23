@@ -22,12 +22,17 @@ import farm.query.vgirpc.external.ExternalLocationConfig;
 import farm.query.vgirpc.external.ExternalizedResponseCapExceededException;
 import farm.query.vgirpc.external.Externalizer;
 import farm.query.vgirpc.external.LocationResolver;
+import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.log.Message;
 import farm.query.vgirpc.marshal.Marshalling;
 import farm.query.vgirpc.marshal.ParameterBinder;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgirpc.schema.ArrowSerializableRecord;
 import farm.query.vgirpc.schema.SchemaDerivation;
+import farm.query.vgirpc.stateref.StateRefError;
+import farm.query.vgirpc.stateref.StateRefRuntime;
+import farm.query.vgirpc.stateref.StateRefScope;
+import farm.query.vgirpc.stateref.StateRefs;
 import farm.query.vgirpc.wire.Allocators;
 import farm.query.vgirpc.wire.IpcStreamReader;
 import farm.query.vgirpc.wire.IpcStreamWriter;
@@ -95,6 +100,13 @@ public final class HttpStreamHandler {
      * first init call instead, and cannot be resumed on a fresh process.
      */
     private final Map<String, Class<? extends StreamState>> stateTypes = new ConcurrentHashMap<>();
+    /**
+     * The {@code StateRef} machinery (STATE_REF_V1.md): this handler's token key and TTL,
+     * plus the storage, fetch cap, request cap, inline cap and cursor rule the server
+     * configures through {@link #configureStateRefs}. Until then: no storage, no request
+     * cap, so every ref stays inline and the cursor rule never fires.
+     */
+    private volatile StateRefRuntime stateRefs;
 
     /**
      * Create a handler with a random per-process token key, no token TTL, and an
@@ -149,7 +161,37 @@ public final class HttpStreamHandler {
         this.tokenTtlSeconds = tokenTtlSeconds;
         this.callStates = new CallStateCache(tokenTtlSeconds, callStateCacheMaxEntries);
         this.maxResponseBytes = maxResponseBytes;
+        this.stateRefs = StateRefRuntime.builder().tokenKey(this.tokenKey).tokenTtlSeconds(tokenTtlSeconds).build();
         seedStateTypes();
+    }
+
+    /**
+     * Configure the {@code StateRef} machinery for this server (STATE_REF_V1.md §5, §9).
+     *
+     * @param storage returns the server's storage, read per use; one that is not an
+     *     {@link farm.query.vgirpc.external.ObjectStore} keeps every ref inline
+     * @param maxFetchBytes the server's inbound fetch cap
+     * @param maxRequestBytes the advertised request cap, or {@code null} when unbounded
+     * @param inlineBytesCap {@code VGI_RPC_STATE_REF_INLINE_BYTES}
+     * @param cursorRule what an over-budget cursor does
+     */
+    public void configureStateRefs(java.util.function.Supplier<?> storage, long maxFetchBytes,
+                                   Long maxRequestBytes, int inlineBytesCap,
+                                   StateRefRuntime.CursorRule cursorRule) {
+        this.stateRefs = StateRefRuntime.builder()
+                .tokenKey(tokenKey)
+                .tokenTtlSeconds(tokenTtlSeconds)
+                .storage(storage)
+                .maxFetchBytes(maxFetchBytes)
+                .maxRequestBytes(maxRequestBytes)
+                .inlineBytesCap(inlineBytesCap)
+                .cursorRule(cursorRule)
+                .build();
+    }
+
+    /** @return this handler's {@code StateRef} runtime */
+    public StateRefRuntime stateRefRuntime() {
+        return stateRefs;
     }
 
     /**
@@ -368,7 +410,7 @@ public final class HttpStreamHandler {
 
         OutputCollectorSink sink = new OutputCollectorSink();
         CallContext ctx = buildCallContext(protocol, method, sink, responseLimitBytes,
-                preferredResponseBytes);
+                preferredResponseBytes, null, true);
 
         // Minted here rather than inside mintInitTokens so the init record
         // carries it even when the producer finishes in one turn and no
@@ -402,6 +444,11 @@ public final class HttpStreamHandler {
             return errorStream(ie.getCause() != null ? ie.getCause() : ie, sink);
         } catch (Throwable t) {
             return errorStream(t, sink);
+        } finally {
+            // The stream method's own context is the init request: the one place state_ref()
+            // is allowed. The first producer tick HTTP folds into /init is a continuation on
+            // every other transport, so it is refused here too (transport parity).
+            ctx.stateRefScope().endInit();
         }
         // Record the concrete state class for this method so /exchange can rehydrate.
         stateTypes.put(stateKey(protocol, method), streamResult.state().getClass());
@@ -410,12 +457,18 @@ public final class HttpStreamHandler {
         if (streamResult.header() != null) {
             writeHeaderIpcStream(out, streamResult.header(), sink);
         }
-        if (streamResult.isProducer()) {
-            writeProducerRun(out, streamResult, ctx, sink, requestMeta, protocol, streamId, turn,
-                    responseLimitBytes, preferredResponseBytes);
-        } else {
-            writeExchangeInitToken(out, streamResult, sink, protocol, streamId, turn,
-                    responseLimitBytes);
+        try {
+            if (streamResult.isProducer()) {
+                writeProducerRun(out, streamResult, ctx, sink, requestMeta, protocol, method, streamId, turn,
+                        responseLimitBytes, preferredResponseBytes);
+            } else {
+                writeExchangeInitToken(out, streamResult, sink, protocol, method, streamId, turn,
+                        responseLimitBytes);
+            }
+        } catch (StateRefError e) {
+            // Minting decided (and may have stored) the stream's StateRefs and applied the
+            // cursor rule; a refusal there replaces the response.
+            return errorStream(e, sink);
         }
         return out.toByteArray();
     }
@@ -504,6 +557,8 @@ public final class HttpStreamHandler {
                 token = StateToken.unpack(tokenB64.getBytes(StandardCharsets.US_ASCII),
                         tokenKey, tokenTtlSeconds, auth, protocol);
             } catch (Exception e) {
+                // A token failure is a uniform 400, as in the reference (and for invalid_state_ref).
+                CallOutcome.markBadRequest();
                 return errorStream(e);
             }
             CallToken call;
@@ -511,6 +566,7 @@ public final class HttpStreamHandler {
                 call = resolveCall(token, wireMeta.get(Metadata.CALL_STATE), auth, cacheIdentity,
                         protocol);
             } catch (Exception e) {
+                CallOutcome.markBadRequest();
                 return errorStream(e);
             }
 
@@ -565,8 +621,20 @@ public final class HttpStreamHandler {
             return errorStream(new IllegalStateException(
                     "Cannot resolve state type for method '" + method + "'"));
         }
-        Schema outputSchema = deserializeSchema(call.outputSchema());
-        Schema inputSchema = deserializeSchema(call.inputSchema());
+        // Both schemas live behind a StateRef (call token v3): inline in the common case, one
+        // GET per process per stream when a very wide table stored them, then the object cache.
+        byte[][] schemas;
+        try {
+            schemas = CallToken.unpackSchemas(
+                    StateRefs.resolveEncoded(stateRefs, call.schemasRef(), auth, protocol, call.callId()));
+        } catch (StateRefError e) {
+            return errorStream(e);
+        } catch (IllegalArgumentException e) {
+            CallOutcome.markBadRequest();
+            return errorStream(e);
+        }
+        Schema outputSchema = deserializeSchema(schemas[0]);
+        Schema inputSchema = deserializeSchema(schemas[1]);
         boolean isProducer = inputSchema.getFields().isEmpty();
         StreamState state = StateSerializer.deserialize(token.state(), stateCls);
 
@@ -579,7 +647,7 @@ public final class HttpStreamHandler {
         // progress logs are the only in-band diagnostic a caller has.
         OutputCollectorSink sink = new OutputCollectorSink();
         CallContext ctx = buildCallContext(protocol, method, sink, responseLimitBytes,
-                preferredResponseBytes);
+                preferredResponseBytes, token.callId(), false);
 
         if (cancel) {
             onTurn(turn, i -> i.cancelled = true);
@@ -615,8 +683,13 @@ public final class HttpStreamHandler {
                 // diagnosable for the same worker code.
                 return errorStream(t, sink);
             }
-            return writeExchangeResponse(collector, state, token, outputSchema, isProducer, auth,
-                    inputDicts, turn, sink, protocol);
+            try {
+                return writeExchangeResponse(collector, state, token, call, outputSchema, isProducer, auth,
+                        inputDicts, turn, sink, protocol, method);
+            } catch (StateRefError e) {
+                for (OutputCollector.Entry entry : collector.entries()) entry.root().close();
+                return errorStream(e, sink);
+            }
         }
     }
 
@@ -690,14 +763,17 @@ public final class HttpStreamHandler {
     }
 
     private byte[] writeExchangeResponse(OutputCollector collector, StreamState state, StateToken priorToken,
-                                         Schema outputSchema, boolean isProducer, AuthContext auth,
-                                         DictionaryProvider inputDicts, StreamTurn turn,
-                                         OutputCollectorSink sink, String protocol) throws IOException {
+                                         CallToken call, Schema outputSchema, boolean isProducer,
+                                         AuthContext auth, DictionaryProvider inputDicts, StreamTurn turn,
+                                         OutputCollectorSink sink, String protocol, String method)
+            throws IOException {
         boolean finished = collector.finished();
         // Absent on the terminal turn: there is no outbound state when the
         // stream closes, which is exactly what its absence in the record means.
+        // Minted before anything is written, so a cursor_too_large refusal replaces the
+        // response rather than following data.
         String newTokenStr = finished ? null
-                : serializeContinuationToken(state, priorToken, auth, turn, protocol);
+                : serializeContinuationToken(state, priorToken, call, auth, turn, protocol, method, sink);
 
         BoundedByteArrayOutputStream out = new BoundedByteArrayOutputStream(maxResponseBytes);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
@@ -743,14 +819,40 @@ public final class HttpStreamHandler {
         return out.toByteArray();
     }
 
-    private String serializeContinuationToken(StreamState state, StateToken priorToken, AuthContext auth,
-                                               StreamTurn turn, String protocol) {
-        byte[] newStateBytes = StateSerializer.serialize(state);
-        StateToken newToken = new StateToken(newStateBytes, priorToken.callId(),
-                System.currentTimeMillis() / 1000);
-        String packed = new String(newToken.pack(tokenKey, auth, protocol), StandardCharsets.US_ASCII);
+    private String serializeContinuationToken(StreamState state, StateToken priorToken, CallToken call,
+                                               AuthContext auth, StreamTurn turn, String protocol,
+                                               String method, OutputCollectorSink sink) {
+        byte[] callId = priorToken.callId();
+        long callTokenBytes = call.sealedLength();
+        byte[] newStateBytes = StateRefs.encodingForStream(stateRefs, auth, protocol, method, callId,
+                callTokenBytes, () -> StateSerializer.serialize(state));
+        StateToken newToken = new StateToken(newStateBytes, callId, System.currentTimeMillis() / 1000);
+        byte[] packedBytes = newToken.pack(tokenKey, auth, protocol);
+        String packed = new String(packedBytes, StandardCharsets.US_ASCII);
+        applyCursorRule(packedBytes, callTokenBytes, protocol, method, sink);
         onTurn(turn, i -> i.responseStateBytes = packed.length());
         return packed;
+    }
+
+    /**
+     * The cursor rule (STATE_REF_V1.md §9): compare the sealed cursor with the turn budget.
+     * Under the warn rule the client is also sent a WARN log starting {@code cursor_large:}.
+     */
+    private void applyCursorRule(byte[] packedCursorB64, long callTokenBytes, String protocol, String method,
+                                 OutputCollectorSink sink) {
+        String warning = stateRefs.checkCursor(sealedLength(packedCursorB64), callTokenBytes, protocol, method);
+        if (warning != null) {
+            sink.accept(new Message(Level.WARN, warning, Map.of("kind", "cursor_large")));
+        }
+    }
+
+    /** The base64-decoded length of a token, without decoding it. */
+    static long sealedLength(byte[] b64) {
+        int n = b64.length;
+        int pad = 0;
+        if (n > 0 && b64[n - 1] == '=') pad++;
+        if (n > 1 && b64[n - 2] == '=') pad++;
+        return (long) n / 4 * 3 - pad;
     }
 
     /**
@@ -791,39 +893,58 @@ public final class HttpStreamHandler {
         return call;
     }
 
-    /** Mint a stream's call id, call token, and first cursor at {@code /init}. */
+    /**
+     * Mint a stream's call id, call token, and first cursor at {@code /init}.
+     *
+     * <p>The call token's schemas go behind a {@code StateRef} sized with
+     * {@code call_token_bytes = 0}; the cursor is then serialized with the encoder installed,
+     * which decides each un-encoded {@code StateRef}'s form (and stores it once when it is
+     * stored), and the cursor rule is applied to the result.</p>
+     */
     private Map<String, String> mintInitTokens(StreamState state, Schema outputSchema,
                                                 Schema inputSchema, AuthContext auth,
-                                                String protocol, String streamId, StreamTurn turn,
-                                                long responseLimitBytes) {
+                                                String protocol, String method, String streamId,
+                                                StreamTurn turn, long responseLimitBytes,
+                                                OutputCollectorSink sink) {
         byte[] callId = new byte[Tokens.CALL_ID_LEN];
         new java.security.SecureRandom().nextBytes(callId);
         long now = System.currentTimeMillis() / 1000;
 
-        CallToken call = new CallToken(serializeSchema(outputSchema), serializeSchema(inputSchema),
-                streamId, callId, now, responseLimitBytes);
+        StateRefRuntime runtime = stateRefs;
+        byte[] schemasRef = StateRefs.encodeValue(runtime,
+                CallToken.packSchemas(serializeSchema(outputSchema), serializeSchema(inputSchema)),
+                auth, protocol, method, callId, 0);
+        CallToken call = new CallToken(schemasRef, streamId, callId, now, responseLimitBytes, 0);
+        byte[] packedCall = call.pack(tokenKey, auth, protocol);
+        long callTokenBytes = sealedLength(packedCall);
         // Warm the cache with what we already hold, so this stream's first
         // continuation does not have to open the token it was just handed.
-        callStates.put(callId, Tokens.cacheIdentity(auth), call);
+        callStates.put(callId, Tokens.cacheIdentity(auth), call.withSealedLength(callTokenBytes));
 
-        byte[] stateBytes = StateSerializer.serialize(state);
+        byte[] stateBytes = StateRefs.encodingForStream(runtime, auth, protocol, method, callId, callTokenBytes,
+                () -> StateSerializer.serialize(state));
         StateToken cursor = new StateToken(stateBytes, callId, now);
-        String packedCursor = new String(cursor.pack(tokenKey, auth, protocol), StandardCharsets.US_ASCII);
+        byte[] packedCursorBytes = cursor.pack(tokenKey, auth, protocol);
+        applyCursorRule(packedCursorBytes, callTokenBytes, protocol, method, sink);
+        String packedCursor = new String(packedCursorBytes, StandardCharsets.US_ASCII);
         onTurn(turn, i -> i.responseStateBytes = packedCursor.length());
         return Map.of(
                 Metadata.STREAM_STATE,
                 packedCursor,
                 Metadata.CALL_STATE,
-                new String(call.pack(tokenKey, auth, protocol), StandardCharsets.US_ASCII));
+                new String(packedCall, StandardCharsets.US_ASCII));
     }
 
     private CallContext buildCallContext(String protocol, String method, Consumer<Message> sink,
-                                         long responseLimitBytes, Long preferredResponseBytes) {
+                                         long responseLimitBytes, Long preferredResponseBytes,
+                                         byte[] callId, boolean init) {
         AuthScope.Scope scope = AuthScope.current();
-        return new CallContext(scope.auth(), sink, scope.transportMetadata(),
+        CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
                 rpc.serverId(), method, protocol, "", TransportKind.HTTP, scope.peerEvidence(),
                 responseLimitBytes == Long.MAX_VALUE ? null : responseLimitBytes,
                 preferredResponseBytes);
+        ctx.attachStateRefs(new StateRefScope(stateRefs, scope.auth(), protocol, method, callId, init));
+        return ctx;
     }
 
     /** Principal for state-token key derivation; empty string for anonymous. */
@@ -833,7 +954,7 @@ public final class HttpStreamHandler {
 
     private void writeProducerRun(ByteArrayOutputStream out, RpcStream<?> streamResult,
                                    CallContext ctx, OutputCollectorSink sink,
-                                   Map<String, String> requestMeta, String protocol,
+                                   Map<String, String> requestMeta, String protocol, String method,
                                    String streamId, StreamTurn turn, long responseLimitBytes,
                                    Long preferredResponseBytes) throws IOException {
         Schema outputSchema = streamResult.outputSchema();
@@ -864,6 +985,22 @@ public final class HttpStreamHandler {
             }
 
             if (!error) {
+                // Mint the tokens BEFORE flushing: minting decides (and may store) this
+                // stream's StateRefs and applies the cursor rule, and a cursor_too_large
+                // refusal must not follow data the client would otherwise have consumed.
+                Map<String, String> md = null;
+                if (!coll.finished()) {
+                    try {
+                        md = mintInitTokens(state, outputSchema, inputSchema, currentAuth(), protocol,
+                                method, streamId, turn, responseLimitBytes, sink);
+                    } catch (StateRefError refused) {
+                        for (OutputCollector.Entry e : coll.entries()) e.root().close();
+                        Wire.writeZeroBatch(w, outputSchema,
+                                Wire.errorMetadata(refused, rpc.serverId(), rpc.includeTracebacks()));
+                        CallOutcome.suppressResponseFlag();
+                        return;
+                    }
+                }
                 // Emit all buffered entries (logs + at most one data batch) in order.
                 for (OutputCollector.Entry e : coll.entries()) {
                     writeStreamBatch(w, outputSchema, e.root(), e.customMetadata(),
@@ -872,23 +1009,19 @@ public final class HttpStreamHandler {
                 }
                 // If the producer isn't finished, append a zero-row state-token batch so the
                 // client knows to call /exchange to continue. Finished streams just EOS.
-                if (!coll.finished()) {
-                    Map<String, String> md = mintInitTokens(state, outputSchema, inputSchema,
-                            currentAuth(), protocol, streamId, turn, responseLimitBytes);
-                    Wire.writeZeroBatch(w, outputSchema, md);
-                }
+                if (md != null) Wire.writeZeroBatch(w, outputSchema, md);
             }
         }
     }
 
     private void writeExchangeInitToken(ByteArrayOutputStream out, RpcStream<?> streamResult,
-                                         OutputCollectorSink sink, String protocol,
+                                         OutputCollectorSink sink, String protocol, String method,
                                          String streamId, StreamTurn turn,
                                          long responseLimitBytes) throws IOException {
         Schema outputSchema = streamResult.outputSchema();
         Schema inputSchema = streamResult.inputSchema();
         Map<String, String> md = mintInitTokens(streamResult.state(), outputSchema, inputSchema,
-                currentAuth(), protocol, streamId, turn, responseLimitBytes);
+                currentAuth(), protocol, method, streamId, turn, responseLimitBytes, sink);
         try (IpcStreamWriter w = new IpcStreamWriter(out)) {
             w.writeSchema(outputSchema);
             sink.bind(w, outputSchema);

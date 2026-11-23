@@ -1333,6 +1333,11 @@ public final class RpcServer {
             w.writeSchema(schema);
             CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
                     serverId, info.name(), proto, "", transportKind, scope.peerEvidence());
+            // Unary: no stream, so stateRef() is refused; on HTTP the server's runtime is here
+            // for resolveArgumentRef().
+            ctx.attachStateRefs(new farm.query.vgirpc.stateref.StateRefScope(
+                    farm.query.vgirpc.stateref.StateRefRuntime.current(), scope.auth(), proto, info.name(),
+                    null, false));
             sink.bind(w, schema);
             ctx.allowExternalRef();
             try {
@@ -1465,8 +1470,18 @@ public final class RpcServer {
         AuthScope.Scope scope = AuthScope.current();
         CallContext ctx = new CallContext(scope.auth(), sink, scope.transportMetadata(),
                 serverId, info.name(), binding.name(), "", transportKind, scope.peerEvidence());
+        // The state never leaves the process on these transports: StateRefs stay in memory.
+        // stateRef() is allowed only while the stream method itself runs.
+        farm.query.vgirpc.stateref.StateRefScope refs = new farm.query.vgirpc.stateref.StateRefScope(
+                null, scope.auth(), binding.name(), info.name(), null, true);
+        ctx.attachStateRefs(refs);
 
-        RpcStream<?> stream = runStreamInit(info, kwargs, ctx, transport, binding.implementation());
+        RpcStream<?> stream;
+        try {
+            stream = runStreamInit(info, kwargs, ctx, transport, binding.implementation());
+        } finally {
+            refs.endInit();
+        }
         if (stream == null) return;  // init failed; error already reported + input drained
 
         if (stream.header() != null) {

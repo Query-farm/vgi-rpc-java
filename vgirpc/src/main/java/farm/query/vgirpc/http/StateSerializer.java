@@ -74,6 +74,24 @@ public final class StateSerializer {
                 return Schema.deserializeMessage(ByteBuffer.wrap(p.getBinaryValue()));
             }
         });
+        // A StateRef field serializes as its encoded bytes (STATE_REF_V1.md §3). Inside a cursor
+        // mint the HTTP handler has installed the encoder, so the first serialization decides
+        // the form (inline or stored) and caches it on the ref; later ones re-emit those bytes.
+        arrow.addSerializer(farm.query.vgirpc.stateref.StateRef.class,
+                new JsonSerializer<farm.query.vgirpc.stateref.StateRef>() {
+                    @Override public void serialize(farm.query.vgirpc.stateref.StateRef r, JsonGenerator g,
+                                                    SerializerProvider p) throws IOException {
+                        g.writeBinary(r.toBytes());
+                    }
+                });
+        arrow.addDeserializer(farm.query.vgirpc.stateref.StateRef.class,
+                new JsonDeserializer<farm.query.vgirpc.stateref.StateRef>() {
+                    @Override public farm.query.vgirpc.stateref.StateRef deserialize(JsonParser p,
+                                                                                    DeserializationContext c)
+                            throws IOException {
+                        return farm.query.vgirpc.stateref.StateRef.fromBytes(p.getBinaryValue());
+                    }
+                });
         return new CBORMapper()
                 .setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.NONE)
                 .setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.ANY)

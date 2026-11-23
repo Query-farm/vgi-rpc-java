@@ -9,6 +9,9 @@ import farm.query.vgirpc.http.SessionScope;
 import farm.query.vgirpc.identity.PeerEvidenceSet;
 import farm.query.vgirpc.log.Level;
 import farm.query.vgirpc.log.Message;
+import farm.query.vgirpc.schema.ArrowSerializableRecord;
+import farm.query.vgirpc.stateref.StateRef;
+import farm.query.vgirpc.stateref.StateRefScope;
 
 import java.util.Collections;
 import java.util.Map;
@@ -33,6 +36,8 @@ public final class CallContext {
     private final TransportKind kind;
     private final Long responseLimitBytes;
     private final Long preferredResponseBytes;
+    /** The framework's StateRef view of this request; see {@link #attachStateRefs}. */
+    private volatile StateRefScope stateRefs;
     /** Set by the unary dispatcher; only then may the method answer with a ref. */
     private boolean externalRefAllowed;
     private ExternalRef externalRef;
@@ -380,5 +385,119 @@ public final class CallContext {
         s.setAction(SessionScope.ACTION_CLOSE);
         s.setCloseSignal(true);
         s.setMintTokenB64(null);
+    }
+
+    // --- StateRef (protocol 3.4, STATE_REF_V1.md) ---------------------------
+
+    /**
+     * Attach the framework's {@link StateRefScope} for this request. Called by the transports
+     * when they build the context: whether {@link #stateRef} is allowed (only on a stream
+     * method's own context) and, on HTTP, the server's key, storage and object cache.
+     *
+     * @param scope the scope
+     */
+    public void attachStateRefs(StateRefScope scope) {
+        this.stateRefs = Objects.requireNonNull(scope, "scope");
+    }
+
+    /**
+     * The request's {@link StateRefScope}; a context built without one gets an in-memory scope
+     * that resolves in-memory and inline refs and refuses {@link #stateRef}.
+     *
+     * @return the scope
+     */
+    public StateRefScope stateRefScope() {
+        StateRefScope scope = stateRefs;
+        if (scope == null) {
+            synchronized (this) {
+                if (stateRefs == null) {
+                    stateRefs = new StateRefScope(null, auth, protocolName, methodName, null, false);
+                }
+                scope = stateRefs;
+            }
+        }
+        return scope;
+    }
+
+    /**
+     * Wrap a value that does not change for the life of a stream.
+     *
+     * <p>Store the returned {@link StateRef} in a field of the stream state and read it back
+     * with {@link #resolve} on any turn. On HTTP a large value is stored once and only a
+     * ~130-byte sealed tag rides each continuation; a small one is carried inline, compressed.
+     * On pipe, stdio, Unix and TCP the value is held in memory. Worker code is the same
+     * everywhere.</p>
+     *
+     * <p>Only valid on the context passed to the stream method itself (the handling of the
+     * stream's init request). State transitions copy the ref; they never call
+     * {@code stateRef()} again. Within one init, identical or byte-equal values share one ref
+     * and one stored object. A ref belongs to its stream and must not be copied into
+     * another.</p>
+     *
+     * @param value {@code byte[]} or an {@link ArrowSerializableRecord}; treat it as
+     *     immutable afterwards
+     * @return the ref
+     * @throws farm.query.vgirpc.stateref.StateRefMisuseError on a continuation
+     *     ({@code process}, {@code onCancel}) or a unary call (kind {@code state_ref_misuse},
+     *     code {@code FAILED_PRECONDITION})
+     */
+    public StateRef stateRef(Object value) {
+        return stateRefScope().stateRef(value);
+    }
+
+    /**
+     * The value bytes a {@link StateRef} names. Valid on every turn and every transport. A
+     * stored ref is fetched through the process's object cache (one {@code get} per process
+     * per object, single-flight), verified and opened.
+     *
+     * @param ref the ref, as read from the stream state
+     * @return the value bytes (shared: treat as immutable)
+     * @throws farm.query.vgirpc.stateref.InvalidStateRefError unknown form, a tag that does
+     *     not open for this stream and principal, an expired tag, or a digest mismatch
+     *     ({@code invalid_state_ref}, HTTP 400)
+     * @throws farm.query.vgirpc.stateref.StateRefMissingError storage reports the object gone
+     * @throws farm.query.vgirpc.stateref.StateRefTooLargeError the object exceeds
+     *     {@code max_fetch_bytes}
+     */
+    public byte[] resolve(StateRef ref) {
+        return stateRefScope().resolve(ref);
+    }
+
+    /**
+     * Resolve a {@link StateRef} into a record.
+     *
+     * @param ref the ref
+     * @param type the record type the value was created from
+     * @param <R> the record type
+     * @return the record (the original instance while the ref still holds it in memory)
+     */
+    public <R extends ArrowSerializableRecord> R resolve(StateRef ref, Class<R> type) {
+        return stateRefScope().resolve(ref, type);
+    }
+
+    /**
+     * Resolve a sealed argument reference minted by this server's {@code __upload_url__}
+     * grant (the grant's {@code ref} column).
+     *
+     * <p>Opens {@code ref} under this request's principal ({@code vgi_rpc.argref.v1}),
+     * checks that its sealed size and SHA-256 equal {@code size} and {@code sha256}, then
+     * fetches the object through the object cache and verifies it. Only an HTTP server can
+     * resolve one (it holds the key and the storage).</p>
+     *
+     * @param ref the grant's {@code ref} value
+     * @param size the byte length claimed alongside the ref
+     * @param sha256 the SHA-256 hex claimed alongside the ref
+     * @return the verified object bytes (shared with the object cache: do not modify)
+     * @throws farm.query.vgirpc.stateref.InvalidArgumentsRefError malformed claim, no
+     *     storage, not an HTTP server, a ref that does not open for this principal, or a sealed
+     *     size/digest that differs from the claim
+     * @throws farm.query.vgirpc.stateref.ArgumentsRefIntegrityError the fetched bytes do not
+     *     match
+     * @throws farm.query.vgirpc.stateref.ArgumentsRefMissingError storage reports the object
+     *     gone
+     * @throws farm.query.vgirpc.stateref.StorageUnavailableError a transient storage failure
+     */
+    public byte[] resolveArgumentRef(byte[] ref, long size, String sha256) {
+        return stateRefScope().resolveArgumentRef(ref, size, sha256);
     }
 }

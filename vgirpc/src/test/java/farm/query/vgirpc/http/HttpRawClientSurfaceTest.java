@@ -397,7 +397,7 @@ final class HttpRawClientSurfaceTest {
                 .maxUploadBytes(16L << 20)
                 .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(
                         "http://storage.invalid/put", "http://storage.invalid/get",
-                        Instant.ofEpochSecond(1_767_225_600L))));
+                        Instant.ofEpochSecond(1_767_225_600L), Map.of(), "obj")));
         HttpCapabilities caps = conn.capabilities();
         assertTrue(caps.stickyEnabled());
         assertEquals(300, caps.stickyDefaultTtl());
@@ -497,7 +497,7 @@ final class HttpRawClientSurfaceTest {
     void uploadUrlsComeBackWithWholeSecondExpiries() throws Exception {
         HttpRpcConnection conn = connect(b -> b.uploadUrlProvider(
                 (size, sha256) -> new UploadUrlProvider.UploadUrl("http://storage.invalid/put",
-                        "http://storage.invalid/get", Instant.ofEpochSecond(1_767_225_600L, 500_000))));
+                        "http://storage.invalid/get", Instant.ofEpochSecond(1_767_225_600L, 500_000), Map.of(), "obj")));
         List<UploadUrl> urls = conn.requestUploadUrls(List.of(
                 new UploadRequest(10, UploadRequests.SHA), new UploadRequest(20, "b".repeat(64))));
         assertEquals(2, urls.size());
@@ -525,7 +525,7 @@ final class HttpRawClientSurfaceTest {
             seen.add(size + ":" + sha256);
             return new UploadUrlProvider.UploadUrl("http://storage.invalid/put/" + size,
                     "http://storage.invalid/get/" + size, null,
-                    Map.of("x-amz-checksum-sha256", "c2l6ZS" + size, "Content-Length", "999"));
+                    Map.of("x-amz-checksum-sha256", "c2l6ZS" + size, "Content-Length", "999"), "obj-" + size);
         }));
         List<UploadUrl> urls = conn.requestUploadUrls(List.of(
                 new UploadRequest(10, UploadRequests.SHA), new UploadRequest(20, "b".repeat(64))));
@@ -541,7 +541,7 @@ final class HttpRawClientSurfaceTest {
     @Timeout(30)
     void uploadUrlSupportIsVersionTwo() throws Exception {
         HttpRpcConnection conn = connect(b -> b.uploadUrlProvider((size, sha256) ->
-                new UploadUrlProvider.UploadUrl("http://storage.invalid/put", "http://storage.invalid/get", null)));
+                new UploadUrlProvider.UploadUrl("http://storage.invalid/put", "http://storage.invalid/get", null, Map.of(), "obj")));
         assertEquals(2, conn.capabilities().uploadUrlVersion());
         assertEquals(1, syntheticHealth(Map.of(HttpServer.UPLOAD_URL_HEADER, "true"))
                 .capabilities().uploadUrlVersion());
@@ -685,7 +685,7 @@ final class HttpRawClientSurfaceTest {
     /** A provider that signs like S3: the checksum header the PUT must carry. */
     private static UploadUrlProvider.UploadUrl signed(String blob, String sha256Hex) {
         return new UploadUrlProvider.UploadUrl(blob, blob, null, Map.of("x-amz-checksum-sha256",
-                java.util.Base64.getEncoder().encodeToString(java.util.HexFormat.of().parseHex(sha256Hex))));
+                java.util.Base64.getEncoder().encodeToString(java.util.HexFormat.of().parseHex(sha256Hex))), "obj");
     }
 
     private String startStorage() throws Exception {
@@ -792,7 +792,7 @@ final class HttpRawClientSurfaceTest {
         AtomicReference<Map<String, String>> sent = new AtomicReference<>();
         HttpRpcConnection conn = connect(b -> b
                 .maxRequestBytes(4096)
-                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(blob, blob, null))
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(blob, blob, null, Map.of(), "obj"))
                 .preHandlers(List.of(new UnaryIntercept("/shout", sent, 0))));
         String value = bigValue();
         assertEquals("HI", conn.proxy(RawDemo.class).shout(value));
@@ -827,7 +827,7 @@ final class HttpRawClientSurfaceTest {
         String blob = startStorage();
         AtomicReference<Map<String, String>> sent = new AtomicReference<>();
         HttpRpcConnection conn = connect(b -> b
-                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(blob, blob, null))
+                .uploadUrlProvider((size, sha256) -> new UploadUrlProvider.UploadUrl(blob, blob, null, Map.of(), "obj"))
                 .preHandlers(List.of(new UnaryIntercept("/shout", sent, 1))));
         assertEquals("HI", conn.proxy(RawDemo.class).shout(bigValue()));
         Map<String, String> metadata = sent.get();

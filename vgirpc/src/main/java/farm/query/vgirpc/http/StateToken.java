@@ -3,8 +3,6 @@
 
 package farm.query.vgirpc.http;
 
-import com.github.luben.zstd.Zstd;
-
 import farm.query.vgirpc.http.auth.Crypto;
 import farm.query.vgirpc.AuthContext;
 
@@ -70,26 +68,6 @@ public record StateToken(
     private static final byte[] AAD_PREFIX = "vgi_rpc.state.v4\0".getBytes(StandardCharsets.UTF_8);
     private static final byte[] BOUND_AAD_PREFIX = "vgi_rpc.state.v5\0".getBytes(StandardCharsets.UTF_8);
 
-    /** Codec tags for the sealed payload. See {@link #packPayload}. */
-    private static final byte CODEC_RAW = 0x00;
-    private static final byte CODEC_ZSTD = 0x01;
-
-    /**
-     * Matches the Python reference's choice. At token payload sizes this
-     * measures the same speed as level 1 and slightly smaller, while the
-     * levels that compress materially better cost many times the CPU for a
-     * few hundred bytes.
-     */
-    private static final int ZSTD_LEVEL = 3;
-
-    /**
-     * Bounds decompression. The payload is authenticated before it is ever
-     * decompressed, so this guards against a framework bug rather than an
-     * attacker — but an unbounded decompress on a request path is not worth
-     * having.
-     */
-    private static final long MAX_PLAINTEXT_BYTES = 64L << 20;
-
     public StateToken {
         state = state.clone();
         callId = callId.clone();
@@ -126,6 +104,19 @@ public record StateToken(
      */
     public byte[] pack(byte[] tokenKey, AuthContext auth, String protocol) {
         return packWithAad(tokenKey, Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth, protocol));
+    }
+
+    /**
+     * {@code BASE_AAD} of STATE_REF_V1.md §4: exactly the AAD this server seals a cursor
+     * under for {@code auth} and {@code protocol}. The {@code StateRef} tag, object and
+     * argument-reference scopes are built on it.
+     *
+     * @param auth the caller's authenticated context
+     * @param protocol the routing key that owns the stream, or the server scope
+     * @return the AAD bytes
+     */
+    public static byte[] baseAad(AuthContext auth, String protocol) {
+        return Tokens.aad(AAD_PREFIX, BOUND_AAD_PREFIX, auth, protocol);
     }
 
     private byte[] packWithAad(byte[] tokenKey, byte[] aad) {

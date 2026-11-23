@@ -8,6 +8,8 @@ import com.google.cloud.storage.HttpMethod;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageOptions;
 import farm.query.vgirpc.external.ExternalStorage;
+import farm.query.vgirpc.external.ObjectMissingException;
+import farm.query.vgirpc.external.ObjectStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,8 +26,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@link ExternalStorage} backed by Google Cloud Storage. Uploads via the
  * synchronous {@code Storage} client using Application Default Credentials
  * (or a caller-supplied {@link Storage}) and returns a V4 signed GET URL.
+ *
+ * <p>Also the protocol-3.4 object API ({@link ObjectStore}): {@link #putObject} creates
+ * {@code <keyPrefix><uuid>.bin} (only if absent) and the key is the {@code object_id}. GCS
+ * cannot verify a SHA-256 at storage; readers verify size and digest themselves. Objects carry
+ * no TTL: set a bucket lifecycle rule of at least one day on the prefix.</p>
  */
-public final class GcsStorage implements ExternalStorage, AutoCloseable {
+public final class GcsStorage implements ExternalStorage, ObjectStore, AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(GcsStorage.class);
 
@@ -94,6 +101,42 @@ public final class GcsStorage implements ExternalStorage, AutoCloseable {
             // The URL came from the GCS signer — it should not fail URI parsing.
             throw new IllegalStateException("GCS signer returned unparseable URL", e);
         }
+    }
+
+    /**
+     * Store {@code data} under a fresh key and return the key.
+     *
+     * @param data the bytes to store
+     * @return the object key (the {@code object_id})
+     */
+    @Override
+    public String putObject(byte[] data) {
+        String key = keyPrefix + UUID.randomUUID().toString().replace("-", "") + ".bin";
+        storage.create(BlobInfo.newBuilder(bucket, key).setContentType("application/octet-stream").build(),
+                data, Storage.BlobTargetOption.doesNotExist());
+        return key;
+    }
+
+    /**
+     * Fetch the blob a key names, refusing more than {@code maxBytes}.
+     *
+     * @param objectId the object key
+     * @param maxBytes the largest object accepted
+     * @return the object bytes
+     * @throws ObjectMissingException when the blob does not exist
+     * @throws java.io.IOException when the blob is over the cap
+     */
+    @Override
+    public byte[] get(String objectId, long maxBytes) throws ObjectMissingException, java.io.IOException {
+        com.google.cloud.storage.Blob blob = storage.get(com.google.cloud.storage.BlobId.of(bucket, objectId));
+        if (blob == null) throw new ObjectMissingException("GCS object is gone");
+        Long size = blob.getSize();
+        if (size != null && size > maxBytes) {
+            throw new java.io.IOException("GCS object is " + size + " bytes, over max_fetch_bytes (" + maxBytes + ")");
+        }
+        byte[] out = blob.getContent();
+        if (out.length > maxBytes) throw new java.io.IOException("GCS object exceeds max_fetch_bytes (" + maxBytes + ")");
+        return out;
     }
 
     /**

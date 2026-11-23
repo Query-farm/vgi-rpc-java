@@ -111,6 +111,8 @@ import java.util.concurrent.TimeoutException;
  */
 public final class HttpServer {
 
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(HttpServer.class);
+
     /** MIME type of every request and response body: a single Arrow IPC stream. */
     public static final String ARROW_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 
@@ -190,7 +192,11 @@ public final class HttpServer {
             new Field("upload_headers", FieldType.notNullable(new ArrowType.Map(false)), List.of(
                     new Field("entries", FieldType.notNullable(new ArrowType.Struct()), List.of(
                             new Field("key", FieldType.notNullable(new ArrowType.Utf8()), null),
-                            new Field("value", FieldType.nullable(new ArrowType.Utf8()), null)))))));
+                            new Field("value", FieldType.nullable(new ArrowType.Utf8()), null))))),
+            // Protocol 3.4 grant columns (STATE_REF_V1.md §10.2): the storage id of the object the
+            // PUT creates, and a sealed argument reference for it, bound to the caller.
+            new Field("object_id", FieldType.notNullable(new ArrowType.Utf8()), null),
+            new Field("ref", FieldType.notNullable(new ArrowType.Binary()), null)));
 
     private static final Schema UPLOAD_URL_SCHEMA = UPLOAD_URL_RESPONSE_SCHEMA;
 
@@ -323,7 +329,7 @@ public final class HttpServer {
         this.advertiseMaxRequestBytes = config.advertiseMaxRequestBytes();
         this.zstdLevel = config.zstdLevel();
         this.uploadUrlProvider = config.uploadUrlProvider();
-        this.maxUploadBytes = config.maxUploadBytes();
+        this.maxUploadBytes = resolveMaxUploadBytes(rpc, config.uploadUrlProvider(), config.maxUploadBytes());
         this.advertisedMaxResponseBytes = config.advertisedMaxResponseBytes();
         this.advertisedMaxExternalizedResponseBytes = config.advertisedMaxExternalizedResponseBytes();
         this.hostingMaxRequestBytes = config.hostingMaxRequestBytes();
@@ -361,6 +367,18 @@ public final class HttpServer {
         }
         this.strictAuth = config.strictAuth();
         this.wwwAuthenticate = config.wwwAuthenticate();
+        // StateRef machinery (STATE_REF_V1.md): the same key as the tokens, the server's
+        // storage (read per use), its fetch cap, and the advertised request cap the turn budget
+        // derives from.
+        long requestCap = configuredRequestLimit();
+        streamHandler.configureStateRefs(
+                () -> rpc.externalConfig() != null ? rpc.externalConfig().storage() : null,
+                rpc.externalConfig() != null ? rpc.externalConfig().maxFetchBytes()
+                        : farm.query.vgirpc.external.ExternalLocationConfig.DEFAULT_MAX_FETCH_BYTES,
+                requestCap == Long.MAX_VALUE ? null : requestCap,
+                config.stateRefInlineBytes() > 0 ? config.stateRefInlineBytes()
+                        : farm.query.vgirpc.stateref.StateRefRuntime.inlineBytesFromEnv(System.getenv()),
+                config.cursorRule());
         this.cors = config.corsOrigins().isEmpty()
                 ? null
                 : new CorsPolicy(config.corsOrigins(), config.corsMaxAgeSeconds(), corsExposeHeaders());
@@ -455,9 +473,15 @@ public final class HttpServer {
      *                         endpoint (presigned upload/download URL minting) and
      *                         advertises {@code VGI-Upload-URL-Support: 2}.
      *                         {@code null} disables the endpoint.
-     * @param maxUploadBytes   advisory per-object upload cap advertised via
+     * @param maxUploadBytes   per-object upload cap advertised via
      *                         {@code VGI-Max-Upload-Bytes} when an upload-URL
-     *                         provider is set; {@code null} omits the header.
+     *                         provider is set. {@code null} advertises the server's
+     *                         inbound fetch cap (512 MiB unless the external config
+     *                         sets another): an upload comes back as a pointer the
+     *                         server fetches under that cap, so the advertised size
+     *                         never exceeds it. A larger value is clamped to the
+     *                         default fetch cap with a warning, and refused at startup
+     *                         when the fetch cap was set explicitly below it.
      *                         {@code __upload_url__/init} refuses an entry whose
      *                         declared size exceeds it.
      * @param advertisedMaxResponseBytes operator-facing cap on inline response
@@ -541,6 +565,16 @@ public final class HttpServer {
      *                         401, replacing whatever the authenticator supplied;
      *                         {@code null} (the default) keeps the
      *                         authenticator's own.
+     * @param stateRefInlineBytes largest compressed {@code StateRef} payload kept inline in a
+     *                         token before it is stored (STATE_REF_V1.md §9); the effective
+     *                         limit is also capped at a quarter of the turn budget. {@code 0}
+     *                         (the default) reads {@code VGI_RPC_STATE_REF_INLINE_BYTES}, else
+     *                         16384.
+     * @param cursorRule       what a sealed cursor over the turn budget does: {@code WARN} (the
+     *                         default) logs {@code cursor_large} and sends the client a WARN log;
+     *                         {@code ERROR} refuses the turn with {@code cursor_too_large} (only
+     *                         when a request cap is set). Below a 16 KiB request cap the rule is
+     *                         disabled with a startup warning.
      */
     public record Config(
             String host,
@@ -580,10 +614,13 @@ public final class HttpServer {
             long hostingMaxResponseBytes,
             long preferredResponseBytes,
             boolean strictAuth,
-            String wwwAuthenticate) {
+            String wwwAuthenticate,
+            int stateRefInlineBytes,
+            farm.query.vgirpc.stateref.StateRefRuntime.CursorRule cursorRule) {
 
-        /** 1 hour. */
-        public static final long DEFAULT_TOKEN_TTL_SECONDS = 3600;
+        /** 6 hours: the maximum stream duration (STATE_REF_V1.md §12). Applies to cursor tokens,
+         *  call tokens and stored {@code StateRef} tags. */
+        public static final long DEFAULT_TOKEN_TTL_SECONDS = 21600;
         /** 2 hours — the ceiling Chromium honours for a preflight cache entry. */
         public static final long DEFAULT_CORS_MAX_AGE_SECONDS = 7200;
         /** 16 MiB request-body ceiling. Larger inputs should use external locations. */
@@ -688,6 +725,10 @@ public final class HttpServer {
             if (callStateCacheMaxEntries < 0) {
                 throw new IllegalArgumentException("callStateCacheMaxEntries must be >= 0");
             }
+            if (stateRefInlineBytes < 0) {
+                throw new IllegalArgumentException("stateRefInlineBytes must be a positive integer (or 0 for the default)");
+            }
+            if (cursorRule == null) cursorRule = farm.query.vgirpc.stateref.StateRefRuntime.CursorRule.WARN;
             if (stickyEnabled && stickyDefaultTtlSeconds <= 0) {
                 throw new IllegalArgumentException("stickyDefaultTtlSeconds must be > 0 when sticky is enabled");
             }
@@ -782,6 +823,9 @@ public final class HttpServer {
             private int peerProviderConcurrency = 64;
             private boolean strictAuth;
             private String wwwAuthenticate;
+            private int stateRefInlineBytes;
+            private farm.query.vgirpc.stateref.StateRefRuntime.CursorRule cursorRule =
+                    farm.query.vgirpc.stateref.StateRefRuntime.CursorRule.WARN;
 
             /**
              * Listen address (default {@code "127.0.0.1"}). See {@link Config#host()}.
@@ -1117,6 +1161,25 @@ public final class HttpServer {
              * @return this builder
              */
             public Builder wwwAuthenticate(String challenge) { this.wwwAuthenticate = challenge; return this; }
+            /**
+             * Largest compressed {@code StateRef} payload kept inline (STATE_REF_V1.md §9).
+             *
+             * @param bytes a positive cap; {@code 0} (the default) reads
+             *        {@code VGI_RPC_STATE_REF_INLINE_BYTES}, else 16384
+             * @return this builder
+             */
+            public Builder stateRefInlineBytes(int bytes) { this.stateRefInlineBytes = bytes; return this; }
+            /**
+             * What a sealed cursor over the turn budget does (STATE_REF_V1.md §9). A framework
+             * that keeps its unchanging state in {@code StateRef} should pass {@code ERROR}.
+             *
+             * @param rule {@code WARN} (the default) or {@code ERROR}
+             * @return this builder
+             */
+            public Builder cursorRule(farm.query.vgirpc.stateref.StateRefRuntime.CursorRule rule) {
+                this.cursorRule = rule;
+                return this;
+            }
 
             /**
              * Build the immutable config.
@@ -1138,7 +1201,7 @@ public final class HttpServer {
                         peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
                         peerResolutionTimeoutMs, peerProviderConcurrency,
                         hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes,
-                        strictAuth, wwwAuthenticate);
+                        strictAuth, wwwAuthenticate, stateRefInlineBytes, cursorRule);
             }
         }
 
@@ -1162,7 +1225,7 @@ public final class HttpServer {
                     peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
                     peerResolutionTimeoutMs, peerProviderConcurrency,
                     hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes,
-                    strictAuth, wwwAuthenticate);
+                    strictAuth, wwwAuthenticate, stateRefInlineBytes, cursorRule);
         }
     }
 
@@ -1684,6 +1747,33 @@ public final class HttpServer {
         return expose;
     }
 
+    /**
+     * Fix 1 of the 3.4 plan: the {@code VGI-Max-Upload-Bytes} to advertise never exceeds the
+     * server's inbound fetch cap, and is always advertised alongside upload URLs.
+     *
+     * <p>An upload comes back to the server as a pointer it fetches under the external
+     * config's {@code maxFetchBytes}; advertising more would let a client upload a request the
+     * server then refuses, after the whole upload.</p>
+     */
+    private static Long resolveMaxUploadBytes(RpcServer rpc, UploadUrlProvider provider, Long requested) {
+        if (provider == null) return requested;
+        farm.query.vgirpc.external.ExternalLocationConfig external = rpc.externalConfig();
+        long fetchCap = external != null ? external.maxFetchBytes()
+                : farm.query.vgirpc.external.ExternalLocationConfig.DEFAULT_MAX_FETCH_BYTES;
+        if (requested == null) return fetchCap;
+        if (requested < 1) throw new IllegalArgumentException("maxUploadBytes must be a positive integer, got " + requested);
+        if (requested <= fetchCap) return requested;
+        if (external != null && external.maxFetchBytesExplicit()) {
+            throw new IllegalArgumentException("maxUploadBytes (" + requested + ") exceeds the server's inbound "
+                    + "fetch cap (ExternalLocationConfig.maxFetchBytes = " + fetchCap + "): clients would upload "
+                    + "requests the server then refuses to fetch. Raise maxFetchBytes (VGI_RPC_MAX_FETCH_BYTES "
+                    + "for BlobVendor.externalConfigFromEnv) or lower maxUploadBytes (VGI_RPC_MAX_UPLOAD_BYTES).");
+        }
+        LOG.warn("maxUploadBytes ({}) exceeds the server's default inbound fetch cap ({}); advertising {} "
+                + "(set VGI_RPC_MAX_FETCH_BYTES to raise it)", requested, fetchCap, fetchCap);
+        return fetchCap;
+    }
+
     private static long minConfigured(long current, long candidate) {
         return candidate > 0 && candidate < current ? candidate : current;
     }
@@ -1807,6 +1897,12 @@ public final class HttpServer {
             VarCharVector downloadVec = (VarCharVector) root.getVector("download_url");
             TimeStampMicroTZVector expiresVec = (TimeStampMicroTZVector) root.getVector("expires_at");
             MapVector headersVec = (MapVector) root.getVector("upload_headers");
+            VarCharVector objectIdVec = (VarCharVector) root.getVector("object_id");
+            org.apache.arrow.vector.VarBinaryVector refVec =
+                    (org.apache.arrow.vector.VarBinaryVector) root.getVector("ref");
+            byte[] refKey = streamHandler.stateRefRuntime().tokenKey();
+            objectIdVec.allocateNew();
+            refVec.allocateNew();
             uploadVec.allocateNew();
             downloadVec.allocateNew();
             expiresVec.allocateNew(count);
@@ -1821,6 +1917,16 @@ public final class HttpServer {
                     } catch (Exception e) {
                         throw new IOException("upload URL generation failed: " + e.getMessage(), e);
                     }
+                    if (url.objectId().isEmpty()) {
+                        throw new IOException("upload URL provider " + uploadUrlProvider.getClass().getSimpleName()
+                                + " returned no object_id (required since protocol 3.4)");
+                    }
+                    // Sealed under the grant request's AuthContext, authenticated exactly like a
+                    // protocol method, so it opens only for the same caller.
+                    byte[] ref = farm.query.vgirpc.stateref.ArgumentRefs.mint(refKey, identity.auth(),
+                            want.size(), want.sha256(), url.objectId());
+                    objectIdVec.setSafe(i, url.objectId().getBytes(StandardCharsets.UTF_8));
+                    refVec.setSafe(i, ref);
                     uploadVec.setSafe(i, url.uploadUrl().getBytes(StandardCharsets.UTF_8));
                     downloadVec.setSafe(i, url.downloadUrl().getBytes(StandardCharsets.UTF_8));
                     Instant exp = url.expiresAt() != null ? url.expiresAt() : Instant.now().plusSeconds(3600);
@@ -2115,6 +2221,8 @@ public final class HttpServer {
         try {
             try (AutoCloseable authPop = AuthScope.push(auth, md, identity.evidence());
                  AutoCloseable sessPop = SessionScope.push(scope);
+                 AutoCloseable refsPop = farm.query.vgirpc.stateref.StateRefRuntime.push(
+                         streamHandler.stateRefRuntime());
                  InMemoryTransport t = new InMemoryTransport(body, out)) {
                 // The path already resolved the binding, so it is handed to dispatch as the
                 // routing key. vgi_rpc.protocol stays canonical when the request carries it --
@@ -2990,6 +3098,9 @@ public final class HttpServer {
         } finally {
             releaseSessionLock(scope);
         }
+        // A token failure (tampered, expired, another principal or protocol) and
+        // invalid_state_ref are a uniform 400, with the RPC error batch as the body.
+        if (CallOutcome.badRequest()) resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
         emitResponseCookies(resp, md);
         emitSessionResponseHeaders(resp, scope);
         // External-channel cap: hard on producer /init too, unlike the wire cap

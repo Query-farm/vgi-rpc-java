@@ -47,6 +47,8 @@ public final class CallOutcome implements AutoCloseable {
     private Throwable error;
     /** Set when the error was appended to a body the client reads as a stream sequence. */
     private boolean errorAppendedToBody;
+    /** Set when the response is a 400: a token failure, or {@code invalid_state_ref}. */
+    private boolean badRequest;
 
     private CallOutcome(boolean owner) {
         this.owner = owner;
@@ -77,7 +79,30 @@ public final class CallOutcome implements AutoCloseable {
      */
     public static void recordError(Throwable t) {
         CallOutcome scope = CURRENT.get();
-        if (scope != null && scope.error == null && t != null) scope.error = t;
+        if (scope != null && scope.error == null && t != null) {
+            scope.error = t;
+            // invalid_state_ref is answered 400 like every other token failure (STATE_REF_V1.md §6).
+            if (t instanceof farm.query.vgirpc.stateref.InvalidStateRefError) scope.badRequest = true;
+        }
+    }
+
+    /**
+     * Note that this call's response is a {@code 400 Bad Request}: the stream turn presented a
+     * state token that does not open (tampered, expired, another principal or protocol), the
+     * uniform answer to every token failure. No-op when no scope is installed.
+     */
+    public static void markBadRequest() {
+        CallOutcome scope = CURRENT.get();
+        if (scope != null) scope.badRequest = true;
+    }
+
+    /**
+     * @return whether the HTTP transport should answer this call with status 400 (a token
+     *         failure, or an {@code invalid_state_ref} error)
+     */
+    public static boolean badRequest() {
+        CallOutcome scope = CURRENT.get();
+        return scope != null && scope.badRequest;
     }
 
     /**

@@ -4,6 +4,12 @@
 package farm.query.vgirpc.external.s3;
 
 import farm.query.vgirpc.external.ExternalStorage;
+import farm.query.vgirpc.external.ObjectMissingException;
+import farm.query.vgirpc.external.ObjectStore;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
@@ -29,8 +35,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p>Uploads opaque IPC bytes under {@code <keyPrefix>/<uuid>} and returns a
  * V4 pre-signed GET URL whose expiry defaults to one hour.</p>
+ *
+ * <p>Also the protocol-3.4 object API ({@link ObjectStore}): {@link #putObject} stores
+ * under {@code <keyPrefix><uuid>.bin} with a signed {@code x-amz-checksum-sha256}, and the
+ * key is the {@code object_id}. Objects carry no TTL: set a bucket lifecycle rule of at least
+ * one day on the prefix.</p>
  */
-public final class S3Storage implements ExternalStorage, AutoCloseable {
+public final class S3Storage implements ExternalStorage, ObjectStore, AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(S3Storage.class);
 
@@ -109,6 +120,63 @@ public final class S3Storage implements ExternalStorage, AutoCloseable {
         } catch (URISyntaxException e) {
             // The URL came from the AWS presigner — it should not fail URI parsing.
             throw new IllegalStateException("S3 presigner returned unparseable URL", e);
+        }
+    }
+
+    /**
+     * Store {@code data} under a fresh key and return the key: a SigV4 PutObject with the
+     * length and {@code ChecksumSHA256}, so S3/R2 verify the body.
+     *
+     * @param data the bytes to store
+     * @return the object key (the {@code object_id})
+     */
+    @Override
+    public String putObject(byte[] data) {
+        String key = keyPrefix + UUID.randomUUID().toString().replace("-", "") + ".bin";
+        String sha256;
+        try {
+            sha256 = java.util.Base64.getEncoder().encodeToString(
+                    java.security.MessageDigest.getInstance("SHA-256").digest(data));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+        s3.putObject(PutObjectRequest.builder()
+                .bucket(bucket)
+                .key(key)
+                .contentType("application/octet-stream")
+                .contentLength((long) data.length)
+                .checksumSHA256(sha256)
+                .build(), RequestBody.fromBytes(data));
+        return key;
+    }
+
+    /**
+     * Fetch the object a key names, refusing more than {@code maxBytes}.
+     *
+     * @param objectId the object key
+     * @param maxBytes the largest object accepted
+     * @return the object bytes
+     * @throws ObjectMissingException when the key does not exist
+     * @throws java.io.IOException on a read failure or an object over the cap
+     */
+    @Override
+    public byte[] get(String objectId, long maxBytes) throws ObjectMissingException, java.io.IOException {
+        try (ResponseInputStream<GetObjectResponse> in =
+                     s3.getObject(r -> r.bucket(bucket).key(objectId))) {
+            Long length = in.response().contentLength();
+            if (length != null && length > maxBytes) {
+                throw new java.io.IOException("S3 object is " + length + " bytes, over max_fetch_bytes (" + maxBytes + ")");
+            }
+            byte[] out = in.readNBytes((int) Math.min(maxBytes + 1, Integer.MAX_VALUE - 8));
+            if (out.length > maxBytes) {
+                throw new java.io.IOException("S3 object exceeds max_fetch_bytes (" + maxBytes + ")");
+            }
+            return out;
+        } catch (NoSuchKeyException e) {
+            throw new ObjectMissingException("S3 object is gone");
+        } catch (S3Exception e) {
+            if (e.statusCode() == 404) throw new ObjectMissingException("S3 object is gone");
+            throw e;
         }
     }
 

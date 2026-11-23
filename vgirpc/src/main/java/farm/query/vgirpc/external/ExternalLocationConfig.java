@@ -19,12 +19,17 @@ import java.util.function.Consumer;
  */
 public final class ExternalLocationConfig {
 
+    /** Default hard cap on a fetched body: 512 MiB. Also the default fetch cap the
+     *  {@code StateRef} machinery and the advertised upload cap derive from. */
+    public static final long DEFAULT_MAX_FETCH_BYTES = 512L * 1024 * 1024;
+
     /** Storage backend for the upload side. Null disables externalisation. */
     private final ExternalStorage storage;
     /** Size (in bytes) above which outgoing batches are externalised. */
     private final long thresholdBytes;
     /** Max total bytes the fetcher will download per pointer (safety cap). */
     private final long maxFetchBytes;
+    private final boolean maxFetchBytesExplicit;
     /** Max bytes after external content decompression. */
     private final long maxDecompressedBytes;
     /** Retry attempts on transient fetch errors (caller count, not including first). */
@@ -44,6 +49,7 @@ public final class ExternalLocationConfig {
         this.storage = b.storage;
         this.thresholdBytes = b.thresholdBytes;
         this.maxFetchBytes = b.maxFetchBytes;
+        this.maxFetchBytesExplicit = b.maxFetchBytesSet;
         this.maxDecompressedBytes = b.maxDecompressedBytes;
         this.maxRetries = b.maxRetries;
         this.retryDelay = b.retryDelay;
@@ -63,6 +69,10 @@ public final class ExternalLocationConfig {
     /** Safety cap protecting the fetcher against runaway downloads.
      * @return hard cap (bytes) on a fetched body; oversized fetches are rejected. */
     public long maxFetchBytes() { return maxFetchBytes; }
+    /** @return whether {@link #maxFetchBytes()} was set explicitly (not the 512 MiB default).
+     *  An explicit fetch cap below the advertised upload cap refuses server startup; the
+     *  default one clamps the advertised upload cap instead. */
+    public boolean maxFetchBytesExplicit() { return maxFetchBytesExplicit; }
     /** Safety cap applied after external content decompression.
      * @return hard cap (bytes) on the decoded body. */
     public long maxDecompressedBytes() { return maxDecompressedBytes; }
@@ -135,9 +145,10 @@ public final class ExternalLocationConfig {
     public static final class Builder {
         private ExternalStorage storage;
         private long thresholdBytes = 1L << 20;      // 1 MiB
-        private long maxFetchBytes = 512L * 1024 * 1024; // 512 MiB safety cap
+        private long maxFetchBytes = DEFAULT_MAX_FETCH_BYTES; // 512 MiB safety cap
         private long maxDecompressedBytes = 512L * 1024 * 1024;
         private boolean maxDecompressedBytesSet;
+        private boolean maxFetchBytesSet;
         private int maxRetries = 2;
         private Duration retryDelay = Duration.ofMillis(500);
         private Duration httpTimeout = Duration.ofSeconds(30);
@@ -158,6 +169,7 @@ public final class ExternalLocationConfig {
          * @return this builder */
         public Builder maxFetchBytes(long v) {
             this.maxFetchBytes = v;
+            this.maxFetchBytesSet = true;
             // Before decoded bytes had a separate setting, maxFetchBytes was
             // enforced after decompression. Preserve that protection unless
             // the caller explicitly chooses an independent decoded cap.

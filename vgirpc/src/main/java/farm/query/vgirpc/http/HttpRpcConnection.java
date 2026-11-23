@@ -574,6 +574,11 @@ public final class HttpRpcConnection implements AutoCloseable {
                     throw new RpcError("ProtocolError", what
                             + ": response has no upload_headers column (not an upload-URL v2 server)", "");
                 }
+                // Protocol 3.4 grant columns, read by name when present; older servers omit them.
+                org.apache.arrow.vector.VarCharVector objectIds =
+                        root.getVector("object_id") instanceof org.apache.arrow.vector.VarCharVector v ? v : null;
+                org.apache.arrow.vector.VarBinaryVector refs =
+                        root.getVector("ref") instanceof org.apache.arrow.vector.VarBinaryVector v ? v : null;
                 for (int i = 0; i < root.getRowCount(); i++) {
                     urls.add(new UploadUrl(
                             upload.isNull(i) ? null : new String(upload.get(i), StandardCharsets.UTF_8),
@@ -583,7 +588,10 @@ public final class HttpRpcConnection implements AutoCloseable {
                             // noise, and floor keeps a slot from looking valid
                             // for a microsecond longer than it is.
                             expires.isNull(i) ? 0L : Math.floorDiv(expires.get(i), 1_000_000L),
-                            readHeaderMap(hdrs, i)));
+                            readHeaderMap(hdrs, i),
+                            objectIds == null || objectIds.isNull(i) ? ""
+                                    : new String(objectIds.get(i), StandardCharsets.UTF_8),
+                            refs == null || refs.isNull(i) ? null : refs.get(i)));
                 }
             }
         } catch (IOException e) {

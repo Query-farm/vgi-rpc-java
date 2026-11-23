@@ -5,6 +5,8 @@ package farm.query.vgirpc.vendor;
 
 import farm.query.vgirpc.external.ExternalStorage;
 import farm.query.vgirpc.external.LocationResolver;
+import farm.query.vgirpc.external.ObjectMissingException;
+import farm.query.vgirpc.external.ObjectStore;
 import farm.query.vgirpc.external.UploadUrlProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,10 +38,15 @@ import java.util.Map;
  * server's own writes. The unsized {@code /v1/upload_urls} path is not
  * used.</p>
  *
+ * <p>{@link #putObject} / {@link #get(String, long)} are the protocol-3.4 object API
+ * (STATE_REF_V1.md §10.1): a sized {@code rpc} grant with the advisory
+ * {@code origin: "state_ref"} ({@link #STATE_REF_ORIGIN}), and a download minted
+ * server-side from the {@code object_id} ({@code POST /v1/blobs/get}), pinned and capped.</p>
+ *
  * <p>Thread-safe. Objects are cleaned up by the vendor (registry alarm plus
  * storage lifecycle rules); vgi-rpc never deletes them.</p>
  */
-public final class VendorStorage extends VendorClient implements ExternalStorage, UploadUrlProvider {
+public final class VendorStorage extends VendorClient implements ExternalStorage, UploadUrlProvider, ObjectStore {
 
     private static final Logger LOG = LoggerFactory.getLogger(VendorStorage.class);
 
@@ -54,6 +61,14 @@ public final class VendorStorage extends VendorClient implements ExternalStorage
      * {@code vgi_rpc.vendor.CLIENT_UPLOAD_ORIGIN}.
      */
     public static final String CLIENT_UPLOAD_ORIGIN = "client_upload";
+
+    /**
+     * The advisory {@code origin} on a {@code /v1/blobs/put} grant for a stored
+     * {@code StateRef} object ({@link #putObject}). The vendor ignores it; the fake vendor
+     * counts those grants ({@code puts_state_ref}) and their reads. Mirrors vgi-rpc-python
+     * {@code vgi_rpc.vendor.STATE_REF_ORIGIN}.
+     */
+    public static final String STATE_REF_ORIGIN = "state_ref";
 
     /**
      * Create a vendor-backed storage.
@@ -138,7 +153,75 @@ public final class VendorStorage extends VendorClient implements ExternalStorage
         if (grant.downloadExpiresAt() != null && (expires == null || grant.downloadExpiresAt().isBefore(expires))) {
             expires = grant.downloadExpiresAt();
         }
-        return new UploadUrl(grant.uploadUrl(), downloadUrl, expires, grant.requiredHeaders());
+        return new UploadUrl(grant.uploadUrl(), downloadUrl, expires, grant.requiredHeaders(), grant.objectId());
+    }
+
+    /**
+     * Store {@code data} as one {@code rpc} object and return its {@code object_id}.
+     *
+     * <p>A sized, checksummed grant ({@code /v1/blobs/put}, purpose {@code rpc}, advisory
+     * {@code origin: "state_ref"}) and a PUT with exactly its required headers, so storage
+     * verifies the body. Objects carry no TTL; the bucket lifecycle removes them.</p>
+     *
+     * @param data the bytes to store (a sealed {@code StateRef} object)
+     * @return the vendor's {@code object_id}
+     * @throws VendorError if the vendor or the signed upload fails
+     */
+    @Override
+    public String putObject(byte[] data) {
+        PutGrant grant = api.put(data.length, b64Sha256(data), "rpc", null, null, null, STATE_REF_ORIGIN);
+        if (pinHosts) check(grant.uploadUrl());
+        api.putObject(grant, data, null);
+        return grant.objectId();
+    }
+
+    /**
+     * Fetch an object by id: the download is minted server-side ({@code /v1/blobs/get}),
+     * pinned to the vendor's download hosts and capped at {@code maxBytes}. The caller verifies
+     * size and digest.
+     *
+     * @param objectId a vendor {@code object_id}
+     * @param maxBytes the largest object accepted
+     * @return the object bytes
+     * @throws ObjectMissingException the vendor reports {@code not_found} / {@code not_uploaded},
+     *     or storage answers 404
+     * @throws VendorError any other vendor or download failure
+     */
+    @Override
+    public byte[] get(String objectId, long maxBytes) throws ObjectMissingException {
+        BlobLocation location;
+        try {
+            location = api.get(objectId);
+        } catch (VendorError e) {
+            if (isMissing(e)) {
+                throw new ObjectMissingException("blob vendor object is gone ("
+                        + (e.code() != null ? e.code() : e.status()) + ")");
+            }
+            throw e;
+        }
+        if (location.size() > maxBytes) {
+            throw new VendorError("Blob vendor object is " + location.size() + " bytes, over max_fetch_bytes ("
+                    + maxBytes + ")");
+        }
+        String encoding = location.contentEncoding();
+        if (encoding != null && !"identity".equals(encoding)) {
+            throw new VendorError("Blob vendor object has unsupported content_encoding '" + encoding + "'");
+        }
+        try {
+            return api.fetch(location.downloadUrl(), uri -> {
+                if (pinHosts) urlValidator().accept(uri);
+            }, maxBytes, "object");
+        } catch (VendorError e) {
+            if (e.status() != null && e.status() == 404) {
+                throw new ObjectMissingException("blob vendor object is gone (storage 404)");
+            }
+            throw e;
+        }
+    }
+
+    private static boolean isMissing(VendorError e) {
+        return "not_found".equals(e.code()) || "not_uploaded".equals(e.code())
+                || (e.status() != null && e.status() == 404);
     }
 
     static String b64Sha256(byte[] data) {

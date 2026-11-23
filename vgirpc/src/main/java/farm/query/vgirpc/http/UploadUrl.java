@@ -32,14 +32,52 @@ package farm.query.vgirpc.http;
  * @param expiresAtUnixSeconds when the slot stops being usable, in seconds
  *     since the Unix epoch
  * @param uploadHeaders headers the PUT must carry verbatim; never {@code null}
+ * @param objectId the storage id of the object the PUT creates (protocol 3.4 {@code object_id}
+ *     column); empty when the server did not send one
+ * @param ref the sealed argument reference for that object (protocol 3.4 {@code ref} column);
+ *     empty when the server did not send one
  */
 public record UploadUrl(String uploadUrl, String downloadUrl, long expiresAtUnixSeconds,
-                        java.util.Map<String, String> uploadHeaders) {
+                        java.util.Map<String, String> uploadHeaders, String objectId, byte[] ref) {
 
     /** Copy the header map, preserving its order. */
     public UploadUrl {
         uploadHeaders = uploadHeaders == null ? java.util.Map.of()
                 : java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(uploadHeaders));
+        objectId = objectId != null ? objectId : "";
+        ref = ref != null ? ref.clone() : new byte[0];
+    }
+
+    /**
+     * A slot from a server that sends no {@code object_id} / {@code ref}.
+     *
+     * @param uploadUrl the URL to PUT the payload to
+     * @param downloadUrl the URL to name as {@code vgi_rpc.location} afterwards
+     * @param expiresAtUnixSeconds expiry, seconds since the epoch
+     * @param uploadHeaders headers the PUT must carry verbatim
+     */
+    public UploadUrl(String uploadUrl, String downloadUrl, long expiresAtUnixSeconds,
+                     java.util.Map<String, String> uploadHeaders) {
+        this(uploadUrl, downloadUrl, expiresAtUnixSeconds, uploadHeaders, "", null);
+    }
+
+    @Override
+    public byte[] ref() {
+        return ref.clone();
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        return o instanceof UploadUrl u && java.util.Objects.equals(uploadUrl, u.uploadUrl)
+                && java.util.Objects.equals(downloadUrl, u.downloadUrl)
+                && expiresAtUnixSeconds == u.expiresAtUnixSeconds && uploadHeaders.equals(u.uploadHeaders)
+                && objectId.equals(u.objectId) && java.util.Arrays.equals(ref, u.ref);
+    }
+
+    @Override
+    public int hashCode() {
+        return java.util.Objects.hash(uploadUrl, downloadUrl, expiresAtUnixSeconds, uploadHeaders, objectId,
+                java.util.Arrays.hashCode(ref));
     }
 
     @Override

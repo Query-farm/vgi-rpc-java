@@ -58,6 +58,8 @@ public final class BlobVendor {
     public static final String ENV_COMPRESSION = "VGI_RPC_EXTERNAL_COMPRESSION";
     /** Advertised client-upload size. */
     public static final String ENV_MAX_UPLOAD_BYTES = "VGI_RPC_MAX_UPLOAD_BYTES";
+    /** Inbound fetch cap (bytes) for pointers clients upload; also caps the advertised upload size. */
+    public static final String ENV_MAX_FETCH_BYTES = "VGI_RPC_MAX_FETCH_BYTES";
     /** Advertised and enforced request-body cap. */
     public static final String ENV_MAX_REQUEST_BYTES = "VGI_RPC_MAX_REQUEST_BYTES";
 
@@ -249,8 +251,8 @@ public final class BlobVendor {
      * Server external-location config from the blob-vendor environment.
      *
      * <p>Uses a {@link VendorStorage} for uploads, pins inbound pointer URLs to
-     * the vendor's hosts, and reads {@value #ENV_THRESHOLD} (default 1 MiB) and
-     * {@value #ENV_COMPRESSION} (default none). Pass the config's
+     * the vendor's hosts, and reads {@value #ENV_THRESHOLD} (default 1 MiB),
+     * {@value #ENV_COMPRESSION} (default none) and {@value #ENV_MAX_FETCH_BYTES} (default 512 MiB). Pass the config's
      * {@link ExternalLocationConfig#storage()} (a {@link VendorStorage}) as the
      * HTTP server's upload-URL provider to also vend client upload URLs.</p>
      *
@@ -264,12 +266,14 @@ public final class BlobVendor {
         if (envOrEmpty(environ, ENV_URL).isEmpty()) return null;
         VendorStorage storage = VendorStorage.fromEnv("rpc", environ);
         long threshold = positiveLongFromEnv(environ, ENV_THRESHOLD, DEFAULT_THRESHOLD);
-        return ExternalLocationConfig.builder()
+        ExternalLocationConfig.Builder b = ExternalLocationConfig.builder()
                 .storage(storage)
                 .thresholdBytes(threshold)
                 .compression(parseCompression(environ.get(ENV_COMPRESSION)))
-                .urlValidator(storage.urlValidator())
-                .build();
+                .urlValidator(storage.urlValidator());
+        Long maxFetch = positiveLongFromEnv(environ, ENV_MAX_FETCH_BYTES, null);
+        if (maxFetch != null) b.maxFetchBytes(maxFetch);
+        return b.build();
     }
 
     /**
