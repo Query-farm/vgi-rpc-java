@@ -282,6 +282,7 @@ public final class HttpServer {
     private final CorsPolicy cors;
     /** {@link Config#strictAuth()}: authenticate every request but the exempt two before routing. */
     private final boolean strictAuth;
+    private final Map<String, String> extraCapabilityHeaders;
     /** {@link Config#wwwAuthenticate()}: the challenge on every 401, or {@code null}. */
     private final String wwwAuthenticate;
     private int port;
@@ -366,6 +367,7 @@ public final class HttpServer {
             this.sessionRegistry = null;
         }
         this.strictAuth = config.strictAuth();
+        this.extraCapabilityHeaders = config.extraCapabilityHeaders();
         this.wwwAuthenticate = config.wwwAuthenticate();
         // StateRef machinery (STATE_REF_V1.md): the same key as the tokens, the server's
         // storage (read per use), its fetch cap, and the advertised request cap the turn budget
@@ -575,6 +577,12 @@ public final class HttpServer {
      *                         {@code ERROR} refuses the turn with {@code cursor_too_large} (only
      *                         when a request cap is set). Below a 16 KiB request cap the rule is
      *                         disabled with a startup warning.
+     * @param extraCapabilityHeaders application capability headers (name to value) set on every
+     *                         response, capability discovery ({@code OPTIONS}) included, and
+     *                         listed in the CORS expose set, e.g. a framework's
+     *                         {@code VGI-Arguments-Ref-Bytes}. Names are HTTP tokens, values
+     *                         visible ASCII; a header vgi-rpc sets itself is refused. Default
+     *                         none.
      */
     public record Config(
             String host,
@@ -616,7 +624,8 @@ public final class HttpServer {
             boolean strictAuth,
             String wwwAuthenticate,
             int stateRefInlineBytes,
-            farm.query.vgirpc.stateref.StateRefRuntime.CursorRule cursorRule) {
+            farm.query.vgirpc.stateref.StateRefRuntime.CursorRule cursorRule,
+            Map<String, String> extraCapabilityHeaders) {
 
         /** 6 hours: the maximum stream duration (STATE_REF_V1.md §12). Applies to cursor tokens,
          *  call tokens and stored {@code StateRef} tags. */
@@ -687,6 +696,7 @@ public final class HttpServer {
             preHandlers = preHandlers != null ? List.copyOf(preHandlers) : List.of();
             proxyAuthHeaders = proxyAuthHeaders != null ? List.copyOf(proxyAuthHeaders) : List.of();
             stickyEchoHeaders = stickyEchoHeaders != null ? Map.copyOf(stickyEchoHeaders) : Map.of();
+            extraCapabilityHeaders = validateExtraCapabilityHeaders(extraCapabilityHeaders);
             corsOrigins = corsOrigins != null ? List.copyOf(corsOrigins) : List.of();
             peerIdentityProviders = peerIdentityProviders != null ? List.copyOf(peerIdentityProviders) : List.of();
             supportedEncodings = supportedEncodings != null
@@ -826,6 +836,7 @@ public final class HttpServer {
             private int stateRefInlineBytes;
             private farm.query.vgirpc.stateref.StateRefRuntime.CursorRule cursorRule =
                     farm.query.vgirpc.stateref.StateRefRuntime.CursorRule.WARN;
+            private Map<String, String> extraCapabilityHeaders = Map.of();
 
             /**
              * Listen address (default {@code "127.0.0.1"}). See {@link Config#host()}.
@@ -1180,6 +1191,17 @@ public final class HttpServer {
                 this.cursorRule = rule;
                 return this;
             }
+            /**
+             * Application capability headers set on every response, capability discovery
+             * included, and exposed to browser clients. See {@link Config#extraCapabilityHeaders()}.
+             *
+             * @param headers name to value; {@code null} or empty for none (the default)
+             * @return this builder
+             */
+            public Builder extraCapabilityHeaders(Map<String, String> headers) {
+                this.extraCapabilityHeaders = headers;
+                return this;
+            }
 
             /**
              * Build the immutable config.
@@ -1201,7 +1223,8 @@ public final class HttpServer {
                         peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
                         peerResolutionTimeoutMs, peerProviderConcurrency,
                         hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes,
-                        strictAuth, wwwAuthenticate, stateRefInlineBytes, cursorRule);
+                        strictAuth, wwwAuthenticate, stateRefInlineBytes, cursorRule,
+                        extraCapabilityHeaders);
             }
         }
 
@@ -1225,7 +1248,78 @@ public final class HttpServer {
                     peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
                     peerResolutionTimeoutMs, peerProviderConcurrency,
                     hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes,
-                    strictAuth, wwwAuthenticate, stateRefInlineBytes, cursorRule);
+                    strictAuth, wwwAuthenticate, stateRefInlineBytes, cursorRule, extraCapabilityHeaders);
+        }
+
+        /**
+         * Return a copy of this config with {@code extraCapabilityHeaders} replaced. Used by
+         * worker libraries that receive a fully-built config and add their own capability
+         * headers.
+         *
+         * @param headers the headers (name to value); {@code null} or empty for none
+         * @return a copy of this config with the headers set
+         * @throws IllegalArgumentException for an invalid name or value, or a header vgi-rpc
+         *         sets itself
+         */
+        public Config withExtraCapabilityHeaders(Map<String, String> headers) {
+            return new Config(host, port, prefix, tokenKey, tokenTtlSeconds, authenticator,
+                    preHandlers, maxRequestBytes, maxResponseBytes, idleTimeoutMs, zstdLevel,
+                    supportedEncodings, tls,
+                    advertiseMaxRequestBytes, uploadUrlProvider, maxUploadBytes,
+                    advertisedMaxResponseBytes, advertisedMaxExternalizedResponseBytes,
+                    proxyProofRequired, proxyAuthHeaders, callStateCacheMaxEntries,
+                    stickyEnabled, stickyDefaultTtlSeconds, stickyEchoHeaders, exposeTestDrainAdmin,
+                    landingInfo, corsOrigins, corsMaxAgeSeconds,
+                    peerIdentityProviders, peerAuthenticationPolicy, peerServiceName,
+                    peerResolutionTimeoutMs, peerProviderConcurrency,
+                    hostingMaxRequestBytes, hostingMaxResponseBytes, preferredResponseBytes,
+                    strictAuth, wwwAuthenticate, stateRefInlineBytes, cursorRule, headers);
+        }
+
+        /** Headers vgi-rpc writes itself; an extra capability header may not name one. */
+        private static final java.util.Set<String> RESERVED_HEADERS = java.util.Set.of(
+                MAX_REQUEST_BYTES_HEADER, MAX_RESPONSE_BYTES_HEADER,
+                ACCEPT_MAX_RESPONSE_BYTES_SUPPORT_HEADER, MAX_EXTERNALIZED_RESPONSE_BYTES_HEADER,
+                EXTERNALIZATION_ENABLED_HEADER, SUPPORTED_ENCODINGS_HEADER, UPLOAD_URL_HEADER,
+                MAX_UPLOAD_BYTES_HEADER, ProxyProof.PROOF_REQUIRED_HEADER, StickyHeaders.STICKY_ENABLED,
+                StickyHeaders.STICKY_TTL, StickyHeaders.STICKY_ECHO, StickyHeaders.SESSION,
+                StickyHeaders.SESSION_CLOSE, HttpHeaders.REQUEST_ID, HttpHeaders.WWW_AUTHENTICATE,
+                HttpHeaders.X_VGI_CONTENT_ENCODING, HttpHeaders.VGI_AUTH_REASON,
+                HttpHeaders.VGI_AUTH_PROXY_REQUIRED, RPC_ERROR_HEADER,
+                "Content-Type", "Content-Length", "Content-Encoding", "Cache-Control", "Set-Cookie",
+                "Access-Control-Allow-Origin", "Access-Control-Expose-Headers");
+
+        private static Map<String, String> validateExtraCapabilityHeaders(Map<String, String> headers) {
+            if (headers == null || headers.isEmpty()) return Map.of();
+            java.util.Set<String> reserved = new java.util.HashSet<>();
+            for (String r : RESERVED_HEADERS) reserved.add(r.toLowerCase(java.util.Locale.ROOT));
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            Map<String, String> out = new java.util.LinkedHashMap<>();
+            for (Map.Entry<String, String> e : headers.entrySet()) {
+                String name = e.getKey();
+                String value = e.getValue();
+                if (name == null || name.isEmpty() || !name.chars().allMatch(Config::isTokenChar)) {
+                    throw new IllegalArgumentException("extraCapabilityHeaders: invalid header name '" + name + "'");
+                }
+                String lower = name.toLowerCase(java.util.Locale.ROOT);
+                if (reserved.contains(lower)) {
+                    throw new IllegalArgumentException("extraCapabilityHeaders: " + name
+                            + " is set by vgi-rpc itself");
+                }
+                if (!seen.add(lower)) {
+                    throw new IllegalArgumentException("extraCapabilityHeaders: " + name + " given twice");
+                }
+                if (value == null || !value.chars().allMatch(c -> c == ' ' || c == '\t' || (c > 0x20 && c < 0x7f))) {
+                    throw new IllegalArgumentException("extraCapabilityHeaders: invalid value for " + name);
+                }
+                out.put(name, value);
+            }
+            return java.util.Collections.unmodifiableMap(out);
+        }
+
+        private static boolean isTokenChar(int c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                    || "!#$%&'*+-.^_`|~".indexOf(c) >= 0;
         }
     }
 
@@ -1684,6 +1778,11 @@ public final class HttpServer {
         if (proxyProofRequired) {
             resp.setHeader(ProxyProof.PROOF_REQUIRED_HEADER, "true");
         }
+        // Application capability headers (Config#extraCapabilityHeaders): on every response,
+        // beside vgi-rpc's own, so a client reads them wherever it reads those.
+        for (Map.Entry<String, String> e : extraCapabilityHeaders.entrySet()) {
+            resp.setHeader(e.getKey(), e.getValue());
+        }
         if (stickyEnabled) {
             resp.setHeader(StickyHeaders.STICKY_ENABLED, "true");
             resp.setHeader(StickyHeaders.STICKY_TTL, Long.toString(stickyDefaultTtlSeconds));
@@ -1729,6 +1828,7 @@ public final class HttpServer {
             if (maxUploadBytes != null) expose.add(MAX_UPLOAD_BYTES_HEADER);
         }
         if (proxyProofRequired) expose.add(ProxyProof.PROOF_REQUIRED_HEADER);
+        expose.addAll(extraCapabilityHeaders.keySet());
         if (!proxyHint.isEmpty()) expose.add(HttpHeaders.VGI_AUTH_PROXY_REQUIRED);
         if (stickyEnabled) {
             expose.add(StickyHeaders.STICKY_ENABLED);

@@ -629,4 +629,54 @@ final class CapabilityHeadersTest {
                 .POST(HttpRequest.BodyPublishers.ofByteArray(UploadRequests.v2(1, 42, UploadRequests.SHA))));
         assertEquals(500, resp.statusCode());
     }
+
+    // --- extraCapabilityHeaders ---------------------------------------------------------
+
+    @Test
+    void extraCapabilityHeadersRideEveryResponseIncludingDiscovery() throws Exception {
+        startWithConfig(HttpServer.Config.builder().prefix("/vgi")
+                .corsOrigins(List.of("https://app.example"))
+                .extraCapabilityHeaders(Map.of("VGI-Arguments-Ref-Bytes", "4194304")));
+        HttpClient client = HttpClient.newHttpClient();
+        // Capability discovery: OPTIONS runs no pre-handlers, so a header added there is the test.
+        HttpResponse<Void> options = client.send(HttpRequest.newBuilder(URI.create(base + "/health"))
+                .method("OPTIONS", HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.discarding());
+        assertEquals("4194304", options.headers().firstValue("VGI-Arguments-Ref-Bytes").orElse(null));
+        // An ordinary GET, and a request that fails (404), carry it too.
+        HttpResponse<Void> health = client.send(HttpRequest.newBuilder(URI.create(base + "/health")).GET().build(),
+                HttpResponse.BodyHandlers.discarding());
+        assertEquals("4194304", health.headers().firstValue("VGI-Arguments-Ref-Bytes").orElse(null));
+        HttpResponse<Void> missing = client.send(HttpRequest.newBuilder(URI.create(base + "/no/such/route"))
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.discarding());
+        assertEquals("4194304", missing.headers().firstValue("VGI-Arguments-Ref-Bytes").orElse(null));
+        // A browser client may read it: it is in the CORS expose set.
+        HttpResponse<Void> cors = client.send(HttpRequest.newBuilder(URI.create(base + "/health"))
+                .header("Origin", "https://app.example").GET().build(), HttpResponse.BodyHandlers.discarding());
+        String exposed = cors.headers().firstValue("Access-Control-Expose-Headers").orElse("");
+        assertTrue(exposed.toLowerCase(java.util.Locale.ROOT).contains("vgi-arguments-ref-bytes"), exposed);
+    }
+
+    @Test
+    void noExtraCapabilityHeadersByDefault() throws Exception {
+        start(null);
+        HttpResponse<Void> options = HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create(base + "/health"))
+                .method("OPTIONS", HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.discarding());
+        assertFalse(options.headers().firstValue("VGI-Arguments-Ref-Bytes").isPresent());
+    }
+
+    @Test
+    void extraCapabilityHeadersAreValidated() {
+        assertThrows(IllegalArgumentException.class, () -> HttpServer.Config.builder()
+                .extraCapabilityHeaders(Map.of("Bad Name", "1")).build());
+        assertThrows(IllegalArgumentException.class, () -> HttpServer.Config.builder()
+                .extraCapabilityHeaders(Map.of("X-Ok", "line\r\nbreak")).build());
+        // vgi-rpc's own capability headers cannot be overridden (case-insensitively).
+        assertThrows(IllegalArgumentException.class, () -> HttpServer.Config.builder()
+                .extraCapabilityHeaders(Map.of("vgi-upload-url-support", "9")).build());
+        // A built config gains headers through its copy method.
+        HttpServer.Config cfg = HttpServer.Config.builder().build()
+                .withExtraCapabilityHeaders(Map.of("VGI-Arguments-Ref-Bytes", "1"));
+        assertEquals(Map.of("VGI-Arguments-Ref-Bytes", "1"), cfg.extraCapabilityHeaders());
+        assertTrue(HttpServer.Config.builder().build().extraCapabilityHeaders().isEmpty());
+    }
 }
