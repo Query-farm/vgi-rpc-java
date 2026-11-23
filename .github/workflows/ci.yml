@@ -145,14 +145,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # The vgi-rpc-python commit whose vgi-rpc-fake-vendor --test-routes this
-      # job runs (the same pin as the vgi extension's start_fake_blob_vendor.sh).
-      # protocol-3.4: the fake vendor that verifies sized PUTs (upload-URL v2) and
-      # counts client-upload grants by their origin marker (f0fb675), plus the
-      # protocol-3.4 StateRef counters (puts_state_ref, gets_state_ref, gets_upload)
-      # and the origin delete route; 6a21ee3 also imports zstandard lazily, so the
-      # bare uvx install starts.
-      VGI_RPC_FAKE_VENDOR_REF: 6a21ee3
+      # The released vgi-rpc-python whose vgi-rpc-fake-vendor --test-routes this
+      # job runs: 0.57.0 (protocol 3.4) verifies sized PUTs (upload-URL v2), counts
+      # client-upload grants by origin, serves the StateRef counters and the
+      # origin delete route, and imports zstandard lazily.
+      VGI_RPC_FAKE_VENDOR_VERSION: 0.57.0
     steps:
       - uses: actions/checkout@v4
 
@@ -179,7 +176,7 @@ jobs:
       - name: Start the fake blob vendor
         run: |
           log="$RUNNER_TEMP/fake-vendor.log"
-          nohup uvx --from "git+https://github.com/Query-farm/vgi-rpc-python@${VGI_RPC_FAKE_VENDOR_REF}" \
+          nohup uvx --from "vgi-rpc==${VGI_RPC_FAKE_VENDOR_VERSION}" \
             vgi-rpc-fake-vendor --test-routes --token "test-token=tenant-a" > "$log" 2>&1 &
           echo "FAKE_VENDOR_PID=$!" >> "$GITHUB_ENV"
           url=""
