@@ -380,4 +380,30 @@ public final class ConformanceServiceImpl implements ConformanceService {
                 StreamStates.COUNTER_SINGLE_SCHEMA,
                 new StreamStates.SessionCounterExchange());
     }
+
+    // --- StateRef, the object cache and argument references (protocol 3.4) --
+
+    @Override public RpcStream<StreamStates.StateRefExchange> state_ref_exchange(
+            long size, boolean compressible, String seed, boolean misuse, long cursor_padding, CallContext ctx) {
+        // Wrapped here, in the init handler: the one place stateRef() is allowed.
+        farm.query.vgirpc.stateref.StateRef value =
+                ctx.stateRef(StreamStates.stateRefPayload(size, compressible, seed));
+        byte[] padding = StreamStates.stateRefPayload(cursor_padding, false, seed + ":padding");
+        return RpcStream.exchange(StreamStates.STATE_REF_INPUT_SCHEMA, StreamStates.STATE_REF_OUTPUT_SCHEMA,
+                new StreamStates.StateRefExchange(value, padding, misuse));
+    }
+
+    @Override public ObjectCacheStatsResult object_cache_stats() {
+        farm.query.vgirpc.stateref.ObjectCache.Stats s = farm.query.vgirpc.stateref.ObjectCache.defaultCache().stats();
+        return new ObjectCacheStatsResult(s.residentBytes(), s.entries(), s.maxBytes(), s.hits(), s.misses(),
+                s.evictions(), s.fetches());
+    }
+
+    @Override public long object_cache_age(long seconds) {
+        return farm.query.vgirpc.stateref.ObjectCache.defaultCache().ageEntries(seconds);
+    }
+
+    @Override public String resolve_argument_ref(byte[] ref, long size, String sha256, CallContext ctx) {
+        return java.util.HexFormat.of().formatHex(StreamStates.sha256(ctx.resolveArgumentRef(ref, size, sha256)));
+    }
 }

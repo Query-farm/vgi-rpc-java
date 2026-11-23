@@ -150,8 +150,10 @@ jobs:
       # The vgi-rpc-python commit whose vgi-rpc-fake-vendor --test-routes this
       # job runs (the same pin as the vgi extension's start_fake_blob_vendor.sh).
       # protocol-3.4: the fake vendor that verifies sized PUTs (upload-URL v2) and
-      # counts client-upload grants by their origin marker (f0fb675).
-      VGI_RPC_FAKE_VENDOR_REF: f0fb6754ae5b70900ba21629a1e2d48eb2182774
+      # counts client-upload grants by their origin marker (f0fb675), plus the
+      # protocol-3.4 StateRef counters (puts_state_ref, gets_state_ref, gets_upload)
+      # and the origin delete route (3a06983).
+      VGI_RPC_FAKE_VENDOR_REF: 3a06983
     steps:
       - uses: actions/checkout@v4
 

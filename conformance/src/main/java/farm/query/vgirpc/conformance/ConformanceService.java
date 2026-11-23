@@ -251,4 +251,37 @@ public interface ConformanceService {
 
     RpcStream<? extends ProducerState> stream_session_counter(long count);
     RpcStream<? extends ExchangeState> exchange_session_counter();
+
+    // --- StateRef, the object cache and argument references (protocol 3.4) --
+    //
+    // STATE_REF_V1.md §15. The shared suite (vgi_rpc.conformance._state_ref_pytest) drives
+    // them over raw HTTP.
+
+    /**
+     * Hold a {@code StateRef} of {@code state_ref_payload(size, compressible, seed)} and resolve
+     * it per exchange. The init handler wraps the payload with {@code ctx.stateRef} and keeps the
+     * ref in the cursor, plus {@code cursor_padding} incompressible bytes held directly in the
+     * cursor. Input {@code {override: binary}}: a non-null override is resolved instead of the
+     * stream's own ref. Output, one row per exchange: {@code {size, sha256, form, ref}}. With
+     * {@code misuse} every exchange calls {@code ctx.stateRef}, which must fail with
+     * {@code state_ref_misuse}.
+     */
+    RpcStream<? extends ExchangeState> state_ref_exchange(long size, boolean compressible, String seed,
+                                                          boolean misuse, long cursor_padding, CallContext ctx);
+
+    /** @return this worker process's object-cache counters */
+    ObjectCacheStatsResult object_cache_stats();
+
+    /**
+     * Move every object-cache entry's {@code fetched_at} back by {@code seconds} (test hook).
+     *
+     * @return how many entries were shifted
+     */
+    long object_cache_age(long seconds);
+
+    /**
+     * Resolve an argument reference minted by this worker's {@code __upload_url__} grant and
+     * return the SHA-256 hex of the fetched bytes.
+     */
+    String resolve_argument_ref(byte[] ref, long size, String sha256, CallContext ctx);
 }

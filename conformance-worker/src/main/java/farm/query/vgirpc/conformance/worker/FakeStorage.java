@@ -6,6 +6,8 @@ package farm.query.vgirpc.conformance.worker;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import farm.query.vgirpc.external.ExternalStorage;
+import farm.query.vgirpc.external.ObjectMissingException;
+import farm.query.vgirpc.external.ObjectStore;
 import farm.query.vgirpc.external.UploadUrlProvider;
 
 import java.io.IOException;
@@ -29,8 +31,13 @@ import java.util.regex.Pattern;
  * {@code vgi_rpc/conformance/fake_storage.py}: this class implements
  * the upload side as {@code POST /alloc} followed by {@code PUT} to the
  * returned {@code object_url}.</p>
+ *
+ * <p>The protocol-3.4 object API: every {@code /alloc} response carries {@code object_id};
+ * {@link #putObject} is a sized allocation with {@code "purpose": "object"} (counted as
+ * {@code object_puts}) plus a verified PUT, and {@link #get(String, long)} is
+ * {@code GET /objects/{id}} (counted as {@code object_gets}, 404 when absent).</p>
  */
-final class FakeStorage implements ExternalStorage, UploadUrlProvider {
+final class FakeStorage implements ExternalStorage, UploadUrlProvider, ObjectStore {
 
     /** Minimal extractors for the fake storage allocation response. */
     private static final Pattern OBJECT_URL = Pattern.compile("\"object_url\"\\s*:\\s*\"([^\"]+)\"");
@@ -154,11 +161,79 @@ final class FakeStorage implements ExternalStorage, UploadUrlProvider {
             String uploadUrl = extractUrl(UPLOAD_URL, allocResp.body(), "upload_url", legacyUrl);
             String downloadUrl = extractUrl(DOWNLOAD_URL, allocResp.body(), "download_url", legacyUrl);
             return new UploadUrl(uploadUrl, downloadUrl, Instant.now().plus(Duration.ofHours(1)),
-                    uploadHeaders(allocResp.body()));
+                    uploadHeaders(allocResp.body()), objectId(allocResp.body()));
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted during fake-storage alloc", ie);
         }
+    }
+
+    @Override
+    public String putObject(byte[] data) throws IOException {
+        try {
+            String sha256B64 = java.util.Base64.getEncoder().encodeToString(
+                    java.security.MessageDigest.getInstance("SHA-256").digest(data));
+            String allocBody = "{\"size\":" + data.length + ",\"sha256_b64\":\"" + sha256B64
+                    + "\",\"purpose\":\"object\"}";
+            HttpRequest alloc = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/alloc"))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(allocBody))
+                    .build();
+            HttpResponse<String> allocResp = sendWithRetry(alloc, HttpResponse.BodyHandlers.ofString());
+            if (allocResp.statusCode() / 100 != 2) {
+                throw new IOException("fake-storage /alloc failed: " + allocResp.statusCode());
+            }
+            String legacyUrl = extractUrl(OBJECT_URL, allocResp.body(), "object_url", null);
+            URI uploadUrl = URI.create(extractUrl(UPLOAD_URL, allocResp.body(), "upload_url", legacyUrl));
+            HttpRequest.Builder put = HttpRequest.newBuilder()
+                    .uri(uploadUrl)
+                    .header("Content-Type", "application/octet-stream")
+                    .PUT(HttpRequest.BodyPublishers.ofByteArray(data));
+            uploadHeaders(allocResp.body()).forEach(put::header);
+            HttpResponse<Void> putResp = sendWithRetry(put.build(), HttpResponse.BodyHandlers.discarding());
+            if (putResp.statusCode() / 100 != 2) {
+                throw new IOException("fake-storage PUT failed: " + putResp.statusCode());
+            }
+            return objectId(allocResp.body());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted during fake-storage put_object", ie);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    @Override
+    public byte[] get(String objectId, long maxBytes) throws IOException, ObjectMissingException {
+        try {
+            HttpRequest get = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "/objects/" + objectId))
+                    .GET()
+                    .build();
+            HttpResponse<byte[]> resp = sendWithRetry(get, HttpResponse.BodyHandlers.ofByteArray());
+            if (resp.statusCode() == 404) throw new ObjectMissingException("fake storage object is gone");
+            if (resp.statusCode() / 100 != 2) {
+                throw new IOException("fake-storage GET /objects failed: " + resp.statusCode());
+            }
+            byte[] data = resp.body();
+            if (data.length > maxBytes) {
+                throw new IOException("object is " + data.length + " bytes, over max_fetch_bytes (" + maxBytes + ")");
+            }
+            return data;
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted during fake-storage get", ie);
+        }
+    }
+
+    /** The {@code object_id} of an {@code /alloc} response. */
+    private static String objectId(String body) throws IOException {
+        JsonNode node = JSON.readTree(body).path("object_id");
+        if (!node.isTextual() || node.asText().isEmpty()) {
+            throw new IOException("fake-storage /alloc response has no object_id");
+        }
+        return node.asText();
     }
 
     /** The {@code upload_headers} object of an {@code /alloc} response, or none. */

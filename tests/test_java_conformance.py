@@ -71,13 +71,14 @@ _REF_CLI = [_REF_PY, "-c", "from vgi_rpc.conformance._cli import main; main()"]
 #: Flags the Java worker and the reference HTTP server spell identically.
 _REF_HTTP_PASSTHROUGH = frozenset({
     "--http", "--no-compression", "--no-call-state-cache", "--sticky-auth",
-    "--fail-serve-start-once", "--reject-localhost-redirects",
+    "--fail-serve-start-once", "--reject-localhost-redirects", "--require-principal",
 })
 #: Flags taking one value that both spell identically.
 _REF_HTTP_VALUED = frozenset({
     "--host", "--port", "--fake-storage", "--externalize-threshold", "--max-request-bytes",
     "--compression", "--max-fetch-bytes", "--max-decompressed-fetch-bytes", "--sticky-ttl",
     "--token-key", "--access-log", "--identity", "--cors-origin",
+    "--cursor-rule", "--token-ttl", "--object-cache-bytes",
 })
 #: Flags the reference CLI accepts on its byte-stream transports, so they must
 #: not be translated into an HTTP variant.
@@ -881,6 +882,50 @@ def conformance_fake_storage() -> Iterator[str]:
         yield base_url
     finally:
         shutdown()
+
+
+@pytest.fixture(scope="session")
+def conformance_state_ref_replicas(conformance_fake_storage: str) -> Iterator[Any]:
+    """Two workers sharing a token key and the fake storage (STATE_REF_V1.md §15).
+
+    No request cap, cursor rule ``error``, object cache bound
+    ``OBJECT_CACHE_TEST_BYTES``, ``X-Conformance-Principal`` required.
+    """
+    from vgi_rpc.conformance._state_ref_pytest import OBJECT_CACHE_TEST_BYTES, StateRefReplicas
+
+    flags = (
+        "--http",
+        "--fake-storage", conformance_fake_storage,
+        "--token-key", os.urandom(32).hex(),
+        "--max-request-bytes", "0",
+        "--cursor-rule", "error",
+        "--object-cache-bytes", str(OBJECT_CACHE_TEST_BYTES),
+        "--require-principal",
+    )
+    with contextlib.ExitStack() as stack:
+        a = stack.enter_context(contextlib.contextmanager(_start_http_worker)(*flags))
+        b = stack.enter_context(contextlib.contextmanager(_start_http_worker)(*flags))
+        yield StateRefReplicas(ports=(a, b), storage_url=conformance_fake_storage)
+
+
+@pytest.fixture(scope="session")
+def conformance_state_ref_short_ttl_port(conformance_fake_storage: str) -> Iterator[int]:
+    """One worker with the fake storage, no request cap and ``token_ttl`` 2 s."""
+    yield from _start_http_worker(
+        "--http", "--fake-storage", conformance_fake_storage, "--max-request-bytes", "0", "--token-ttl", "2")
+
+
+@pytest.fixture(scope="session")
+def conformance_cursor_budget_ports() -> Iterator[Any]:
+    """The warn / error / floor cursor-rule workers (no storage)."""
+    from vgi_rpc.conformance._state_ref_pytest import CursorBudgetPorts
+
+    with contextlib.ExitStack() as stack:
+        start = contextlib.contextmanager(_start_http_worker)
+        warn = stack.enter_context(start("--http", "--max-request-bytes", "32768", "--cursor-rule", "warn"))
+        error = stack.enter_context(start("--http", "--max-request-bytes", "32768", "--cursor-rule", "error"))
+        floor = stack.enter_context(start("--http", "--max-request-bytes", "9000", "--cursor-rule", "error"))
+        yield CursorBudgetPorts(warn=warn, error=error, floor=floor)
 
 
 @pytest.fixture(scope="session")

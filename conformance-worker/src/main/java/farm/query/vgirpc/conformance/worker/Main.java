@@ -130,6 +130,11 @@ public final class Main {
         List<String> grantKeyArgs = new ArrayList<>();
         boolean transportKindProbe = false;
         boolean failServeStartOnce = false;
+        // StateRef / turn-budget knobs (STATE_REF_V1.md §15 runner fixtures), spelled as the
+        // reference worker spells them.
+        String cursorRule = "warn";
+        long objectCacheBytes = -1;
+        boolean requirePrincipal = false;
         ArgCursor c = new ArgCursor(args);
         while (c.hasNext()) {
             String a = c.next();
@@ -210,9 +215,18 @@ public final class Main {
                 case "--grant-key" -> grantKeyArgs.add(c.requireValue(a));
                 case "--transport-kind-probe" -> transportKindProbe = true;
                 case "--fail-serve-start-once" -> failServeStartOnce = true;
+                case "--cursor-rule" -> cursorRule = c.requireValue(a);
+                case "--object-cache-bytes" -> objectCacheBytes = Long.parseLong(c.requireValue(a));
+                case "--require-principal" -> { mode = "http"; requirePrincipal = true; }
                 default -> { System.err.println("unknown arg: " + a); System.exit(2); }
             }
         }
+        if (objectCacheBytes >= 0) {
+            // Before any server exists: the process-wide cache is created once.
+            farm.query.vgirpc.stateref.ObjectCache.installDefault(
+                    new farm.query.vgirpc.stateref.ObjectCache(objectCacheBytes));
+        }
+        if (requirePrincipal) authenticator = requiredPrincipalHeaderAuthenticator();
         FakeStorage fakeStorage = null;
         ExternalLocationConfig externalCfg = null;
         if (fakeStorageUrl != null) {
@@ -322,7 +336,8 @@ public final class Main {
                     stickyEnabled, stickyTtl, responseCompression,
                     // Only require mode denies, so only require mode advertises.
                     httpProof && "require".equals(proofMode),
-                    callStateCache, corsOrigins);
+                    callStateCache, corsOrigins,
+                    farm.query.vgirpc.stateref.StateRefRuntime.CursorRule.parse(cursorRule));
             case "unix" -> serveUnix(server, Path.of(unixPath), (long) (unixIdleTimeoutSeconds * 1000));
             case "tcp" -> serveTcp(server, tcpHost, tcpPort);
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
@@ -439,6 +454,23 @@ public final class Main {
      * port.</strong> It exists to give six language ports a deterministic authenticated caller
      * without standing up an identity provider. It is a test fixture and must never be deployed.
      */
+    /**
+     * Like {@link #principalHeaderAuthenticator()}, but a request without the header is refused
+     * (401). Backs {@code --require-principal}: the shared StateRef / argument-reference cases
+     * need two principals and an unauthenticated grant refused exactly like an unauthenticated
+     * method call.
+     */
+    private static Authenticator requiredPrincipalHeaderAuthenticator() {
+        Authenticator inner = principalHeaderAuthenticator();
+        return request -> {
+            String principal = request.getHeader("X-Conformance-Principal");
+            if (principal == null || principal.isEmpty()) {
+                throw new farm.query.vgirpc.http.InvalidCredentials("X-Conformance-Principal is required");
+            }
+            return inner.authenticate(request);
+        };
+    }
+
     private static Authenticator principalHeaderAuthenticator() {
         return request -> {
             String principal = request.getHeader("X-Conformance-Principal");
@@ -783,13 +815,23 @@ public final class Main {
                                    boolean responseCompression,
                                    boolean proxyProofRequired,
                                    boolean callStateCache,
-                                   List<String> corsOrigins) throws Exception {
+                                   List<String> corsOrigins,
+                                   farm.query.vgirpc.stateref.StateRefRuntime.CursorRule cursorRule)
+            throws Exception {
+        // --max-request-bytes 0 means "no request cap" (no VGI-Max-Request-Bytes, no turn
+        // budget); the storage mode otherwise defaults the cap to the externalization threshold.
+        boolean noRequestCap = advertiseMaxRequestBytes && maxRequestBytes == 0;
+        if (noRequestCap) {
+            maxRequestBytes = Long.MAX_VALUE;
+            advertiseMaxRequestBytes = false;
+        }
         HttpServer.Config.Builder cb = HttpServer.Config.builder()
                 .tokenKey(tokenKey)
                 .tokenTtlSeconds(tokenTtl)
                 .authenticator(authenticator)
                 .preHandlers(preHandlers)
-                .proxyProofRequired(proxyProofRequired);
+                .proxyProofRequired(proxyProofRequired)
+                .cursorRule(cursorRule);
         if (!callStateCache) cb.callStateCacheMaxEntries(0);
         if (!corsOrigins.isEmpty()) cb.corsOrigins(corsOrigins);
         // Empty producible set ⇒ present-but-empty VGI-Supported-Encodings and
@@ -829,9 +871,11 @@ public final class Main {
             // *response* batch externalizes while normal-sized inline
             // *requests* still flow through.
             cb.maxRequestBytes(maxRequestBytes)
-              .advertiseMaxRequestBytes(true)
-              .uploadUrlProvider(fakeStorage)
-              .maxUploadBytes(64L << 20);  // 64 MiB advisory upload ceiling
+              .advertiseMaxRequestBytes(!noRequestCap)
+              // No explicit upload cap: the server advertises its inbound fetch cap, which an
+              // advertised upload size may never exceed (an explicit --max-fetch-bytes below
+              // an explicit upload cap would refuse startup).
+              .uploadUrlProvider(fakeStorage);
         }
         HttpServer http = new HttpServer(server, cb.build());
         http.start();

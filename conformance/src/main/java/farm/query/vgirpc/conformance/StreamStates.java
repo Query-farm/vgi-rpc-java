@@ -466,4 +466,100 @@ final class StreamStates {
         }
         @Override public void onCancel(CallContext ctx) { CancelProbe.onCancelCalls++; }
     }
+
+    // --- StateRef (protocol 3.4, STATE_REF_V1.md §15) ------------------------
+
+    /** Input of {@code state_ref_exchange}: an optional raw StateRef to resolve instead. */
+    static final Schema STATE_REF_INPUT_SCHEMA = new Schema(List.of(
+            new Field("override", FieldType.nullable(new ArrowType.Binary()), null)));
+    /** Output of {@code state_ref_exchange}: one row per exchange. */
+    static final Schema STATE_REF_OUTPUT_SCHEMA = new Schema(List.of(
+            i64("size"),
+            new Field("sha256", FieldType.notNullable(new ArrowType.Utf8()), null),
+            new Field("form", FieldType.notNullable(new ArrowType.Utf8()), null),
+            new Field("ref", FieldType.nullable(new ArrowType.Binary()), null)));
+
+    static byte[] sha256(byte[] data) {
+        try {
+            return java.security.MessageDigest.getInstance("SHA-256").digest(data);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * The deterministic payload every port builds: compressible = the UTF-8 unit
+     * {@code "vgi-rpc StateRef conformance <seed> "} repeated and truncated; incompressible =
+     * {@code SHA-256(seed || u64le(i))} for i = 0, 1, ... concatenated and truncated.
+     */
+    static byte[] stateRefPayload(long size, boolean compressible, String seed) {
+        if (size <= 0) return new byte[0];
+        byte[] out = new byte[Math.toIntExact(size)];
+        if (compressible) {
+            byte[] unit = ("vgi-rpc StateRef conformance " + seed + " ").getBytes(StandardCharsets.UTF_8);
+            for (int i = 0; i < out.length; i++) out[i] = unit[i % unit.length];
+            return out;
+        }
+        byte[] seedBytes = seed.getBytes(StandardCharsets.UTF_8);
+        java.nio.ByteBuffer idx = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (long block = 0, at = 0; at < out.length; block++) {
+            idx.clear();
+            idx.putLong(block);
+            byte[] digest = sha256(concat(seedBytes, idx.array()));
+            int n = (int) Math.min(digest.length, out.length - at);
+            System.arraycopy(digest, 0, out, (int) at, n);
+            at += n;
+        }
+        return out;
+    }
+
+    private static byte[] concat(byte[] a, byte[] b) {
+        byte[] out = new byte[a.length + b.length];
+        System.arraycopy(a, 0, out, 0, a.length);
+        System.arraycopy(b, 0, out, a.length, b.length);
+        return out;
+    }
+
+    /**
+     * Resolve the stream's StateRef (or a presented one) on every exchange. {@code value} is
+     * created in the init handler and copied by every turn; {@code padding} sits in the cursor
+     * itself (to drive the cursor rule).
+     */
+    static final class StateRefExchange extends ExchangeState {
+        farm.query.vgirpc.stateref.StateRef value;
+        byte[] padding = new byte[0];
+        boolean misuse;
+
+        StateRefExchange() {}
+
+        StateRefExchange(farm.query.vgirpc.stateref.StateRef value, byte[] padding, boolean misuse) {
+            this.value = value;
+            this.padding = padding;
+            this.misuse = misuse;
+        }
+
+        @Override public void exchange(AnnotatedBatch input, OutputCollector out, CallContext ctx) {
+            if (misuse) ctx.stateRef("a continuation may not create a StateRef".getBytes(StandardCharsets.UTF_8));
+            farm.query.vgirpc.stateref.StateRef ref = value;
+            if (input.root().getRowCount() > 0
+                    && input.root().getVector("override") instanceof org.apache.arrow.vector.VarBinaryVector v
+                    && !v.isNull(0)) {
+                ref = farm.query.vgirpc.stateref.StateRef.fromBytes(v.get(0));
+            }
+            byte[] data = ctx.resolve(ref);
+            VectorSchemaRoot root = VectorSchemaRoot.create(STATE_REF_OUTPUT_SCHEMA, Allocators.root());
+            root.allocateNew();
+            ((BigIntVector) root.getVector("size")).setSafe(0, data.length);
+            ((VarCharVector) root.getVector("sha256")).setSafe(0,
+                    java.util.HexFormat.of().formatHex(sha256(data)).getBytes(StandardCharsets.UTF_8));
+            ((VarCharVector) root.getVector("form")).setSafe(0, value.form().getBytes(StandardCharsets.UTF_8));
+            byte[] encoded = value.encoded();
+            org.apache.arrow.vector.VarBinaryVector refVec =
+                    (org.apache.arrow.vector.VarBinaryVector) root.getVector("ref");
+            if (encoded == null) refVec.setNull(0);
+            else refVec.setSafe(0, encoded);
+            root.setRowCount(1);
+            out.emit(root);
+        }
+    }
 }
