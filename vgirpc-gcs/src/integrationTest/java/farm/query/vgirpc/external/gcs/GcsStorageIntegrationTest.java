@@ -44,6 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -199,11 +200,13 @@ final class GcsStorageIntegrationTest {
                     GcsStorage.ENV_PREFIX, "env/",
                     GcsStorage.ENV_ENDPOINT, endpoint.toString(),
                     GcsStorage.ENV_CREDENTIALS_FILE, keyFile.toString(),
-                    GcsStorage.ENV_URL_TTL, "600");
+                    GcsStorage.ENV_URL_TTL, "600",
+                    GcsStorage.ENV_ALLOW_PLAIN_HTTP, "1");
             try (GcsStorage storage = GcsStorage.fromEnv(env)) {
                 byte[] data = "gcs from env".getBytes(StandardCharsets.UTF_8);
                 String key = storage.putObject(data);
-                assertTrue(key.startsWith("env/"), key);
+                assertTrue(key.startsWith("env/rpc/"), key);
+                storage.verify();
                 assertArrayEquals(data, storage.get(key, 1 << 20));
                 URI signed = storage.upload(data, null);
                 assertEquals(endpoint.getScheme(), signed.getScheme(), signed::toString);
@@ -214,6 +217,16 @@ final class GcsStorageIntegrationTest {
                 HttpResponse<byte[]> got = get(signed);
                 assertEquals(200, got.statusCode());
                 assertArrayEquals(data, got.body());
+            }
+            IllegalArgumentException plain = assertThrows(IllegalArgumentException.class, () ->
+                    GcsStorage.fromEnv(java.util.Map.of(GcsStorage.ENV_BUCKET, BUCKET,
+                            GcsStorage.ENV_ENDPOINT, endpoint.toString())));
+            assertTrue(plain.getMessage().contains(GcsStorage.ENV_ALLOW_PLAIN_HTTP), plain.getMessage());
+            java.util.Map<String, String> missing = new java.util.HashMap<>(env);
+            missing.put(GcsStorage.ENV_BUCKET, "vgi-no-such-bucket");
+            try (GcsStorage none = GcsStorage.fromEnv(missing)) {
+                IllegalStateException v = assertThrows(IllegalStateException.class, none::verify);
+                assertTrue(v.getMessage().contains("does not exist"), v.getMessage());
             }
         } finally {
             token.stop(0);

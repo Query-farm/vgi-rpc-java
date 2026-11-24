@@ -261,8 +261,12 @@ own context: continuations, `onCancel`, unary calls and the first producer tick 
   `when_supported`: the AWS SDK's own CRC32), `_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` / `_SESSION_TOKEN`
   (else the AWS default chain, which refreshes temporary credentials), `VGI_STORAGE_URL_TTL_SECONDS`
   (default 3600, capped at credential expiry minus 60 s); `VGI_STORAGE_GCS_BUCKET`, `_PREFIX`, `_ENDPOINT`,
-  `_CREDENTIALS_FILE`. `S3Storage.verify()` HEADs the bucket and names the problem. Add a lifecycle rule
-  expiring the prefix after 1-2 days; the worker never deletes.
+  `_CREDENTIALS_FILE`. `S3Storage.verify()` / `GcsStorage.verify()` check the bucket and name the
+  problem. Keys go under `<prefix>rpc/` (results, grants, StateRef and argument objects) and
+  `<prefix>fs/` (function storage, `fromEnv(env, "fs")`); add lifecycle rules of 1 day on `rpc/` and
+  2 days on `fs/`. An `http://` endpoint needs `VGI_STORAGE_ALLOW_PLAIN_HTTP=1`. An explicit session
+  token's expiry goes in `VGI_STORAGE_S3_SESSION_EXPIRES` (RFC 3339 or epoch seconds) so URL lifetimes
+  are capped. The worker must also reach `_PUBLIC_ENDPOINT`: request-upload pointers are fetched by URL.
 - **Storage timeouts.** Storage transfers (vendor-signed PUTs and GETs, inbound pointer fetches, client
   upload PUTs) fail only when no bytes move for `VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS` (default 30 s;
   connect 30 s). There is no whole-transfer deadline, so a 100 MB result on a 2 MB/s link (50 s)

@@ -54,6 +54,10 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
     public static final String ENV_CREDENTIALS_FILE = "VGI_STORAGE_GCS_CREDENTIALS_FILE";
     /** Signed URL lifetime in seconds (default 3600). */
     public static final String ENV_URL_TTL = "VGI_STORAGE_URL_TTL_SECONDS";
+    /** {@code 1} = check the bucket at startup instead of on first use. */
+    public static final String ENV_VERIFY = "VGI_STORAGE_GCS_VERIFY";
+    /** {@code 1} = allow an {@code http://} endpoint (refused otherwise). */
+    public static final String ENV_ALLOW_PLAIN_HTTP = "VGI_STORAGE_ALLOW_PLAIN_HTTP";
 
     /**
      * Build from the direct-storage environment.
@@ -64,9 +68,26 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
      *     credentials file cannot be read
      */
     public static GcsStorage fromEnv(java.util.Map<String, String> env) {
+        return fromEnv(env, "rpc");
+    }
+
+    /**
+     * As {@link #fromEnv(java.util.Map)}, for one key area: objects go under
+     * {@code <VGI_STORAGE_GCS_PREFIX><area>/} ({@code rpc} for results and StateRef / argument
+     * objects, {@code fs} for function storage).
+     *
+     * @param env  environment mapping
+     * @param area the key area
+     * @return the storage
+     * @throws IllegalArgumentException if the bucket is missing or a variable is malformed
+     */
+    public static GcsStorage fromEnv(java.util.Map<String, String> env, String area) {
         String bucket = trimmed(env, ENV_BUCKET);
         if (bucket == null) throw new IllegalArgumentException(ENV_BUCKET + " is required for the gcs storage backend");
-        Builder b = builder(bucket).keyPrefix(java.util.Objects.requireNonNullElse(trimmed(env, ENV_PREFIX), ""));
+        if (area == null || !area.matches("[a-z0-9-]+")) throw new IllegalArgumentException("bad key area: " + area);
+        String prefix = java.util.Objects.requireNonNullElse(trimmed(env, ENV_PREFIX), "");
+        if (!prefix.isEmpty() && !prefix.endsWith("/")) prefix += "/";
+        Builder b = builder(bucket).keyPrefix(prefix + area + "/");
         String endpoint = trimmed(env, ENV_ENDPOINT);
         if (endpoint != null) {
             URI uri;
@@ -79,6 +100,12 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
                     || !(uri.getScheme().equals("http") || uri.getScheme().equals("https"))) {
                 throw new IllegalArgumentException(ENV_ENDPOINT + " must be an http:// or https:// URL, got '"
                         + endpoint + "'");
+            }
+            if (uri.getScheme().equals("http") && !java.util.Set.of("1", "true", "yes", "on")
+                    .contains(java.util.Objects.requireNonNullElse(trimmed(env, ENV_ALLOW_PLAIN_HTTP), "0")
+                            .toLowerCase(java.util.Locale.ROOT))) {
+                throw new IllegalArgumentException(ENV_ENDPOINT + " is plain http: set " + ENV_ALLOW_PLAIN_HTTP
+                        + "=1 to allow it (emulators and private-network stores only)");
             }
             b.endpoint(endpoint);
         }
@@ -267,6 +294,46 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
         byte[] out = blob.getContent();
         if (out.length > maxBytes) throw new java.io.IOException("GCS object exceeds max_fetch_bytes (" + maxBytes + ")");
         return out;
+    }
+
+    /**
+     * Check the bucket: fails with an actionable message when it does not exist, access is
+     * denied, or the endpoint is unreachable.
+     *
+     * @throws IllegalStateException if the bucket is not usable
+     */
+    public void verify() {
+        String where = "GCS bucket '" + bucket + "'";
+        try {
+            if (storage.get(bucket) == null) {
+                throw new IllegalStateException(where + " does not exist: create it (and lifecycle rules: 1 day on "
+                        + "rpc/, 2 days on fs/), or fix " + ENV_BUCKET + " / " + ENV_ENDPOINT);
+            }
+        } catch (com.google.cloud.storage.StorageException e) {
+            if (e.getCode() == 403 || e.getCode() == 401) {
+                throw new IllegalStateException(where + ": access denied: the credentials need storage.buckets.get, "
+                        + "storage.objects.get and storage.objects.create (check " + ENV_CREDENTIALS_FILE
+                        + " / Application Default Credentials)");
+            }
+            if (e.getCode() == 404) {
+                throw new IllegalStateException(where + " does not exist: fix " + ENV_BUCKET);
+            }
+            throw new IllegalStateException(where + " is not usable (" + (e.getCode() > 0 ? "HTTP " + e.getCode()
+                    : e.getClass().getSimpleName()) + "): check " + ENV_ENDPOINT + " and the network");
+        }
+    }
+
+    /**
+     * Delete an object, best effort: failures are ignored (a lifecycle rule removes leftovers).
+     *
+     * @param objectId the object name
+     */
+    public void deleteObject(String objectId) {
+        try {
+            storage.delete(com.google.cloud.storage.BlobId.of(bucket, objectId));
+        } catch (RuntimeException e) {
+            LOG.debug("GCS delete of an object failed ({})", e.getClass().getSimpleName());
+        }
     }
 
     /**

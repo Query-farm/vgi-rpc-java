@@ -108,6 +108,14 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
     public static final String ENV_URL_TTL = "VGI_STORAGE_URL_TTL_SECONDS";
     /** {@code 1} = check the bucket at startup instead of on first use. */
     public static final String ENV_VERIFY = "VGI_STORAGE_S3_VERIFY";
+    /** Expiry of the explicit session token (RFC 3339 or epoch seconds); caps URL lifetimes. */
+    public static final String ENV_SESSION_EXPIRES = "VGI_STORAGE_S3_SESSION_EXPIRES";
+    /** {@code 1} = allow an {@code http://} endpoint or public endpoint (refused otherwise). */
+    public static final String ENV_ALLOW_PLAIN_HTTP = "VGI_STORAGE_ALLOW_PLAIN_HTTP";
+    /** Key area for results, upload grants and StateRef / argument objects. */
+    public static final String AREA_RPC = "rpc";
+    /** Key area for function storage values. */
+    public static final String AREA_FS = "fs";
 
     /** The shortest lifetime an upload grant may be signed for (15 minutes). */
     public static final Duration MIN_UPLOAD_GRANT_TTL = Duration.ofMinutes(15);
@@ -163,6 +171,22 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
     }
 
     /**
+     * As {@link #fromEnv(Map)}, for one key area: keys go under
+     * {@code <VGI_STORAGE_S3_PREFIX><area>/} ({@link #AREA_RPC} for results, upload grants and
+     * StateRef / argument objects, which {@link #fromEnv(Map)} uses; {@link #AREA_FS} for
+     * function storage). Operators set lifecycle rules of 1 day on {@code rpc/} and 2 days on
+     * {@code fs/}.
+     *
+     * @param env  environment mapping
+     * @param area the key area
+     * @return the storage
+     * @throws IllegalArgumentException if the bucket is missing or a variable is malformed
+     */
+    public static S3Storage fromEnv(Map<String, String> env, String area) {
+        return builderFromEnv(env, area).build();
+    }
+
+    /**
      * The {@link Builder} {@link #fromEnv(Map)} would build, for further settings.
      *
      * @param env environment mapping
@@ -170,13 +194,30 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
      * @throws IllegalArgumentException if the bucket is missing or a variable is malformed
      */
     public static Builder builderFromEnv(Map<String, String> env) {
+        return builderFromEnv(env, AREA_RPC);
+    }
+
+    /**
+     * The {@link Builder} {@link #fromEnv(Map, String)} would build.
+     *
+     * @param env  environment mapping
+     * @param area the key area ({@link #AREA_RPC} or {@link #AREA_FS})
+     * @return the builder
+     * @throws IllegalArgumentException if the bucket is missing or a variable is malformed
+     */
+    public static Builder builderFromEnv(Map<String, String> env, String area) {
         String bucket = trimmed(env, ENV_BUCKET);
         if (bucket == null) throw new IllegalArgumentException(ENV_BUCKET + " is required for the s3 storage backend");
-        Builder b = builder(bucket).keyPrefix(Optional.ofNullable(trimmed(env, ENV_PREFIX)).orElse(""));
+        if (area == null || !area.matches("[a-z0-9-]+")) throw new IllegalArgumentException("bad key area: " + area);
+        String prefix = Optional.ofNullable(trimmed(env, ENV_PREFIX)).orElse("");
+        if (!prefix.isEmpty() && !prefix.endsWith("/")) prefix += "/";
+        Builder b = builder(bucket).keyPrefix(prefix + area + "/");
+        boolean allowHttp = parseBool(ENV_ALLOW_PLAIN_HTTP,
+                Optional.ofNullable(trimmed(env, ENV_ALLOW_PLAIN_HTTP)).orElse("0"));
         String endpoint = trimmed(env, ENV_ENDPOINT);
-        if (endpoint != null) b.endpointOverride(endpointUri(ENV_ENDPOINT, endpoint));
+        if (endpoint != null) b.endpointOverride(endpointUri(ENV_ENDPOINT, endpoint, allowHttp));
         String publicEndpoint = trimmed(env, ENV_PUBLIC_ENDPOINT);
-        if (publicEndpoint != null) b.publicEndpoint(endpointUri(ENV_PUBLIC_ENDPOINT, publicEndpoint));
+        if (publicEndpoint != null) b.publicEndpoint(endpointUri(ENV_PUBLIC_ENDPOINT, publicEndpoint, allowHttp));
         String region = firstNonBlank(env, ENV_REGION, "AWS_REGION", "AWS_DEFAULT_REGION");
         b.region(region != null ? region : "us-east-1");
         String pathStyle = trimmed(env, ENV_FORCE_PATH_STYLE);
@@ -223,10 +264,25 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
             throw new IllegalArgumentException(ENV_SESSION_TOKEN + " needs " + ENV_ACCESS_KEY_ID + " and "
                     + ENV_SECRET_ACCESS_KEY);
         }
+        String expires = trimmed(env, ENV_SESSION_EXPIRES);
+        if (expires != null && token == null) {
+            throw new IllegalArgumentException(ENV_SESSION_EXPIRES + " needs " + ENV_SESSION_TOKEN);
+        }
         if (keyId != null) {
-            b.credentials(StaticCredentialsProvider.create(token != null
-                    ? AwsSessionCredentials.create(keyId, secret, token)
-                    : AwsBasicCredentials.create(keyId, secret)));
+            if (token != null) {
+                AwsSessionCredentials.Builder creds = AwsSessionCredentials.builder()
+                        .accessKeyId(keyId).secretAccessKey(secret).sessionToken(token);
+                if (expires != null) {
+                    creds.expirationTime(parseInstant(ENV_SESSION_EXPIRES, expires));
+                } else {
+                    LOG.warn("{} is set without {}: presigned URL lifetimes cannot be capped at the session's "
+                            + "expiry, so URLs may stop working early; prefer credential_process or the standard "
+                            + "AWS credential chain, which report expiry", ENV_SESSION_TOKEN, ENV_SESSION_EXPIRES);
+                }
+                b.credentials(StaticCredentialsProvider.create(creds.build()));
+            } else {
+                b.credentials(StaticCredentialsProvider.create(AwsBasicCredentials.create(keyId, secret)));
+            }
         }
         b.stallTimeout(StorageHttp.stallTimeoutFromEnv(env));
         return b;
@@ -251,6 +307,25 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
             case "0", "false", "no", "off" -> false;
             default -> throw new IllegalArgumentException(name + " must be true or false, got '" + raw + "'");
         };
+    }
+
+    private static Instant parseInstant(String name, String raw) {
+        try {
+            if (raw.matches("\\d+")) return Instant.ofEpochSecond(Long.parseLong(raw));
+            return java.time.OffsetDateTime.parse(raw).toInstant();
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException(name + " must be an RFC 3339 timestamp or epoch seconds, got '"
+                    + raw + "'");
+        }
+    }
+
+    private static URI endpointUri(String name, String raw, boolean allowHttp) {
+        URI uri = endpointUri(name, raw);
+        if ("http".equalsIgnoreCase(uri.getScheme()) && !allowHttp) {
+            throw new IllegalArgumentException(name + " is plain http (" + uri.getScheme() + "://" + uri.getAuthority()
+                    + "): set " + ENV_ALLOW_PLAIN_HTTP + "=1 to allow it (test and private-network stores only)");
+        }
+        return uri;
     }
 
     private static URI endpointUri(String name, String raw) {
@@ -614,6 +689,21 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
         } catch (S3Exception e) {
             if (e.statusCode() == 404) throw new ObjectMissingException("S3 object is gone");
             throw e;
+        }
+    }
+
+    /**
+     * Delete an object, best effort: failures are logged at debug and ignored (a bucket
+     * lifecycle rule removes whatever is left).
+     *
+     * @param objectId the object key
+     */
+    public void deleteObject(String objectId) {
+        try {
+            s3.deleteObject(r -> r.bucket(bucket).key(objectId));
+        } catch (RuntimeException e) {
+            LOG.debug("S3 delete of an object failed ({}); the lifecycle rule will remove it",
+                    e.getClass().getSimpleName());
         }
     }
 

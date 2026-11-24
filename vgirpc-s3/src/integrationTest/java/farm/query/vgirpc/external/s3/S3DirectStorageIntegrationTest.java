@@ -91,6 +91,7 @@ final class S3DirectStorageIntegrationTest {
         env.put(S3Storage.ENV_BUCKET, BUCKET);
         env.put(S3Storage.ENV_ENDPOINT, endpoint);
         env.put(S3Storage.ENV_PREFIX, "direct/");
+        env.put(S3Storage.ENV_ALLOW_PLAIN_HTTP, "1");
         env.put(S3Storage.ENV_ACCESS_KEY_ID, ACCESS_KEY);
         env.put(S3Storage.ENV_SECRET_ACCESS_KEY, SECRET_KEY);
         for (int i = 0; i < kv.length; i += 2) {
@@ -119,17 +120,23 @@ final class S3DirectStorageIntegrationTest {
             assertTrue(s.supportsUploadGrants());
             byte[] data = "static keys".getBytes(StandardCharsets.UTF_8);
             String key = s.putObject(data);
-            assertTrue(key.startsWith("direct/"), key);
+            assertTrue(key.startsWith("direct/rpc/"), key);
             assertArrayEquals(data, s.get(key, 1 << 20));
             URI result = s.upload(data, null);
             assertArrayEquals(data, HTTP.send(HttpRequest.newBuilder(result).build(),
                     HttpResponse.BodyHandlers.ofByteArray()).body());
             UploadUrlProvider.UploadUrl grant = s.generateUploadUrl(data.length, sha256Hex(data));
+            // The checksum is a signed header, never an (unsigned, droppable) query parameter.
+            String query = java.net.URLDecoder.decode(URI.create(grant.uploadUrl()).getRawQuery(),
+                    StandardCharsets.UTF_8).toLowerCase(java.util.Locale.ROOT);
+            assertFalse(java.util.regex.Pattern.compile("(^|&)x-amz-checksum-sha256=").matcher(query).find(), query);
+            assertTrue(query.matches(".*x-amz-signedheaders=[^&]*x-amz-checksum-sha256.*"), query);
+            assertTrue(grant.headers().containsKey("x-amz-checksum-sha256"), grant.headers().toString());
             assertEquals(200, put(grant, data).statusCode());
             byte[] bad = data.clone();
             bad[0] ^= 1;
             UploadUrlProvider.UploadUrl grant2 = s.generateUploadUrl(data.length, sha256Hex(data));
-            assertTrue(put(grant2, bad).statusCode() >= 400, "storage accepted a corrupted body");
+            assertEquals(400, put(grant2, bad).statusCode(), "a same-length wrong body must be refused (BadDigest)");
         }
     }
 
@@ -203,7 +210,7 @@ final class S3DirectStorageIntegrationTest {
             URI result = s.upload(data, null);
             assertEquals("s3.public.example", result.getHost());
             assertEquals(8443, result.getPort());
-            assertTrue(result.getPath().startsWith("/" + BUCKET + "/direct/"), result.getPath());
+            assertTrue(result.getPath().startsWith("/" + BUCKET + "/direct/rpc/"), result.getPath());
             UploadUrlProvider.UploadUrl grant = s.generateUploadUrl(4, "0".repeat(64));
             assertEquals("s3.public.example", URI.create(grant.uploadUrl()).getHost());
             assertEquals("s3.public.example", URI.create(grant.downloadUrl()).getHost());
@@ -258,6 +265,41 @@ final class S3DirectStorageIntegrationTest {
         }
         assertThrows(IllegalArgumentException.class,
                 () -> S3Storage.fromEnv(env(S3Storage.ENV_SDK_CHECKSUM, "always")));
+    }
+
+    /** Plain http needs the explicit opt-in; the key areas; an explicit token's expiry caps URLs. */
+    @Test
+    void plainHttpOptInKeyAreasAndSessionExpiry() throws Exception {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> S3Storage.fromEnv(env(S3Storage.ENV_ALLOW_PLAIN_HTTP, null)));
+        assertTrue(e.getMessage().contains(S3Storage.ENV_ALLOW_PLAIN_HTTP), e.getMessage());
+        assertThrows(IllegalArgumentException.class, () -> S3Storage.fromEnv(env(S3Storage.ENV_ALLOW_PLAIN_HTTP, null,
+                S3Storage.ENV_ENDPOINT, null, S3Storage.ENV_PUBLIC_ENDPOINT, "http://public.example")));
+        try (S3Storage fs = S3Storage.fromEnv(env(), S3Storage.AREA_FS)) {
+            byte[] data = "fs area".getBytes(StandardCharsets.UTF_8);
+            String key = fs.putObject(data);
+            assertTrue(key.startsWith("direct/fs/"), key);
+            fs.deleteObject(key);
+            assertThrows(farm.query.vgirpc.external.ObjectMissingException.class, () -> fs.get(key, 1 << 20));
+            fs.deleteObject(key); // best effort: a second delete is harmless
+        }
+        long epoch = Instant.now().plus(Duration.ofMinutes(20)).getEpochSecond();
+        try (S3Storage s = S3Storage.fromEnv(env(S3Storage.ENV_SESSION_TOKEN, "t",
+                S3Storage.ENV_SESSION_EXPIRES, Long.toString(epoch)))) {
+            long ttl = s.effectiveUrlTtl(Duration.ofMinutes(5)).toSeconds();
+            assertTrue(ttl <= 20 * 60 - 60 && ttl > 20 * 60 - 120, "ttl " + ttl);
+        }
+        String rfc = Instant.now().plus(Duration.ofMinutes(10)).toString();
+        try (S3Storage s = S3Storage.fromEnv(env(S3Storage.ENV_SESSION_TOKEN, "t",
+                S3Storage.ENV_SESSION_EXPIRES, rfc))) {
+            // A 10-minute session cannot meet the 15-minute grant minimum: sign for what is left.
+            long ttl = s.effectiveUrlTtl(S3Storage.MIN_UPLOAD_GRANT_TTL).toSeconds();
+            assertTrue(ttl <= 540, "ttl " + ttl);
+        }
+        assertThrows(IllegalArgumentException.class, () -> S3Storage.fromEnv(env(
+                S3Storage.ENV_SESSION_EXPIRES, "tomorrow", S3Storage.ENV_SESSION_TOKEN, "t")));
+        assertThrows(IllegalArgumentException.class, () -> S3Storage.fromEnv(env(
+                S3Storage.ENV_SESSION_EXPIRES, "1800000000")));
     }
 
     /** The startup check names the problem. */
