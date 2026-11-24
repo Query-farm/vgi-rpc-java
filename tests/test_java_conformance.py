@@ -1445,6 +1445,82 @@ def conformance_raw_conn(
     return factory
 
 
+# --- Protocol version negotiation: the Java HTTP client (PROTOCOL_VERSIONS_V1 §9) ---
+#
+# TestClientNegotiation drives this port's HttpRpcConnection against a scripted reference
+# server through `conformance-client-driver --negotiating-client`: one JVM per client, one
+# JSON line per ping(), so negotiation state carries across calls exactly as it does inside
+# one connection.
+
+_NEGOTIATING_DRIVER = os.environ.get(
+    "VGI_CLIENT_DRIVER",
+    str(
+        Path(__file__).resolve().parent.parent
+        / "conformance-client-driver/build/install/conformance-client-driver/bin/conformance-client-driver"
+    ),
+)
+
+
+class _NegotiatingClientError(Exception):
+    """A failed ping(), carrying the Java client's error kind and message."""
+
+    def __init__(self, kind: str, code: str, message: str) -> None:
+        super().__init__(message)
+        self.error_kind = kind
+        self.error_code = code
+        self.error_message = message
+
+
+class _NegotiatingClient:
+    def __init__(self, proc: subprocess.Popen[str]) -> None:
+        self._proc = proc
+
+    def ping(self) -> str:
+        import json
+
+        assert self._proc.stdin is not None and self._proc.stdout is not None
+        self._proc.stdin.write("ping\n")
+        self._proc.stdin.flush()
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError(f"negotiating client exited ({self._proc.poll()})")
+        reply = json.loads(line)
+        if "result" in reply:
+            return str(reply["result"])
+        raise _NegotiatingClientError(
+            reply.get("error_kind", ""), reply.get("error_code", ""), reply.get("error_message", "")
+        )
+
+
+@pytest.fixture(scope="session")
+def conformance_negotiating_client() -> Callable[..., Any]:
+    """``factory(base_url, protocol, version, version_range)`` -> the Java client, negotiating."""
+    if not Path(_NEGOTIATING_DRIVER).exists():
+        pytest.fail(f"conformance client driver not built: {_NEGOTIATING_DRIVER} (./gradlew installDist)")
+
+    @contextlib.contextmanager
+    def factory(base_url: str, protocol: str, version: str, version_range: str) -> Iterator[_NegotiatingClient]:
+        assert protocol == "conformance.Negotiated.v1", protocol
+        proc = subprocess.Popen(
+            [_NEGOTIATING_DRIVER, "--negotiating-client", base_url, version, version_range],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            yield _NegotiatingClient(proc)
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    return factory
+
+
 # Import the canonical pytest suite from the vgi-rpc package.
 from vgi_rpc.conformance._pytest_suite import *  # noqa: F401,F403,E402
 

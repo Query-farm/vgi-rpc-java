@@ -405,6 +405,24 @@ public final class RpcConnection implements AutoCloseable {
         private final String protocol;
         private final String protocolVersion;
 
+        /**
+         * The client's own window for {@code protocol} ({@code vgi_rpc.protocol_versions_client},
+         * informational, PROTOCOL_VERSIONS_V1 §4.2): exactly the declared version. A single-version
+         * client has nothing to negotiate on a byte stream, so it sends its version as before and
+         * relies on the server's refusal (§6, decision 11).
+         */
+        private static Map<String, String> clientWindows(String protocol, String protocolVersion) {
+            if (protocol == null || protocol.isBlank() || protocolVersion == null || protocolVersion.isBlank()) {
+                return null;
+            }
+            try {
+                return Map.of(ProtocolVersions.CLIENT_KEY,
+                        protocol + "=" + ProtocolVersions.VersionRange.exactly(protocolVersion));
+            } catch (IllegalArgumentException e) {
+                return null;
+            }
+        }
+
         ClientHandler(Map<String, RpcMethodInfo> methods, String protocol, String protocolVersion) {
             this.methods = methods;
             this.protocol = protocol;
@@ -426,7 +444,8 @@ public final class RpcConnection implements AutoCloseable {
 
         private Object doStream(RpcMethodInfo info, Method m, Object[] args) throws Exception {
             // Send request
-            ClientMarshalling.writeRequest(transport.writer(), info, m, args, protocol, protocolVersion);
+            ClientMarshalling.writeRequest(transport.writer(), info, m, args, protocol, protocolVersion,
+                    clientWindows(protocol, protocolVersion));
             transport.writer().flush();
 
             // Read header IPC stream if declared
@@ -481,7 +500,8 @@ public final class RpcConnection implements AutoCloseable {
 
         private Object doUnary(RpcMethodInfo info, Method m, Object[] args) throws Exception {
             // Send request
-            ClientMarshalling.writeRequest(transport.writer(), info, m, args, protocol, protocolVersion);
+            ClientMarshalling.writeRequest(transport.writer(), info, m, args, protocol, protocolVersion,
+                    clientWindows(protocol, protocolVersion));
             transport.writer().flush();
 
             // Read response. The log / error / external-pointer semantics live in

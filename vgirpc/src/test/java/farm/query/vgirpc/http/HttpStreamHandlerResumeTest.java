@@ -235,7 +235,8 @@ class HttpStreamHandlerResumeTest {
                 versionedInitRequest(server, "count_to", Map.of("limit", 2L), "1.0.0"), Long.MAX_VALUE, null);
         Map<String, String> md = firstErrorMetadata(stale);
         assertNotNull(md, "a 1.0.0 client must be refused by a 2.0.0 binding");
-        assertEquals("protocol_version_mismatch", md.get(Metadata.ERROR_KIND));
+        assertEquals("protocol_version_unsupported", md.get(Metadata.ERROR_KIND));
+        assertEquals("CounterService=2.0-2.0", md.get("vgi_rpc.protocol_versions"));
         assertEquals("FAILED_PRECONDITION", md.get(Metadata.ERROR_CODE));
         assertTrue(md.get(Metadata.ERROR_DETAILS).contains("\"subject\":\"CounterService\""),
                 md.get(Metadata.ERROR_DETAILS));

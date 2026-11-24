@@ -340,6 +340,26 @@ without it, or one that predates reflection (`method_not_implemented`, `UNIMPLEM
 HTTP 404), these throw `ReflectionNotSupportedError`. On a byte-stream transport, don't call them while
 a stream is open on the same connection: the calls would interleave on one channel.
 
+## Protocol versions (`PROTOCOL_VERSIONS_V1`)
+
+A server advertises, for every protocol it gates (one declaring a version), the window of
+`major.minor` versions it accepts: `VGI-Protocol-Versions: vgi.v3=3.4-3.4` on every HTTP response
+(401/404/413/5xx, `HEAD`/`OPTIONS /health` and preflights included, CORS-exposed), and the same
+string as `vgi_rpc.protocol_versions` metadata on reflection results, `__transport_options__`
+replies and refusals on every transport. The window is exactly the declared version's
+`major.minor`; `RpcServer.setProtocolVersionRanges(Map.of("vgi.v3", "3.3-3.4"))` overrides it (how a
+fixture impersonates another version). A request outside it is refused with
+`protocol_version_unsupported` / `FAILED_PRECONDITION` (HTTP 400), naming both windows and which side
+to upgrade, with a `PreconditionFailure` and an `ErrorInfo` carrying the advertisement.
+
+`HttpRpcConnection` negotiates per endpoint: it sends its newest version until a response teaches it
+the server's window, then the highest common one (plus its own patch); a missing header falls back to
+a pre-spec refusal's `Server: X.Y` or its own version; with no common version it fails before
+sending. `Builder.protocolVersionRange("3.4-3.5")` widens what it speaks, `clientProtocolVersion(...)`
+declares it for raw calls, and `negotiation(...)` shares the state between connections. Only
+reflection calls are retried automatically after a refusal. The client's own window rides as
+`VGI-Client-Protocol-Versions` / `vgi_rpc.protocol_versions_client` (informational).
+
 ## Wire compatibility
 
 When the Python and Java implementations disagree, **Python is the reference.** Wire format, metadata keys, error semantics, and stream-state token layout match byte-for-byte so the two interoperate. See the Python project's [README](https://github.com/Query-farm/vgi-rpc-python) for the higher-level protocol design.

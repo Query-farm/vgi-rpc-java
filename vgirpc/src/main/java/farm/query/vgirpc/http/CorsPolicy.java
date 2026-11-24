@@ -58,7 +58,8 @@ final class CorsPolicy {
             HttpServer.ACCEPT_MAX_RESPONSE_BYTES_HEADER,
             StickyHeaders.SESSION,
             StickyHeaders.SESSION_ACCEPT,
-            ProxyProof.PROOF_HEADER));
+            ProxyProof.PROOF_HEADER,
+            farm.query.vgirpc.ProtocolVersions.CLIENT_HEADER));
 
     /** Lowercased for the case-insensitive origin match; empty when {@link #wildcard}. */
     private final List<String> origins;

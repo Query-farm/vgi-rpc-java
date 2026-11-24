@@ -107,8 +107,29 @@ public final class ClientMarshalling {
      */
     public static void writeRequest(OutputStream out, RpcMethodInfo info, Method method, Object[] args,
                                     String protocol, String protocolVersion) throws IOException {
+        writeRequest(out, info, method, args, protocol, protocolVersion, null);
+    }
+
+    /**
+     * As {@link #writeRequest(OutputStream, RpcMethodInfo, Method, Object[], String, String)},
+     * with additional custom metadata (e.g. {@code vgi_rpc.protocol_versions_client}) layered
+     * under the framework keys.
+     *
+     * @param out destination for the framed request; not closed by this method
+     * @param info the introspected method being called
+     * @param method the reflected interface method, used to name the arguments
+     * @param args the invocation arguments, positionally matching {@code method}
+     * @param protocol the protocol name to stamp; {@code null} or blank omits the key
+     * @param protocolVersion the version to stamp; {@code null} or blank omits the key
+     * @param extraMetadata additional metadata, or {@code null}
+     * @throws IOException if {@code out} fails
+     */
+    public static void writeRequest(OutputStream out, RpcMethodInfo info, Method method, Object[] args,
+                                    String protocol, String protocolVersion,
+                                    Map<String, String> extraMetadata) throws IOException {
         Map<String, Object> wireKwargs = convertForWire(bindArgs(method, args), info);
         Map<String, String> meta = Wire.requestMetadata(info.name());
+        if (extraMetadata != null) meta.putAll(extraMetadata);
         if (protocol != null && !protocol.isBlank()) {
             meta.put(farm.query.vgirpc.wire.Metadata.PROTOCOL, protocol);
         }

@@ -144,6 +144,13 @@ public final class HttpRpcConnection implements AutoCloseable {
     private final Duration requestTimeout;
     /** Caller-supplied override for the service interface's own declared version, or {@code null}. */
     private final String protocolVersion;
+    /** Caller-supplied client window for proxied protocols ({@link Builder#protocolVersionRange}), or {@code null}. */
+    private final String protocolVersionRange;
+    /** Protocol version negotiation state for this endpoint (PROTOCOL_VERSIONS_V1 §6). */
+    private final farm.query.vgirpc.ProtocolVersions.EndpointNegotiation negotiation;
+    /** What this client speaks, per protocol: registered by {@link #proxy} and the builder. */
+    private final Map<String, farm.query.vgirpc.ProtocolVersions.ClientVersioning> clientVersionings =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private final Long acceptedMaxResponseBytes;
     /** External-storage configuration, or null when pointer batches are refused. */
     private final ExternalLocationConfig externalConfig;
@@ -184,6 +191,10 @@ public final class HttpRpcConnection implements AutoCloseable {
         this.onLog = b.onLog != null ? b.onLog : m -> {};
         this.requestTimeout = b.requestTimeout;
         this.protocolVersion = b.protocolVersion;
+        this.protocolVersionRange = b.protocolVersionRange;
+        this.negotiation = b.negotiation != null ? b.negotiation
+                : new farm.query.vgirpc.ProtocolVersions.EndpointNegotiation(LocationResolver.redactUrl(b.endpoint));
+        this.clientVersionings.putAll(b.clientVersionings);
         this.acceptedMaxResponseBytes = b.acceptedMaxResponseBytes;
         this.externalConfig = b.externalConfig;
         this.externalFetcher = b.externalConfig != null ? new ExternalFetcher(b.externalConfig) : null;
@@ -294,6 +305,12 @@ public final class HttpRpcConnection implements AutoCloseable {
         // vgi_rpc.protocol, which stays canonical. They are derived from one place here so they
         // cannot disagree -- a disagreement is refused at the worker's dispatch boundary.
         String protocol = ServiceIntrospector.protocolName(serviceInterface);
+        // PROTOCOL_VERSIONS_V1 §6: a versioned protocol negotiates per endpoint; its window is
+        // exactly the declared version unless the builder widened it downward.
+        if (version != null && !version.isBlank() && !clientVersionings.containsKey(protocol)) {
+            clientVersionings.put(protocol,
+                    farm.query.vgirpc.ProtocolVersions.ClientVersioning.of(protocol, version, protocolVersionRange));
+        }
         return (T) Proxy.newProxyInstance(
                 serviceInterface.getClassLoader(),
                 new Class<?>[]{serviceInterface},
@@ -367,6 +384,18 @@ public final class HttpRpcConnection implements AutoCloseable {
      */
     public byte[] callUnaryRaw(String protocol, String protocolVersion, String method,
                                AnnotatedBatch request) {
+        try {
+            return callUnaryRawOnce(protocol, protocolVersion, method, request);
+        } catch (RpcError e) {
+            if (!learnFromRefusal(protocol, e) || !farm.query.vgirpc.ProtocolVersions.isRetrySafe(protocol, null)) {
+                throw e;
+            }
+            return callUnaryRawOnce(protocol, protocolVersion, method, request);
+        }
+    }
+
+    private byte[] callUnaryRawOnce(String protocol, String protocolVersion, String method,
+                                    AnnotatedBatch request) {
         byte[] response = post(urlFor(protocol, method, ""),
                 rawRequestBody(method, protocol, protocolVersion, request), method);
         try (IpcStreamReader r = new IpcStreamReader(
@@ -900,6 +929,8 @@ public final class HttpRpcConnection implements AutoCloseable {
         HttpReply reply = execute("POST", url, postHeaders(encoding), payload, what,
                 effectiveDecodedResponseLimit(null), this::responseLimit);
         captureSessionHeaders(reply);
+        // PROTOCOL_VERSIONS_V1 §6: every response's advertisement replaces what was learned.
+        negotiation.observe(reply.first(farm.query.vgirpc.ProtocolVersions.HEADER));
         return reply.withBody(decodeBody(reply, responseLimit(reply.headers(), reply.status(), what), what));
     }
 
@@ -1126,6 +1157,8 @@ public final class HttpRpcConnection implements AutoCloseable {
     private Map<String, String> postHeaders(String requestEncoding) {
         Map<String, String> framework = new LinkedHashMap<>();
         framework.put(HttpHeaders.CONTENT_TYPE, HttpServer.ARROW_CONTENT_TYPE);
+        String clientWindows = clientVersionsAdvertised();
+        if (!clientWindows.isEmpty()) framework.put(farm.query.vgirpc.ProtocolVersions.CLIENT_HEADER, clientWindows);
         if (requestEncoding != null) {
             framework.put(HttpHeaders.CONTENT_ENCODING, requestEncoding);
             // Having asked the server to decompress, accept a compressed answer
@@ -1790,13 +1823,71 @@ public final class HttpRpcConnection implements AutoCloseable {
         return false;
     }
 
+    /**
+     * Learn from a version refusal ({@code protocol_version_unsupported}, or a pre-spec
+     * {@code protocol_version_mismatch}) for a protocol this client negotiates.
+     *
+     * @return whether {@code e} was such a refusal and a retry could now speak another version
+     */
+    private boolean learnFromRefusal(String protocol, RpcError e) {
+        if (protocol == null || e instanceof farm.query.vgirpc.ProtocolVersions.NoCommonVersionError
+                || !farm.query.vgirpc.ProtocolVersions.isVersionRefusal(e)) {
+            return false;
+        }
+        farm.query.vgirpc.ProtocolVersions.ClientVersioning cv = clientVersionings.get(protocol);
+        if (cv == null) return false;
+        String before = cv.wireVersion(chooseQuietly(cv));
+        negotiation.observeRefusal(protocol, e);
+        int[] after;
+        try {
+            after = negotiation.choose(cv);
+        } catch (farm.query.vgirpc.ProtocolVersions.NoCommonVersionError none) {
+            return false;  // surface the server's refusal: it already names both windows
+        }
+        return !cv.wireVersion(after).equals(before);
+    }
+
+    private int[] chooseQuietly(farm.query.vgirpc.ProtocolVersions.ClientVersioning cv) {
+        try {
+            return negotiation.choose(cv);
+        } catch (farm.query.vgirpc.ProtocolVersions.NoCommonVersionError e) {
+            return new int[] {cv.range().maxMajor(), cv.range().maxMinor()};
+        }
+    }
+
+    /** The {@code VGI-Client-Protocol-Versions} value: every protocol this client negotiates. */
+    private String clientVersionsAdvertised() {
+        if (clientVersionings.isEmpty()) return "";
+        Map<String, farm.query.vgirpc.ProtocolVersions.VersionRange> windows = new java.util.TreeMap<>();
+        clientVersionings.forEach((name, cv) -> windows.put(name, cv.range()));
+        return farm.query.vgirpc.ProtocolVersions.format(windows);
+    }
+
+    /**
+     * This endpoint's protocol version negotiation state: the windows learned from the
+     * server, shareable with another connection to the same worker.
+     *
+     * @return the negotiation state
+     */
+    public farm.query.vgirpc.ProtocolVersions.EndpointNegotiation negotiation() { return negotiation; }
+
     /** Frame an untyped request the way the typed path frames a typed one. */
     private byte[] rawRequestBody(String method, String protocol, String protocolVersion,
                                   AnnotatedBatch request) {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        farm.query.vgirpc.ProtocolVersions.ClientVersioning cv = protocol == null ? null : clientVersionings.get(protocol);
+        Map<String, String> extra = request.customMetadata();
+        String version = protocolVersion;
+        if (cv != null) {
+            version = negotiation.wireVersion(cv);
+            Map<String, String> withWindows = new LinkedHashMap<>();
+            withWindows.put(farm.query.vgirpc.ProtocolVersions.CLIENT_KEY, cv.advertised());
+            if (extra != null) withWindows.putAll(extra);
+            extra = withWindows;
+        }
         try {
             ClientMarshalling.writeRawRequest(buf, method, request.root(), request.dictionaryProvider(),
-                    request.customMetadata(), protocol, protocolVersion);
+                    extra, protocol, version);
         } catch (IOException e) {
             throw new RpcError("TransportError",
                     method + ": could not frame request: " + e.getMessage(), "");
@@ -1881,6 +1972,19 @@ public final class HttpRpcConnection implements AutoCloseable {
         }
 
         private Object doUnary(RpcMethodInfo info, Method m, Object[] args) throws IOException {
+            try {
+                return doUnaryOnce(info, m, args);
+            } catch (RpcError e) {
+                // A refusal teaches this endpoint the server's windows; only a retry-safe call
+                // (reflection, or one declared idempotent) is re-sent, once (§6).
+                if (!learnFromRefusal(protocol, e) || !farm.query.vgirpc.ProtocolVersions.isRetrySafe(protocol, null)) {
+                    throw e;
+                }
+                return doUnaryOnce(info, m, args);
+            }
+        }
+
+        private Object doUnaryOnce(RpcMethodInfo info, Method m, Object[] args) throws IOException {
             byte[] response = post(urlFor(protocol, info.name(), ""), requestBody(info, m, args), info.name());
             try (IpcStreamReader r = new IpcStreamReader(
                     new ByteArrayInputStream(response), Allocators.root())) {
@@ -1918,7 +2022,15 @@ public final class HttpRpcConnection implements AutoCloseable {
 
         private byte[] requestBody(RpcMethodInfo info, Method m, Object[] args) throws IOException {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            ClientMarshalling.writeRequest(buf, info, m, args, protocol, protocolVersion);
+            farm.query.vgirpc.ProtocolVersions.ClientVersioning cv = clientVersionings.get(protocol);
+            if (cv == null) {
+                ClientMarshalling.writeRequest(buf, info, m, args, protocol, protocolVersion);
+            } else {
+                // The negotiated major.minor plus this client's patch; fails before sending
+                // (NoCommonVersionError) once the endpoint is known to share no version.
+                ClientMarshalling.writeRequest(buf, info, m, args, protocol, negotiation.wireVersion(cv),
+                        Map.of(farm.query.vgirpc.ProtocolVersions.CLIENT_KEY, cv.advertised()));
+            }
             return buf.toByteArray();
         }
 
@@ -1979,6 +2091,10 @@ public final class HttpRpcConnection implements AutoCloseable {
         private HttpClient httpClient;
         private ProxyEndpoint socksProxy;
         private String protocolVersion;
+        private String protocolVersionRange;
+        private farm.query.vgirpc.ProtocolVersions.EndpointNegotiation negotiation;
+        private final Map<String, farm.query.vgirpc.ProtocolVersions.ClientVersioning> clientVersionings =
+                new LinkedHashMap<>();
         private Long acceptedMaxResponseBytes = DEFAULT_ACCEPTED_MAX_RESPONSE_BYTES;
         private ExternalLocationConfig externalConfig;
         private Integer compressionLevel;
@@ -2138,6 +2254,47 @@ public final class HttpRpcConnection implements AutoCloseable {
          */
         public Builder protocolVersion(String version) {
             this.protocolVersion = version == null ? "" : version;
+            return this;
+        }
+
+        /**
+         * The window of versions a proxied protocol may speak ({@code PROTOCOL_VERSIONS_V1} §6),
+         * {@code MIN-MAX}; it must end at the protocol version's {@code major.minor}. Default:
+         * exactly that version. With a wider window the client speaks the highest version the
+         * server also advertises.
+         *
+         * @param range {@code MIN-MAX}, e.g. {@code "3.4-3.5"}
+         * @return this builder
+         */
+        public Builder protocolVersionRange(String range) {
+            this.protocolVersionRange = range;
+            return this;
+        }
+
+        /**
+         * Declare what this client speaks for a protocol called by name (the raw call paths):
+         * its newest version and window. Calls to {@code protocol} then negotiate.
+         *
+         * @param protocol the wire name
+         * @param version the newest version spoken, {@code MAJOR.MINOR.PATCH}
+         * @param range {@code MIN-MAX}, or {@code null} for exactly {@code version}
+         * @return this builder
+         */
+        public Builder clientProtocolVersion(String protocol, String version, String range) {
+            clientVersionings.put(protocol,
+                    farm.query.vgirpc.ProtocolVersions.ClientVersioning.of(protocol, version, range));
+            return this;
+        }
+
+        /**
+         * Share protocol version negotiation state with other connections to the same worker
+         * (default: a fresh state per connection).
+         *
+         * @param negotiation the shared state
+         * @return this builder
+         */
+        public Builder negotiation(farm.query.vgirpc.ProtocolVersions.EndpointNegotiation negotiation) {
+            this.negotiation = negotiation;
             return this;
         }
 

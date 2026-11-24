@@ -1286,6 +1286,7 @@ public final class HttpServer {
                 StickyHeaders.SESSION_CLOSE, HttpHeaders.REQUEST_ID, HttpHeaders.WWW_AUTHENTICATE,
                 HttpHeaders.X_VGI_CONTENT_ENCODING, HttpHeaders.VGI_AUTH_REASON,
                 HttpHeaders.VGI_AUTH_PROXY_REQUIRED, RPC_ERROR_HEADER,
+                farm.query.vgirpc.ProtocolVersions.HEADER,
                 "Content-Type", "Content-Length", "Content-Encoding", "Cache-Control", "Set-Cookie",
                 "Access-Control-Allow-Origin", "Access-Control-Expose-Headers");
 
@@ -1375,6 +1376,9 @@ public final class HttpServer {
 
         @Override
         protected void service(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+            // PROTOCOL_VERSIONS_V1 §4.1: before anything that can fail, so even a 5xx from a
+            // failing serve-start hook below carries the advertisement.
+            resp.setHeader(farm.query.vgirpc.ProtocolVersions.HEADER, rpc.protocolVersions());
             // Lazy per-process notification matches pre-fork-safe semantics:
             // a failed hook leaves the kind unset and the next request retries.
             rpc.notifyTransport(TransportKind.HTTP);
@@ -1746,6 +1750,9 @@ public final class HttpServer {
 
     /** Set capability-advertisement headers on every response. */
     private void applyCapabilityHeaders(HttpServletRequest req, HttpServletResponse resp) {
+        // PROTOCOL_VERSIONS_V1 §4.1: on EVERY response (set before dispatch, so 401/404/413/5xx,
+        // HEAD and OPTIONS /health and preflights carry it); empty when nothing is gated.
+        resp.setHeader(farm.query.vgirpc.ProtocolVersions.HEADER, rpc.protocolVersions());
         long requestLimit = configuredRequestLimit();
         if (advertiseMaxRequestBytes || requestLimit != Long.MAX_VALUE) {
             resp.setHeader(MAX_REQUEST_BYTES_HEADER, Long.toString(requestLimit));
@@ -1811,6 +1818,7 @@ public final class HttpServer {
                 RPC_ERROR_HEADER,
                 EXTERNALIZATION_ENABLED_HEADER,
                 SUPPORTED_ENCODINGS_HEADER,
+                farm.query.vgirpc.ProtocolVersions.HEADER,
                 // Describes a rejection rather than a capability, so it is never
                 // advertised on /health — but a browser that cannot read it is
                 // back to guessing the 401 reason out of the body.
@@ -2382,6 +2390,10 @@ public final class HttpServer {
         if (out.size() > responseLimit) {
             writeResponseCapError(req, resp, method, out.size(), responseLimit);
             return;
+        }
+        // PROTOCOL_VERSIONS_V1 §4.3: a version refusal is an HTTP 400, the error batch its body.
+        if (CallOutcome.currentError() instanceof farm.query.vgirpc.ProtocolVersionError) {
+            resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
         }
         writeArrowResponse(req, resp, out.toByteArray());
     }

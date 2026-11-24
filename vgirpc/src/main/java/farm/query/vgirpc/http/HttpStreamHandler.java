@@ -391,7 +391,8 @@ public final class HttpStreamHandler {
             // through RpcServer.serveOne, so it is wired in independently; only /init is gated,
             // since a continuation was admitted when its stream opened.
             farm.query.vgirpc.ProtocolVersionError pve =
-                    rpc.gateVersion(protocol, meta.get(Metadata.PROTOCOL_VERSION_KEY));
+                    rpc.gateVersion(protocol, meta.get(Metadata.PROTOCOL_VERSION_KEY),
+                            meta.get(farm.query.vgirpc.ProtocolVersions.CLIENT_KEY));
             if (pve != null) return errorStream(pve);
             // Less the stream tokens, as on every continuation (see
             // turnInputMetadata). An honest client has not been issued any yet,

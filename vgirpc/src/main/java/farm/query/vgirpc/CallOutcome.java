@@ -83,6 +83,8 @@ public final class CallOutcome implements AutoCloseable {
             scope.error = t;
             // invalid_state_ref is answered 400 like every other token failure (STATE_REF_V1.md §6).
             if (t instanceof farm.query.vgirpc.stateref.InvalidStateRefError) scope.badRequest = true;
+            // A protocol version refusal is an HTTP 400 (PROTOCOL_VERSIONS_V1 §4.3).
+            if (t instanceof farm.query.vgirpc.ProtocolVersionError) scope.badRequest = true;
         }
     }
 

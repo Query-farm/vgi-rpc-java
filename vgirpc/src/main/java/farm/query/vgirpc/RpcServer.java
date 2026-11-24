@@ -267,6 +267,73 @@ public final class RpcServer {
         return b.name().equals(protocolName) ? protocolVersion : b.declaredVersion();
     }
 
+    /** Per-protocol window overrides ({@link #setProtocolVersionRanges}), keyed by wire name. */
+    private final Map<String, ProtocolVersions.VersionRange> versionRangeOverrides = new LinkedHashMap<>();
+
+    /**
+     * Override the {@code major.minor} window a hosted protocol accepts and advertises
+     * ({@code PROTOCOL_VERSIONS_V1.md} §5), keyed by wire name, e.g. {@code {"vgi.v3": "3.3-3.4"}}.
+     * Default: exactly each protocol's declared version's {@code major.minor}. This is how a
+     * fixture worker impersonates an older (or newer) server ({@code VGI_TEST_PROTOCOL_RANGE}).
+     *
+     * @param ranges wire name to {@code MIN-MAX}
+     * @return this server, for chaining
+     * @throws IllegalArgumentException for a malformed range, or a name that is not a hosted
+     *     protocol declaring a version (checked when the window is first used)
+     */
+    public synchronized RpcServer setProtocolVersionRanges(Map<String, String> ranges) {
+        versionRangeOverrides.clear();
+        if (ranges != null) {
+            for (Map.Entry<String, String> e : ranges.entrySet()) {
+                versionRangeOverrides.put(e.getKey(), ProtocolVersions.VersionRange.parse(e.getValue()));
+            }
+        }
+        return this;
+    }
+
+    /** The window a binding accepts, or {@code null} when it declares no version. */
+    private synchronized ProtocolVersions.VersionRange versionRangeOf(Binding b) {
+        String version = versionOf(b);
+        if (version.isEmpty()) return null;
+        ProtocolVersions.VersionRange override = versionRangeOverrides.get(b.name());
+        if (override != null) return override;
+        try {
+            return ProtocolVersions.VersionRange.exactly(version);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The {@code VGI-Protocol-Versions} advertisement: every gated protocol's window,
+     * {@code name=MIN-MAX[, name=MIN-MAX]...} in hosting order, primary first. Lists only the
+     * protocols this server gates (those that declare a version); reflection and identity are
+     * exempt and unversioned protocols are absent. Empty when nothing here is versioned.
+     * Advertised on every HTTP response and as {@code vgi_rpc.protocol_versions} metadata on
+     * reflection results, {@code __transport_options__} replies and refusals.
+     *
+     * @return the advertisement
+     * @throws IllegalArgumentException if a window override names a protocol that is not hosted
+     *     or declares no version
+     */
+    public synchronized String protocolVersions() {
+        for (String name : versionRangeOverrides.keySet()) {
+            Binding b = bindings.get(name);
+            if (b == null || versionOf(b).isEmpty()) {
+                List<String> versioned = new ArrayList<>();
+                for (Binding x : bindings.values()) if (!versionOf(x).isEmpty()) versioned.add(x.name());
+                throw new IllegalArgumentException("setProtocolVersionRanges names '" + name + "', which is not a "
+                        + "hosted protocol that declares a protocol_version. Versioned protocols here: " + versioned);
+            }
+        }
+        Map<String, ProtocolVersions.VersionRange> out = new LinkedHashMap<>();
+        for (Binding b : bindings.values()) {
+            ProtocolVersions.VersionRange r = versionRangeOf(b);
+            if (r != null) out.put(b.name(), r);
+        }
+        return ProtocolVersions.format(out);
+    }
+
     /**
      * Decide whether EXCEPTION batches carry the remote traceback ({@code log_extra.traceback},
      * {@code frames}, {@code cause}).
@@ -1013,7 +1080,8 @@ public final class RpcServer {
                 // server expects, so gating them would hide the answer.
                 {
                     ProtocolVersionError pve = gateVersion(binding.name(),
-                            meta.get(farm.query.vgirpc.wire.Metadata.PROTOCOL_VERSION_KEY));
+                            meta.get(farm.query.vgirpc.wire.Metadata.PROTOCOL_VERSION_KEY),
+                            meta.get(ProtocolVersions.CLIENT_KEY));
                     if (pve != null) {
                         Schema errorSchema = info.methodType() == MethodType.UNARY
                                 ? info.resultSchema() : RpcStream.EMPTY_SCHEMA;
@@ -1224,41 +1292,43 @@ public final class RpcServer {
      * @param clientVersion the version the client declared, or {@code null} when it declared none
      * @return the error to return to the caller, or {@code null} when the versions are compatible
      */
-    private static ProtocolVersionError checkProtocolVersion(String protocol, String protocolVersion,
-                                                             String clientVersion) {
-        String head = "VGI client/worker protocol_version mismatch.\n"
-                + "  Client: " + (clientVersion == null ? "<not declared>" : clientVersion) + "\n"
-                + "  Server: " + protocolVersion + "\n"
-                + "  Direction: ";
+    private ProtocolVersionError checkProtocolVersion(String protocol, ProtocolVersions.VersionRange window,
+                                                      String clientVersion, String clientRanges) {
+        String serverWindow = "this server supports " + protocol + " " + window;
+        String advertised = protocolVersions();
+        String ranges = clientRanges == null ? "" : clientRanges;
+        if (!ranges.isEmpty() && LOG.isDebugEnabled()) {
+            LOG.debug("client protocol versions for {}: {}", protocol, ranges);
+        }
+        String u = ProtocolVersions.UNSUPPORTED;
         if (clientVersion == null) {
-            return new ProtocolVersionError(head
-                    + "the client did not send a vgi_rpc.protocol_version metadata key. "
-                    + "This is either a vgi-rpc framework bug or a non-VGI client "
-                    + "connecting to a VGI worker.", protocol, "", protocolVersion);
+            return new ProtocolVersionError(u + ": the client did not send vgi_rpc.protocol_version for "
+                    + protocol + "; " + serverWindow + ". This is either a vgi-rpc framework bug or a non-VGI "
+                    + "client connecting to a VGI worker.", protocol, "", window.toString(), advertised, ranges);
         }
-        int[] client = parseSemver(clientVersion);
-        int[] server = parseSemver(protocolVersion);
-        if (client == null || server == null) {
-            return new ProtocolVersionError(head
-                    + "client sent a malformed protocol_version. "
-                    + "Expected canonical semver MAJOR.MINOR.PATCH.",
-                    protocol, clientVersion, protocolVersion);
+        int[] client = ProtocolVersions.parseSemver(clientVersion);
+        if (client == null) {
+            return new ProtocolVersionError(u + ": the client sent a malformed protocol_version '" + clientVersion
+                    + "' for " + protocol + " (expected canonical semver MAJOR.MINOR.PATCH); " + serverWindow + ".",
+                    protocol, clientVersion, window.toString(), advertised, ranges);
         }
-        if (client[0] == server[0] && client[1] == server[1]) {
-            return null;
-        }
-        boolean clientOlder = client[0] < server[0] || (client[0] == server[0] && client[1] < server[1]);
-        return new ProtocolVersionError(head + (clientOlder
-                ? "client is too old; upgrade the VGI extension/client to a version "
-                        + "supporting protocol_version " + protocolVersion + "."
-                : "server is too old; upgrade the VGI worker to a version "
-                        + "supporting protocol_version " + clientVersion + "."),
-                protocol, clientVersion, protocolVersion);
+        if (window.contains(client[0], client[1])) return null;
+        String clientMm = client[0] + "." + client[1];
+        ProtocolVersions.VersionRange supports = ProtocolVersions.parse(ranges).get(protocol);
+        String speaks = "client speaks " + protocol + " " + clientMm + (supports != null ? " (supports " + supports + ")" : "");
+        boolean older = client[0] != window.minMajor() ? client[0] < window.minMajor() : client[1] < window.minMinor();
+        String direction = older
+                ? "The client is too old (this server is too new for it). Upgrade the client, or use a worker "
+                        + "that supports " + protocol + " " + clientMm + "."
+                : "The server is too old (the client is too new for it). Upgrade the worker, or use a client "
+                        + "that supports " + protocol + " " + window.max() + ".";
+        return new ProtocolVersionError(u + ": " + speaks + "; " + serverWindow + ". " + direction,
+                protocol, clientVersion, window.toString(), advertised, ranges);
     }
 
     /**
-     * Gate a call against the declared {@code protocol_version} of the application protocol that
-     * owns it -- the binding's own version, never the primary's for every call.
+     * Gate a call against the supported version window of the application protocol that owns it
+     * -- the binding's own window, never the primary's for every call.
      *
      * <p>Shared by raw dispatch and transports that dispatch outside {@link #serveOne} (the HTTP
      * stream {@code /init} route), so the two cannot disagree. A no-op for a protocol that declares
@@ -1270,28 +1340,25 @@ public final class RpcServer {
      * @return the refusal to write back, or {@code null} when the call may proceed
      */
     public ProtocolVersionError gateVersion(String protocol, String clientVersion) {
-        Binding b = binding(protocol);
-        if (b == null) return null;
-        String version = versionOf(b);
-        if (version.isEmpty()) return null;
-        return checkProtocolVersion(b.name(), version, clientVersion);
+        return gateVersion(protocol, clientVersion, null);
     }
 
-    /** {@code MAJOR.MINOR.PATCH} as three ints, or {@code null} when not canonical semver. */
-    private static int[] parseSemver(String v) {
-        if (v == null) return null;
-        String[] parts = v.split("\\.");
-        if (parts.length != 3) return null;
-        int[] out = new int[3];
-        for (int i = 0; i < 3; i++) {
-            try {
-                out[i] = Integer.parseInt(parts[i]);
-            } catch (NumberFormatException e) {
-                return null;
-            }
-            if (out[i] < 0) return null;
-        }
-        return out;
+    /**
+     * As {@link #gateVersion(String, String)}, also quoting the client's advertised windows
+     * ({@code vgi_rpc.protocol_versions_client}) in a refusal. They are logged at debug and never
+     * a reason to refuse, malformed or not.
+     *
+     * @param protocol the routing key the call resolved to
+     * @param clientVersion the request's {@code vgi_rpc.protocol_version}, or {@code null}
+     * @param clientRanges the request's {@code vgi_rpc.protocol_versions_client}, or {@code null}
+     * @return the refusal to write back, or {@code null} when the call may proceed
+     */
+    public ProtocolVersionError gateVersion(String protocol, String clientVersion, String clientRanges) {
+        Binding b = binding(protocol);
+        if (b == null) return null;
+        ProtocolVersions.VersionRange window = versionRangeOf(b);
+        if (window == null) return null;
+        return checkProtocolVersion(b.name(), window, clientVersion, clientRanges);
     }
 
     /** Validate the exact parameter schema/cardinality before handler dispatch. */
@@ -1910,6 +1977,9 @@ public final class RpcServer {
         Map<String, String> md = new LinkedHashMap<>();
         md.put(Metadata.REQUEST_VERSION_KEY, Metadata.REQUEST_VERSION);
         if (serverId != null) md.put(Metadata.SERVER_ID, serverId);
+        // PROTOCOL_VERSIONS_V1 §4.1: reflection results carry the windows on every transport,
+        // present even when empty ("negotiates, gates nothing" is not "pre-spec").
+        md.put(ProtocolVersions.KEY, protocolVersions());
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer());
              VectorSchemaRoot root = VectorSchemaRoot.create(schema, Allocators.root())) {
             ((org.apache.arrow.vector.VarBinaryVector) root.getVector("result")).setSafe(0, payload);
@@ -1925,6 +1995,7 @@ public final class RpcServer {
         Map<String, String> md = new LinkedHashMap<>(TransportOptions.workerCapabilities());
         md.put(Metadata.REQUEST_VERSION_KEY, Metadata.REQUEST_VERSION);
         if (serverId != null) md.put(Metadata.SERVER_ID, serverId);
+        md.put(ProtocolVersions.KEY, protocolVersions());
         try (IpcStreamWriter w = new IpcStreamWriter(transport.writer());
              VectorSchemaRoot root = VectorSchemaRoot.create(RpcStream.EMPTY_SCHEMA, Allocators.root())) {
             root.setRowCount(0);

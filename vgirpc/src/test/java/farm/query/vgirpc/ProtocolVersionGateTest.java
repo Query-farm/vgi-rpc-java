@@ -6,8 +6,6 @@ package farm.query.vgirpc;
 import farm.query.vgirpc.schema.ProtocolVersion;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Method;
-
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,13 +32,10 @@ final class ProtocolVersionGateTest {
         default void ping() {}
     }
 
-    /** The gate is private; drive it directly so the cases below stay unit-sized. */
-    private static String check(RpcServer server, String clientVersion) throws Exception {
-        Method m = RpcServer.class.getDeclaredMethod(
-                "checkProtocolVersion", String.class, String.class, String.class);
-        m.setAccessible(true);
-        Object err = m.invoke(null, server.protocolName(), server.protocolVersion(), clientVersion);
-        return err == null ? null : ((ProtocolVersionError) err).getMessage();
+    /** Drive the public gate directly so the cases below stay unit-sized. */
+    private static String check(RpcServer server, String clientVersion) {
+        ProtocolVersionError err = server.gateVersion(server.protocolName(), clientVersion);
+        return err == null ? null : err.getMessage();
     }
 
     private static RpcServer server() {
@@ -65,9 +60,9 @@ final class ProtocolVersionGateTest {
     void anOlderClientIsToldToUpgradeItself() throws Exception {
         String msg = check(server(), "1.0.0");
         assertNotNull(msg, "1.0.0 against 1.4.0 must be refused");
-        assertTrue(msg.contains("Client: 1.0.0"), msg);
-        assertTrue(msg.contains("Server: 1.4.0"), msg);
-        assertTrue(msg.contains("client is too old"), msg);
+        assertTrue(msg.startsWith("protocol_version_unsupported: client speaks Versioned 1.0;"), msg);
+        assertTrue(msg.contains("this server supports Versioned 1.4-1.4"), msg);
+        assertTrue(msg.contains("The client is too old (this server is too new for it)"), msg);
     }
 
     @Test
@@ -76,8 +71,8 @@ final class ProtocolVersionGateTest {
         // version numbers and no idea which side to move.
         String msg = check(server(), "99.0.0");
         assertNotNull(msg);
-        assertTrue(msg.contains("server is too old"), msg);
-        assertTrue(msg.contains("supporting protocol_version 99.0.0"), msg);
+        assertTrue(msg.contains("The server is too old (the client is too new for it)"), msg);
+        assertTrue(msg.contains("use a client that supports Versioned 1.4."), msg);
     }
 
     @Test
@@ -86,8 +81,8 @@ final class ProtocolVersionGateTest {
         // trusted to speak it.
         String msg = check(server(), null);
         assertNotNull(msg);
-        assertTrue(msg.contains("<not declared>"), msg);
-        assertTrue(msg.contains("did not send a vgi_rpc.protocol_version"), msg);
+        assertTrue(msg.contains("the client did not send vgi_rpc.protocol_version for Versioned"), msg);
+        assertTrue(msg.contains("this server supports Versioned 1.4-1.4"), msg);
     }
 
     @Test
@@ -97,6 +92,26 @@ final class ProtocolVersionGateTest {
             assertNotNull(msg, "'" + bad + "' is not canonical semver and must be refused");
             assertTrue(msg.contains("malformed protocol_version"), msg);
         }
+    }
+
+    @Test
+    void aWindowOverrideWidensAcceptanceAndTheAdvertisement() {
+        RpcServer s = server();
+        assertTrue(s.protocolVersions().equals("Versioned=1.4-1.4"), s.protocolVersions());
+        s.setProtocolVersionRanges(java.util.Map.of("Versioned", "1.3-1.4"));
+        assertTrue(s.protocolVersions().equals("Versioned=1.3-1.4"), s.protocolVersions());
+        assertNull(check(s, "1.3.9"));
+        assertNotNull(check(s, "1.2.0"));
+        s.setProtocolVersionRanges(java.util.Map.of("NotHosted", "1.0-1.0"));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, s::protocolVersions);
+    }
+
+    @Test
+    void theClientWindowIsQuotedNeverARefusal() {
+        RpcServer s = server();
+        assertNull(s.gateVersion("Versioned", "1.4.0", "not a window at all"));
+        String msg = s.gateVersion("Versioned", "1.5.0", "Versioned=1.4-1.5").getMessage();
+        assertTrue(msg.contains("client speaks Versioned 1.5 (supports 1.4-1.5)"), msg);
     }
 
     @Test

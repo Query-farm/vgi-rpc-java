@@ -105,6 +105,10 @@ public final class Main {
         // instead of corrupting the control channel.
         System.setOut(new PrintStream(new java.io.FileOutputStream(java.io.FileDescriptor.err),
                 true, StandardCharsets.UTF_8));
+        if (args.length > 0 && "--negotiating-client".equals(args[0])) {
+            NegotiatingClient.run(args, control);
+            return;
+        }
         new Main(control).run();
     }
 

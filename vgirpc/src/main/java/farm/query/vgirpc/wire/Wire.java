@@ -240,6 +240,10 @@ public final class Wire {
         Message msg = Message.fromException(t, includeTraceback);
         Map<String, String> md = msg.addToMetadata(null);
         if (serverId != null) md.put(Metadata.SERVER_ID, serverId);
+        // PROTOCOL_VERSIONS_V1 §4.3: a refusal's batch carries the server's windows too.
+        if (t instanceof farm.query.vgirpc.ProtocolVersionError pve && !pve.serverVersions().isEmpty()) {
+            md.put(farm.query.vgirpc.ProtocolVersions.KEY, pve.serverVersions());
+        }
         // The three layers of the error model ride as top-level keys (canonical) and are
         // mirrored in log_extra by Message.fromException. Read from the same message so the two
         // cannot disagree: the code always, the kind when declared, the details only when they
