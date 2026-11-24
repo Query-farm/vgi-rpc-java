@@ -433,6 +433,47 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
         }
     }
 
+
+    /**
+     * A {@code urlValidator} for inbound pointers (client uploads to URLs this store signed):
+     * accepts only URLs on the host, port, scheme and key prefix this store signs for (the
+     * public endpoint when one is set). Built on first use from a locally signed sample URL, so
+     * it matches path-style and virtual-hosted addressing alike; {@code http} is accepted only
+     * when the signing endpoint is {@code http}.
+     *
+     * @return the validator; it throws {@link IllegalArgumentException} for any other URL
+     */
+    public java.util.function.Consumer<URI> urlValidator() {
+        return new java.util.function.Consumer<>() {
+            private volatile java.util.function.Consumer<URI> pinned;
+
+            @Override
+            public void accept(URI uri) {
+                java.util.function.Consumer<URI> v = pinned;
+                if (v == null) {
+                    v = pinnedFor(signedSample(PIN_SAMPLE_LEAF));
+                    pinned = v;
+                }
+                v.accept(uri);
+            }
+        };
+    }
+
+    private static final String PIN_SAMPLE_LEAF = "vgi-pin-sample";
+
+    static java.util.function.Consumer<URI> pinnedFor(URI sample) {
+        String path = sample.getRawPath();
+        String dir = path.substring(0, path.length() - PIN_SAMPLE_LEAF.length());
+        String host = sample.getPort() < 0 ? sample.getHost() : sample.getHost() + ":" + sample.getPort();
+        return farm.query.vgirpc.vendor.BlobVendor.pinnedHostsValidator(java.util.List.of(host),
+                "http".equalsIgnoreCase(sample.getScheme()),
+                java.util.List.of(sample.getScheme() + "://" + sample.getRawAuthority() + dir));
+    }
+
+    private URI signedSample(String leaf) {
+        return presignGet(keyPrefix + leaf, Duration.ofMinutes(1));
+    }
+
     private URI presignGet(String key, Duration ttl) {
         GetObjectPresignRequest presign = GetObjectPresignRequest.builder()
                 .signatureDuration(ttl)

@@ -176,6 +176,38 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
                 .setContentType("application/vnd.apache.arrow.stream");
         if (contentEncoding != null) blob.setContentEncoding(contentEncoding);
         storage.create(blob.build(), body);
+        return signGet(key, signDuration);
+    }
+
+    /**
+     * A {@code urlValidator} for inbound pointers: accepts only URLs on the host, port, scheme
+     * and object prefix this store signs for, built on first use from a locally signed sample.
+     *
+     * @return the validator; it throws {@link IllegalArgumentException} for any other URL
+     */
+    public java.util.function.Consumer<URI> urlValidator() {
+        return new java.util.function.Consumer<>() {
+            private volatile java.util.function.Consumer<URI> pinned;
+
+            @Override
+            public void accept(URI uri) {
+                java.util.function.Consumer<URI> v = pinned;
+                if (v == null) {
+                    URI sample = signGet(keyPrefix + "vgi-pin-sample", Duration.ofMinutes(1));
+                    String path = sample.getRawPath();
+                    String dir = path.substring(0, path.length() - "vgi-pin-sample".length());
+                    String host = sample.getPort() < 0 ? sample.getHost() : sample.getHost() + ":" + sample.getPort();
+                    v = farm.query.vgirpc.vendor.BlobVendor.pinnedHostsValidator(java.util.List.of(host),
+                            "http".equalsIgnoreCase(sample.getScheme()),
+                            java.util.List.of(sample.getScheme() + "://" + sample.getRawAuthority() + dir));
+                    pinned = v;
+                }
+                v.accept(uri);
+            }
+        };
+    }
+
+    private URI signGet(String key, Duration ttl) {
         var signOptions = new ArrayList<Storage.SignUrlOption>();
         signOptions.add(Storage.SignUrlOption.httpMethod(HttpMethod.GET));
         signOptions.add(Storage.SignUrlOption.withV4Signature());
@@ -184,7 +216,7 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
         }
         URL url = storage.signUrl(
                 BlobInfo.newBuilder(bucket, key).build(),
-                signDuration.toMillis(),
+                ttl.toMillis(),
                 TimeUnit.MILLISECONDS,
                 signOptions.toArray(Storage.SignUrlOption[]::new));
         try {

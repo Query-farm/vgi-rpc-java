@@ -1722,9 +1722,14 @@ public final class RpcServer {
                         // inline would answer success for the very response the cap was
                         // configured to refuse, so it propagates and fails the stream.
                         throw cap;
+                    } catch (java.io.IOException | RuntimeException up) {
+                        // Upload failed: the stream fails, as in vgi-rpc-python and on the
+                        // unary path. Writing the batch inline instead would hide a broken
+                        // storage configuration behind responses as large as the payload.
+                        throw up;
                     } catch (Exception up) {
-                        // Upload failed — fall through and write the batch inline rather than
-                        // failing the stream. The client will still receive valid data.
+                        throw new java.io.IOException("Externalized result upload failed ("
+                                + up.getClass().getSimpleName() + ")", up);
                     }
                 }
                 writer.writeBatch(e.root(), e.customMetadata(), effective);

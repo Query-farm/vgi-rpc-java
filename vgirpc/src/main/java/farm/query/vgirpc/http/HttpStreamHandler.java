@@ -1178,10 +1178,13 @@ public final class HttpStreamHandler {
             } catch (ExternalizedResponseCapExceededException cap) {
                 // A refusal, not a failure — see Externalizer's docs.
                 throw cap;
+            } catch (IOException | RuntimeException up) {
+                // Upload failed: the turn fails, as in vgi-rpc-python and on the unary
+                // path. Writing inline instead would hide a broken storage configuration.
+                throw up;
             } catch (Exception up) {
-                // Upload failed — fall through and write inline rather than
-                // failing the turn; the client still gets valid data.
-                ptr = null;
+                throw new IOException("Externalized result upload failed (" + up.getClass().getSimpleName() + ")",
+                        up);
             }
             if (ptr != null) {
                 try (VectorSchemaRoot pointer = ptr.root()) {
