@@ -228,6 +228,26 @@ final class S3StorageIntegrationTest {
     }
 
     @Test
+    void customEndpointDefaultsToPathStyleAndAcceptsAnyRegionName() throws Exception {
+        // No forcePathStyle: a custom endpoint is path-style by default (a
+        // virtual-hosted request would go to <bucket>.<host>). Region "auto" is R2's.
+        URI byName = URI.create("http://localhost:" + endpoint.getPort());
+        try (S3Storage storage = S3Storage.builder(BUCKET)
+                .endpointOverride(byName)
+                .credentials(CREDENTIALS)
+                .region("auto")
+                .keyPrefix(PREFIX)
+                .build()) {
+            byte[] data = "path-style by default".getBytes(StandardCharsets.UTF_8);
+            String key = storage.putObject(data);
+            assertArrayEquals(data, storage.get(key, 1 << 20));
+            URI get = storage.upload(data, null);
+            assertEquals("localhost", get.getHost());
+            assertTrue(get.getPath().startsWith("/" + BUCKET + "/"), get.getPath());
+        }
+    }
+
+    @Test
     void slowPutObjectThatKeepsMovingSucceedsOnItsFirstAttempt() throws Exception {
         // 24 MiB at 2 MiB/s is ~12 s against a 3 s stall timeout.
         byte[] data = new byte[24 << 20];

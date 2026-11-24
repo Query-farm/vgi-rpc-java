@@ -83,6 +83,9 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
         this.bucket = b.bucket;
         this.keyPrefix = b.keyPrefix.endsWith("/") ? b.keyPrefix : b.keyPrefix + "/";
         this.presignDuration = b.presignDuration;
+        // Path-style by default for a custom endpoint (MinIO, Ceph, R2, B2, LocalStack),
+        // as boto3 does for vgi-rpc-python; virtual-hosted for AWS.
+        boolean pathStyle = b.forcePathStyle != null ? b.forcePathStyle : b.endpointOverride != null;
         this.connectTimeout = b.connectTimeout;
         this.stallTimeout = b.stallTimeout != null ? b.stallTimeout : StorageHttp.stallTimeoutFromEnv();
         if (b.minUploadRateBytesPerSecond <= 0) {
@@ -103,7 +106,7 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
                 // duplicate header when the object itself is zstd encoded and
                 // is rejected by strict S3-compatible implementations.
                 .serviceConfiguration(S3Configuration.builder()
-                        .pathStyleAccessEnabled(b.forcePathStyle)
+                        .pathStyleAccessEnabled(pathStyle)
                         .chunkedEncodingEnabled(false)
                         .build());
         if (b.endpointOverride != null) sc.endpointOverride(b.endpointOverride);
@@ -113,7 +116,7 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
                 .region(b.region)
                 .credentialsProvider(b.credentials);
         if (b.endpointOverride != null) pb.endpointOverride(b.endpointOverride);
-        if (b.forcePathStyle) pb.serviceConfiguration(
+        if (pathStyle) pb.serviceConfiguration(
                 software.amazon.awssdk.services.s3.S3Configuration.builder()
                         .pathStyleAccessEnabled(true).build());
         this.presigner = pb.build();
@@ -284,7 +287,7 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
         private Region region = Region.US_EAST_1;
         private AwsCredentialsProvider credentials = DefaultCredentialsProvider.create();
         private URI endpointOverride;
-        private boolean forcePathStyle;
+        private Boolean forcePathStyle;
         private Duration presignDuration = Duration.ofHours(1);
         private Duration connectTimeout = StorageHttp.DEFAULT_CONNECT_TIMEOUT;
         private Duration stallTimeout;
@@ -302,7 +305,8 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
         public Builder credentials(AwsCredentialsProvider credentials) { this.credentials = credentials; return this; }
         /** Override the S3 endpoint, e.g. for MinIO or LocalStack. */
         public Builder endpointOverride(URI endpointOverride) { this.endpointOverride = endpointOverride; return this; }
-        /** Enable path-style addressing (required by most S3-compatible stores). */
+        /** Path-style addressing (required by most S3-compatible stores). Default: on when
+         *  {@link #endpointOverride} is set, else off (virtual-hosted, for AWS). */
         public Builder forcePathStyle(boolean forcePathStyle) { this.forcePathStyle = forcePathStyle; return this; }
         /** Validity window of the pre-signed GET URLs (default one hour). */
         public Builder presignDuration(Duration presignDuration) { this.presignDuration = presignDuration; return this; }
