@@ -136,6 +136,18 @@ jobs:
       - name: Run storage integration tests
         run: ./gradlew --no-daemon --continue storageIntegrationTest
 
+      # Testcontainers fails rather than skips without Docker, but a test that
+      # skips for any other reason would still read as green: require that both
+      # lanes ran tests and skipped none.
+      - name: Require the storage tests to have run
+        run: |
+          for module in vgirpc-s3 vgirpc-gcs; do
+            dir="$module/build/test-results/integrationTest"
+            ls "$dir"/TEST-*.xml >/dev/null 2>&1 || { echo "::error::$module ran no integration tests"; exit 1; }
+            if grep -l 'skipped="[1-9]' "$dir"/TEST-*.xml; then echo "::error::$module skipped tests"; exit 1; fi
+            if grep -l 'tests="0"' "$dir"/TEST-*.xml; then echo "::error::$module ran an empty test class"; exit 1; fi
+          done
+
   # The blob-vendor clients (farm.query.vgirpc.vendor) against vgi-rpc-python's
   # in-memory fake vendor with its fault routes. FakeVendorTest skips without
   # VGI_BLOB_VENDOR_URL, so this job starts the vendor and then requires the

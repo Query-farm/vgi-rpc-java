@@ -165,6 +165,62 @@ final class GcsStorageIntegrationTest {
         assertArrayEquals(expected, emulatorFalsePositive.body());
     }
 
+    /**
+     * The direct-storage environment (contract v1 §5): VGI_STORAGE_GCS_ENDPOINT points the client
+     * and the signed URLs at the emulator, VGI_STORAGE_GCS_CREDENTIALS_FILE supplies a
+     * service-account key (its token endpoint is a local stub, since the emulator ignores auth).
+     */
+    @Test
+    void fromEnvUsesTheEndpointForTheApiAndTheSignedUrls() throws Exception {
+        com.sun.net.httpserver.HttpServer token = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        token.createContext("/token", ex -> {
+            byte[] b = "{\"access_token\":\"t\",\"expires_in\":3600,\"token_type\":\"Bearer\"}"
+                    .getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, b.length);
+            ex.getResponseBody().write(b);
+            ex.close();
+        });
+        token.start();
+        java.nio.file.Path keyFile = java.nio.file.Files.createTempFile("vgi-gcs-sa", ".json");
+        try {
+            java.security.KeyPairGenerator g = java.security.KeyPairGenerator.getInstance("RSA");
+            g.initialize(2048);
+            String pem = "-----BEGIN PRIVATE KEY-----\\n"
+                    + java.util.Base64.getEncoder().encodeToString(g.generateKeyPair().getPrivate().getEncoded())
+                    + "\\n-----END PRIVATE KEY-----\\n";
+            java.nio.file.Files.writeString(keyFile, "{\"type\":\"service_account\",\"project_id\":\"" + PROJECT
+                    + "\",\"private_key_id\":\"k1\",\"private_key\":\"" + pem
+                    + "\",\"client_email\":\"vgi@" + PROJECT + ".iam.gserviceaccount.com\",\"client_id\":\"1\","
+                    + "\"token_uri\":\"http://127.0.0.1:" + token.getAddress().getPort() + "/token\"}");
+            java.util.Map<String, String> env = java.util.Map.of(
+                    GcsStorage.ENV_BUCKET, BUCKET,
+                    GcsStorage.ENV_PREFIX, "env/",
+                    GcsStorage.ENV_ENDPOINT, endpoint.toString(),
+                    GcsStorage.ENV_CREDENTIALS_FILE, keyFile.toString(),
+                    GcsStorage.ENV_URL_TTL, "600");
+            try (GcsStorage storage = GcsStorage.fromEnv(env)) {
+                byte[] data = "gcs from env".getBytes(StandardCharsets.UTF_8);
+                String key = storage.putObject(data);
+                assertTrue(key.startsWith("env/"), key);
+                assertArrayEquals(data, storage.get(key, 1 << 20));
+                URI signed = storage.upload(data, null);
+                assertEquals(endpoint.getScheme(), signed.getScheme(), signed::toString);
+                assertEquals(endpoint.getHost(), signed.getHost(), signed::toString);
+                assertEquals(endpoint.getPort(), signed.getPort(), signed::toString);
+                assertTrue(signed.getRawQuery().toLowerCase(Locale.ROOT).contains("x-goog-expires=600"),
+                        signed::toString);
+                HttpResponse<byte[]> got = get(signed);
+                assertEquals(200, got.statusCode());
+                assertArrayEquals(data, got.body());
+            }
+        } finally {
+            token.stop(0);
+            java.nio.file.Files.deleteIfExists(keyFile);
+        }
+    }
+
     private static HttpResponse<byte[]> get(URI uri) throws Exception {
         return HTTP.send(
                 HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(10)).GET().build(),

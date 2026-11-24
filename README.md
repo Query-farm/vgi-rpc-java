@@ -254,6 +254,15 @@ own context: continuations, `onCancel`, unary calls and the first producer tick 
   `VGI-Max-Upload-Bytes` is always sent with upload URLs: by default it is the server's fetch cap
   (`VGI_RPC_MAX_FETCH_BYTES`, default 512 MiB); a larger configured upload cap raises a default fetch cap
   to match, and is refused at startup against an explicit lower one.
+- **Direct object storage (no blob vendor).** `S3Storage.fromEnv(env)` / `GcsStorage.fromEnv(env)` read
+  the cross-SDK direct-storage contract: `VGI_STORAGE_S3_BUCKET`, `_PREFIX`, `_ENDPOINT`, `_PUBLIC_ENDPOINT`
+  (the host of every URL handed to clients), `_REGION`, `_FORCE_PATH_STYLE`, `_CHECKSUM` (`sha256` or
+  `none`: no upload grants), `_SDK_CHECKSUM` (`when_required`, the default with an endpoint, or
+  `when_supported`: the AWS SDK's own CRC32), `_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` / `_SESSION_TOKEN`
+  (else the AWS default chain, which refreshes temporary credentials), `VGI_STORAGE_URL_TTL_SECONDS`
+  (default 3600, capped at credential expiry minus 60 s); `VGI_STORAGE_GCS_BUCKET`, `_PREFIX`, `_ENDPOINT`,
+  `_CREDENTIALS_FILE`. `S3Storage.verify()` HEADs the bucket and names the problem. Add a lifecycle rule
+  expiring the prefix after 1-2 days; the worker never deletes.
 - **Storage timeouts.** Storage transfers (vendor-signed PUTs and GETs, inbound pointer fetches, client
   upload PUTs) fail only when no bytes move for `VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS` (default 30 s;
   connect 30 s). There is no whole-transfer deadline, so a 100 MB result on a 2 MB/s link (50 s)

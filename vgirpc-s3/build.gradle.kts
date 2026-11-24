@@ -2,7 +2,7 @@ plugins {
     `java-library`
 }
 
-val awsSdkVersion = "2.28.29"
+val awsSdkVersion = "2.57.13"
 val junitVersion = "5.11.3"
 val testcontainersVersion = "1.21.4"
 
@@ -14,7 +14,7 @@ dependencies {
     implementation(platform("io.netty:netty-bom:4.2.9.Final"))
     implementation("software.amazon.awssdk:s3")
     // The sync S3Client's HTTP client, configured with idle timeouts (S3Storage).
-    implementation("software.amazon.awssdk:apache-client")
+    implementation("software.amazon.awssdk:apache5-client")
     implementation("software.amazon.awssdk:s3-transfer-manager")
     implementation("software.amazon.awssdk:regions")
 }
@@ -36,6 +36,9 @@ dependencies {
     integrationTest.implementationConfigurationName("org.junit.jupiter:junit-jupiter")
     integrationTest.implementationConfigurationName("org.testcontainers:junit-jupiter:$testcontainersVersion")
     integrationTest.implementationConfigurationName("com.github.luben:zstd-jni:1.5.6-8")
+    // STS AssumeRole against RustFS for the session-token test.
+    integrationTest.implementationConfigurationName(platform("software.amazon.awssdk:bom:$awsSdkVersion"))
+    integrationTest.implementationConfigurationName("software.amazon.awssdk:sts")
     integrationTest.runtimeOnlyConfigurationName("org.junit.platform:junit-platform-launcher")
     integrationTest.runtimeOnlyConfigurationName("org.slf4j:slf4j-simple:2.0.16")
 }

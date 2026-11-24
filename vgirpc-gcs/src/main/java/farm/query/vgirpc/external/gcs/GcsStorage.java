@@ -33,10 +33,78 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code <keyPrefix><uuid>.bin} (only if absent) and the key is the {@code object_id}. GCS
  * cannot verify a SHA-256 at storage; readers verify size and digest themselves. Objects carry
  * no TTL: set a bucket lifecycle rule of at least one day on the prefix.</p>
+ *
+ * <p>{@link #fromEnv(java.util.Map)} reads the direct-storage environment (contract v1 §5):
+ * {@value #ENV_BUCKET}, {@value #ENV_PREFIX}, {@value #ENV_ENDPOINT} (an emulator or private
+ * endpoint; signed URLs then use its host) and {@value #ENV_CREDENTIALS_FILE} (else
+ * Application Default Credentials: {@code GOOGLE_APPLICATION_CREDENTIALS}, workload identity,
+ * the metadata server).</p>
  */
 public final class GcsStorage implements ExternalStorage, ObjectStore, AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(GcsStorage.class);
+
+    /** Bucket name (required for the {@code gcs} backend). */
+    public static final String ENV_BUCKET = "VGI_STORAGE_GCS_BUCKET";
+    /** Object name prefix (default empty). */
+    public static final String ENV_PREFIX = "VGI_STORAGE_GCS_PREFIX";
+    /** Custom endpoint (emulator / private), e.g. {@code http://localhost:4443}; unset = Google. */
+    public static final String ENV_ENDPOINT = "VGI_STORAGE_GCS_ENDPOINT";
+    /** A service-account key file; unset = Application Default Credentials. */
+    public static final String ENV_CREDENTIALS_FILE = "VGI_STORAGE_GCS_CREDENTIALS_FILE";
+    /** Signed URL lifetime in seconds (default 3600). */
+    public static final String ENV_URL_TTL = "VGI_STORAGE_URL_TTL_SECONDS";
+
+    /**
+     * Build from the direct-storage environment.
+     *
+     * @param env environment mapping
+     * @return the storage
+     * @throws IllegalArgumentException if the bucket is missing, a variable is malformed, or the
+     *     credentials file cannot be read
+     */
+    public static GcsStorage fromEnv(java.util.Map<String, String> env) {
+        String bucket = trimmed(env, ENV_BUCKET);
+        if (bucket == null) throw new IllegalArgumentException(ENV_BUCKET + " is required for the gcs storage backend");
+        Builder b = builder(bucket).keyPrefix(java.util.Objects.requireNonNullElse(trimmed(env, ENV_PREFIX), ""));
+        String endpoint = trimmed(env, ENV_ENDPOINT);
+        if (endpoint != null) {
+            URI uri;
+            try {
+                uri = new URI(endpoint);
+            } catch (URISyntaxException e) {
+                throw new IllegalArgumentException(ENV_ENDPOINT + " is not a URL: '" + endpoint + "'");
+            }
+            if (uri.getScheme() == null || uri.getHost() == null
+                    || !(uri.getScheme().equals("http") || uri.getScheme().equals("https"))) {
+                throw new IllegalArgumentException(ENV_ENDPOINT + " must be an http:// or https:// URL, got '"
+                        + endpoint + "'");
+            }
+            b.endpoint(endpoint);
+        }
+        String file = trimmed(env, ENV_CREDENTIALS_FILE);
+        if (file != null) b.credentialsFile(java.nio.file.Path.of(file));
+        String ttl = trimmed(env, ENV_URL_TTL);
+        if (ttl != null) {
+            long seconds;
+            try {
+                seconds = Long.parseLong(ttl);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(ENV_URL_TTL + " must be a positive integer, got '" + ttl + "'");
+            }
+            if (seconds < 1 || seconds > 7 * 24 * 3600) {
+                throw new IllegalArgumentException(ENV_URL_TTL + " must be between 1 and 604800, got " + seconds);
+            }
+            b.signDuration(Duration.ofSeconds(seconds));
+        }
+        b.stallTimeout(StorageHttp.stallTimeoutFromEnv(env));
+        return b.build();
+    }
+
+    private static String trimmed(java.util.Map<String, String> env, String name) {
+        String v = env.get(name);
+        return v == null || v.isBlank() ? null : v.strip();
+    }
 
     private final Storage storage;
     private final boolean ownsStorage;
@@ -61,18 +129,33 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
         } else {
             // Per-read (idle) timeouts as vgi-rpc-python's storage HTTP: 30 s connect,
             // the stall timeout per read; the client sets no whole-transfer deadline.
-            this.storage = StorageOptions.newBuilder()
+            Duration stall = b.stallTimeout != null ? b.stallTimeout : StorageHttp.stallTimeoutFromEnv();
+            StorageOptions.Builder options = StorageOptions.newBuilder()
                     .setTransportOptions(HttpTransportOptions.newBuilder()
                             .setConnectTimeout((int) StorageHttp.DEFAULT_CONNECT_TIMEOUT.toMillis())
-                            .setReadTimeout((int) Math.min(Integer.MAX_VALUE, StorageHttp.stallTimeoutFromEnv().toMillis()))
-                            .build())
-                    .build().getService();
+                            .setReadTimeout((int) Math.min(Integer.MAX_VALUE, stall.toMillis()))
+                            .build());
+            // A custom endpoint is the API host and, unless signedUrlHost says otherwise,
+            // the host of the signed URLs.
+            if (b.endpoint != null) options.setHost(b.endpoint);
+            if (b.credentialsFile != null) {
+                try (java.io.InputStream in = java.nio.file.Files.newInputStream(b.credentialsFile)) {
+                    options.setCredentials(com.google.auth.oauth2.GoogleCredentials.fromStream(in));
+                } catch (java.io.IOException e) {
+                    throw new IllegalArgumentException("cannot read GCS credentials file " + b.credentialsFile
+                            + " (" + e.getClass().getSimpleName() + ")");
+                }
+            }
+            this.storage = options.build().getService();
             this.ownsStorage = true;
         }
         this.bucket = b.bucket;
-        this.keyPrefix = b.keyPrefix.endsWith("/") ? b.keyPrefix : b.keyPrefix + "/";
+        this.keyPrefix = b.keyPrefix.isEmpty() || b.keyPrefix.endsWith("/") ? b.keyPrefix : b.keyPrefix + "/";
         this.signDuration = b.signDuration;
-        this.signedUrlHost = b.signedUrlHost;
+        // Signed URLs for a custom endpoint carry its scheme too (an http:// emulator), which the
+        // client's own host default drops in favour of https://.
+        this.signedUrlHost = b.signedUrlHost != null ? b.signedUrlHost
+                : b.storage == null && b.endpoint != null ? b.endpoint.replaceAll("/+$", "") : null;
     }
 
     /**
@@ -105,7 +188,13 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
                 TimeUnit.MILLISECONDS,
                 signOptions.toArray(Storage.SignUrlOption[]::new));
         try {
-            return url.toURI();
+            URI signed = url.toURI();
+            // The client always writes https://; a V4 signature covers the host, not the
+            // scheme, so an http:// emulator endpoint gets its own scheme back.
+            if (signedUrlHost != null && signedUrlHost.startsWith("http://") && "https".equals(signed.getScheme())) {
+                signed = URI.create("http" + signed.toString().substring("https".length()));
+            }
+            return signed;
         } catch (URISyntaxException e) {
             // The URL came from the GCS signer — it should not fail URI parsing.
             throw new IllegalStateException("GCS signer returned unparseable URL", e);
@@ -167,6 +256,9 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
         private Duration signDuration = Duration.ofHours(1);
         private String signedUrlHost;
         private Storage storage;
+        private String endpoint;
+        private java.nio.file.Path credentialsFile;
+        private Duration stallTimeout;
 
         Builder(String bucket) { this.bucket = bucket; }
 
@@ -190,6 +282,17 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
          * omitted, Application Default Credentials are used and the client is owned.
          */
         public Builder storage(Storage storage) { this.storage = storage; return this; }
+
+        /** Custom API endpoint (an emulator such as fake-gcs-server, or a private endpoint),
+         *  e.g. {@code http://localhost:4443}; also the signed URLs' host unless
+         *  {@link #signedUrlHost} is set. Ignored with a supplied {@link #storage}. */
+        public Builder endpoint(String endpoint) { this.endpoint = endpoint; return this; }
+        /** A service-account key file (default Application Default Credentials). Ignored with a
+         *  supplied {@link #storage}. */
+        public Builder credentialsFile(java.nio.file.Path file) { this.credentialsFile = file; return this; }
+        /** Per-read stall timeout (default {@value StorageHttp#ENV_STALL_TIMEOUT}, else 30&nbsp;s).
+         *  Ignored with a supplied {@link #storage}. */
+        public Builder stallTimeout(Duration stallTimeout) { this.stallTimeout = stallTimeout; return this; }
 
         /** Build the configured {@link GcsStorage}. */
         public GcsStorage build() { return new GcsStorage(this); }
