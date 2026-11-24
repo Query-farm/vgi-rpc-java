@@ -6,6 +6,7 @@ package farm.query.vgirpc.external.s3;
 import farm.query.vgirpc.external.ExternalStorage;
 import farm.query.vgirpc.external.ObjectMissingException;
 import farm.query.vgirpc.external.ObjectStore;
+import farm.query.vgirpc.external.UploadUrlProvider;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
@@ -19,6 +20,8 @@ import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
+import software.amazon.awssdk.services.s3.presigner.model.PresignedPutObjectRequest;
+import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,8 +43,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * under {@code <keyPrefix><uuid>.bin} with a signed {@code x-amz-checksum-sha256}, and the
  * key is the {@code object_id}. Objects carry no TTL: set a bucket lifecycle rule of at least
  * one day on the prefix.</p>
+ *
+ * <p>And an {@link UploadUrlProvider} (upload URLs v2): {@link #generateUploadUrl} pre-signs a
+ * PUT bound to the declared size and SHA-256, so a server wired to S3 directly (no blob vendor)
+ * accepts requests over its request cap and argument references.</p>
  */
-public final class S3Storage implements ExternalStorage, ObjectStore, AutoCloseable {
+public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlProvider, AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(S3Storage.class);
 
@@ -124,6 +131,48 @@ public final class S3Storage implements ExternalStorage, ObjectStore, AutoClosea
     }
 
     /**
+     * Pre-signed PUT and GET URLs for one sized client upload (upload URLs v2), as
+     * vgi-rpc-python's {@code S3Storage.generate_upload_url}.
+     *
+     * <p>The PUT URL signs {@code Content-Length} and {@code x-amz-checksum-sha256} (SigV4), so
+     * S3 refuses a body that is not exactly {@code size} bytes ({@code SignatureDoesNotMatch}) or
+     * does not hash to {@code sha256Hex} ({@code BadDigest}). The client sends the returned
+     * headers verbatim. The object is not deleted automatically: set a lifecycle rule on the
+     * prefix.</p>
+     *
+     * @param size      exact byte length the client will PUT ({@code >= 1})
+     * @param sha256Hex SHA-256 of those bytes, 64 lowercase hex characters
+     * @return the PUT/GET pair, the headers the PUT must carry, and the object key
+     * @throws IllegalArgumentException if {@code size} or {@code sha256Hex} is malformed
+     */
+    @Override
+    public UploadUrl generateUploadUrl(long size, String sha256Hex) {
+        if (size < 1) throw new IllegalArgumentException("size must be >= 1, got " + size);
+        if (sha256Hex == null || !sha256Hex.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("sha256 must be 64 lowercase hex characters");
+        }
+        String checksum = java.util.Base64.getEncoder().encodeToString(java.util.HexFormat.of().parseHex(sha256Hex));
+        String key = keyPrefix + UUID.randomUUID() + ".arrow";
+        PresignedPutObjectRequest put = presigner.presignPutObject(PutObjectPresignRequest.builder()
+                .signatureDuration(presignDuration)
+                .putObjectRequest(r -> r.bucket(bucket).key(key).contentLength(size).checksumSHA256(checksum))
+                .build());
+        String get = presigner.presignGetObject(GetObjectPresignRequest.builder()
+                .signatureDuration(presignDuration)
+                .getObjectRequest(r -> r.bucket(bucket).key(key))
+                .build()).url().toString();
+        // Every signed header the client must send, except the ones its HTTP stack derives.
+        java.util.Map<String, String> headers = new java.util.LinkedHashMap<>();
+        put.signedHeaders().forEach((name, values) -> {
+            if (!"host".equalsIgnoreCase(name) && !"content-length".equalsIgnoreCase(name)) {
+                headers.put(name, String.join(",", values));
+            }
+        });
+        headers.putIfAbsent("x-amz-checksum-sha256", checksum);
+        return new UploadUrl(put.url().toString(), get, put.expiration(), headers, key);
+    }
+
+    /**
      * Store {@code data} under a fresh key and return the key: a SigV4 PutObject with the
      * length and {@code ChecksumSHA256}, so S3/R2 verify the body.
      *
@@ -167,7 +216,8 @@ public final class S3Storage implements ExternalStorage, ObjectStore, AutoClosea
             if (length != null && length > maxBytes) {
                 throw new java.io.IOException("S3 object is " + length + " bytes, over max_fetch_bytes (" + maxBytes + ")");
             }
-            byte[] out = in.readNBytes((int) Math.min(maxBytes + 1, Integer.MAX_VALUE - 8));
+            // maxBytes + 1 (to detect an over-cap body) without overflowing at Long.MAX_VALUE.
+            byte[] out = in.readNBytes((int) Math.min(maxBytes, Integer.MAX_VALUE - 9) + 1);
             if (out.length > maxBytes) {
                 throw new java.io.IOException("S3 object exceeds max_fetch_bytes (" + maxBytes + ")");
             }

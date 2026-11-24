@@ -161,6 +161,43 @@ final class S3StorageIntegrationTest {
                 HttpResponse.BodyHandlers.ofByteArray());
     }
 
+    @Test
+    void uploadUrlAcceptsOnlyTheDeclaredSizeAndDigest() throws Exception {
+        try (S3Storage storage = storage()) {
+            byte[] body = new byte[100_000];
+            new java.util.Random(7).nextBytes(body);
+            String sha = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(body));
+
+            var corrupt = storage.generateUploadUrl(body.length, sha);
+            byte[] bad = body.clone();
+            bad[0] ^= (byte) 0xff;
+            assertTrue(put(corrupt, bad) >= 400, "a corrupted body of the declared length must be refused");
+
+            var truncated = storage.generateUploadUrl(body.length, sha);
+            assertTrue(put(truncated, java.util.Arrays.copyOf(body, body.length - 1)) >= 400,
+                    "a body of another length must be refused");
+
+            var good = storage.generateUploadUrl(body.length, sha);
+            assertTrue(good.objectId().startsWith(PREFIX), good.objectId());
+            assertTrue(good.headers().containsKey("x-amz-checksum-sha256"), good.headers().toString());
+            assertTrue(URI.create(good.uploadUrl()).getRawQuery().toLowerCase(Locale.ROOT).contains("content-length"),
+                    "the PUT must sign Content-Length");
+            assertEquals(200, put(good, body));
+            assertArrayEquals(body, storage.get(good.objectId(), Long.MAX_VALUE));
+            HttpResponse<byte[]> got = HTTP.send(HttpRequest.newBuilder(URI.create(good.downloadUrl())).GET().build(),
+                    HttpResponse.BodyHandlers.ofByteArray());
+            assertEquals(200, got.statusCode());
+            assertArrayEquals(body, got.body());
+        }
+    }
+
+    private static int put(farm.query.vgirpc.external.UploadUrlProvider.UploadUrl url, byte[] body) throws Exception {
+        HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(url.uploadUrl()))
+                .PUT(HttpRequest.BodyPublishers.ofByteArray(body));
+        url.headers().forEach(req::header);
+        return HTTP.send(req.build(), HttpResponse.BodyHandlers.discarding()).statusCode();
+    }
+
     private static void assertSignedObjectPath(URI uri) {
         assertEquals(endpoint.getScheme(), uri.getScheme());
         assertEquals(endpoint.getHost(), uri.getHost());
