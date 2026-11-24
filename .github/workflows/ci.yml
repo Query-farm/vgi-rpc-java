@@ -455,8 +455,10 @@ jobs:
       # `gradlew run`: stdout is the driver's control channel, and Gradle writes
       # its progress there. A single line of progress output desynchronises
       # every later response from its request.
+      # Every lane builds it: the server-role lanes also run the shared
+      # TestClientNegotiation group (PROTOCOL_VERSIONS_V1), which drives this
+      # port's client through the conformance_negotiating_client fixture.
       - name: Build conformance client driver
-        if: matrix.role == 'client'
         run: ./gradlew --no-daemon :conformance-client-driver:installDist
 
       # Cross-port drift. Every step below compares this port to the reference
