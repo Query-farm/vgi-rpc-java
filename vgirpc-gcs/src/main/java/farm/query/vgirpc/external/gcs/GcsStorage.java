@@ -12,6 +12,7 @@ import farm.query.vgirpc.external.StorageHttp;
 import farm.query.vgirpc.external.ExternalStorage;
 import farm.query.vgirpc.external.ObjectMissingException;
 import farm.query.vgirpc.external.ObjectStore;
+import farm.query.vgirpc.external.UploadUrlProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,8 +40,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * endpoint; signed URLs then use its host) and {@value #ENV_CREDENTIALS_FILE} (else
  * Application Default Credentials: {@code GOOGLE_APPLICATION_CREDENTIALS}, workload identity,
  * the metadata server).</p>
+ *
+ * <p>And an {@link UploadUrlProvider} (upload URLs v2, direct storage contract Addendum C):
+ * {@link #generateUploadUrl} signs a V4 PUT whose signed {@code x-goog-content-length-range}
+ * extension header pins the exact size, so GCS refuses a body of any other length. GCS cannot
+ * enforce a SHA-256 at upload, so the server verifies the digest when it resolves the upload
+ * (a request pointer's {@code vgi_rpc.location.sha256}, an argument reference's sha256) and
+ * refuses a mismatch ({@code arguments_ref_integrity} / sha256 mismatch).</p>
  */
-public final class GcsStorage implements ExternalStorage, ObjectStore, AutoCloseable {
+public final class GcsStorage implements ExternalStorage, ObjectStore, UploadUrlProvider, AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(GcsStorage.class);
 
@@ -235,9 +243,45 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
     }
 
     private URI signGet(String key, Duration ttl) {
+        return sign(key, ttl, HttpMethod.GET, java.util.Map.of());
+    }
+
+    /** The extension header that pins an upload grant's exact size. */
+    static final String LENGTH_RANGE_HEADER = "x-goog-content-length-range";
+
+    /**
+     * Pre-signed PUT and GET URLs for one sized client upload (upload URLs v2, Addendum C).
+     *
+     * <p>The V4 PUT signs {@code x-goog-content-length-range: size,size}: the client must send
+     * it (it is in the returned headers) and GCS refuses a body of any other length. GCS cannot
+     * check the SHA-256; the server verifies it when it resolves the upload, so a same-length
+     * wrong body is refused there. The object is not deleted automatically: set a lifecycle
+     * rule on the prefix.</p>
+     *
+     * @param size      exact byte length the client will PUT ({@code >= 1})
+     * @param sha256Hex SHA-256 of those bytes, 64 lowercase hex characters
+     * @return the PUT/GET pair, the headers the PUT must carry, and the object name
+     * @throws IllegalArgumentException if {@code size} or {@code sha256Hex} is malformed
+     */
+    @Override
+    public UploadUrl generateUploadUrl(long size, String sha256Hex) {
+        if (size < 1) throw new IllegalArgumentException("size must be >= 1, got " + size);
+        if (sha256Hex == null || !sha256Hex.matches("[0-9a-f]{64}")) {
+            throw new IllegalArgumentException("sha256 must be 64 lowercase hex characters");
+        }
+        String key = keyPrefix + UUID.randomUUID() + ".arrow";
+        java.util.Map<String, String> headers = java.util.Map.of(LENGTH_RANGE_HEADER, size + "," + size);
+        URI put = sign(key, signDuration, HttpMethod.PUT, headers);
+        URI get = signGet(key, signDuration);
+        return new UploadUrl(put.toString(), get.toString(), java.time.Instant.now().plus(signDuration),
+                headers, key);
+    }
+
+    private URI sign(String key, Duration ttl, HttpMethod method, java.util.Map<String, String> extHeaders) {
         var signOptions = new ArrayList<Storage.SignUrlOption>();
-        signOptions.add(Storage.SignUrlOption.httpMethod(HttpMethod.GET));
+        signOptions.add(Storage.SignUrlOption.httpMethod(method));
         signOptions.add(Storage.SignUrlOption.withV4Signature());
+        if (!extHeaders.isEmpty()) signOptions.add(Storage.SignUrlOption.withExtHeaders(extHeaders));
         if (signedUrlHost != null) {
             signOptions.add(Storage.SignUrlOption.withHostName(signedUrlHost));
         }
