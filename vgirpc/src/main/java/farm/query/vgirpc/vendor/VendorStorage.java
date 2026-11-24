@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc.vendor;
 
+import farm.query.vgirpc.external.StorageHttp;
 import farm.query.vgirpc.external.ExternalStorage;
 import farm.query.vgirpc.external.LocationResolver;
 import farm.query.vgirpc.external.ObjectMissingException;
@@ -77,7 +78,7 @@ public final class VendorStorage extends VendorClient implements ExternalStorage
      * @param token          bearer token
      * @param purpose        object purpose, {@code "rpc"} (gets a download URL and
      *                       the short lifecycle) or {@code "fs"}
-     * @param timeout        per-request timeout
+     * @param timeout        whole-request timeout for vendor API (control) calls
      * @param maxAttempts    attempts per request (transport errors, 429 and 5xx retry)
      * @param backoffSeconds base backoff between attempts
      * @param infoTtlSeconds how long the {@code /v1/info} host pin is cached
@@ -85,7 +86,27 @@ public final class VendorStorage extends VendorClient implements ExternalStorage
      */
     public VendorStorage(String url, String token, String purpose, Duration timeout, int maxAttempts,
                          double backoffSeconds, double infoTtlSeconds, boolean pinHosts) {
-        super(url, token, timeout, maxAttempts, backoffSeconds, infoTtlSeconds);
+        this(url, token, purpose, timeout, StorageHttp.stallTimeoutFromEnv(), maxAttempts, backoffSeconds,
+                infoTtlSeconds, pinHosts);
+    }
+
+    /**
+     * Create a vendor-backed storage with an explicit storage stall timeout.
+     *
+     * @param url            vendor base URL ({@code https}; {@code http} only for loopback)
+     * @param token          bearer token
+     * @param purpose        object purpose, {@code "rpc"} or {@code "fs"}
+     * @param timeout        whole-request timeout for vendor API (control) calls
+     * @param stallTimeout   storage transfers fail (and retry) only after no bytes
+     *                       moved for this long; there is no whole-transfer deadline
+     * @param maxAttempts    attempts per request (transport errors, 429 and 5xx retry)
+     * @param backoffSeconds base backoff between attempts
+     * @param infoTtlSeconds how long the {@code /v1/info} host pin is cached
+     * @param pinHosts       check vended URLs against the vendor's hosts before use
+     */
+    public VendorStorage(String url, String token, String purpose, Duration timeout, Duration stallTimeout,
+                         int maxAttempts, double backoffSeconds, double infoTtlSeconds, boolean pinHosts) {
+        super(url, token, timeout, stallTimeout, maxAttempts, backoffSeconds, infoTtlSeconds);
         if (!"rpc".equals(purpose) && !"fs".equals(purpose)) {
             throw new IllegalArgumentException("purpose must be rpc or fs");
         }
@@ -113,9 +134,10 @@ public final class VendorStorage extends VendorClient implements ExternalStorage
      * @throws IllegalArgumentException if the URL or token is missing
      */
     public static VendorStorage fromEnv(String purpose, Map<String, String> env) {
-        String[] urlToken = BlobVendor.envUrlAndToken(BlobVendor.resolveEnv(env));
-        return new VendorStorage(urlToken[0], urlToken[1], purpose, BlobVendor.DEFAULT_TIMEOUT, 3, 0.25,
-                BlobVendor.DEFAULT_INFO_TTL_SECONDS, true);
+        Map<String, String> environ = BlobVendor.resolveEnv(env);
+        String[] urlToken = BlobVendor.envUrlAndToken(environ);
+        return new VendorStorage(urlToken[0], urlToken[1], purpose, BlobVendor.DEFAULT_TIMEOUT,
+                StorageHttp.stallTimeoutFromEnv(environ), 3, 0.25, BlobVendor.DEFAULT_INFO_TTL_SECONDS, true);
     }
 
     @Override

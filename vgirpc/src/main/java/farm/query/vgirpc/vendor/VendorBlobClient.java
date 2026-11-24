@@ -3,6 +3,7 @@
 
 package farm.query.vgirpc.vendor;
 
+import farm.query.vgirpc.external.StorageHttp;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -35,7 +36,7 @@ public final class VendorBlobClient extends VendorClient {
      * @param url            vendor base URL ({@code https}; {@code http} only for loopback)
      * @param token          bearer token
      * @param purpose        object purpose (normally {@code "fs"})
-     * @param timeout        per-request timeout
+     * @param timeout        whole-request timeout for vendor API (control) calls
      * @param maxAttempts    attempts per request
      * @param backoffSeconds base backoff between attempts
      * @param infoTtlSeconds how long the {@code /v1/info} host pin is cached
@@ -43,7 +44,27 @@ public final class VendorBlobClient extends VendorClient {
      */
     public VendorBlobClient(String url, String token, String purpose, Duration timeout, int maxAttempts,
                             double backoffSeconds, double infoTtlSeconds, long maxFetchBytes) {
-        super(url, token, timeout, maxAttempts, backoffSeconds, infoTtlSeconds);
+        this(url, token, purpose, timeout, StorageHttp.stallTimeoutFromEnv(), maxAttempts, backoffSeconds,
+                infoTtlSeconds, maxFetchBytes);
+    }
+
+    /**
+     * Create a blob client with an explicit storage stall timeout.
+     *
+     * @param url            vendor base URL ({@code https}; {@code http} only for loopback)
+     * @param token          bearer token
+     * @param purpose        object purpose (normally {@code "fs"})
+     * @param timeout        whole-request timeout for vendor API (control) calls
+     * @param stallTimeout   storage transfers fail (and retry) only after no bytes
+     *                       moved for this long; there is no whole-transfer deadline
+     * @param maxAttempts    attempts per request
+     * @param backoffSeconds base backoff between attempts
+     * @param infoTtlSeconds how long the {@code /v1/info} host pin is cached
+     * @param maxFetchBytes  largest blob {@link #getBytes} will fetch
+     */
+    public VendorBlobClient(String url, String token, String purpose, Duration timeout, Duration stallTimeout,
+                            int maxAttempts, double backoffSeconds, double infoTtlSeconds, long maxFetchBytes) {
+        super(url, token, timeout, stallTimeout, maxAttempts, backoffSeconds, infoTtlSeconds);
         if (!"rpc".equals(purpose) && !"fs".equals(purpose)) {
             throw new IllegalArgumentException("purpose must be rpc or fs");
         }
@@ -72,9 +93,11 @@ public final class VendorBlobClient extends VendorClient {
      * @throws IllegalArgumentException if the URL or token is missing
      */
     public static VendorBlobClient fromEnv(String purpose, Map<String, String> env) {
-        String[] urlToken = BlobVendor.envUrlAndToken(BlobVendor.resolveEnv(env));
-        return new VendorBlobClient(urlToken[0], urlToken[1], purpose, BlobVendor.DEFAULT_TIMEOUT, 3, 0.25,
-                BlobVendor.DEFAULT_INFO_TTL_SECONDS, DEFAULT_MAX_FETCH_BYTES);
+        Map<String, String> environ = BlobVendor.resolveEnv(env);
+        String[] urlToken = BlobVendor.envUrlAndToken(environ);
+        return new VendorBlobClient(urlToken[0], urlToken[1], purpose, BlobVendor.DEFAULT_TIMEOUT,
+                StorageHttp.stallTimeoutFromEnv(environ), 3, 0.25, BlobVendor.DEFAULT_INFO_TTL_SECONDS,
+                DEFAULT_MAX_FETCH_BYTES);
     }
 
     /**

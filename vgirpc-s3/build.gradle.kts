@@ -13,6 +13,8 @@ dependencies {
     // at 4.1. Mixing Netty minors is unsupported, so pin every module to Arrow's.
     implementation(platform("io.netty:netty-bom:4.2.9.Final"))
     implementation("software.amazon.awssdk:s3")
+    // The sync S3Client's HTTP client, configured with idle timeouts (S3Storage).
+    implementation("software.amazon.awssdk:apache-client")
     implementation("software.amazon.awssdk:s3-transfer-manager")
     implementation("software.amazon.awssdk:regions")
 }

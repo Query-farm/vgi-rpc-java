@@ -7,6 +7,8 @@ import com.google.cloud.storage.BlobInfo;
 import com.google.cloud.storage.HttpMethod;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageOptions;
+import com.google.cloud.http.HttpTransportOptions;
+import farm.query.vgirpc.external.StorageHttp;
 import farm.query.vgirpc.external.ExternalStorage;
 import farm.query.vgirpc.external.ObjectMissingException;
 import farm.query.vgirpc.external.ObjectStore;
@@ -57,7 +59,14 @@ public final class GcsStorage implements ExternalStorage, ObjectStore, AutoClose
             this.storage = b.storage;
             this.ownsStorage = false;
         } else {
-            this.storage = StorageOptions.getDefaultInstance().getService();
+            // Per-read (idle) timeouts as vgi-rpc-python's storage HTTP: 30 s connect,
+            // the stall timeout per read; the client sets no whole-transfer deadline.
+            this.storage = StorageOptions.newBuilder()
+                    .setTransportOptions(HttpTransportOptions.newBuilder()
+                            .setConnectTimeout((int) StorageHttp.DEFAULT_CONNECT_TIMEOUT.toMillis())
+                            .setReadTimeout((int) Math.min(Integer.MAX_VALUE, StorageHttp.stallTimeoutFromEnv().toMillis()))
+                            .build())
+                    .build().getService();
             this.ownsStorage = true;
         }
         this.bucket = b.bucket;

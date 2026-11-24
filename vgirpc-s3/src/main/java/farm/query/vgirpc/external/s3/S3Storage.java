@@ -6,6 +6,7 @@ package farm.query.vgirpc.external.s3;
 import farm.query.vgirpc.external.ExternalStorage;
 import farm.query.vgirpc.external.ObjectMissingException;
 import farm.query.vgirpc.external.ObjectStore;
+import farm.query.vgirpc.external.StorageHttp;
 import farm.query.vgirpc.external.UploadUrlProvider;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
@@ -14,6 +15,7 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.http.apache.ApacheHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.S3Client;
@@ -47,6 +49,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>And an {@link UploadUrlProvider} (upload URLs v2): {@link #generateUploadUrl} pre-signs a
  * PUT bound to the declared size and SHA-256, so a server wired to S3 directly (no blob vendor)
  * accepts requests over its request cap and argument references.</p>
+ *
+ * <p>Timeouts match vgi-rpc-python's storage HTTP: a 30&nbsp;s connect timeout and a
+ * socket idle (stall) timeout ({@value StorageHttp#ENV_STALL_TIMEOUT}, default 30&nbsp;s)
+ * on every read, and no fixed whole-request deadline, so a large object on a slow link
+ * completes. A blocked write is not covered by the socket timeout, so each PUT attempt
+ * has a deadline that scales with the body: connect + stall + size at 64&nbsp;KiB/s
+ * ({@link Builder#minUploadRateBytesPerSecond}). The SDK retries transient failures.</p>
  */
 public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlProvider, AutoCloseable {
 
@@ -57,6 +66,9 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
     private final String bucket;
     private final String keyPrefix;
     private final Duration presignDuration;
+    private final Duration connectTimeout;
+    private final Duration stallTimeout;
+    private final long minUploadRate;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     /**
@@ -71,10 +83,21 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
         this.bucket = b.bucket;
         this.keyPrefix = b.keyPrefix.endsWith("/") ? b.keyPrefix : b.keyPrefix + "/";
         this.presignDuration = b.presignDuration;
+        this.connectTimeout = b.connectTimeout;
+        this.stallTimeout = b.stallTimeout != null ? b.stallTimeout : StorageHttp.stallTimeoutFromEnv();
+        if (b.minUploadRateBytesPerSecond <= 0) {
+            throw new IllegalArgumentException("minUploadRateBytesPerSecond must be positive");
+        }
+        this.minUploadRate = b.minUploadRateBytesPerSecond;
 
         var sc = S3Client.builder()
                 .region(b.region)
                 .credentialsProvider(b.credentials)
+                // Idle timeouts, not deadlines: Apache's socket timeout bounds each
+                // read; no apiCallTimeout / apiCallAttemptTimeout is set.
+                .httpClientBuilder(ApacheHttpClient.builder()
+                        .connectionTimeout(b.connectTimeout)
+                        .socketTimeout(stallTimeout))
                 // Every upload is a known-length byte array. Avoid the SDK's
                 // aws-chunked Content-Encoding, which otherwise becomes a
                 // duplicate header when the object itself is zstd encoded and
@@ -116,6 +139,7 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
                 .contentType("application/vnd.apache.arrow.stream")
                 .contentLength((long) body.length);
         if (contentEncoding != null) put.contentEncoding(contentEncoding);
+        put.overrideConfiguration(o -> o.apiCallAttemptTimeout(uploadAttemptDeadline(body.length)));
         s3.putObject(put.build(), RequestBody.fromBytes(body));
 
         GetObjectPresignRequest presign = GetObjectPresignRequest.builder()
@@ -195,6 +219,7 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
                 .contentType("application/octet-stream")
                 .contentLength((long) data.length)
                 .checksumSHA256(sha256)
+                .overrideConfiguration(o -> o.apiCallAttemptTimeout(uploadAttemptDeadline(data.length)))
                 .build(), RequestBody.fromBytes(data));
         return key;
     }
@@ -230,6 +255,19 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
         }
     }
 
+    /**
+     * The per-attempt deadline of a PUT of {@code size} bytes: connect + stall +
+     * {@code size} at the floor rate (default 64&nbsp;KiB/s). The Apache client's
+     * socket timeout bounds every read but not a blocked write, so a server that
+     * stops reading a body would otherwise hang the upload; this backstop scales
+     * with the body so a slow upload that keeps moving above the floor rate is
+     * never cut off. Reads (GETs) have no deadline beyond the stall timeout.
+     */
+    Duration uploadAttemptDeadline(long size) {
+        long bodyMillis = (long) Math.ceil(size * 1000.0 / minUploadRate);
+        return connectTimeout.plus(stallTimeout).plusMillis(bodyMillis);
+    }
+
     /** Close the underlying {@link S3Client} and {@link S3Presigner}. Idempotent. */
     @Override
     public void close() {
@@ -248,6 +286,9 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
         private URI endpointOverride;
         private boolean forcePathStyle;
         private Duration presignDuration = Duration.ofHours(1);
+        private Duration connectTimeout = StorageHttp.DEFAULT_CONNECT_TIMEOUT;
+        private Duration stallTimeout;
+        private long minUploadRateBytesPerSecond = 64 * 1024;
 
         Builder(String bucket) { this.bucket = bucket; }
 
@@ -265,6 +306,14 @@ public final class S3Storage implements ExternalStorage, ObjectStore, UploadUrlP
         public Builder forcePathStyle(boolean forcePathStyle) { this.forcePathStyle = forcePathStyle; return this; }
         /** Validity window of the pre-signed GET URLs (default one hour). */
         public Builder presignDuration(Duration presignDuration) { this.presignDuration = presignDuration; return this; }
+        /** TCP/TLS connect timeout (default 30&nbsp;s). */
+        public Builder connectTimeout(Duration connectTimeout) { this.connectTimeout = connectTimeout; return this; }
+        /** Socket idle (stall) timeout: a read that waits this long with no bytes fails and
+         *  is retried (default {@value StorageHttp#ENV_STALL_TIMEOUT}, else 30&nbsp;s). */
+        public Builder stallTimeout(Duration stallTimeout) { this.stallTimeout = stallTimeout; return this; }
+        /** Floor rate for the per-attempt PUT deadline, connect + stall + size / rate
+         *  (default 64&nbsp;KiB/s): the backstop for a server that stops reading a body. */
+        public Builder minUploadRateBytesPerSecond(long rate) { this.minUploadRateBytesPerSecond = rate; return this; }
 
         /** Build the configured {@link S3Storage}. */
         public S3Storage build() { return new S3Storage(this); }

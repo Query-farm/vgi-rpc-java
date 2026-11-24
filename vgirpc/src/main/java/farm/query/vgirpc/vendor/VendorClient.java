@@ -16,9 +16,9 @@ public abstract sealed class VendorClient implements AutoCloseable permits Vendo
     final VendorApi api;
     final VendorHostsValidator validator;
 
-    VendorClient(String url, String token, Duration timeout, int maxAttempts, double backoffSeconds,
-                 double infoTtlSeconds) {
-        this.api = new VendorApi(url, token, timeout, maxAttempts, backoffSeconds);
+    VendorClient(String url, String token, Duration timeout, Duration stallTimeout, int maxAttempts,
+                 double backoffSeconds, double infoTtlSeconds) {
+        this.api = new VendorApi(url, token, timeout, stallTimeout, maxAttempts, backoffSeconds);
         this.validator = new VendorHostsValidator(api, infoTtlSeconds);
     }
 

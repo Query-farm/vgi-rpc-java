@@ -4,6 +4,7 @@
 package farm.query.vgirpc.vendor;
 
 import farm.query.vgirpc.external.ExternalLocationConfig;
+import farm.query.vgirpc.external.StorageHttp;
 import farm.query.vgirpc.external.LocationResolver;
 
 import java.net.URI;
@@ -36,6 +37,10 @@ import java.util.function.Consumer;
  *   <dt>{@value #ENV_MAX_REQUEST_BYTES}</dt>
  *   <dd>Optional request-body cap, advertised and enforced; clients send larger
  *       requests through vendor upload URLs.</dd>
+ *   <dt>{@value farm.query.vgirpc.external.StorageHttp#ENV_STALL_TIMEOUT}</dt>
+ *   <dd>Seconds a storage transfer (signed PUT/GET, pointer fetch) may move no
+ *       bytes before it is abandoned and retried (default 30). There is no
+ *       whole-transfer deadline.</dd>
  * </dl>
  *
  * <p>Every vendor request carries {@code Authorization: Bearer <token>}. The
@@ -270,7 +275,8 @@ public final class BlobVendor {
                 .storage(storage)
                 .thresholdBytes(threshold)
                 .compression(parseCompression(environ.get(ENV_COMPRESSION)))
-                .urlValidator(storage.urlValidator());
+                .urlValidator(storage.urlValidator())
+                .stallTimeout(StorageHttp.stallTimeoutFromEnv(environ));
         Long maxFetch = positiveLongFromEnv(environ, ENV_MAX_FETCH_BYTES, null);
         if (maxFetch != null) b.maxFetchBytes(maxFetch);
         return b.build();
@@ -288,7 +294,8 @@ public final class BlobVendor {
         Map<String, String> environ = resolveEnv(env);
         if (envOrEmpty(environ, ENV_URL).isEmpty()) return null;
         String[] urlToken = envUrlAndToken(environ);
-        return ExternalLocationConfig.builder().urlValidator(vendorUrlValidator(urlToken[0], urlToken[1])).build();
+        return ExternalLocationConfig.builder().urlValidator(vendorUrlValidator(urlToken[0], urlToken[1]))
+                .stallTimeout(StorageHttp.stallTimeoutFromEnv(environ)).build();
     }
 
     /**

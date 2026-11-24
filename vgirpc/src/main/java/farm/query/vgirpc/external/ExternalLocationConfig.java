@@ -37,8 +37,10 @@ public final class ExternalLocationConfig {
     private final int maxRetries;
     /** Delay between retries. */
     private final Duration retryDelay;
-    /** Per-fetch HTTP timeout. */
+    /** Connect timeout, and the whole-request timeout of a ranged fetch's HEAD probe. */
     private final Duration httpTimeout;
+    /** Stall (idle) timeout for a fetch; {@code null} reads the environment. */
+    private final Duration stallTimeout;
     /** Run before each fetch; throw to reject the URL. */
     private final Consumer<URI> urlValidator;
     /** Max concurrent range requests for a single fetch (1 = no ranges). */
@@ -56,6 +58,7 @@ public final class ExternalLocationConfig {
         this.maxRetries = b.maxRetries;
         this.retryDelay = b.retryDelay;
         this.httpTimeout = b.httpTimeout;
+        this.stallTimeout = b.stallTimeout;
         this.urlValidator = b.urlValidator;
         this.maxRangeParallelism = b.maxRangeParallelism;
         this.compression = b.compression;
@@ -94,6 +97,7 @@ public final class ExternalLocationConfig {
         b.maxRetries = maxRetries;
         b.retryDelay = retryDelay;
         b.httpTimeout = httpTimeout;
+        b.stallTimeout = stallTimeout;
         b.urlValidator = urlValidator;
         b.maxRangeParallelism = maxRangeParallelism;
         b.compression = compression;
@@ -108,9 +112,16 @@ public final class ExternalLocationConfig {
     /** Pause inserted between successive fetch attempts.
      * @return delay between fetch retries. */
     public Duration retryDelay() { return retryDelay; }
-    /** Timeout applied to each individual HTTP request issued by the fetcher.
-     * @return per-request HTTP timeout. */
+    /** Connect timeout of the fetcher's client, and the whole-request timeout of
+     * the HEAD probe a ranged fetch sends. Body transfers never use it: see
+     * {@link #stallTimeout()}.
+     * @return the connect / control-request timeout. */
     public Duration httpTimeout() { return httpTimeout; }
+    /** Stall (idle) timeout for a fetch: it fails, and is retried, only when no
+     * bytes have moved for this long; there is no whole-fetch deadline.
+     * @return the stall timeout, or {@code null} for
+     *     {@value StorageHttp#ENV_STALL_TIMEOUT} (default 30&nbsp;s). */
+    public Duration stallTimeout() { return stallTimeout; }
     /** Security hook run before every fetch; it throws {@link IllegalArgumentException}
      * to reject a URL.
      * @return validator applied to each fetch URL before the request is made. */
@@ -178,6 +189,7 @@ public final class ExternalLocationConfig {
         private int maxRetries = 2;
         private Duration retryDelay = Duration.ofMillis(500);
         private Duration httpTimeout = Duration.ofSeconds(30);
+        private Duration stallTimeout;
         private Consumer<URI> urlValidator = httpsOnlyValidator();
         private int maxRangeParallelism = 1; // simple path by default; set >1 to enable ranges
         private Compression compression; // null = upload raw
@@ -218,10 +230,21 @@ public final class ExternalLocationConfig {
          * @param d the inter-retry delay
          * @return this builder */
         public Builder retryDelay(Duration d) { this.retryDelay = d; return this; }
-        /** Per-request HTTP timeout (default 30&nbsp;s).
-         * @param d the timeout applied to each HTTP request
+        /** Connect timeout, and the HEAD probe's whole-request timeout (default 30&nbsp;s).
+         * @param d the timeout
          * @return this builder */
         public Builder httpTimeout(Duration d) { this.httpTimeout = d; return this; }
+        /** Stall (idle) timeout for a fetch (default {@value StorageHttp#ENV_STALL_TIMEOUT},
+         * else 30&nbsp;s): no whole-fetch deadline.
+         * @param d the stall timeout
+         * @return this builder */
+        public Builder stallTimeout(Duration d) {
+            if (d != null && (d.isZero() || d.isNegative())) {
+                throw new IllegalArgumentException("stallTimeout must be positive");
+            }
+            this.stallTimeout = d;
+            return this;
+        }
         /** Validator run against each fetch URL (default {@link #httpsOnlyValidator()}).
          * @param v the validator; throw {@link IllegalArgumentException} to reject a URL
          * @return this builder */

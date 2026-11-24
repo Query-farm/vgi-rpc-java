@@ -254,6 +254,14 @@ own context: continuations, `onCancel`, unary calls and the first producer tick 
   `VGI-Max-Upload-Bytes` is always sent with upload URLs: by default it is the server's fetch cap
   (`VGI_RPC_MAX_FETCH_BYTES`, default 512 MiB); a larger configured upload cap raises a default fetch cap
   to match, and is refused at startup against an explicit lower one.
+- **Storage timeouts.** Storage transfers (vendor-signed PUTs and GETs, inbound pointer fetches, client
+  upload PUTs) fail only when no bytes move for `VGI_RPC_STORAGE_STALL_TIMEOUT_SECONDS` (default 30 s;
+  connect 30 s). There is no whole-transfer deadline, so a 100 MB result on a 2 MB/s link (50 s)
+  completes in one attempt. Transport errors (connect, reset, stall), 429 and 5xx retry up to three
+  attempts (0.25 s backoff, doubling, 5 s cap, jitter). Vendor API calls keep their 30 s request
+  timeout. `S3Storage` uses a 30 s connect and a per-read stall timeout, plus a per-PUT backstop of
+  connect + stall + size at 64 KiB/s for a server that stops reading; `GcsStorage` (default client)
+  uses 30 s connect and the stall timeout per read. See `farm.query.vgirpc.external.StorageHttp`.
 
 ## Protocol names
 

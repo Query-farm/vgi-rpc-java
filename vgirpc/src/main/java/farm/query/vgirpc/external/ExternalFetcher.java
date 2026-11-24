@@ -5,15 +5,14 @@ package farm.query.vgirpc.external;
 
 import com.github.luben.zstd.Zstd;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
@@ -206,22 +205,30 @@ public final class ExternalFetcher {
         URI current = initial;
         for (int redirects = 0; ; redirects++) {
             validateUrl(current);
+            // A stall (idle) timeout, never a whole-fetch deadline: a slow
+            // fetch that keeps moving completes (StorageHttp).
             HttpRequest.Builder request = HttpRequest.newBuilder(current)
-                    .timeout(config.httpTimeout())
                     .header("Accept-Encoding", "zstd, identity");
             if (range != null) request.header("Range", range);
-            HttpResponse<InputStream> response;
+            long cap = config.maxFetchBytes();
+            if (cap < 0 || cap >= Integer.MAX_VALUE) cap = Integer.MAX_VALUE - 1L;
+            StorageHttp.Result response;
             try {
-                response = client.send(request.GET().build(), HttpResponse.BodyHandlers.ofInputStream());
+                response = StorageHttp.exchange(client, request, "GET", null, cap, stallTimeout());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("external fetch interrupted");
+            } catch (StorageHttp.BodyTooLargeException e) {
+                throw new NonRetryableFetchException("External fetch exceeds max_fetch_bytes (more than "
+                        + config.maxFetchBytes() + ") for " + safeUri(current));
+            } catch (StorageHttp.StallTimeoutException e) {
+                throw new IOException("HTTP request stalled (no bytes for " + stallTimeout().toMillis()
+                        + " ms) for " + safeUri(current));
             } catch (IOException e) {
                 throw new IOException("HTTP request failed for " + safeUri(current));
             }
-            int status = response.statusCode();
+            int status = response.status();
             if (isRedirect(status)) {
-                response.body().close();
                 if (redirects >= MAX_REDIRECTS) {
                     throw new NonRetryableFetchException(
                             "external redirect limit exceeded for " + safeUri(initial));
@@ -230,18 +237,9 @@ public final class ExternalFetcher {
                 continue;
             }
             if (status / 100 != 2) {
-                response.body().close();
                 throw new IOException("HTTP " + status + " fetching " + safeUri(current));
             }
-            long announced = response.headers().firstValueAsLong("Content-Length").orElse(-1);
-            if (announced > config.maxFetchBytes()) {
-                response.body().close();
-                throw new NonRetryableFetchException("External fetch exceeds max_fetch_bytes ("
-                        + announced + " > " + config.maxFetchBytes() + ") for " + safeUri(current));
-            }
-            try (InputStream body = response.body()) {
-                return new FetchResponse(readEncodedBody(body), response.headers(), current);
-            }
+            return new FetchResponse(response.body(), response.headers(), current);
         }
     }
 
@@ -277,23 +275,8 @@ public final class ExternalFetcher {
         }
     }
 
-    private byte[] readEncodedBody(InputStream input) throws IOException {
-        long cap = config.maxFetchBytes();
-        if (cap < 0 || cap >= Integer.MAX_VALUE) cap = Integer.MAX_VALUE - 1L;
-        ByteArrayOutputStream out = new ByteArrayOutputStream((int) Math.min(cap, 64 * 1024));
-        byte[] chunk = new byte[8192];
-        long total = 0;
-        while (true) {
-            int n = input.read(chunk);
-            if (n < 0) break;
-            total += n;
-            if (total > cap) {
-                throw new NonRetryableFetchException("External fetch exceeds max_fetch_bytes (more than "
-                        + config.maxFetchBytes() + ")");
-            }
-            out.write(chunk, 0, n);
-        }
-        return out.toByteArray();
+    private Duration stallTimeout() {
+        return config.stallTimeout() != null ? config.stallTimeout() : StorageHttp.stallTimeoutFromEnv();
     }
 
     private void validateUrl(URI uri) {

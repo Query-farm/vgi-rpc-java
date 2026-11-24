@@ -1018,6 +1018,30 @@ public final class HttpRpcConnection implements AutoCloseable {
         }
     }
 
+    /**
+     * The upload PUT to storage on the JDK transport: a stall (idle) timeout
+     * ({@value farm.query.vgirpc.external.StorageHttp#ENV_STALL_TIMEOUT}, default
+     * 30&nbsp;s) instead of the request timeout, which would bound the whole body.
+     */
+    private HttpReply storagePut(String url, Map<String, String> requestHeaders, byte[] body, String what) {
+        HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(url));
+        requestHeaders.forEach(req::header);
+        farm.query.vgirpc.external.StorageHttp.Result result;
+        try {
+            result = farm.query.vgirpc.external.StorageHttp.exchange(http, req, "PUT", body, 64L << 10,
+                    farm.query.vgirpc.external.StorageHttp.stallTimeoutFromEnv());
+        } catch (farm.query.vgirpc.external.StorageHttp.StallTimeoutException e) {
+            throw new RpcError("TransportError", what + ": " + e.getMessage(), "");
+        } catch (IOException e) {
+            // Never the JDK message: it can embed the signed URL.
+            throw new RpcError("TransportError", what + ": " + e.getClass().getSimpleName(), "");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RpcError("TransportError", what + ": interrupted", "");
+        }
+        return new HttpReply(result.status(), caseInsensitive(result.headers().map()), result.body());
+    }
+
     private HttpReply executeIroh(String method, String url, Map<String, String> requestHeaders,
                                   byte[] body, String what, long preflightLimit, LimitPolicy policy) {
         Map<String, List<String>> outgoing = new LinkedHashMap<>();
@@ -1237,8 +1261,10 @@ public final class HttpRpcConnection implements AutoCloseable {
         UploadUrl slot = urls.getFirst();
         validateExternalUrl(slot.uploadUrl());
         validateExternalUrl(slot.downloadUrl());
-        HttpReply put = execute("PUT", slot.uploadUrl(), uploadHeaders(slot), body,
-                what + " (upload)", 64L << 10, (h, status, w) -> 64L << 10);
+        HttpReply put = irohHttp == null && socksHttp == null
+                ? storagePut(slot.uploadUrl(), uploadHeaders(slot), body, what + " (upload)")
+                : execute("PUT", slot.uploadUrl(), uploadHeaders(slot), body,
+                        what + " (upload)", 64L << 10, (h, status, w) -> 64L << 10);
         if (put.status() < 200 || put.status() >= 300) {
             String code = storageErrorCode(put.body());
             throw new RpcError("ExternalUploadFailed",

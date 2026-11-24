@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import farm.query.vgirpc.external.LocationResolver;
+import farm.query.vgirpc.external.StorageHttp;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,6 +42,12 @@ import java.util.function.Consumer;
  * {@link HttpClient}s with no authenticator, cookie handler or redirects, so a
  * signed-URL request carries exactly the headers the grant names and never the
  * bearer token.</p>
+ *
+ * <p>Vendor API (control) calls keep a whole-request timeout. Storage
+ * transfers never do: they run under {@link StorageHttp#exchange}, which fails
+ * only when no bytes have moved for the stall timeout
+ * ({@value StorageHttp#ENV_STALL_TIMEOUT}, default 30 s), so a large object on
+ * a slow link completes.</p>
  */
 final class VendorApi implements AutoCloseable {
 
@@ -59,12 +66,18 @@ final class VendorApi implements AutoCloseable {
     final boolean loopbackHttp;
     private final String token;
     private final Duration timeout;
+    private final Duration stallTimeout;
     private final int maxAttempts;
     private final double backoffSeconds;
     private final HttpClient api;
     private final HttpClient storage;
 
     VendorApi(String url, String token, Duration timeout, int maxAttempts, double backoffSeconds) {
+        this(url, token, timeout, StorageHttp.stallTimeoutFromEnv(), maxAttempts, backoffSeconds);
+    }
+
+    VendorApi(String url, String token, Duration timeout, Duration stallTimeout, int maxAttempts,
+              double backoffSeconds) {
         URI parsed;
         try {
             parsed = URI.create(url);
@@ -86,13 +99,24 @@ final class VendorApi implements AutoCloseable {
         }
         if (token == null || token.isEmpty()) throw new IllegalArgumentException("Blob vendor token is empty");
         if (maxAttempts < 1) throw new IllegalArgumentException("maxAttempts must be >= 1");
+        if (stallTimeout == null || stallTimeout.isZero() || stallTimeout.isNegative()) {
+            throw new IllegalArgumentException("stallTimeout must be positive");
+        }
         this.baseUrl = url.endsWith("/") ? url.replaceAll("/+$", "") : url;
         this.token = token;
         this.timeout = timeout;
+        this.stallTimeout = stallTimeout;
         this.maxAttempts = maxAttempts;
         this.backoffSeconds = backoffSeconds;
         this.api = newBareClient(timeout);
-        this.storage = newBareClient(timeout);
+        // Storage hosts: the storage connect timeout (30 s); transfers are
+        // bounded by the stall timeout only.
+        this.storage = StorageHttp.newClientBuilder().build();
+    }
+
+    /** The stall timeout storage transfers run under. */
+    Duration stallTimeout() {
+        return stallTimeout;
     }
 
     private static HttpClient newBareClient(Duration timeout) {
@@ -131,8 +155,11 @@ final class VendorApi implements AutoCloseable {
     private record Response(int status, byte[] body, java.net.http.HttpHeaders headers) {}
 
     /**
-     * Send one request, retrying transport errors, 429 and 5xx with backoff.
-     * The request carries exactly {@code headers}.
+     * Send one request, retrying transport errors (connect, reset, stall), 429
+     * and 5xx with backoff. The request carries exactly {@code headers}. A
+     * vendor API call has the whole-request {@code timeout}; a storage-host
+     * transfer has only the stall timeout, and a retry resends its body (a
+     * signed PUT cannot resume).
      */
     private Response send(String method, String url, String op, Map<String, String> headers, byte[] content,
                           boolean storageHost, long maxBodyBytes) {
@@ -149,6 +176,36 @@ final class VendorApi implements AutoCloseable {
                     Thread.currentThread().interrupt();
                     throw new VendorError("Blob vendor " + op + " interrupted: " + LocationResolver.redactUrl(url));
                 }
+            }
+            if (storageHost) {
+                StorageHttp.Result result;
+                HttpRequest.Builder sb = HttpRequest.newBuilder(URI.create(url));
+                headers.forEach(sb::header);
+                try {
+                    result = StorageHttp.exchange(client, sb, method, content, maxBodyBytes, stallTimeout);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new VendorError("Blob vendor " + op + " interrupted: " + LocationResolver.redactUrl(url));
+                } catch (StorageHttp.BodyTooLargeException e) {
+                    throw new VendorError("Blob vendor " + op + " response exceeds " + maxBodyBytes + " bytes: "
+                            + LocationResolver.redactUrl(url));
+                } catch (IOException e) {
+                    // Never e.getMessage() from the JDK: it can embed the full URL.
+                    status = null;
+                    lastError = e instanceof StorageHttp.StallTimeoutException ? "stalled" : e.getClass().getSimpleName();
+                    LOG.debug("Blob vendor {} transport error (attempt {}/{}): {} {}", op, attempt + 1, maxAttempts,
+                            lastError, LocationResolver.redactUrl(url));
+                    continue;
+                }
+                int code = result.status();
+                if (code == 429 || code >= 500) {
+                    status = code;
+                    lastError = "HTTP " + code;
+                    LOG.debug("Blob vendor {} got HTTP {} (attempt {}/{}): {}", op, code, attempt + 1, maxAttempts,
+                            LocationResolver.redactUrl(url));
+                    continue;
+                }
+                return new Response(code, result.body(), result.headers());
             }
             HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create(url)).timeout(timeout);
             headers.forEach(rb::header);
