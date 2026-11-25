@@ -428,14 +428,8 @@ jobs:
       # yardstick, and a pinned yardstick is how that lane rotted for eleven days while
       # reporting green. A reference change that breaks this port should turn
       # this port red the same day.
-      # TODO(release-wave): the protocol-3.4 branch tracks the reference's protocol-3.4
-      # branch (PROTOCOL_VERSIONS_V1: protocol_version_unsupported, the version
-      # advertisement), which main has not merged yet. Back to main with the merge.
       - name: Clone vgi-rpc-python reference (deliberately unpinned)
-        run: |
-          branch=main
-          if [ "${GITHUB_REF_NAME}" = "protocol-3.4" ] || [ "${GITHUB_HEAD_REF:-}" = "protocol-3.4" ]; then branch=protocol-3.4; fi
-          git clone --depth 1 --branch "$branch" https://github.com/Query-farm/vgi-rpc-python.git "$VGI_RPC_REPOS/vgi-rpc-python"
+        run: git clone --depth 1 --branch main https://github.com/Query-farm/vgi-rpc-python.git "$VGI_RPC_REPOS/vgi-rpc-python"
 
       - name: Install Python dependencies
         run: |
